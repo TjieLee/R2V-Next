@@ -35,7 +35,7 @@ from ltx_core.text_encoders.gemma import convert_to_additive_mask
 from ltx_trainer import logger
 from ltx_trainer.config import LtxTrainerConfig
 from ltx_trainer.config_display import print_config
-from ltx_trainer.datasets import PrecomputedDataset
+from ltx_trainer.datasets import PrecomputedDataset, collate_precomputed_batch
 from ltx_trainer.gpu_utils import free_gpu_memory, get_gpu_memory_gb
 from ltx_trainer.hf_hub_utils import push_to_hub
 from ltx_trainer.model_loader import load_embeddings_processor, load_transformer
@@ -668,6 +668,7 @@ class LtxvTrainer:
             batch_size=self._config.optimization.batch_size,
             shuffle=True,
             drop_last=True,
+            collate_fn=collate_precomputed_batch,
             num_workers=num_workers,
             pin_memory=num_workers > 0,
             persistent_workers=num_workers > 0,

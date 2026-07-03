@@ -17,11 +17,12 @@ from ltx_trainer.training_strategies.base_strategy import (
     TrainingStrategyConfigBase,
 )
 from ltx_trainer.training_strategies.flexible import FlexibleStrategy, FlexibleStrategyConfig
+from ltx_trainer.training_strategies.multi_reference_video import MultiReferenceVideoConfig, MultiReferenceVideoStrategy
 from ltx_trainer.training_strategies.text_to_video import TextToVideoConfig, TextToVideoStrategy
 from ltx_trainer.training_strategies.video_to_video import VideoToVideoConfig, VideoToVideoStrategy
 
 # Type alias for all strategy config types
-TrainingStrategyConfig = TextToVideoConfig | VideoToVideoConfig | FlexibleStrategyConfig
+TrainingStrategyConfig = TextToVideoConfig | VideoToVideoConfig | FlexibleStrategyConfig | MultiReferenceVideoConfig
 
 __all__ = [
     "DEFAULT_FPS",
@@ -29,6 +30,8 @@ __all__ = [
     "FlexibleStrategy",
     "FlexibleStrategyConfig",
     "ModelInputs",
+    "MultiReferenceVideoConfig",
+    "MultiReferenceVideoStrategy",
     "TextToVideoConfig",
     "TextToVideoStrategy",
     "TrainingStrategy",
@@ -75,6 +78,8 @@ def get_training_strategy(config: TrainingStrategyConfig) -> TrainingStrategy:
             strategy = VideoToVideoStrategy(config)
         case FlexibleStrategyConfig():
             strategy = FlexibleStrategy(config)
+        case MultiReferenceVideoConfig():
+            strategy = MultiReferenceVideoStrategy(config)
         case _:
             raise ValueError(f"Unknown training strategy config type: {type(config).__name__}")
 

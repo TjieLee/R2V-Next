@@ -5,6 +5,7 @@ import torch
 from einops import rearrange
 from torch import Tensor
 from torch.utils.data import Dataset
+from torch.utils.data._utils.collate import default_collate
 
 from ltx_trainer import logger
 
@@ -313,3 +314,60 @@ class PrecomputedDataset(Dataset):
             data["latents"] = latents
 
         return data
+
+
+def collate_precomputed_batch(batch: list[dict]) -> dict:
+    """Collate precomputed samples and pad variable-length multi-reference tensors.
+
+    Most LTX-2 training sources are fixed-shape tensors and can use PyTorch's
+    default collate. Multi-reference image conditioning is different: each sample
+    may contain 1-N reference latents saved as ``[R, C, F, H, W]``. This helper
+    pads those tensors on the reference axis inside the current batch while
+    leaving all existing fixed-shape sources untouched.
+    """
+
+    return _collate_value(batch)
+
+
+def _collate_value(values: list):
+    first = values[0]
+
+    if isinstance(first, dict):
+        return {key: _collate_value([value[key] for value in values]) for key in first}
+
+    if isinstance(first, torch.Tensor):
+        if _can_stack(values):
+            return default_collate(values)
+        if _can_pad_reference_axis(values):
+            return _pad_reference_axis(values)
+        return default_collate(values)
+
+    return default_collate(values)
+
+
+def _can_stack(values: list[torch.Tensor]) -> bool:
+    shape = values[0].shape
+    return all(value.shape == shape for value in values)
+
+
+def _can_pad_reference_axis(values: list[torch.Tensor]) -> bool:
+    if not values or not all(isinstance(value, torch.Tensor) for value in values):
+        return False
+    first = values[0]
+    if first.ndim == 0:
+        return False
+    trailing = first.shape[1:]
+    return all(value.ndim == first.ndim and value.shape[1:] == trailing for value in values)
+
+
+def _pad_reference_axis(values: list[torch.Tensor]) -> torch.Tensor:
+    max_refs = max(value.shape[0] for value in values)
+    padded = []
+    for value in values:
+        if value.shape[0] == max_refs:
+            padded.append(value)
+            continue
+        pad_shape = (max_refs - value.shape[0], *value.shape[1:])
+        pad_value = torch.zeros(pad_shape, dtype=value.dtype, device=value.device)
+        padded.append(torch.cat([value, pad_value], dim=0))
+    return torch.stack(padded, dim=0)

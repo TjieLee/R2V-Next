@@ -34,7 +34,7 @@ class TrainingStrategyConfigBase(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    name: Literal["text_to_video", "video_to_video", "flexible"] = Field(
+    name: Literal["text_to_video", "video_to_video", "flexible", "multi_reference_video"] = Field(
         description="Unique name identifying the training strategy type"
     )
 
