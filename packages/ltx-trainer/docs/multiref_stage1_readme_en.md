@@ -65,6 +65,18 @@ For your cleaned `stage1_dataset.py` data, export the same three concepts:
 - text prompt -> `caption`
 - list of cropped reference paths -> `reference_images` or pass `--reference-column`
 
+If you are using the raw Phantom JSON shown in `stage1_dataset.py`, convert it first:
+
+```bash
+python scripts/convert_phantom_manifest.py \
+  /mnt/workspace/liutao/phantom_data/train_data_0202.json \
+  --root-dir /mnt/workspace/liutao/phantom_data \
+  --output-json /mnt/workspace/litengjie/my_dataset/train.json
+```
+
+This maps `video_path -> video`, `metadata.video_caption -> caption`, and
+`cropped_ref_paths -> reference_images`.
+
 ## Precompute Data
 
 1. Encode target videos and text as usual:

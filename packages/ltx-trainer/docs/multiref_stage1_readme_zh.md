@@ -65,6 +65,18 @@
 - 文本 prompt -> `caption`；
 - cropped reference paths 列表 -> `reference_images`，或通过 `--reference-column` 指定。
 
+如果直接使用 `stage1_dataset.py` 里的 Phantom 原始 JSON，先这样转换：
+
+```bash
+python scripts/convert_phantom_manifest.py \
+  /mnt/workspace/liutao/phantom_data/train_data_0202.json \
+  --root-dir /mnt/workspace/liutao/phantom_data \
+  --output-json /mnt/workspace/litengjie/my_dataset/train.json
+```
+
+这个脚本会把 `video_path -> video`、`metadata.video_caption -> caption`、
+`cropped_ref_paths -> reference_images`。
+
 ## 数据预处理
 
 1. 先按 LTX-2 原流程编码目标视频和文本：
