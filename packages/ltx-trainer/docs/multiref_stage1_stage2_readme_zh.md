@@ -6,7 +6,7 @@
 VLM context tokens + thinking/register tokens + visual tokens
 ```
 
-其中 `VLM context tokens` 来自 `system prompt -> user prompt -> reference images` 的 Gemma/VLM 编码。Stage 1 在这段 context 后追加 target-video GT SigLIP/projector visual tokens。Stage 2/3 在同样的 source context 后追加固定数量 learnable planner placeholders，让 VLM 输出 planner visual tokens，并用 MSE 对齐 target-video GT SigLIP/projector visual tokens。`planner_token_count` 必须等于 `gt_siglip_tokens/*.pt` 中的 `num_visual_tokens`。
+其中 `VLM context tokens` 来自 `system prompt -> user prompt -> reference images` 的 Gemma/VLM 编码。Stage 1 在这段 context 后追加 target-video GT SigLIP/projector visual tokens。Stage 2/3 在同样的 source context 后追加 Baton-style target planning region：`<image_start> + <image_pad> * planner_token_count + <image_end>`。VLM 在 `<image_pad>` 位置输出 hidden states；planner bridge 使用 repeated LTX thinking/register tokens 作为 Q，使用这些 hidden states 作为 K/V，经过 zero-init cross-attention + zero-init FFN 生成 planner visual tokens，并用 MSE 对齐 target-video GT SigLIP/projector visual tokens。`planner_token_count` 必须等于 `gt_siglip_tokens/*.pt` 中的 `num_visual_tokens`。
 
 ## 不要混淆的视觉来源
 
@@ -31,10 +31,10 @@ VLM context tokens + thinking/register tokens + visual tokens
 
 - `ltx_core.multicond.visual_tokens`：新增冻结 SigLIP/projector visual token 提取、Gemma image-token scatter、固定数量 `VisualPlannerTokens`。
 - `ltx_trainer.training_strategies.multi_reference_video`：Stage 1 可通过 `conditions_dir` 读取 `vlm_conditions/`，再在 VLM context features 后追加 `gt_siglip_tokens/visual_tokens`，统一进入 LTX text connector。
-- `ltx_trainer.training_strategies.multi_reference_planner_stage2`：Stage 2 不再把 planner hidden 压成 256 个任意 tokens，而是使用固定 `planner_token_count` 个 learnable placeholders；VLM 输出的同数量 tokens 直接替换 GT visual tokens 进入 DiT，并和 GT tokens 做 MSE。
+- `ltx_trainer.training_strategies.multi_reference_planner_stage2`：Stage 2 使用固定 `planner_token_count` 个 `<image_pad>` target placeholders；VLM 的 placeholder hidden states 作为 K/V，repeated LTX thinking/register tokens 作为 Q，通过 zero-init cross-attention + zero-init FFN 生成 visual planner tokens，再替换 GT visual tokens 进入 DiT，并和 GT tokens 做 MSE。
 - `scripts/precompute_gt_siglip_tokens.py`：从 target video 采样帧生成 `.precomputed/gt_siglip_tokens/`。
 - `scripts/precompute_multiref_vlm_conditions.py`：为 Stage 1/2 生成 `system prompt -> user prompt -> reference image tokens` 的 VLM context conditions。
-- `scripts/precompute_planner_vlm_inputs.py`：按 `system prompt -> user prompt -> reference image tokens -> planner placeholders` 构建 Stage 2 VLM 输入。
+- `scripts/precompute_planner_vlm_inputs.py`：按 `system prompt -> user prompt -> reference image tokens -> <image_start> + <image_pad>*K + <image_end>` 构建 Stage 2 VLM 输入。
 - `configs/multiref_stage1_lora.yaml`、`configs/multiref_stage2_planner.yaml`：更新 Stage 1/2 配置。
 
 ## 目录结构
@@ -46,7 +46,7 @@ VLM context tokens + thinking/register tokens + visual tokens
 ├── latents/                    # target video VAE latents
 ├── multi_reference_latents/    # 参考图 VAE latents，用于 Stage 1 latent stream conditioning
 ├── gt_siglip_tokens/           # 冻结 target-video SigLIP/projector GT visual tokens
-└── planner_vlm_inputs/         # Stage 2 VLM 输入 + fixed planner placeholder mask
+└── planner_vlm_inputs/         # Stage 2 VLM 输入 + Baton-style target planner placeholder mask
 ```
 
 ## 预处理顺序
@@ -222,12 +222,14 @@ system prompt
 -> Reference image 1: <image tokens>
 -> Reference image 2: <image tokens>
 -> ...
--> planner placeholder tokens, count = planner_token_count
+-> <image_start>
+-> <image_pad> repeated planner_token_count times
+-> <image_end>
 ```
 
-这等价于 Bernini 公式里的 `MLLM(t, v_src_1, ..., v_src_N, v_tgt)`：文本 `t` 在前，参考图 `v_src` 在中间，target/planner visual slots `v_tgt` 在最后。训练时 planner placeholder 的 token id 只是占位；真正送进 Gemma language model 的 embedding 会被 `VisualPlannerTokens` 的 learnable embeddings 替换。
+这等价于 Bernini 公式里的 `MLLM(t, v_src_1, ..., v_src_N, v_tgt)`：文本 `t` 在前，参考图 `v_src` 在中间，target/planner visual slots `v_tgt` 在最后。这里的 `<image_start>/<image_pad>/<image_end>` 使用 Gemma 已有的图像特殊 token id，不扩 tokenizer，不 resize embedding。`planner_placeholder_mask` 只标记中间的 `planner_token_count` 个 `<image_pad>`；前后的 boundary tokens 只用于告诉 VLM 这是 target visual planning region。
 
-当前实现沿用 Gemma language model 的 causal attention。因为 planner placeholders 位于序列最后，它们可以 attend 到前面的 system/user/reference image tokens；planner slots 之间是按 causal 顺序交互。若要做严格的 planner-slot 双向 attention，需要在 Gemma 前向里增加经过验证的 block attention mask，这应该作为独立改动测试。
+VLM 内部仍沿用 Gemma language model 的 causal attention；因为 target planner region 位于序列最后，`<image_pad>` 可以 attend 到前面的 system/user/reference image tokens。VLM 输出后，代码提取 `<image_pad>` hidden states 作为 K/V，再用 repeated LTX thinking/register tokens 作为 Q，经过 zero-init cross-attention + zero-init FFN 得到最终 predicted visual planner tokens。也就是说，thinking/register tokens 不再用于初始化 `<image_pad>` embedding，而是替代 Baton 图里的 Learnable Video Query。
 
 ## 训练时的数据流
 
@@ -247,15 +249,17 @@ reference_images
 target video
   -> precompute_gt_siglip_tokens.py
   -> gt_siglip_tokens.visual_tokens
-  -> text connector input after text/thinking tokens
+  -> text connector input after VLM context tokens
   -> DiT condition tokens
 ```
 
 Stage 2 每条样本的数据流：
 
 ```text
-reference_images + system prompt + user prompt + fixed planner placeholders
+reference_images + system prompt + user prompt + <image_start> + <image_pad>*K + <image_end>
   -> VLM/Gemma language model
+  -> hidden states at <image_pad> positions as K/V
+  -> zero-init cross-attention + zero-init FFN with repeated LTX thinking/register tokens as Q
   -> predicted planner visual tokens
   -> text connector input after VLM context tokens
   -> DiT condition tokens
@@ -268,7 +272,7 @@ target video
 因此，Stage 1 和 Stage 2 的最大区别不是是否使用参考图，而是 DiT condition 里的 visual tokens 来源不同：
 
 - Stage 1：使用 target-video GT SigLIP/projector tokens。
-- Stage 2：使用 VLM + learnable planner placeholders 预测出来的 tokens，并用 target-video GT tokens 对齐。
+- Stage 2：使用 VLM `<image_pad>` hidden states + repeated LTX thinking/register-token queries 预测出来的 tokens，并用 target-video GT tokens 对齐。
 
 ## Negative RoPE
 
@@ -343,6 +347,11 @@ Stage 1 的 DiT 输入区别是：visual tokens 来自 target video 的冻结 Si
 - `model.load_checkpoint`：Stage 1 checkpoint。
 - `training_strategy.conditions_dir`：保持和 Stage 1 一致，默认 `vlm_conditions`。
 - `training_strategy.planner_token_count`：必须等于 `gt_siglip_tokens` 的 `num_visual_tokens`。
+- `training_strategy.planner_cross_attention_heads`：zero-init planner cross-attention 的 head 数，默认 `16`。
+- `training_strategy.planner_zero_init_cross_attention: true`：cross-attention 输出投影零初始化，初始时是 repeated thinking/register query 的 residual。
+- `training_strategy.planner_ffn_multiplier: 4.0`：planner FFN 的 hidden dim 倍率。
+- `training_strategy.planner_zero_init_ffn: true`：FFN 输出投影零初始化，初始不扰动 cross-attention 后的 residual。
+- `training_strategy.planner_slot_encoding: true`：给 query slots 和 VLM placeholder hidden states 加可学习的 slot/type encoding，用于区分 token 位置和角色。
 - `training_strategy.visual_token_frame_stride`：必须和 Stage 1 使用方式一致；如果 Stage 1 用 `2`，Stage 2 也用 `2`，并把 `planner_token_count` 改成降采样后的 token 数。
 - `training_strategy.train_vlm_language_model: true`：训练 Gemma language model。
 - `training_strategy.freeze_vlm_vision_tower: true`：冻结 SigLIP。
@@ -357,7 +366,7 @@ accelerate launch --num_processes 8 --num_machines 1 \
   scripts/train.py configs/multiref_stage2_planner.yaml
 ```
 
-Stage 2 的 DiT 输入区别是：visual tokens 来自 VLM + learnable planner placeholders 的预测结果。MSE 保证预测 tokens 和 Stage 1 使用的 target-video GT SigLIP/projector tokens 位于同一 token 数量、同一特征空间。
+Stage 2 的 DiT 输入区别是：visual tokens 来自 VLM `<image_pad>` hidden states 与 repeated LTX thinking/register queries 的 cross-attention + FFN 输出。MSE 保证预测 tokens 和 Stage 1 使用的 target-video GT SigLIP/projector tokens 位于同一 token 数量、同一特征空间。
 
 ## Stage 3 后续目标
 

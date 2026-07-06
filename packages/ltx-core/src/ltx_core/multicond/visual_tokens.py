@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 
 
@@ -14,46 +16,157 @@ class VisualTokenBatch:
 
 
 class VisualPlannerTokens(nn.Module):
-    """Learnable VLM planner placeholders with a fixed SigLIP-token count."""
+    """Baton-style visual planner using LTX thinking/register tokens as queries.
+
+    The VLM input uses real Gemma image-placeholder token embeddings. This module
+    is the VA-planner bridge after the VLM: repeated LTX connector registers act
+    as video queries, while hidden states at the target ``<img_pad>`` positions
+    provide keys/values. The output projection is zero-initialized by default so
+    the cross-attention and FFN branches start as identity residuals over the
+    repeated register queries.
+    """
 
     def __init__(
         self,
         *,
-        base_tokens: Tensor,
         token_count: int,
         dim: int,
         source_dim: int | None = None,
+        num_heads: int = 16,
+        dropout: float = 0.0,
+        zero_init_output: bool = True,
+        use_slot_encoding: bool = True,
+        ffn_multiplier: float = 4.0,
+        ffn_dropout: float = 0.0,
+        zero_init_ffn: bool = True,
     ) -> None:
         super().__init__()
-        if base_tokens.ndim != 2:
-            raise ValueError(f"base_tokens must be [N, D], got {tuple(base_tokens.shape)}")
         if token_count <= 0:
             raise ValueError("token_count must be positive")
+        if num_heads <= 0:
+            raise ValueError("num_heads must be positive")
+        if dim % num_heads != 0:
+            raise ValueError(f"dim={dim} must be divisible by num_heads={num_heads}")
+        if ffn_multiplier <= 0:
+            raise ValueError("ffn_multiplier must be positive")
 
         self.token_count = token_count
         self.dim = dim
         self.source_dim = source_dim or dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.dropout = dropout
+        self.ffn_dropout = ffn_dropout
+        self.use_slot_encoding = use_slot_encoding
 
-        repeats = (token_count + base_tokens.shape[0] - 1) // base_tokens.shape[0]
-        init_tokens = base_tokens.detach().float().repeat(repeats, 1)[:token_count]
-        if init_tokens.shape[-1] != dim:
-            self.input_projection = nn.Linear(init_tokens.shape[-1], dim)
+        self.query_norm = nn.LayerNorm(dim)
+        self.kv_norm = nn.LayerNorm(self.source_dim)
+        self.query_projection = nn.Linear(dim, dim)
+        self.key_projection = nn.Linear(self.source_dim, dim)
+        self.value_projection = nn.Linear(self.source_dim, dim)
+        self.output_projection = nn.Linear(dim, dim)
+
+        if zero_init_output:
+            nn.init.zeros_(self.output_projection.weight)
+            nn.init.zeros_(self.output_projection.bias)
+
+        ffn_hidden_dim = max(1, int(dim * ffn_multiplier))
+        self.ffn_norm = nn.LayerNorm(dim)
+        self.ffn_fc1 = nn.Linear(dim, ffn_hidden_dim)
+        self.ffn_fc2 = nn.Linear(ffn_hidden_dim, dim)
+        if zero_init_ffn:
+            nn.init.zeros_(self.ffn_fc2.weight)
+            nn.init.zeros_(self.ffn_fc2.bias)
+
+        if use_slot_encoding:
+            self.query_slot_encoding = nn.Parameter(torch.zeros(token_count, dim))
+            self.kv_slot_encoding = nn.Parameter(torch.zeros(token_count, self.source_dim))
         else:
-            self.input_projection = nn.Identity()
-        self.input_tokens = nn.Parameter(init_tokens, requires_grad=True)
+            self.register_parameter("query_slot_encoding", None)
+            self.register_parameter("kv_slot_encoding", None)
 
-        self.output_norm = nn.LayerNorm(self.source_dim)
-        if self.source_dim != dim:
-            self.output_projection = nn.Linear(self.source_dim, dim)
-        else:
-            self.output_projection = nn.Identity()
+        self.query_type_encoding = nn.Parameter(torch.zeros(1, 1, dim))
+        self.kv_type_encoding = nn.Parameter(torch.zeros(1, 1, self.source_dim))
 
-    def input_embeddings(self, *, batch_size: int, device: torch.device, dtype: torch.dtype) -> Tensor:
-        tokens = self.input_projection(self.input_tokens.to(device=device, dtype=dtype))
-        return tokens.unsqueeze(0).expand(batch_size, -1, -1)
+    def forward(
+        self,
+        *,
+        planner_hidden: Tensor,
+        query_registers: Tensor,
+        planner_mask: Tensor | None = None,
+    ) -> Tensor:
+        if planner_hidden.ndim != 3:
+            raise ValueError(f"planner_hidden must be [B,K,D], got {tuple(planner_hidden.shape)}")
+        if planner_hidden.shape[1] != self.token_count:
+            raise ValueError(f"planner_hidden token count {planner_hidden.shape[1]} != {self.token_count}")
+        if query_registers.ndim != 2:
+            raise ValueError(f"query_registers must be [R,D], got {tuple(query_registers.shape)}")
+        if query_registers.shape[-1] != self.dim:
+            raise ValueError(f"query_registers dim {query_registers.shape[-1]} != planner dim {self.dim}")
 
-    def project_hidden(self, hidden: Tensor) -> Tensor:
-        return self.output_projection(self.output_norm(hidden))
+        batch_size = planner_hidden.shape[0]
+        query = self._repeat_query_registers(
+            query_registers=query_registers,
+            batch_size=batch_size,
+            device=planner_hidden.device,
+            dtype=planner_hidden.dtype,
+        )
+        kv = planner_hidden
+
+        if self.query_slot_encoding is not None:
+            query = query + self.query_slot_encoding.to(device=query.device, dtype=query.dtype).unsqueeze(0)
+            kv = kv + self.kv_slot_encoding.to(device=kv.device, dtype=kv.dtype).unsqueeze(0)
+        query = query + self.query_type_encoding.to(device=query.device, dtype=query.dtype)
+        kv = kv + self.kv_type_encoding.to(device=kv.device, dtype=kv.dtype)
+
+        q = self.query_projection(self.query_norm(query))
+        k = self.key_projection(self.kv_norm(kv))
+        v = self.value_projection(self.kv_norm(kv))
+
+        q = self._split_heads(q)
+        k = self._split_heads(k)
+        v = self._split_heads(v)
+
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        if planner_mask is not None:
+            key_mask = planner_mask.to(device=scores.device, dtype=torch.bool)
+            scores = scores.masked_fill(~key_mask[:, None, None, :], torch.finfo(scores.dtype).min)
+        attn = torch.softmax(scores, dim=-1)
+        if self.training and self.dropout > 0:
+            attn = F.dropout(attn, p=self.dropout)
+        attended = torch.matmul(attn, v)
+        attended = self._merge_heads(attended)
+        x = query + self.output_projection(attended)
+
+        ffn_hidden = self.ffn_fc1(self.ffn_norm(x))
+        ffn_hidden = F.gelu(ffn_hidden)
+        if self.training and self.ffn_dropout > 0:
+            ffn_hidden = F.dropout(ffn_hidden, p=self.ffn_dropout)
+        ffn_out = self.ffn_fc2(ffn_hidden)
+        if self.training and self.ffn_dropout > 0:
+            ffn_out = F.dropout(ffn_out, p=self.ffn_dropout)
+        return x + ffn_out
+
+    def _repeat_query_registers(
+        self,
+        *,
+        query_registers: Tensor,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tensor:
+        repeats = (self.token_count + query_registers.shape[0] - 1) // query_registers.shape[0]
+        query = query_registers.to(device=device, dtype=dtype).repeat(repeats, 1)[: self.token_count]
+        return query.unsqueeze(0).expand(batch_size, -1, -1)
+
+    def _split_heads(self, value: Tensor) -> Tensor:
+        batch_size, seq_len, _dim = value.shape
+        return value.reshape(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+
+    @staticmethod
+    def _merge_heads(value: Tensor) -> Tensor:
+        batch_size, _heads, seq_len, head_dim = value.shape
+        return value.transpose(1, 2).reshape(batch_size, seq_len, -1)
 
 
 def extract_projected_visual_tokens(

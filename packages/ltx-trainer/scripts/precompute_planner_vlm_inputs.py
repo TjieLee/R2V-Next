@@ -4,7 +4,8 @@
 This script is intentionally lightweight: it does not run Gemma. It builds the
 chat-template input expected by Gemma3Processor in the order:
 
-    system prompt -> user text -> reference image tokens -> planner placeholders
+    system prompt -> user text -> reference image tokens
+    -> <image_start> -> <image_pad> * K -> <image_end>
 
 It stores tensors under ``planner_vlm_inputs/`` with the same relative paths as
 ``latents/`` and ``conditions/``.
@@ -141,6 +142,8 @@ def _append_planner_placeholders(
     planner_token_count: int,
     max_length: int,
     placeholder_token_id: int,
+    start_token_id: int,
+    end_token_id: int,
     pad_token_id: int,
 ) -> dict[str, torch.Tensor]:
     for unused_key in ("token_type_ids", "position_ids", "cache_position"):
@@ -150,10 +153,11 @@ def _append_planner_placeholders(
     attention_mask = tensor_data["attention_mask"].to(dtype=torch.long)
     if input_ids.ndim != 1:
         raise ValueError(f"Expected 1D input_ids after squeeze, got {tuple(input_ids.shape)}")
-    if input_ids.shape[0] + planner_token_count > max_length:
-        keep = max_length - planner_token_count
+    planner_region_len = planner_token_count + 2
+    if input_ids.shape[0] + planner_region_len > max_length:
+        keep = max_length - planner_region_len
         if keep <= 0:
-            raise ValueError("max_length must be greater than planner_token_count")
+            raise ValueError("max_length must be greater than planner_token_count + 2")
         input_ids = input_ids[:keep]
         attention_mask = attention_mask[:keep]
         for key in ("token_type_ids", "position_ids", "cache_position"):
@@ -162,28 +166,50 @@ def _append_planner_placeholders(
 
     placeholder_ids = torch.full((planner_token_count,), placeholder_token_id, dtype=torch.long)
     placeholder_mask = torch.ones(planner_token_count, dtype=torch.bool)
+    boundary_ids = torch.tensor([start_token_id, end_token_id], dtype=torch.long)
 
-    input_ids = torch.cat([input_ids, placeholder_ids], dim=0)
-    attention_mask = torch.cat([attention_mask, torch.ones_like(placeholder_ids)], dim=0)
+    input_ids = torch.cat([input_ids, boundary_ids[:1], placeholder_ids, boundary_ids[1:]], dim=0)
+    planner_attention = torch.ones(planner_region_len, dtype=torch.long)
+    attention_mask = torch.cat([attention_mask, planner_attention], dim=0)
     planner_placeholder_mask = torch.cat(
         [
-            torch.zeros(input_ids.shape[0] - planner_token_count, dtype=torch.bool),
+            torch.zeros(input_ids.shape[0] - planner_token_count - 1, dtype=torch.bool),
             placeholder_mask,
+            torch.zeros(1, dtype=torch.bool),
         ],
         dim=0,
     )
+    planner_boundary_mask = torch.cat(
+        [
+            torch.zeros(input_ids.shape[0] - planner_region_len, dtype=torch.bool),
+            torch.ones(1, dtype=torch.bool),
+            torch.zeros(planner_token_count, dtype=torch.bool),
+            torch.ones(1, dtype=torch.bool),
+        ],
+        dim=0,
+    )
+    planner_region_mask = planner_placeholder_mask | planner_boundary_mask
 
     pad_len = max_length - input_ids.shape[0]
     if pad_len > 0:
         input_ids = torch.cat([input_ids, torch.full((pad_len,), pad_token_id, dtype=torch.long)], dim=0)
         attention_mask = torch.cat([attention_mask, torch.zeros(pad_len, dtype=torch.long)], dim=0)
         planner_placeholder_mask = torch.cat([planner_placeholder_mask, torch.zeros(pad_len, dtype=torch.bool)], dim=0)
+        planner_boundary_mask = torch.cat([planner_boundary_mask, torch.zeros(pad_len, dtype=torch.bool)], dim=0)
+        planner_region_mask = torch.cat([planner_region_mask, torch.zeros(pad_len, dtype=torch.bool)], dim=0)
 
     tensor_data["input_ids"] = input_ids
     tensor_data["attention_mask"] = attention_mask
     tensor_data["planner_placeholder_mask"] = planner_placeholder_mask
-    tensor_data["gt_image_token_mask"] = (input_ids == GEMMA3_CONFIG_FOR_LTX.image_token_index).to(dtype=torch.bool)
+    tensor_data["planner_boundary_mask"] = planner_boundary_mask
+    tensor_data["planner_region_mask"] = planner_region_mask
+    tensor_data["gt_image_token_mask"] = (
+        (input_ids == GEMMA3_CONFIG_FOR_LTX.image_token_index) & ~planner_placeholder_mask
+    ).to(dtype=torch.bool)
     tensor_data["planner_token_count"] = torch.tensor(planner_token_count, dtype=torch.long)
+    tensor_data["planner_placeholder_token_id"] = torch.tensor(placeholder_token_id, dtype=torch.long)
+    tensor_data["planner_start_token_id"] = torch.tensor(start_token_id, dtype=torch.long)
+    tensor_data["planner_end_token_id"] = torch.tensor(end_token_id, dtype=torch.long)
     return tensor_data
 
 
@@ -213,7 +239,7 @@ def main(
     max_ref_images: int | None = typer.Option(None, help="Optional cap on reference images per sample."),
     planner_token_count: int = typer.Option(
         1024,
-        help="Fixed learnable visual planner placeholder count. Must match gt_siglip_tokens visual token count.",
+        help="Fixed <image_pad> target planner placeholder count. Must match gt_siglip_tokens visual token count.",
     ),
     max_length: int = typer.Option(4096, help="Tokenizer max length."),
     overwrite: bool = typer.Option(False, help="Rebuild files that already exist."),
@@ -228,8 +254,8 @@ def main(
         raise typer.BadParameter("--planner-token-count must be >= 1")
     if max_length < 1:
         raise typer.BadParameter("--max-length must be >= 1")
-    if planner_token_count >= max_length:
-        raise typer.BadParameter("--planner-token-count must be smaller than --max-length")
+    if planner_token_count + 2 >= max_length:
+        raise typer.BadParameter("--planner-token-count + 2 boundary tokens must be smaller than --max-length")
 
     data_root = Path(root_dir) if root_dir is not None else dataset_path.parent
     out_root = Path(output_dir)
@@ -288,7 +314,9 @@ def main(
                 tensor_data,
                 planner_token_count=planner_token_count,
                 max_length=max_length,
-                placeholder_token_id=pad_token_id,
+                placeholder_token_id=GEMMA3_CONFIG_FOR_LTX.image_token_index,
+                start_token_id=GEMMA3_CONFIG_FOR_LTX.boi_token_index,
+                end_token_id=GEMMA3_CONFIG_FOR_LTX.eoi_token_index,
                 pad_token_id=pad_token_id,
             )
             tensor_data["num_ref_images"] = torch.tensor(len(images), dtype=torch.long)

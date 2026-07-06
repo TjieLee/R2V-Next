@@ -86,10 +86,51 @@ class MultiReferencePlannerStage2Config(MultiReferenceVideoConfig):
     planner_token_count: int = Field(
         default=1024,
         description=(
-            "Fixed learnable visual planner token count. Must equal the token count saved in "
+            "Fixed target visual planner token count. Must equal the token count saved in "
             "gt_siglip_tokens/ for every sample."
         ),
         ge=1,
+    )
+
+    planner_cross_attention_heads: int = Field(
+        default=16,
+        description="Number of heads in the zero-init planner cross-attention bridge.",
+        ge=1,
+    )
+
+    planner_cross_attention_dropout: float = Field(
+        default=0.0,
+        description="Dropout used inside the planner cross-attention bridge.",
+        ge=0.0,
+        le=1.0,
+    )
+
+    planner_zero_init_cross_attention: bool = Field(
+        default=True,
+        description="Zero-initialize the planner cross-attention output projection.",
+    )
+
+    planner_ffn_multiplier: float = Field(
+        default=4.0,
+        description="Hidden-size multiplier for the planner FFN after cross-attention.",
+        gt=0.0,
+    )
+
+    planner_ffn_dropout: float = Field(
+        default=0.0,
+        description="Dropout used inside the planner FFN.",
+        ge=0.0,
+        le=1.0,
+    )
+
+    planner_zero_init_ffn: bool = Field(
+        default=True,
+        description="Zero-initialize the planner FFN output projection.",
+    )
+
+    planner_slot_encoding: bool = Field(
+        default=True,
+        description="Add trainable slot/type encodings to repeated query registers and planner hidden states.",
     )
 
     planner_source_dim: int | None = Field(
@@ -148,6 +189,7 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
         super().__init__(config)
         self.planner_tokens: VisualPlannerTokens | None = None
         self.text_encoder: nn.Module | None = None
+        self._planner_query_registers: Tensor | None = None
         self._last_planner_mse_loss: Tensor | None = None
         self._last_vlm_lm_loss: Tensor | None = None
 
@@ -173,12 +215,19 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
             base_tokens = torch.zeros(1, dim, device=next(video_connector.parameters()).device)
         elif dim is None:
             dim = base_tokens.shape[-1]
+        self._planner_query_registers = base_tokens
 
         self.planner_tokens = VisualPlannerTokens(
-            base_tokens=base_tokens.detach().float(),
             token_count=self.config.planner_token_count,
             dim=dim,
             source_dim=self.config.planner_source_dim,
+            num_heads=self.config.planner_cross_attention_heads,
+            dropout=self.config.planner_cross_attention_dropout,
+            zero_init_output=self.config.planner_zero_init_cross_attention,
+            use_slot_encoding=self.config.planner_slot_encoding,
+            ffn_multiplier=self.config.planner_ffn_multiplier,
+            ffn_dropout=self.config.planner_ffn_dropout,
+            zero_init_ffn=self.config.planner_zero_init_ffn,
         ).to(device=base_tokens.device)
 
         self.text_encoder = text_encoder
@@ -264,6 +313,11 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
             {
                 "conditioning": "multi_reference_planner_stage2",
                 "planner_token_count": self.config.planner_token_count,
+                "planner_cross_attention_heads": self.config.planner_cross_attention_heads,
+                "planner_zero_init_cross_attention": self.config.planner_zero_init_cross_attention,
+                "planner_ffn_multiplier": self.config.planner_ffn_multiplier,
+                "planner_zero_init_ffn": self.config.planner_zero_init_ffn,
+                "planner_slot_encoding": self.config.planner_slot_encoding,
                 "planner_mse_weight": self.config.planner_mse_weight,
                 "flow_loss_weight": self.config.flow_loss_weight,
                 "freeze_transformer": self.config.freeze_transformer,
@@ -277,8 +331,8 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
         return metadata
 
     def _run_online_vlm(self, planner_data: dict[str, Any], device: torch.device) -> tuple[Tensor, Tensor]:
-        if self.text_encoder is None or self.planner_tokens is None:
-            raise RuntimeError("Online VLM mode requires text_encoder and planner_tokens.")
+        if self.text_encoder is None or self.planner_tokens is None or self._planner_query_registers is None:
+            raise RuntimeError("Online VLM mode requires text_encoder, planner_tokens and query registers.")
 
         forward_inputs = self._build_vlm_forward_inputs(planner_data, device)
         placeholder_mask = planner_data[self.config.vlm_placeholder_mask_key].to(device=device, dtype=torch.bool)
@@ -302,7 +356,11 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
             hidden_states[self.config.vlm_hidden_layer],
             placeholder_mask,
         )
-        predicted_tokens = self.planner_tokens.project_hidden(selected_hidden)
+        predicted_tokens = self.planner_tokens(
+            planner_hidden=selected_hidden,
+            query_registers=self._planner_query_registers,
+            planner_mask=selected_mask,
+        )
 
         labels = planner_data.get(self.config.vlm_lm_labels_key)
         if labels is not None and self.config.vlm_lm_loss_weight > 0:
@@ -340,15 +398,7 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
                 planner_placeholder_mask=placeholder_mask,
             )
 
-        planner_inputs = self.planner_tokens.input_embeddings(
-            batch_size=input_ids.shape[0],
-            device=input_ids.device,
-            dtype=inputs_embeds.dtype,
-        )
-        out = inputs_embeds.clone()
-        for batch_index in range(out.shape[0]):
-            out[batch_index, placeholder_mask[batch_index]] = planner_inputs[batch_index]
-        return out
+        return inputs_embeds
 
     def _build_vlm_forward_inputs(self, planner_data: dict[str, Any], device: torch.device) -> dict[str, Tensor]:
         allowed_keys = {

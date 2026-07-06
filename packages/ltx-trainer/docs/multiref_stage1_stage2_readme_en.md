@@ -6,7 +6,7 @@ This branch extends the DiT conditioning sequence to:
 VLM context tokens + thinking/register tokens + visual tokens
 ```
 
-`VLM context tokens` are encoded from `system prompt -> user prompt -> reference images`. Stage 1 appends target-video GT SigLIP/projector visual tokens after that context. Stage 2/3 append a fixed number of learnable planner placeholders after the same source context, use the VLM to produce planner visual tokens, and align them to target-video GT SigLIP/projector visual tokens with MSE. `planner_token_count` must exactly match `num_visual_tokens` in `gt_siglip_tokens/*.pt`.
+`VLM context tokens` are encoded from `system prompt -> user prompt -> reference images`. Stage 1 appends target-video GT SigLIP/projector visual tokens after that context. Stage 2/3 append a Baton-style target planning region after the same source context: `<image_start> + <image_pad> * planner_token_count + <image_end>`. The VLM produces hidden states at the `<image_pad>` positions; the planner bridge uses repeated LTX thinking/register tokens as Q and those hidden states as K/V, then applies zero-init cross-attention + zero-init FFN to produce planner visual tokens, which are aligned to target-video GT SigLIP/projector visual tokens with MSE. `planner_token_count` must exactly match `num_visual_tokens` in `gt_siglip_tokens/*.pt`.
 
 ## Visual Sources That Must Not Be Confused
 
@@ -31,10 +31,10 @@ Hard requirements:
 
 - `ltx_core.multicond.visual_tokens`: frozen SigLIP/projector token extraction, Gemma image-token scatter, and fixed-count `VisualPlannerTokens`.
 - `ltx_trainer.training_strategies.multi_reference_video`: Stage 1 can read `vlm_conditions/` through `conditions_dir`, then append `gt_siglip_tokens/visual_tokens` after the VLM context features before the LTX text connector.
-- `ltx_trainer.training_strategies.multi_reference_planner_stage2`: Stage 2 uses fixed `planner_token_count` learnable placeholders. The VLM hidden states at those placeholder positions become the predicted visual tokens; the same tokens are injected into the DiT condition sequence and aligned to GT visual tokens with MSE.
+- `ltx_trainer.training_strategies.multi_reference_planner_stage2`: Stage 2 uses fixed `planner_token_count` `<image_pad>` target placeholders. Their VLM hidden states act as K/V, repeated LTX thinking/register tokens act as Q, and a zero-init cross-attention + zero-init FFN bridge produces visual planner tokens that replace GT visual tokens in the DiT condition sequence and align to GT visual tokens with MSE.
 - `scripts/precompute_gt_siglip_tokens.py`: builds `.precomputed/gt_siglip_tokens/` from sampled target-video frames.
 - `scripts/precompute_multiref_vlm_conditions.py`: builds Stage 1/2 `system prompt -> user prompt -> reference image tokens` VLM context conditions.
-- `scripts/precompute_planner_vlm_inputs.py`: builds Stage 2 VLM inputs in `system prompt -> user prompt -> reference image tokens -> planner placeholders` order.
+- `scripts/precompute_planner_vlm_inputs.py`: builds Stage 2 VLM inputs in `system prompt -> user prompt -> reference image tokens -> <image_start> + <image_pad>*K + <image_end>` order.
 - `configs/multiref_stage1_lora.yaml` and `configs/multiref_stage2_planner.yaml`: Stage 1/2 configs.
 
 ## Preprocessed Layout
@@ -46,7 +46,7 @@ Hard requirements:
 ├── latents/                    # target video VAE latents
 ├── multi_reference_latents/    # reference-image VAE latents for Stage 1 latent-stream conditioning
 ├── gt_siglip_tokens/           # frozen target-video SigLIP/projector GT visual tokens
-└── planner_vlm_inputs/         # Stage 2 VLM inputs + fixed planner placeholder masks
+└── planner_vlm_inputs/         # Stage 2 VLM inputs + Baton-style target planner placeholder masks
 ```
 
 ## Precompute Order
@@ -222,12 +222,14 @@ system prompt
 -> Reference image 1: <image tokens>
 -> Reference image 2: <image tokens>
 -> ...
--> planner placeholder tokens, count = planner_token_count
+-> <image_start>
+-> <image_pad> repeated planner_token_count times
+-> <image_end>
 ```
 
-This matches the Bernini-style sequence `MLLM(t, v_src_1, ..., v_src_N, v_tgt)`: text `t` first, source reference visuals `v_src` in the middle, and target/planner visual slots `v_tgt` at the end. During training, the placeholder token ids are only markers; their actual embeddings are replaced by learnable `VisualPlannerTokens`.
+This matches the Bernini-style sequence `MLLM(t, v_src_1, ..., v_src_N, v_tgt)`: text `t` first, source reference visuals `v_src` in the middle, and target/planner visual slots `v_tgt` at the end. `<image_start>/<image_pad>/<image_end>` use Gemma's existing image special token ids, so there is no tokenizer extension or embedding resize. `planner_placeholder_mask` marks only the middle `planner_token_count` `<image_pad>` tokens; the boundary tokens only mark this as the target visual planning region.
 
-The current implementation keeps Gemma's standard causal language-model attention. Because planner placeholders are at the sequence tail, they can attend to previous system/user/reference-image tokens; planner slots interact with each other causally. Strict bidirectional planner-slot attention would require a validated custom block attention mask inside the Gemma forward path, and should be tested as a separate change.
+Inside the VLM, Gemma still uses its standard causal language-model attention. Because the target planner region is at the sequence tail, `<image_pad>` tokens can attend to previous system/user/reference-image tokens. After the VLM forward pass, the code extracts hidden states at `<image_pad>` positions as K/V, then uses repeated LTX thinking/register tokens as Q in a zero-init cross-attention + zero-init FFN bridge to produce final predicted visual planner tokens. In other words, thinking/register tokens are not used to initialize `<image_pad>` embeddings; they replace the Learnable Video Query in the Baton-style VA-planner.
 
 ## Training Data Flow
 
@@ -247,15 +249,17 @@ reference_images
 target video
   -> precompute_gt_siglip_tokens.py
   -> gt_siglip_tokens.visual_tokens
-  -> text connector input after text/thinking tokens
+  -> text connector input after VLM context tokens
   -> DiT condition tokens
 ```
 
 Stage 2 per-sample flow:
 
 ```text
-reference_images + system prompt + user prompt + fixed planner placeholders
+reference_images + system prompt + user prompt + <image_start> + <image_pad>*K + <image_end>
   -> VLM/Gemma language model
+  -> hidden states at <image_pad> positions as K/V
+  -> zero-init cross-attention + zero-init FFN with repeated LTX thinking/register tokens as Q
   -> predicted planner visual tokens
   -> text connector input after VLM context tokens
   -> DiT condition tokens
@@ -268,7 +272,7 @@ target video
 Therefore, the main Stage 1 vs Stage 2 difference is not whether reference images are used; it is where the DiT condition visual tokens come from:
 
 - Stage 1: target-video GT SigLIP/projector tokens.
-- Stage 2: VLM + learnable planner placeholder predicted tokens, aligned to the target-video GT tokens.
+- Stage 2: VLM `<image_pad>` hidden states plus repeated LTX thinking/register-token queries, aligned to the target-video GT tokens.
 
 ## Negative RoPE
 
@@ -343,6 +347,11 @@ Edit `configs/multiref_stage2_planner.yaml`:
 - `model.load_checkpoint`: Stage 1 checkpoint.
 - `training_strategy.conditions_dir`: keep this consistent with Stage 1, default `vlm_conditions`.
 - `training_strategy.planner_token_count`: must equal `num_visual_tokens` in `gt_siglip_tokens`.
+- `training_strategy.planner_cross_attention_heads`: number of heads in the zero-init planner cross-attention bridge, default `16`.
+- `training_strategy.planner_zero_init_cross_attention: true`: zero-initialize the cross-attention output projection, so initialization is a residual over repeated thinking/register queries.
+- `training_strategy.planner_ffn_multiplier: 4.0`: hidden-dim multiplier for the planner FFN.
+- `training_strategy.planner_zero_init_ffn: true`: zero-initialize the FFN output projection, so initialization does not perturb the post-cross-attention residual.
+- `training_strategy.planner_slot_encoding: true`: add trainable slot/type encodings to query slots and VLM placeholder hidden states.
 - `training_strategy.visual_token_frame_stride`: must match Stage 1. If Stage 1 uses `2`, Stage 2 also uses `2`, and `planner_token_count` must be the downsampled token count.
 - `training_strategy.train_vlm_language_model: true`: train the Gemma language model.
 - `training_strategy.freeze_vlm_vision_tower: true`: freeze SigLIP.
@@ -357,7 +366,7 @@ accelerate launch --num_processes 8 --num_machines 1 \
   scripts/train.py configs/multiref_stage2_planner.yaml
 ```
 
-Stage 2 feeds VLM-predicted visual tokens to the DiT condition path. The MSE loss keeps those predicted tokens aligned with the exact target-video GT SigLIP/projector token count and feature space learned by Stage 1.
+Stage 2 feeds the cross-attention + FFN output from VLM `<image_pad>` hidden states and repeated LTX thinking/register queries to the DiT condition path. The MSE loss keeps those predicted tokens aligned with the exact target-video GT SigLIP/projector token count and feature space learned by Stage 1.
 
 ## Stage 3 Target
 

@@ -4,8 +4,9 @@
 #
 # Stage 2 freezes the Stage 1 multi-reference renderer by default and trains:
 #   1. Gemma/VLM language model (SigLIP vision tower + image projector frozen)
-#   2. fixed-count learnable visual planner placeholders
-#   3. Optional LTX video text connector refinement
+#   2. Baton-style <image_start> + <image_pad>*K + <image_end> planner slots
+#   3. zero-init cross-attention + FFN bridge whose Q is repeated LTX thinking/register tokens
+#   4. Optional LTX video text connector refinement
 #
 # The DiT condition sequence remains:
 #   VLM text/reference-image context tokens + visual tokens
@@ -84,6 +85,13 @@ training_strategy:
   # Your current log showed 2048 GT visual tokens per sample; if you rerun GT
   # extraction with 4 sampled frames, change this back to 1024.
   planner_token_count: 2048
+  planner_cross_attention_heads: 16
+  planner_cross_attention_dropout: 0.0
+  planner_zero_init_cross_attention: true
+  planner_ffn_multiplier: 4.0
+  planner_ffn_dropout: 0.0
+  planner_zero_init_ffn: true
+  planner_slot_encoding: true
   # Set this if the selected VLM hidden layer dim differs from the LTX connector input dim (default 3840).
   planner_source_dim: null
   predicted_visual_token_key: "predicted_visual_tokens"
