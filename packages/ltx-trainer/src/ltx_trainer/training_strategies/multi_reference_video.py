@@ -45,7 +45,7 @@ class MultiReferenceVideoConfig(TrainingStrategyConfigBase):
     gt_visual_tokens_dir: str | None = Field(
         default="gt_siglip_tokens",
         description=(
-            "Directory containing frozen SigLIP/projector visual tokens. Set to null to disable the "
+            "Directory containing frozen target-video SigLIP/projector visual tokens. Set to null to disable the "
             "Stage 1 text-condition expansion path."
         ),
     )
@@ -58,6 +58,20 @@ class MultiReferenceVideoConfig(TrainingStrategyConfigBase):
     visual_token_mask_key: str = Field(
         default="visual_token_mask",
         description="Optional bool mask key in gt_visual_tokens_dir files. Shape per sample: [K].",
+    )
+
+    visual_tokens_per_frame_key: str = Field(
+        default="tokens_per_frame",
+        description="Optional scalar key for target-video SigLIP tokens per sampled frame.",
+    )
+
+    visual_token_frame_stride: int = Field(
+        default=1,
+        description=(
+            "Optional post-encoding temporal downsampling for target-video SigLIP tokens. "
+            "For example, stride=2 uses every other sampled frame without rerunning SigLIP."
+        ),
+        ge=1,
     )
 
     max_ref_images_per_sample: int | None = Field(
@@ -278,7 +292,40 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
             mask = mask.to(device=tokens.device, dtype=torch.bool)
         if mask.shape != tokens.shape[:2]:
             raise ValueError(f"GT visual token mask must be [B,K], got {tuple(mask.shape)} for tokens {tuple(tokens.shape)}")
+        tokens, mask = self._downsample_visual_tokens_by_frame(tokens, mask, visual_data)
         return tokens, mask
+
+    def _downsample_visual_tokens_by_frame(
+        self,
+        tokens: Tensor,
+        mask: Tensor,
+        visual_data: dict[str, Any],
+    ) -> tuple[Tensor, Tensor]:
+        if self.config.visual_token_frame_stride == 1:
+            return tokens, mask
+
+        tokens_per_frame = visual_data.get(self.config.visual_tokens_per_frame_key)
+        if tokens_per_frame is None:
+            raise ValueError(
+                "visual_token_frame_stride > 1 requires tokens_per_frame metadata in gt visual-token files."
+            )
+        if isinstance(tokens_per_frame, Tensor):
+            if not torch.all(tokens_per_frame == tokens_per_frame.flatten()[0]):
+                raise ValueError(f"Mixed tokens_per_frame in batch: {tokens_per_frame.tolist()}")
+            tokens_per_frame = int(tokens_per_frame.flatten()[0].item())
+        else:
+            tokens_per_frame = int(tokens_per_frame)
+
+        if tokens.shape[1] % tokens_per_frame != 0:
+            raise ValueError(
+                f"Visual token count {tokens.shape[1]} is not divisible by tokens_per_frame={tokens_per_frame}"
+            )
+
+        num_frames = tokens.shape[1] // tokens_per_frame
+        stride = self.config.visual_token_frame_stride
+        tokens = tokens.reshape(tokens.shape[0], num_frames, tokens_per_frame, tokens.shape[-1])[:, ::stride]
+        mask = mask.reshape(mask.shape[0], num_frames, tokens_per_frame)[:, ::stride]
+        return tokens.reshape(tokens.shape[0], -1, tokens.shape[-1]), mask.reshape(mask.shape[0], -1)
 
     def _append_visual_tokens_to_conditions(
         self,

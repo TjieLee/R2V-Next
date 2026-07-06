@@ -6,14 +6,14 @@
 text embedding tokens + thinking/register tokens + visual tokens
 ```
 
-Stage 1 使用冻结 Gemma/SigLIP vision tower 和 multi-modal projector 生成的 GT visual tokens。Stage 2 使用 VLM language model + 固定数量 learnable planner placeholder tokens 预测 visual tokens，并用 MSE 对齐 Stage 1 的 GT SigLIP/projector visual tokens。`planner_token_count` 必须等于 `gt_siglip_tokens/*.pt` 中的 `num_visual_tokens`。
+Stage 1 使用冻结 Gemma/SigLIP vision tower 和 multi-modal projector 从 target video 采样帧生成的 GT visual tokens。Stage 2 使用 VLM language model + 固定数量 learnable planner placeholder tokens 预测 visual tokens，并用 MSE 对齐 Stage 1 的 target-video GT SigLIP/projector visual tokens。`planner_token_count` 必须等于 `gt_siglip_tokens/*.pt` 中的 `num_visual_tokens`。
 
 ## 主要改动
 
 - `ltx_core.multicond.visual_tokens`：新增冻结 SigLIP/projector visual token 提取、Gemma image-token scatter、固定数量 `VisualPlannerTokens`。
 - `ltx_trainer.training_strategies.multi_reference_video`：Stage 1 在原 text features 后追加 `gt_siglip_tokens/visual_tokens`，再统一进入 LTX text connector。
 - `ltx_trainer.training_strategies.multi_reference_planner_stage2`：Stage 2 不再把 planner hidden 压成 256 个任意 tokens，而是使用固定 `planner_token_count` 个 learnable placeholders；VLM 输出的同数量 tokens 直接替换 GT visual tokens 进入 DiT，并和 GT tokens 做 MSE。
-- `scripts/precompute_gt_siglip_tokens.py`：从 `reference_images` 生成 `.precomputed/gt_siglip_tokens/`。
+- `scripts/precompute_gt_siglip_tokens.py`：从 target video 采样帧生成 `.precomputed/gt_siglip_tokens/`。
 - `scripts/precompute_planner_vlm_inputs.py`：构建 system/user prompt，并在 token 序列末尾追加固定数量 planner placeholders。
 - `configs/multiref_stage1_lora.yaml`、`configs/multiref_stage2_planner.yaml`：更新 Stage 1/2 配置。
 
@@ -24,7 +24,7 @@ Stage 1 使用冻结 Gemma/SigLIP vision tower 和 multi-modal projector 生成�
 ├── conditions/                 # text/thinking features, connector 前
 ├── latents/                    # target video VAE latents
 ├── multi_reference_latents/    # 参考图 VAE latents，用于 Stage 1 latent stream conditioning
-├── gt_siglip_tokens/           # 冻结 SigLIP/projector GT visual tokens
+├── gt_siglip_tokens/           # 冻结 target-video SigLIP/projector GT visual tokens
 └── planner_vlm_inputs/         # Stage 2 VLM 输入 + fixed planner placeholder mask
 ```
 
@@ -89,18 +89,19 @@ python scripts/precompute_multiref_images.py /mnt/workspace/litengjie/my_dataset
   --device cuda
 ```
 
-4. 生成 GT SigLIP/projector visual tokens：
+4. 生成 target-video GT SigLIP/projector visual tokens：
 
 ```bash
 python scripts/precompute_gt_siglip_tokens.py /mnt/workspace/litengjie/my_dataset/train.json \
   --text-encoder-path /mnt/workspace/litengjie/LTX-2/models/gemma-3-12b-it-qat-q4_0-unquantized \
   --output-dir /mnt/workspace/litengjie/my_dataset/.precomputed/gt_siglip_tokens \
   --video-column video \
-  --reference-column reference_images \
+  --sample-fps 6 \
+  --max-source-frames 81 \
   --device cuda
 ```
 
-脚本会打印检测到的 `num_visual_tokens`。把这个值填到 Stage 2 配置的：
+脚本会在 target video 的前 `81` 个源帧内按 `6fps` 抽帧，并打印检测到的 `num_visual_tokens`。把这个值填到 Stage 2 配置的：
 
 ```yaml
 training_strategy:
@@ -127,6 +128,7 @@ python scripts/precompute_planner_vlm_inputs.py /mnt/workspace/litengjie/my_data
 - `model.text_encoder_path`：Gemma text encoder 目录。
 - `data.preprocessed_data_root`：`/mnt/workspace/litengjie/my_dataset/.precomputed`。
 - `training_strategy.gt_visual_tokens_dir`：默认 `gt_siglip_tokens`。
+- `training_strategy.visual_token_frame_stride`：默认 `1`。如果你已经按 `6fps` 编码，后期想按 `3fps` 用，可以设为 `2`，无需重跑 SigLIP。
 - `output_dir`：Stage 1 输出目录。
 
 启动：
@@ -136,7 +138,7 @@ accelerate launch --num_processes 8 --num_machines 1 \
   scripts/train.py configs/multiref_stage1_lora.yaml
 ```
 
-Stage 1 的 DiT 输入区别是：visual tokens 来自冻结 SigLIP/projector 的 GT tokens。
+Stage 1 的 DiT 输入区别是：visual tokens 来自 target video 的冻结 SigLIP/projector GT tokens。
 
 ## Stage 2 训练
 
@@ -144,6 +146,7 @@ Stage 1 的 DiT 输入区别是：visual tokens 来自冻结 SigLIP/projector �
 
 - `model.load_checkpoint`：Stage 1 checkpoint。
 - `training_strategy.planner_token_count`：必须等于 `gt_siglip_tokens` 的 `num_visual_tokens`。
+- `training_strategy.visual_token_frame_stride`：必须和 Stage 1 使用方式一致；如果 Stage 1 用 `2`，Stage 2 也用 `2`，并把 `planner_token_count` 改成降采样后的 token 数。
 - `training_strategy.train_vlm_language_model: true`：训练 Gemma language model。
 - `training_strategy.freeze_vlm_vision_tower: true`：冻结 SigLIP。
 - `training_strategy.freeze_vlm_multi_modal_projector: true`：冻结 image projection。
@@ -157,7 +160,7 @@ accelerate launch --num_processes 8 --num_machines 1 \
   scripts/train.py configs/multiref_stage2_planner.yaml
 ```
 
-Stage 2 的 DiT 输入区别是：visual tokens 来自 VLM + learnable planner placeholders 的预测结果。MSE 保证预测 tokens 和 Stage 1 使用的 GT SigLIP/projector tokens 位于同一 token 数量、同一特征空间。
+Stage 2 的 DiT 输入区别是：visual tokens 来自 VLM + learnable planner placeholders 的预测结果。MSE 保证预测 tokens 和 Stage 1 使用的 target-video GT SigLIP/projector tokens 位于同一 token 数量、同一特征空间。
 
 ## Stage 3 后续目标
 

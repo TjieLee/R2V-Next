@@ -4,7 +4,7 @@
 #
 # Stage 1 trains the video renderer to consume:
 #   1. text/thinking tokens from the normal LTX-2 Gemma text path
-#   2. frozen GT SigLIP/projector visual condition tokens
+#   2. frozen target-video GT SigLIP/projector visual condition tokens
 #   3. clean multi-reference image latent token segments prepended to the video stream
 # Audio is disabled.
 #
@@ -12,7 +12,7 @@
 #   preprocessed_data_root/
 #   ├── latents/                  # Target video VAE latents
 #   ├── conditions/               # Text embeddings
-#   ├── gt_siglip_tokens/         # Frozen GT visual tokens from Gemma SigLIP/projector
+#   ├── gt_siglip_tokens/         # Frozen target-video GT visual tokens from Gemma SigLIP/projector
 #   └── multi_reference_latents/  # Stacked 1-N reference image latents per sample
 #
 # Build multi_reference_latents with:
@@ -28,7 +28,8 @@
 #     --text-encoder-path /path/to/gemma-text-encoder \
 #     --output-dir /path/to/.precomputed/gt_siglip_tokens \
 #     --video-column video \
-#     --reference-column reference_images
+#     --sample-fps 6 \
+#     --max-source-frames 81
 
 model:
   model_path: "path/to/ltx-2-model.safetensors"
@@ -56,6 +57,8 @@ training_strategy:
   gt_visual_tokens_dir: "gt_siglip_tokens"
   visual_token_key: "visual_tokens"
   visual_token_mask_key: "visual_token_mask"
+  visual_tokens_per_frame_key: "tokens_per_frame"
+  visual_token_frame_stride: 1
   max_ref_images_per_sample: null
   reference_time_stride: 1.0
   first_frame_conditioning_p: 0.0

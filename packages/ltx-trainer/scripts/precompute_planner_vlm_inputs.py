@@ -17,6 +17,7 @@ from typing import Any
 
 import torch
 import typer
+from rich.progress import track
 from transformers import AutoImageProcessor, AutoTokenizer, Gemma3Processor
 
 from ltx_core.text_encoders.gemma.config import GEMMA3_CONFIG_FOR_LTX
@@ -231,7 +232,7 @@ def main(
     custom_system_prompt = Path(system_prompt_path).read_text(encoding="utf-8") if system_prompt_path else None
     pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
 
-    for row in rows:
+    for row in track(rows, description="Building planner VLM inputs"):
         if video_column not in row:
             raise ValueError(f"Missing video column '{video_column}' in row: {row}")
         if caption_column not in row:

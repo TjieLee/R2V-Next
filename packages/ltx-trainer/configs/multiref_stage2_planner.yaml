@@ -9,7 +9,7 @@
 #
 # The DiT condition sequence remains:
 #   text/thinking tokens + visual tokens
-# Stage 1 uses GT visual tokens from frozen SigLIP/projector.
+# Stage 1 uses target-video GT visual tokens from frozen SigLIP/projector.
 # Stage 2 replaces them with VLM-predicted visual tokens and aligns them to GT
 # with MSE. planner_token_count must equal the GT visual token count.
 #
@@ -18,7 +18,7 @@
 #   ├── latents/                    # Target video VAE latents
 #   ├── conditions/                 # Text embeddings
 #   ├── multi_reference_latents/    # Stage 1 reference image latents
-#   ├── gt_siglip_tokens/           # frozen SigLIP/projector visual tokens
+#   ├── gt_siglip_tokens/           # frozen target-video SigLIP/projector visual tokens
 #   └── planner_vlm_inputs/         # tokenized VLM inputs with fixed planner placeholders
 #
 # planner_vlm_inputs/*.pt format:
@@ -58,6 +58,8 @@ training_strategy:
   gt_visual_tokens_dir: "gt_siglip_tokens"
   visual_token_key: "visual_tokens"
   visual_token_mask_key: "visual_token_mask"
+  visual_tokens_per_frame_key: "tokens_per_frame"
+  visual_token_frame_stride: 1
   planner_conditions_dir: "planner_conditions"
   use_online_vlm: true
   planner_vlm_inputs_dir: "planner_vlm_inputs"
