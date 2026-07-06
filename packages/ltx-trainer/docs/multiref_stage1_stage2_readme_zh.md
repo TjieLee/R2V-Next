@@ -138,10 +138,20 @@ python scripts/precompute_planner_vlm_inputs.py /mnt/workspace/litengjie/my_data
   --video-column video \
   --caption-column caption \
   --reference-column reference_images \
-  --planner-token-count 1024
+  --planner-token-count 1024 \
+  --max-length 4096
 ```
 
 这里的 `planner-token-count` 必须和 `gt_siglip_tokens` 的 `num_visual_tokens` 完全一致。最多 `4` 张 reference images 只影响 VLM 能看到多少参考图，以及 `multi_reference_latents/` 中有多少参考 latent；它不决定 MSE teacher token 数。
+
+如果你已经生成的 `gt_siglip_tokens` 日志显示 `Detected 2048 GT visual tokens per sample`，这里就要改成：
+
+```bash
+  --planner-token-count 2048 \
+  --max-length 4096
+```
+
+如果 caption 很长或参考图 token 占用较多，可以把 `--max-length` 提到 `8192`。
 
 ## 训练时的数据流
 

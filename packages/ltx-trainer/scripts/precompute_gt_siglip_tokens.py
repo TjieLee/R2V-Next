@@ -145,6 +145,7 @@ def main(  # noqa: PLR0913
     ),
     device: str = typer.Option("cuda", help="Torch device for SigLIP/projector extraction."),
     overwrite: bool = typer.Option(False, help="Rebuild files that already exist."),
+    skip_errors: bool = typer.Option(True, help="Skip unreadable/bad rows instead of stopping the whole shard."),
 ) -> None:
     if sample_fps <= 0:
         raise typer.BadParameter("--sample-fps must be greater than 0.")
@@ -165,61 +166,69 @@ def main(  # noqa: PLR0913
     rows = _read_rows(dataset_path)
     processed = 0
     skipped = 0
+    failed = 0
     first_token_count: int | None = None
 
     for row in track(rows, description="Encoding target-video GT SigLIP visual tokens"):
-        if video_column not in row:
-            raise ValueError(f"Missing video column '{video_column}' in row: {row}")
+        try:
+            if video_column not in row:
+                raise ValueError(f"Missing video column '{video_column}' in row: {row}")
 
-        video_path = _resolve_path(str(row[video_column]), data_root)
-        output_file = out_root / _output_relative(video_path, data_root).with_suffix(".pt")
-        if output_file.exists() and not overwrite:
-            skipped += 1
-            continue
+            video_path = _resolve_path(str(row[video_column]), data_root)
+            output_file = out_root / _output_relative(video_path, data_root).with_suffix(".pt")
+            if output_file.exists() and not overwrite:
+                skipped += 1
+                continue
 
-        images, source_fps, frame_indices = _sample_video_frames(
-            video_path,
-            sample_fps=sample_fps,
-            max_source_frames=max_source_frames,
-            num_sampled_frames=num_sampled_frames,
-            max_sampled_frames=max_sampled_frames,
-        )
-        processed_images = image_processor(images=images, return_tensors="pt")
-        pixel_values = processed_images["pixel_values"].to(device=device, dtype=torch.bfloat16)
-
-        with torch.inference_mode():
-            visual_batch = extract_projected_visual_tokens(text_encoder.model, pixel_values)
-
-        tokens = visual_batch.tokens[0].cpu().contiguous()
-        mask = visual_batch.mask[0].cpu().contiguous()
-        token_count = int(mask.sum().item())
-        tokens_per_frame = token_count // len(images)
-        if first_token_count is None:
-            first_token_count = token_count
-            logger.info(f"Detected {first_token_count} GT visual tokens per sample")
-        if expected_token_count is not None and token_count != expected_token_count:
-            raise ValueError(
-                f"{video_path} produced {token_count} visual tokens, expected {expected_token_count}. "
-                "Use the detected count in planner_token_count or keep target-video sampling fixed."
+            images, source_fps, frame_indices = _sample_video_frames(
+                video_path,
+                sample_fps=sample_fps,
+                max_source_frames=max_source_frames,
+                num_sampled_frames=num_sampled_frames,
+                max_sampled_frames=max_sampled_frames,
             )
+            processed_images = image_processor(images=images, return_tensors="pt")
+            pixel_values = processed_images["pixel_values"].to(device=device, dtype=torch.bfloat16)
 
-        save_data = {
-            "visual_tokens": tokens,
-            "visual_token_mask": mask,
-            "num_visual_tokens": torch.tensor(token_count, dtype=torch.long),
-            "num_video_frames": torch.tensor(len(images), dtype=torch.long),
-            "tokens_per_frame": torch.tensor(tokens_per_frame, dtype=torch.long),
-            "sampled_frame_indices": frame_indices.cpu().contiguous(),
-            "source_fps": torch.tensor(source_fps, dtype=torch.float32),
-            "sample_fps": torch.tensor(sample_fps, dtype=torch.float32),
-            "num_sampled_frames_setting": torch.tensor(num_sampled_frames or -1, dtype=torch.long),
-            "max_source_frames": torch.tensor(max_source_frames or -1, dtype=torch.long),
-        }
-        _atomic_save(save_data, output_file)
-        processed += 1
+            with torch.inference_mode():
+                visual_batch = extract_projected_visual_tokens(text_encoder.model, pixel_values)
+
+            tokens = visual_batch.tokens[0].cpu().contiguous()
+            mask = visual_batch.mask[0].cpu().contiguous()
+            token_count = int(mask.sum().item())
+            tokens_per_frame = token_count // len(images)
+            if first_token_count is None:
+                first_token_count = token_count
+                logger.info(f"Detected {first_token_count} GT visual tokens per sample")
+            if expected_token_count is not None and token_count != expected_token_count:
+                raise ValueError(
+                    f"{video_path} produced {token_count} visual tokens, expected {expected_token_count}. "
+                    "Use the detected count in planner_token_count or keep target-video sampling fixed."
+                )
+
+            save_data = {
+                "visual_tokens": tokens,
+                "visual_token_mask": mask,
+                "num_visual_tokens": torch.tensor(token_count, dtype=torch.long),
+                "num_video_frames": torch.tensor(len(images), dtype=torch.long),
+                "tokens_per_frame": torch.tensor(tokens_per_frame, dtype=torch.long),
+                "sampled_frame_indices": frame_indices.cpu().contiguous(),
+                "source_fps": torch.tensor(source_fps, dtype=torch.float32),
+                "sample_fps": torch.tensor(sample_fps, dtype=torch.float32),
+                "num_sampled_frames_setting": torch.tensor(num_sampled_frames or -1, dtype=torch.long),
+                "max_source_frames": torch.tensor(max_source_frames or -1, dtype=torch.long),
+            }
+            _atomic_save(save_data, output_file)
+            processed += 1
+        except Exception as exc:
+            if not skip_errors:
+                raise
+            failed += 1
+            logger.warning(f"Skipping row due to GT SigLIP preprocessing error: {exc}")
 
     logger.info(
-        f"Target-video GT SigLIP token preprocessing complete: {processed} encoded, {skipped} skipped -> {out_root}"
+        f"Target-video GT SigLIP token preprocessing complete: "
+        f"{processed} encoded, {skipped} existing skipped, {failed} failed skipped -> {out_root}"
     )
 
 

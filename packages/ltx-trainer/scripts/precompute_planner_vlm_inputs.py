@@ -22,6 +22,7 @@ from transformers import AutoImageProcessor, AutoTokenizer, Gemma3Processor
 
 from ltx_core.text_encoders.gemma.config import GEMMA3_CONFIG_FOR_LTX
 from ltx_core.utils import find_matching_file
+from ltx_trainer import logger
 from ltx_trainer.utils import open_image_as_srgb
 
 app = typer.Typer(
@@ -204,12 +205,13 @@ def main(
     ),
     max_ref_images: int | None = typer.Option(None, help="Optional cap on reference images per sample.", min=1),
     planner_token_count: int = typer.Option(
-        256,
+        1024,
         help="Fixed learnable visual planner placeholder count. Must match gt_siglip_tokens visual token count.",
         min=1,
     ),
-    max_length: int = typer.Option(1024, help="Tokenizer max length.", min=1),
+    max_length: int = typer.Option(4096, help="Tokenizer max length.", min=1),
     overwrite: bool = typer.Option(False, help="Rebuild files that already exist."),
+    skip_errors: bool = typer.Option(True, help="Skip unreadable/bad rows instead of stopping the whole shard."),
 ) -> None:
     dataset_path = Path(dataset_file)
     if not dataset_path.is_file():
@@ -231,46 +233,66 @@ def main(
     default_t2v_prompt = _load_default_system_prompt("gemma_t2v_system_prompt.txt")
     custom_system_prompt = Path(system_prompt_path).read_text(encoding="utf-8") if system_prompt_path else None
     pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+    processed_count = 0
+    skipped_count = 0
+    failed_count = 0
 
     for row in track(rows, description="Building planner VLM inputs"):
-        if video_column not in row:
-            raise ValueError(f"Missing video column '{video_column}' in row: {row}")
-        if caption_column not in row:
-            raise ValueError(f"Missing caption column '{caption_column}' in row: {row}")
+        try:
+            if video_column not in row:
+                raise ValueError(f"Missing video column '{video_column}' in row: {row}")
+            if caption_column not in row:
+                raise ValueError(f"Missing caption column '{caption_column}' in row: {row}")
 
-        video_path = _resolve_path(str(row[video_column]), data_root)
-        output_file = out_root / _output_relative(video_path, data_root).with_suffix(".pt")
-        if output_file.exists() and not overwrite:
-            continue
+            video_path = _resolve_path(str(row[video_column]), data_root)
+            output_file = out_root / _output_relative(video_path, data_root).with_suffix(".pt")
+            if output_file.exists() and not overwrite:
+                skipped_count += 1
+                continue
 
-        ref_values = _parse_reference_images(row.get(reference_column))
-        if max_ref_images is not None:
-            ref_values = ref_values[:max_ref_images]
-        ref_paths = [_resolve_path(value, data_root) for value in ref_values]
-        images = [open_image_as_srgb(path) for path in ref_paths]
+            ref_values = _parse_reference_images(row.get(reference_column))
+            if max_ref_images is not None:
+                ref_values = ref_values[:max_ref_images]
+            ref_paths = [_resolve_path(value, data_root) for value in ref_values]
+            images = [open_image_as_srgb(path) for path in ref_paths]
 
-        system_prompt = custom_system_prompt or (default_i2v_prompt if images else default_t2v_prompt)
-        messages = _build_messages(system_prompt=system_prompt, user_prompt=str(row[caption_column]), num_images=len(images))
-        text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        processed = processor(
-            text=text,
-            images=images if images else None,
-            return_tensors="pt",
-            padding=False,
-            max_length=max_length - planner_token_count,
-            truncation=True,
-        )
+            system_prompt = custom_system_prompt or (default_i2v_prompt if images else default_t2v_prompt)
+            messages = _build_messages(
+                system_prompt=system_prompt,
+                user_prompt=str(row[caption_column]),
+                num_images=len(images),
+            )
+            text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            processed = processor(
+                text=text,
+                images=images if images else None,
+                return_tensors="pt",
+                padding=False,
+                max_length=max_length - planner_token_count,
+                truncation=True,
+            )
 
-        tensor_data = _tensorize_processor_output(processed)
-        tensor_data = _append_planner_placeholders(
-            tensor_data,
-            planner_token_count=planner_token_count,
-            max_length=max_length,
-            placeholder_token_id=pad_token_id,
-            pad_token_id=pad_token_id,
-        )
-        tensor_data["num_ref_images"] = torch.tensor(len(images), dtype=torch.long)
-        _atomic_save(tensor_data, output_file)
+            tensor_data = _tensorize_processor_output(processed)
+            tensor_data = _append_planner_placeholders(
+                tensor_data,
+                planner_token_count=planner_token_count,
+                max_length=max_length,
+                placeholder_token_id=pad_token_id,
+                pad_token_id=pad_token_id,
+            )
+            tensor_data["num_ref_images"] = torch.tensor(len(images), dtype=torch.long)
+            _atomic_save(tensor_data, output_file)
+            processed_count += 1
+        except Exception as exc:
+            if not skip_errors:
+                raise
+            failed_count += 1
+            logger.warning(f"Skipping row due to planner VLM input preprocessing error: {exc}")
+
+    logger.info(
+        f"Planner VLM input preprocessing complete: "
+        f"{processed_count} encoded, {skipped_count} existing skipped, {failed_count} failed skipped -> {out_root}"
+    )
 
 
 if __name__ == "__main__":
