@@ -79,8 +79,11 @@ def main(
     ),
     output_dir: str = typer.Argument(..., help="Output directory to watch, e.g. .precomputed/gt_siglip_tokens."),
     label: str = typer.Option("precompute", help="Progress label shown in the terminal."),
-    interval: float = typer.Option(20.0, help="Refresh interval in seconds.", gt=0.0),
+    interval: float = typer.Option(20.0, help="Refresh interval in seconds."),
 ) -> None:
+    if interval <= 0:
+        raise typer.BadParameter("--interval must be greater than 0.")
+
     manifest_path = Path(manifest)
     output_path = Path(output_dir)
     total = _count_expected(manifest_path)

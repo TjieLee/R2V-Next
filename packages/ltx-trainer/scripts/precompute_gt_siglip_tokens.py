@@ -122,7 +122,6 @@ def main(  # noqa: PLR0913
     sample_fps: float = typer.Option(
         6.0,
         help="Target-video frame sampling rate for SigLIP teacher tokens.",
-        gt=0.0,
     ),
     num_sampled_frames: int | None = typer.Option(
         None,
@@ -147,6 +146,9 @@ def main(  # noqa: PLR0913
     device: str = typer.Option("cuda", help="Torch device for SigLIP/projector extraction."),
     overwrite: bool = typer.Option(False, help="Rebuild files that already exist."),
 ) -> None:
+    if sample_fps <= 0:
+        raise typer.BadParameter("--sample-fps must be greater than 0.")
+
     dataset_path = Path(dataset_file)
     if not dataset_path.is_file():
         raise FileNotFoundError(f"Manifest does not exist: {dataset_path}")
