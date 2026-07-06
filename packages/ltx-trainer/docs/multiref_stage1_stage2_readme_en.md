@@ -3,10 +3,10 @@
 This branch extends the DiT conditioning sequence to:
 
 ```text
-text embedding tokens + thinking/register tokens + visual tokens
+VLM context tokens + thinking/register tokens + visual tokens
 ```
 
-Stage 1 uses target-video GT visual tokens produced by the frozen Gemma/SigLIP vision tower and frozen multi-modal projector from sampled target-video frames. Stage 2 replaces those GT visual tokens with VLM-predicted visual tokens from a fixed number of learnable planner placeholders, and aligns them to the Stage 1 target-video GT SigLIP/projector tokens with MSE. `planner_token_count` must exactly match `num_visual_tokens` in `gt_siglip_tokens/*.pt`.
+`VLM context tokens` are encoded from `system prompt -> user prompt -> reference images`. Stage 1 appends target-video GT SigLIP/projector visual tokens after that context. Stage 2/3 append a fixed number of learnable planner placeholders after the same source context, use the VLM to produce planner visual tokens, and align them to target-video GT SigLIP/projector visual tokens with MSE. `planner_token_count` must exactly match `num_visual_tokens` in `gt_siglip_tokens/*.pt`.
 
 ## Visual Sources That Must Not Be Confused
 
@@ -15,24 +15,26 @@ This implementation uses three different visual data streams:
 | Directory/data | Source | Where it goes | Role |
 | --- | --- | --- | --- |
 | `multi_reference_latents/` | `reference_images` | DiT video latent stream, prepended before noisy target video latents | Multi-reference VAE latent conditioning |
+| `vlm_conditions/` | `system prompt + caption + reference_images` | Stage 1/2 DiT condition context before visual tokens | Makes the base Stage 1 context see reference images |
 | `planner_vlm_inputs/` | `reference_images` plus system/user prompt | VLM/Gemma input | Lets the VLM planner see the reference images and text before predicting planner tokens |
 | `gt_siglip_tokens/` | sampled frames from `video`, the target video | Stage 1 DiT condition tokens; Stage 2 MSE teacher | Target-video GT SigLIP/projector visual tokens |
 
 Hard requirements:
 
 - `gt_siglip_tokens/` must be extracted from the target video only, never from `reference_images`.
-- Stage 1 DiT conditioning is `text/thinking tokens + target-video GT SigLIP/projector tokens`.
-- Stage 2 DiT conditioning is `text/thinking tokens + VLM-predicted planner tokens`.
+- Stage 1 DiT conditioning is `VLM(system + user + ref images) context tokens + target-video GT SigLIP/projector tokens`.
+- Stage 2 DiT conditioning is `VLM(system + user + ref images) context tokens + VLM-predicted planner tokens`.
 - The Stage 2 MSE teacher is the same sample's target-video GT SigLIP/projector tokens.
 - `reference_images` are not the Stage 1 condition visual-token teacher and are not the Stage 2 MSE teacher; they only enter the reference VAE latent stream and the VLM input.
 
 ## Main Changes
 
 - `ltx_core.multicond.visual_tokens`: frozen SigLIP/projector token extraction, Gemma image-token scatter, and fixed-count `VisualPlannerTokens`.
-- `ltx_trainer.training_strategies.multi_reference_video`: Stage 1 appends `gt_siglip_tokens/visual_tokens` after the normal text features before the LTX text connector.
+- `ltx_trainer.training_strategies.multi_reference_video`: Stage 1 can read `vlm_conditions/` through `conditions_dir`, then append `gt_siglip_tokens/visual_tokens` after the VLM context features before the LTX text connector.
 - `ltx_trainer.training_strategies.multi_reference_planner_stage2`: Stage 2 uses fixed `planner_token_count` learnable placeholders. The VLM hidden states at those placeholder positions become the predicted visual tokens; the same tokens are injected into the DiT condition sequence and aligned to GT visual tokens with MSE.
 - `scripts/precompute_gt_siglip_tokens.py`: builds `.precomputed/gt_siglip_tokens/` from sampled target-video frames.
-- `scripts/precompute_planner_vlm_inputs.py`: builds system/user VLM inputs and appends a fixed planner placeholder mask.
+- `scripts/precompute_multiref_vlm_conditions.py`: builds Stage 1/2 `system prompt -> user prompt -> reference image tokens` VLM context conditions.
+- `scripts/precompute_planner_vlm_inputs.py`: builds Stage 2 VLM inputs in `system prompt -> user prompt -> reference image tokens -> planner placeholders` order.
 - `configs/multiref_stage1_lora.yaml` and `configs/multiref_stage2_planner.yaml`: Stage 1/2 configs.
 
 ## Preprocessed Layout
@@ -40,6 +42,7 @@ Hard requirements:
 ```text
 /mnt/workspace/litengjie/my_dataset/.precomputed/
 ├── conditions/                 # pre-connector text/thinking features
+├── vlm_conditions/             # VLM context features from system + user + reference images
 ├── latents/                    # target video VAE latents
 ├── multi_reference_latents/    # reference-image VAE latents for Stage 1 latent-stream conditioning
 ├── gt_siglip_tokens/           # frozen target-video SigLIP/projector GT visual tokens
@@ -95,7 +98,37 @@ accelerate launch --num_processes 8 --num_machines 1 \
   --device cuda
 ```
 
-3. Build reference-image VAE latents:
+3. Build Stage 1/2 VLM reference-image context conditions:
+
+```bash
+mkdir -p /mnt/workspace/litengjie/my_dataset/logs
+
+for i in 0 1 2 3 4 5 6 7; do
+  CUDA_VISIBLE_DEVICES=$i nohup python scripts/precompute_multiref_vlm_conditions.py \
+    /mnt/workspace/litengjie/my_dataset/manifest_shards/train_shard_${i}.json \
+    --model-path /mnt/workspace/litengjie/LTX-2/models/LTX-2.3/ltx-2.3-22b-dev.safetensors \
+    --text-encoder-path /mnt/workspace/litengjie/LTX-2/models/gemma-3-12b-it-qat-q4_0-unquantized \
+    --output-dir /mnt/workspace/litengjie/my_dataset/.precomputed/vlm_conditions \
+    --video-column video \
+    --caption-column caption \
+    --reference-column reference_images \
+    --max-ref-images 4 \
+    --max-length 8192 \
+    --device cuda \
+    > /mnt/workspace/litengjie/my_dataset/logs/vlm_conditions_${i}.log 2>&1 &
+done
+```
+
+This directory is selected by:
+
+```yaml
+training_strategy:
+  conditions_dir: "vlm_conditions"
+```
+
+You can temporarily set it back to `conditions` for text-only conditioning, but then the Stage 1 base context will not see reference images.
+
+4. Build reference-image VAE latents:
 
 ```bash
 python scripts/precompute_multiref_images.py /mnt/workspace/litengjie/my_dataset/train.json \
@@ -107,7 +140,7 @@ python scripts/precompute_multiref_images.py /mnt/workspace/litengjie/my_dataset
   --device cuda
 ```
 
-4. Build target-video GT SigLIP/projector visual tokens:
+5. Build target-video GT SigLIP/projector visual tokens:
 
 ```bash
 python scripts/precompute_gt_siglip_tokens.py /mnt/workspace/litengjie/my_dataset/train.json \
@@ -120,44 +153,92 @@ python scripts/precompute_gt_siglip_tokens.py /mnt/workspace/litengjie/my_datase
   --device cuda
 ```
 
-The recommended setting samples `4` frames uniformly from the target video's first `81` source frames. Gemma/SigLIP produces `256` projected visual tokens per sampled frame, so `num_visual_tokens = 4 * 256 = 1024`. Use that value in:
+The recommended setting samples `4` frames uniformly from the target video's first `81` source frames. Gemma/SigLIP produces `256` projected visual tokens per sampled frame, so `num_visual_tokens = 4 * 256 = 1024`. If your current log says `Detected 2048 GT visual tokens per sample`, then this dataset has `2048` target-video GT visual tokens per sample and the planner token count below must also be `2048`.
+
+Use the actually detected value in:
 
 ```yaml
 training_strategy:
-  planner_token_count: 1024
+  planner_token_count: 2048
 ```
 
 If you change this to `--num-sampled-frames N`, then `planner_token_count = N * 256`. `--sample-fps 6` is also supported, but the token count then depends on the source video fps and `--max-source-frames`; for fixed Stage 2 planner placeholders, prefer `--num-sampled-frames`.
 
-5. Build Stage 2 VLM inputs:
+6. Build Stage 2 VLM inputs:
 
 ```bash
-python scripts/precompute_planner_vlm_inputs.py /mnt/workspace/litengjie/my_dataset/train.json \
-  --text-encoder-path /mnt/workspace/litengjie/LTX-2/models/gemma-3-12b-it-qat-q4_0-unquantized \
-  --output-dir /mnt/workspace/litengjie/my_dataset/.precomputed/planner_vlm_inputs \
-  --video-column video \
-  --caption-column caption \
-  --reference-column reference_images \
-  --planner-token-count 1024 \
-  --max-length 4096
+mkdir -p /mnt/workspace/litengjie/my_dataset/logs
+
+for i in 0 1 2 3 4 5 6 7; do
+  nohup python scripts/precompute_planner_vlm_inputs.py \
+    /mnt/workspace/litengjie/my_dataset/manifest_shards/train_shard_${i}.json \
+    --text-encoder-path /mnt/workspace/litengjie/LTX-2/models/gemma-3-12b-it-qat-q4_0-unquantized \
+    --output-dir /mnt/workspace/litengjie/my_dataset/.precomputed/planner_vlm_inputs \
+    --video-column video \
+    --caption-column caption \
+    --reference-column reference_images \
+    --max-ref-images 4 \
+    --planner-token-count 2048 \
+    --max-length 8192 \
+    > /mnt/workspace/litengjie/my_dataset/logs/planner_vlm_inputs_${i}.log 2>&1 &
+done
 ```
 
 `planner-token-count` must exactly match `num_visual_tokens` in `gt_siglip_tokens`. The maximum of `4` reference images only controls how many reference images the VLM can see and how many reference latents are stored in `multi_reference_latents/`; it does not define the MSE teacher token count.
 
-If your existing `gt_siglip_tokens` log says `Detected 2048 GT visual tokens per sample`, use:
+If you regenerate GT tokens with fixed `4`-frame sampling and get `1024` GT tokens, use:
 
 ```bash
-  --planner-token-count 2048 \
-  --max-length 4096
+  --planner-token-count 1024
 ```
 
 For very long captions or heavier reference-image prompts, increase `--max-length` to `8192`.
+
+## VLM Prompt Order And System Prompt
+
+Default system prompt file:
+
+```text
+packages/ltx-core/src/ltx_core/text_encoders/gemma/encoders/prompts/gemma_multiref_video_planner_system_prompt.txt
+```
+
+This prompt tells the VLM that reference images are source visual conditions. They may provide subject identity, appearance, clothing, objects, style, spatial cues, or other visual constraints. They are not the first frame of the target video unless the user explicitly says so.
+
+Stage 1 `vlm_conditions/` order:
+
+```text
+system prompt
+-> User Raw Input Prompt: {caption}
+-> Reference image 1: <image tokens>
+-> Reference image 2: <image tokens>
+-> ...
+```
+
+Stage 2 `planner_vlm_inputs/` order:
+
+```text
+system prompt
+-> User Raw Input Prompt: {caption}
+-> Reference image 1: <image tokens>
+-> Reference image 2: <image tokens>
+-> ...
+-> planner placeholder tokens, count = planner_token_count
+```
+
+This matches the Bernini-style sequence `MLLM(t, v_src_1, ..., v_src_N, v_tgt)`: text `t` first, source reference visuals `v_src` in the middle, and target/planner visual slots `v_tgt` at the end. During training, the placeholder token ids are only markers; their actual embeddings are replaced by learnable `VisualPlannerTokens`.
+
+The current implementation keeps Gemma's standard causal language-model attention. Because planner placeholders are at the sequence tail, they can attend to previous system/user/reference-image tokens; planner slots interact with each other causally. Strict bidirectional planner-slot attention would require a validated custom block attention mask inside the Gemma forward path, and should be tested as a separate change.
 
 ## Training Data Flow
 
 Stage 1 per-sample flow:
 
 ```text
+system prompt + user prompt + reference_images
+  -> precompute_multiref_vlm_conditions.py
+  -> vlm_conditions
+  -> DiT condition context before visual tokens
+
 reference_images
   -> precompute_multiref_images.py
   -> multi_reference_latents
@@ -176,7 +257,7 @@ Stage 2 per-sample flow:
 reference_images + system prompt + user prompt + fixed planner placeholders
   -> VLM/Gemma language model
   -> predicted planner visual tokens
-  -> text connector input after text/thinking tokens
+  -> text connector input after VLM context tokens
   -> DiT condition tokens
 
 target video
@@ -221,7 +302,7 @@ print("sampled_frame_indices:", x["sampled_frame_indices"].tolist())
 PY
 ```
 
-Recommended output should look like:
+For fixed `4`-frame sampling, the output should look like:
 
 ```text
 visual_tokens: (1024, D)
@@ -229,6 +310,8 @@ num_visual_tokens: 1024
 tokens_per_frame: 256
 sampled_frame_indices: [...]
 ```
+
+If your current log says `2048`, this should be `(2048, D)`, and Stage 2 `planner_token_count` must be `2048`.
 
 The output path should mirror the `video` target-video path, not a reference-image path.
 
@@ -239,6 +322,7 @@ Edit `configs/multiref_stage1_lora.yaml`:
 - `model.model_path`: LTX-2 checkpoint.
 - `model.text_encoder_path`: Gemma text encoder directory.
 - `data.preprocessed_data_root`: `/mnt/workspace/litengjie/my_dataset/.precomputed`.
+- `training_strategy.conditions_dir`: defaults to `vlm_conditions`, the VLM context encoded from `system + user + reference images`.
 - `training_strategy.gt_visual_tokens_dir`: defaults to `gt_siglip_tokens`.
 - `training_strategy.visual_token_frame_stride`: defaults to `1`. If you encoded target-video tokens at `6fps` and later want to use them as `3fps`, set it to `2` without rerunning SigLIP.
 - `output_dir`: Stage 1 output directory.
@@ -257,6 +341,7 @@ Stage 1 feeds target-video GT SigLIP/projector visual tokens to the DiT conditio
 Edit `configs/multiref_stage2_planner.yaml`:
 
 - `model.load_checkpoint`: Stage 1 checkpoint.
+- `training_strategy.conditions_dir`: keep this consistent with Stage 1, default `vlm_conditions`.
 - `training_strategy.planner_token_count`: must equal `num_visual_tokens` in `gt_siglip_tokens`.
 - `training_strategy.visual_token_frame_stride`: must match Stage 1. If Stage 1 uses `2`, Stage 2 also uses `2`, and `planner_token_count` must be the downsampled token count.
 - `training_strategy.train_vlm_language_model: true`: train the Gemma language model.

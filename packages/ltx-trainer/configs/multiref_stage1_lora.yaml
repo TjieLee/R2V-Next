@@ -3,7 +3,7 @@
 # =============================================================================
 #
 # Stage 1 trains the video renderer to consume:
-#   1. text/thinking tokens from the normal LTX-2 Gemma text path
+#   1. VLM text/reference-image context from system prompt + user prompt + reference images
 #   2. frozen target-video GT SigLIP/projector visual condition tokens
 #   3. clean multi-reference image latent token segments prepended to the video stream
 # Audio is disabled.
@@ -11,7 +11,8 @@
 # Required preprocessed layout:
 #   preprocessed_data_root/
 #   ├── latents/                  # Target video VAE latents
-#   ├── conditions/               # Text embeddings
+#   ├── vlm_conditions/           # VLM context from system prompt + user prompt + reference images
+#   ├── conditions/               # Optional fallback: text-only embeddings
 #   ├── gt_siglip_tokens/         # Frozen target-video GT visual tokens from Gemma SigLIP/projector
 #   └── multi_reference_latents/  # Stacked 1-N reference image latents per sample
 #
@@ -31,6 +32,17 @@
 #     --num-sampled-frames 4 \
 #     --max-source-frames 81 \
 #     --expected-token-count 1024
+#
+# Build vlm_conditions with:
+#   python scripts/precompute_multiref_vlm_conditions.py dataset.json \
+#     --model-path /path/to/ltx2.safetensors \
+#     --text-encoder-path /path/to/gemma-text-encoder \
+#     --output-dir /path/to/.precomputed/vlm_conditions \
+#     --video-column video \
+#     --caption-column caption \
+#     --reference-column reference_images \
+#     --max-ref-images 4 \
+#     --max-length 8192
 
 model:
   model_path: "path/to/ltx-2-model.safetensors"
@@ -54,6 +66,7 @@ lora:
 
 training_strategy:
   name: "multi_reference_video"
+  conditions_dir: "vlm_conditions"
   reference_latents_dir: "multi_reference_latents"
   gt_visual_tokens_dir: "gt_siglip_tokens"
   visual_token_key: "visual_tokens"

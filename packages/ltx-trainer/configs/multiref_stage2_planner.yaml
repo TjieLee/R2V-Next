@@ -8,18 +8,19 @@
 #   3. Optional LTX video text connector refinement
 #
 # The DiT condition sequence remains:
-#   text/thinking tokens + visual tokens
+#   VLM text/reference-image context tokens + visual tokens
 # Stage 1 uses target-video GT visual tokens from frozen SigLIP/projector.
-# Stage 2 replaces them with VLM-predicted visual tokens and aligns them to GT
-# with MSE. planner_token_count must equal the target-video GT visual token count.
-# With the recommended precompute setting, planner_token_count = 4 target-video
-# frames * 256 SigLIP/projector tokens per frame = 1024. Reference image count
-# does not define this value.
+# Stage 2 replaces those GT tokens with VLM-predicted visual tokens and aligns
+# them to GT with MSE. planner_token_count must equal the target-video GT visual
+# token count. If precompute_gt_siglip_tokens.py logs "Detected 2048 GT visual
+# tokens per sample", use planner_token_count: 2048. Reference image count does
+# not define this value.
 #
 # Required preprocessed layout:
 #   preprocessed_data_root/
 #   ├── latents/                    # Target video VAE latents
-#   ├── conditions/                 # Text embeddings
+#   ├── vlm_conditions/             # VLM context from system prompt + user prompt + reference images
+#   ├── conditions/                 # Optional fallback: text-only embeddings
 #   ├── multi_reference_latents/    # Stage 1 reference image latents
 #   ├── gt_siglip_tokens/           # frozen target-video SigLIP/projector visual tokens
 #   └── planner_vlm_inputs/         # tokenized VLM inputs with fixed planner placeholders
@@ -57,6 +58,7 @@ lora:
 
 training_strategy:
   name: "multi_reference_planner_stage2"
+  conditions_dir: "vlm_conditions"
   reference_latents_dir: "multi_reference_latents"
   gt_visual_tokens_dir: "gt_siglip_tokens"
   visual_token_key: "visual_tokens"
@@ -79,8 +81,9 @@ training_strategy:
   freeze_vlm_multi_modal_projector: true
 
   # Set this to the exact num_visual_tokens detected by precompute_gt_siglip_tokens.py.
-  # Recommended default: 4 sampled target-video frames * 256 tokens/frame = 1024.
-  planner_token_count: 1024
+  # Your current log showed 2048 GT visual tokens per sample; if you rerun GT
+  # extraction with 4 sampled frames, change this back to 1024.
+  planner_token_count: 2048
   # Set this if the selected VLM hidden layer dim differs from the LTX connector input dim (default 3840).
   planner_source_dim: null
   predicted_visual_token_key: "predicted_visual_tokens"

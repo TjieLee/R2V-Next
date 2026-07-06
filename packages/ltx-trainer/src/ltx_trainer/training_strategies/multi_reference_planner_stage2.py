@@ -84,7 +84,7 @@ class MultiReferencePlannerStage2Config(MultiReferenceVideoConfig):
     )
 
     planner_token_count: int = Field(
-        default=256,
+        default=1024,
         description=(
             "Fixed learnable visual planner token count. Must equal the token count saved in "
             "gt_siglip_tokens/ for every sample."

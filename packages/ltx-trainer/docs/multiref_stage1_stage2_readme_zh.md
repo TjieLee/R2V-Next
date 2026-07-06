@@ -3,10 +3,10 @@
 这版代码把 DiT 条件序列统一扩展为：
 
 ```text
-text embedding tokens + thinking/register tokens + visual tokens
+VLM context tokens + thinking/register tokens + visual tokens
 ```
 
-Stage 1 使用冻结 Gemma/SigLIP vision tower 和 multi-modal projector 从 target video 采样帧生成的 GT visual tokens。Stage 2 使用 VLM language model + 固定数量 learnable planner placeholder tokens 预测 visual tokens，并用 MSE 对齐 Stage 1 的 target-video GT SigLIP/projector visual tokens。`planner_token_count` 必须等于 `gt_siglip_tokens/*.pt` 中的 `num_visual_tokens`。
+其中 `VLM context tokens` 来自 `system prompt -> user prompt -> reference images` 的 Gemma/VLM 编码。Stage 1 在这段 context 后追加 target-video GT SigLIP/projector visual tokens。Stage 2/3 在同样的 source context 后追加固定数量 learnable planner placeholders，让 VLM 输出 planner visual tokens，并用 MSE 对齐 target-video GT SigLIP/projector visual tokens。`planner_token_count` 必须等于 `gt_siglip_tokens/*.pt` 中的 `num_visual_tokens`。
 
 ## 不要混淆的视觉来源
 
@@ -15,24 +15,26 @@ Stage 1 使用冻结 Gemma/SigLIP vision tower 和 multi-modal projector 从 tar
 | 目录/数据 | 来源 | 进入哪里 | 作用 |
 | --- | --- | --- | --- |
 | `multi_reference_latents/` | `reference_images` 参考图 | DiT video latent stream，拼在 noisy target video latents 前面 | 多参考图的 VAE latent 条件 |
+| `vlm_conditions/` | `system prompt + caption + reference_images` | Stage 1/2 的 DiT condition context，位于 visual tokens 前面 | 让 Stage 1 的基础条件已经看过参考图 |
 | `planner_vlm_inputs/` | `reference_images` 参考图 + system/user prompt | VLM/Gemma 输入 | 让 VLM planner 看参考图和文本，预测 visual planner tokens |
 | `gt_siglip_tokens/` | `video` target video 的采样帧 | Stage 1 的 DiT condition tokens；Stage 2 的 MSE teacher | target-video GT SigLIP/projector visual tokens |
 
 关键约束：
 
 - `gt_siglip_tokens/` **只能从 target video 提取**，不能从 `reference_images` 提取。
-- Stage 1 的 DiT condition 是 `text/thinking tokens + target-video GT SigLIP/projector tokens`。
-- Stage 2 的 DiT condition 是 `text/thinking tokens + VLM predicted planner tokens`。
+- Stage 1 的 DiT condition 是 `VLM(system + user + ref images) context tokens + target-video GT SigLIP/projector tokens`。
+- Stage 2 的 DiT condition 是 `VLM(system + user + ref images) context tokens + VLM predicted planner tokens`。
 - Stage 2 的 MSE teacher 是同一条样本的 `target-video GT SigLIP/projector tokens`。
 - `reference_images` 不作为 Stage 1 condition visual-token teacher，也不作为 Stage 2 MSE teacher；它们只进入 reference VAE latent stream 和 VLM 输入。
 
 ## 主要改动
 
 - `ltx_core.multicond.visual_tokens`：新增冻结 SigLIP/projector visual token 提取、Gemma image-token scatter、固定数量 `VisualPlannerTokens`。
-- `ltx_trainer.training_strategies.multi_reference_video`：Stage 1 在原 text features 后追加 `gt_siglip_tokens/visual_tokens`，再统一进入 LTX text connector。
+- `ltx_trainer.training_strategies.multi_reference_video`：Stage 1 可通过 `conditions_dir` 读取 `vlm_conditions/`，再在 VLM context features 后追加 `gt_siglip_tokens/visual_tokens`，统一进入 LTX text connector。
 - `ltx_trainer.training_strategies.multi_reference_planner_stage2`：Stage 2 不再把 planner hidden 压成 256 个任意 tokens，而是使用固定 `planner_token_count` 个 learnable placeholders；VLM 输出的同数量 tokens 直接替换 GT visual tokens 进入 DiT，并和 GT tokens 做 MSE。
 - `scripts/precompute_gt_siglip_tokens.py`：从 target video 采样帧生成 `.precomputed/gt_siglip_tokens/`。
-- `scripts/precompute_planner_vlm_inputs.py`：构建 system/user prompt，并在 token 序列末尾追加固定数量 planner placeholders。
+- `scripts/precompute_multiref_vlm_conditions.py`：为 Stage 1/2 生成 `system prompt -> user prompt -> reference image tokens` 的 VLM context conditions。
+- `scripts/precompute_planner_vlm_inputs.py`：按 `system prompt -> user prompt -> reference image tokens -> planner placeholders` 构建 Stage 2 VLM 输入。
 - `configs/multiref_stage1_lora.yaml`、`configs/multiref_stage2_planner.yaml`：更新 Stage 1/2 配置。
 
 ## 目录结构
@@ -40,6 +42,7 @@ Stage 1 使用冻结 Gemma/SigLIP vision tower 和 multi-modal projector 从 tar
 ```text
 /mnt/workspace/litengjie/my_dataset/.precomputed/
 ├── conditions/                 # text/thinking features, connector 前
+├── vlm_conditions/             # system + user + reference images 的 VLM context features
 ├── latents/                    # target video VAE latents
 ├── multi_reference_latents/    # 参考图 VAE latents，用于 Stage 1 latent stream conditioning
 ├── gt_siglip_tokens/           # 冻结 target-video SigLIP/projector GT visual tokens
@@ -95,7 +98,37 @@ accelerate launch --num_processes 8 --num_machines 1 \
   --device cuda
 ```
 
-3. 生成 reference image latents：
+3. 生成 Stage 1/2 使用的 VLM reference-image context conditions：
+
+```bash
+mkdir -p /mnt/workspace/litengjie/my_dataset/logs
+
+for i in 0 1 2 3 4 5 6 7; do
+  CUDA_VISIBLE_DEVICES=$i nohup python scripts/precompute_multiref_vlm_conditions.py \
+    /mnt/workspace/litengjie/my_dataset/manifest_shards/train_shard_${i}.json \
+    --model-path /mnt/workspace/litengjie/LTX-2/models/LTX-2.3/ltx-2.3-22b-dev.safetensors \
+    --text-encoder-path /mnt/workspace/litengjie/LTX-2/models/gemma-3-12b-it-qat-q4_0-unquantized \
+    --output-dir /mnt/workspace/litengjie/my_dataset/.precomputed/vlm_conditions \
+    --video-column video \
+    --caption-column caption \
+    --reference-column reference_images \
+    --max-ref-images 4 \
+    --max-length 8192 \
+    --device cuda \
+    > /mnt/workspace/litengjie/my_dataset/logs/vlm_conditions_${i}.log 2>&1 &
+done
+```
+
+这个目录对应配置里的：
+
+```yaml
+training_strategy:
+  conditions_dir: "vlm_conditions"
+```
+
+如果你临时想退回纯文本条件，可以把它改成 `conditions`，但这会让 Stage 1 的基础 context 看不到参考图。
+
+4. 生成 reference image latents：
 
 ```bash
 python scripts/precompute_multiref_images.py /mnt/workspace/litengjie/my_dataset/train.json \
@@ -107,7 +140,7 @@ python scripts/precompute_multiref_images.py /mnt/workspace/litengjie/my_dataset
   --device cuda
 ```
 
-4. 生成 target-video GT SigLIP/projector visual tokens：
+5. 生成 target-video GT SigLIP/projector visual tokens：
 
 ```bash
 python scripts/precompute_gt_siglip_tokens.py /mnt/workspace/litengjie/my_dataset/train.json \
@@ -120,44 +153,92 @@ python scripts/precompute_gt_siglip_tokens.py /mnt/workspace/litengjie/my_datase
   --device cuda
 ```
 
-推荐固定从 target video 的前 `81` 个源帧内均匀抽 `4` 帧。Gemma/SigLIP 每帧产生 `256` 个 projected visual tokens，因此 `num_visual_tokens = 4 * 256 = 1024`。把这个值填到 Stage 2 配置的：
+推荐固定从 target video 的前 `81` 个源帧内均匀抽 `4` 帧。Gemma/SigLIP 每帧产生 `256` 个 projected visual tokens，因此 `num_visual_tokens = 4 * 256 = 1024`。如果你当前日志显示 `Detected 2048 GT visual tokens per sample`，说明这批数据每条样本是 `2048` 个 target-video GT visual tokens；后面的 planner token 数必须用 `2048`。
+
+把实际检测到的值填到 Stage 2 配置的：
 
 ```yaml
 training_strategy:
-  planner_token_count: 1024
+  planner_token_count: 2048
 ```
 
 如果你改成 `--num-sampled-frames N`，则 `planner_token_count = N * 256`。`--sample-fps 6` 也可以用，但 token 数会随源视频 fps 和 `--max-source-frames` 变化；为了 Stage 2 固定 planner placeholders，推荐用 `--num-sampled-frames`。
 
-5. 生成 Stage 2 VLM 输入：
+6. 生成 Stage 2 VLM 输入：
 
 ```bash
-python scripts/precompute_planner_vlm_inputs.py /mnt/workspace/litengjie/my_dataset/train.json \
-  --text-encoder-path /mnt/workspace/litengjie/LTX-2/models/gemma-3-12b-it-qat-q4_0-unquantized \
-  --output-dir /mnt/workspace/litengjie/my_dataset/.precomputed/planner_vlm_inputs \
-  --video-column video \
-  --caption-column caption \
-  --reference-column reference_images \
-  --planner-token-count 1024 \
-  --max-length 4096
+mkdir -p /mnt/workspace/litengjie/my_dataset/logs
+
+for i in 0 1 2 3 4 5 6 7; do
+  nohup python scripts/precompute_planner_vlm_inputs.py \
+    /mnt/workspace/litengjie/my_dataset/manifest_shards/train_shard_${i}.json \
+    --text-encoder-path /mnt/workspace/litengjie/LTX-2/models/gemma-3-12b-it-qat-q4_0-unquantized \
+    --output-dir /mnt/workspace/litengjie/my_dataset/.precomputed/planner_vlm_inputs \
+    --video-column video \
+    --caption-column caption \
+    --reference-column reference_images \
+    --max-ref-images 4 \
+    --planner-token-count 2048 \
+    --max-length 8192 \
+    > /mnt/workspace/litengjie/my_dataset/logs/planner_vlm_inputs_${i}.log 2>&1 &
+done
 ```
 
 这里的 `planner-token-count` 必须和 `gt_siglip_tokens` 的 `num_visual_tokens` 完全一致。最多 `4` 张 reference images 只影响 VLM 能看到多少参考图，以及 `multi_reference_latents/` 中有多少参考 latent；它不决定 MSE teacher token 数。
 
-如果你已经生成的 `gt_siglip_tokens` 日志显示 `Detected 2048 GT visual tokens per sample`，这里就要改成：
+如果你重新按 `4` 帧固定采样生成 `1024` 个 GT tokens，这里就改成：
 
 ```bash
-  --planner-token-count 2048 \
-  --max-length 4096
+  --planner-token-count 1024
 ```
 
 如果 caption 很长或参考图 token 占用较多，可以把 `--max-length` 提到 `8192`。
+
+## VLM prompt 顺序和 system prompt
+
+默认 system prompt 文件：
+
+```text
+packages/ltx-core/src/ltx_core/text_encoders/gemma/encoders/prompts/gemma_multiref_video_planner_system_prompt.txt
+```
+
+这个 prompt 明确告诉 VLM：reference images 是 source visual conditions，可能提供主体身份、外观、衣服、物体、风格、空间线索等；它们不是 target video 的首帧，除非用户显式说明。
+
+Stage 1 的 `vlm_conditions/` 使用顺序：
+
+```text
+system prompt
+-> User Raw Input Prompt: {caption}
+-> Reference image 1: <image tokens>
+-> Reference image 2: <image tokens>
+-> ...
+```
+
+Stage 2 的 `planner_vlm_inputs/` 使用顺序：
+
+```text
+system prompt
+-> User Raw Input Prompt: {caption}
+-> Reference image 1: <image tokens>
+-> Reference image 2: <image tokens>
+-> ...
+-> planner placeholder tokens, count = planner_token_count
+```
+
+这等价于 Bernini 公式里的 `MLLM(t, v_src_1, ..., v_src_N, v_tgt)`：文本 `t` 在前，参考图 `v_src` 在中间，target/planner visual slots `v_tgt` 在最后。训练时 planner placeholder 的 token id 只是占位；真正送进 Gemma language model 的 embedding 会被 `VisualPlannerTokens` 的 learnable embeddings 替换。
+
+当前实现沿用 Gemma language model 的 causal attention。因为 planner placeholders 位于序列最后，它们可以 attend 到前面的 system/user/reference image tokens；planner slots 之间是按 causal 顺序交互。若要做严格的 planner-slot 双向 attention，需要在 Gemma 前向里增加经过验证的 block attention mask，这应该作为独立改动测试。
 
 ## 训练时的数据流
 
 Stage 1 每条样本的数据流：
 
 ```text
+system prompt + user prompt + reference_images
+  -> precompute_multiref_vlm_conditions.py
+  -> vlm_conditions
+  -> DiT condition context before visual tokens
+
 reference_images
   -> precompute_multiref_images.py
   -> multi_reference_latents
@@ -176,7 +257,7 @@ Stage 2 每条样本的数据流：
 reference_images + system prompt + user prompt + fixed planner placeholders
   -> VLM/Gemma language model
   -> predicted planner visual tokens
-  -> text connector input after text/thinking tokens
+  -> text connector input after VLM context tokens
   -> DiT condition tokens
 
 target video
@@ -221,7 +302,7 @@ print("sampled_frame_indices:", x["sampled_frame_indices"].tolist())
 PY
 ```
 
-推荐输出应类似：
+固定 4 帧采样时推荐输出类似：
 
 ```text
 visual_tokens: (1024, D)
@@ -229,6 +310,8 @@ num_visual_tokens: 1024
 tokens_per_frame: 256
 sampled_frame_indices: [...]
 ```
+
+如果你当前日志显示 `2048`，则这里应是 `(2048, D)`，Stage 2 的 `planner_token_count` 也必须是 `2048`。
 
 路径应该镜像 `video` 字段的 target video 路径，而不是 reference image 路径。
 
@@ -239,6 +322,7 @@ sampled_frame_indices: [...]
 - `model.model_path`：LTX-2 checkpoint。
 - `model.text_encoder_path`：Gemma text encoder 目录。
 - `data.preprocessed_data_root`：`/mnt/workspace/litengjie/my_dataset/.precomputed`。
+- `training_strategy.conditions_dir`：默认 `vlm_conditions`，也就是 `system + user + reference images` 编码后的 VLM context。
 - `training_strategy.gt_visual_tokens_dir`：默认 `gt_siglip_tokens`。
 - `training_strategy.visual_token_frame_stride`：默认 `1`。如果你已经按 `6fps` 编码，后期想按 `3fps` 用，可以设为 `2`，无需重跑 SigLIP。
 - `output_dir`：Stage 1 输出目录。
@@ -257,6 +341,7 @@ Stage 1 的 DiT 输入区别是：visual tokens 来自 target video 的冻结 Si
 编辑 `configs/multiref_stage2_planner.yaml`：
 
 - `model.load_checkpoint`：Stage 1 checkpoint。
+- `training_strategy.conditions_dir`：保持和 Stage 1 一致，默认 `vlm_conditions`。
 - `training_strategy.planner_token_count`：必须等于 `gt_siglip_tokens` 的 `num_visual_tokens`。
 - `training_strategy.visual_token_frame_stride`：必须和 Stage 1 使用方式一致；如果 Stage 1 用 `2`，Stage 2 也用 `2`，并把 `planner_token_count` 改成降采样后的 token 数。
 - `training_strategy.train_vlm_language_model: true`：训练 Gemma language model。

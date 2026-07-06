@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-"""Precompute tokenized Gemma/VLM planner inputs for Stage 2 training.
+"""Precompute Stage 1 multi-reference VLM text conditions.
 
-This script is intentionally lightweight: it does not run Gemma. It builds the
-chat-template input expected by Gemma3Processor in the order:
+This builds connector-input features from:
 
-    system prompt -> user text -> reference image tokens -> planner placeholders
+    system prompt -> user text prompt -> reference image tokens
 
-It stores tensors under ``planner_vlm_inputs/`` with the same relative paths as
-``latents/`` and ``conditions/``.
+No planner placeholders are appended here. Stage 1 appends target-video GT
+SigLIP/projector visual tokens later in the training strategy.
 """
 
 from __future__ import annotations
@@ -23,15 +22,17 @@ import typer
 from rich.progress import track
 from transformers import AutoImageProcessor, AutoTokenizer, Gemma3Processor
 
+from ltx_core.multicond.visual_tokens import extract_projected_visual_tokens, scatter_visual_tokens_into_embeddings
 from ltx_core.text_encoders.gemma.config import GEMMA3_CONFIG_FOR_LTX
 from ltx_core.utils import find_matching_file
 from ltx_trainer import logger
+from ltx_trainer.model_loader import load_embeddings_processor, load_text_encoder
 from ltx_trainer.utils import open_image_as_srgb
 
 app = typer.Typer(
     pretty_exceptions_enable=False,
     no_args_is_help=True,
-    help="Build tokenized Gemma/VLM chat inputs for multi-reference Stage 2 planner training.",
+    help="Build Stage 1 VLM-aware conditions from text plus 1-N reference images.",
 )
 
 
@@ -123,70 +124,6 @@ def _build_messages(system_prompt: str, user_prompt: str, num_images: int) -> li
     ]
 
 
-def _tensorize_processor_output(processed: dict[str, Any]) -> dict[str, torch.Tensor]:
-    tensors: dict[str, torch.Tensor] = {}
-    for key, value in processed.items():
-        if isinstance(value, torch.Tensor):
-            if key in {"input_ids", "attention_mask", "token_type_ids", "position_ids", "cache_position"}:
-                value = value.squeeze(0)
-            elif key == "pixel_values" and value.ndim == 5 and value.shape[0] == 1:
-                value = value.squeeze(0)
-            tensors[key] = value.cpu().contiguous()
-    return tensors
-
-
-def _append_planner_placeholders(
-    tensor_data: dict[str, torch.Tensor],
-    *,
-    planner_token_count: int,
-    max_length: int,
-    placeholder_token_id: int,
-    pad_token_id: int,
-) -> dict[str, torch.Tensor]:
-    for unused_key in ("token_type_ids", "position_ids", "cache_position"):
-        tensor_data.pop(unused_key, None)
-
-    input_ids = tensor_data["input_ids"].to(dtype=torch.long)
-    attention_mask = tensor_data["attention_mask"].to(dtype=torch.long)
-    if input_ids.ndim != 1:
-        raise ValueError(f"Expected 1D input_ids after squeeze, got {tuple(input_ids.shape)}")
-    if input_ids.shape[0] + planner_token_count > max_length:
-        keep = max_length - planner_token_count
-        if keep <= 0:
-            raise ValueError("max_length must be greater than planner_token_count")
-        input_ids = input_ids[:keep]
-        attention_mask = attention_mask[:keep]
-        for key in ("token_type_ids", "position_ids", "cache_position"):
-            if key in tensor_data:
-                tensor_data[key] = tensor_data[key][:keep]
-
-    placeholder_ids = torch.full((planner_token_count,), placeholder_token_id, dtype=torch.long)
-    placeholder_mask = torch.ones(planner_token_count, dtype=torch.bool)
-
-    input_ids = torch.cat([input_ids, placeholder_ids], dim=0)
-    attention_mask = torch.cat([attention_mask, torch.ones_like(placeholder_ids)], dim=0)
-    planner_placeholder_mask = torch.cat(
-        [
-            torch.zeros(input_ids.shape[0] - planner_token_count, dtype=torch.bool),
-            placeholder_mask,
-        ],
-        dim=0,
-    )
-
-    pad_len = max_length - input_ids.shape[0]
-    if pad_len > 0:
-        input_ids = torch.cat([input_ids, torch.full((pad_len,), pad_token_id, dtype=torch.long)], dim=0)
-        attention_mask = torch.cat([attention_mask, torch.zeros(pad_len, dtype=torch.long)], dim=0)
-        planner_placeholder_mask = torch.cat([planner_placeholder_mask, torch.zeros(pad_len, dtype=torch.bool)], dim=0)
-
-    tensor_data["input_ids"] = input_ids
-    tensor_data["attention_mask"] = attention_mask
-    tensor_data["planner_placeholder_mask"] = planner_placeholder_mask
-    tensor_data["gt_image_token_mask"] = (input_ids == GEMMA3_CONFIG_FOR_LTX.image_token_index).to(dtype=torch.bool)
-    tensor_data["planner_token_count"] = torch.tensor(planner_token_count, dtype=torch.long)
-    return tensor_data
-
-
 def _atomic_save(data: dict[str, torch.Tensor], output_file: Path) -> None:
     output_file.parent.mkdir(parents=True, exist_ok=True)
     tmp_file = output_file.with_suffix(output_file.suffix + f".tmp.{os.getpid()}")
@@ -194,12 +131,61 @@ def _atomic_save(data: dict[str, torch.Tensor], output_file: Path) -> None:
     tmp_file.replace(output_file)
 
 
+def _get_language_model(text_encoder: torch.nn.Module) -> torch.nn.Module:
+    gemma_model = text_encoder.model.model
+    language_model = getattr(gemma_model, "language_model", None)
+    if language_model is None:
+        raise ValueError("Gemma model does not expose language_model")
+    return language_model
+
+
+def _get_input_embeddings(language_model: torch.nn.Module) -> torch.nn.Module:
+    if hasattr(language_model, "get_input_embeddings"):
+        embeddings = language_model.get_input_embeddings()
+        if embeddings is not None:
+            return embeddings
+    embeddings = getattr(language_model, "embed_tokens", None)
+    if embeddings is None:
+        raise ValueError("Gemma language_model does not expose input embeddings")
+    return embeddings
+
+
+def _build_inputs_embeds(
+    *,
+    text_encoder: torch.nn.Module,
+    input_ids: torch.Tensor,
+    pixel_values: torch.Tensor | None,
+    num_ref_images: int,
+) -> torch.Tensor:
+    language_model = _get_language_model(text_encoder)
+    embed_tokens = _get_input_embeddings(language_model)
+    inputs_embeds = embed_tokens(input_ids)
+
+    if pixel_values is None:
+        return inputs_embeds
+
+    image_counts = torch.tensor([num_ref_images], device=pixel_values.device, dtype=torch.long)
+    visual_batch = extract_projected_visual_tokens(
+        text_encoder.model,
+        pixel_values,
+        image_counts=image_counts,
+    )
+    return scatter_visual_tokens_into_embeddings(
+        inputs_embeds=inputs_embeds,
+        input_ids=input_ids,
+        visual_tokens=visual_batch.tokens,
+        visual_mask=visual_batch.mask,
+        image_token_index=GEMMA3_CONFIG_FOR_LTX.image_token_index,
+    )
+
+
 @app.command()
-def main(
+def main(  # noqa: PLR0913
     dataset_file: str = typer.Argument(..., help="Flat CSV/JSON/JSONL manifest."),
+    model_path: str = typer.Option(..., help="Path to the LTX-2 checkpoint (.safetensors)."),
     text_encoder_path: str = typer.Option(..., help="Local Gemma text encoder directory."),
-    output_dir: str = typer.Option(..., help="Output planner_vlm_inputs directory."),
-    video_column: str = typer.Option("video", help="Column containing target video path."),
+    output_dir: str = typer.Option(..., help="Output directory, usually .precomputed/vlm_conditions."),
+    video_column: str = typer.Option("video", help="Target video path column used for output names."),
     caption_column: str = typer.Option("caption", help="Column containing user/raw prompt text."),
     reference_column: str = typer.Option("reference_images", help="Column containing 1-N reference image paths."),
     root_dir: str | None = typer.Option(
@@ -211,11 +197,9 @@ def main(
         help="Optional custom system prompt file. Defaults to the multi-reference video planner prompt.",
     ),
     max_ref_images: int | None = typer.Option(None, help="Optional cap on reference images per sample."),
-    planner_token_count: int = typer.Option(
-        1024,
-        help="Fixed learnable visual planner placeholder count. Must match gt_siglip_tokens visual token count.",
-    ),
     max_length: int = typer.Option(4096, help="Tokenizer max length."),
+    device: str = typer.Option("cuda", help="Torch device for VLM condition extraction."),
+    load_in_8bit: bool = typer.Option(False, help="Load Gemma in 8-bit mode."),
     overwrite: bool = typer.Option(False, help="Rebuild files that already exist."),
     skip_errors: bool = typer.Option(True, help="Skip unreadable/bad rows instead of stopping the whole shard."),
 ) -> None:
@@ -224,15 +208,12 @@ def main(
         raise FileNotFoundError(f"Manifest does not exist: {dataset_path}")
     if max_ref_images is not None and max_ref_images < 1:
         raise typer.BadParameter("--max-ref-images must be >= 1")
-    if planner_token_count < 1:
-        raise typer.BadParameter("--planner-token-count must be >= 1")
     if max_length < 1:
         raise typer.BadParameter("--max-length must be >= 1")
-    if planner_token_count >= max_length:
-        raise typer.BadParameter("--planner-token-count must be smaller than --max-length")
 
     data_root = Path(root_dir) if root_dir is not None else dataset_path.parent
     out_root = Path(output_dir)
+    out_root.mkdir(parents=True, exist_ok=True)
 
     tokenizer_root = str(find_matching_file(text_encoder_path, "tokenizer.model").parent)
     processor_root = str(find_matching_file(text_encoder_path, "preprocessor_config.json").parent)
@@ -240,15 +221,19 @@ def main(
     image_processor = AutoImageProcessor.from_pretrained(processor_root, local_files_only=True, use_fast=False)
     processor = Gemma3Processor(image_processor=image_processor, tokenizer=tokenizer)
 
+    text_encoder = load_text_encoder(text_encoder_path, device=device, dtype=torch.bfloat16, load_in_8bit=load_in_8bit)
+    text_encoder.eval()
+    embeddings_processor = load_embeddings_processor(model_path, device=device, dtype=torch.bfloat16)
+    embeddings_processor.eval()
+
     rows = _read_rows(dataset_path)
-    default_multiref_prompt = _load_default_system_prompt("gemma_multiref_video_planner_system_prompt.txt")
+    default_system_prompt = _load_default_system_prompt("gemma_multiref_video_planner_system_prompt.txt")
     custom_system_prompt = Path(system_prompt_path).read_text(encoding="utf-8") if system_prompt_path else None
-    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
     processed_count = 0
     skipped_count = 0
     failed_count = 0
 
-    for row in track(rows, description="Building planner VLM inputs"):
+    for row in track(rows, description="Building Stage 1 multi-reference VLM conditions"):
         try:
             if video_column not in row:
                 raise ValueError(f"Missing video column '{video_column}' in row: {row}")
@@ -267,7 +252,7 @@ def main(
             ref_paths = [_resolve_path(value, data_root) for value in ref_values]
             images = [open_image_as_srgb(path) for path in ref_paths]
 
-            system_prompt = custom_system_prompt or default_multiref_prompt
+            system_prompt = custom_system_prompt or default_system_prompt
             messages = _build_messages(
                 system_prompt=system_prompt,
                 user_prompt=str(row[caption_column]),
@@ -279,29 +264,54 @@ def main(
                 images=images if images else None,
                 return_tensors="pt",
                 padding=False,
-                max_length=max_length - planner_token_count,
+                max_length=max_length,
                 truncation=True,
             )
 
-            tensor_data = _tensorize_processor_output(processed)
-            tensor_data = _append_planner_placeholders(
-                tensor_data,
-                planner_token_count=planner_token_count,
-                max_length=max_length,
-                placeholder_token_id=pad_token_id,
-                pad_token_id=pad_token_id,
-            )
-            tensor_data["num_ref_images"] = torch.tensor(len(images), dtype=torch.long)
-            _atomic_save(tensor_data, output_file)
+            input_ids = processed["input_ids"].to(device=device, dtype=torch.long)
+            attention_mask = processed["attention_mask"].to(device=device, dtype=torch.long)
+            pixel_values = processed.get("pixel_values")
+            if pixel_values is not None:
+                pixel_values = pixel_values.to(device=device, dtype=torch.bfloat16)
+
+            with torch.inference_mode():
+                inputs_embeds = _build_inputs_embeds(
+                    text_encoder=text_encoder,
+                    input_ids=input_ids,
+                    pixel_values=pixel_values,
+                    num_ref_images=len(images),
+                )
+                language_model = _get_language_model(text_encoder)
+                outputs = language_model(
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=attention_mask,
+                    output_hidden_states=True,
+                    return_dict=True,
+                )
+                hidden_states = outputs.hidden_states
+                video_prompt_embeds, audio_prompt_embeds = embeddings_processor.feature_extractor(
+                    hidden_states,
+                    attention_mask,
+                    "right",
+                )
+
+            save_data = {
+                "video_prompt_embeds": video_prompt_embeds[0].cpu().contiguous(),
+                "prompt_attention_mask": attention_mask[0].cpu().contiguous(),
+                "num_ref_images": torch.tensor(len(images), dtype=torch.long),
+            }
+            if audio_prompt_embeds is not None:
+                save_data["audio_prompt_embeds"] = audio_prompt_embeds[0].cpu().contiguous()
+            _atomic_save(save_data, output_file)
             processed_count += 1
         except Exception as exc:
             if not skip_errors:
                 raise
             failed_count += 1
-            logger.warning(f"Skipping row due to planner VLM input preprocessing error: {exc}")
+            logger.warning(f"Skipping row due to Stage 1 VLM condition preprocessing error: {exc}")
 
     logger.info(
-        f"Planner VLM input preprocessing complete: "
+        f"Stage 1 VLM condition preprocessing complete: "
         f"{processed_count} encoded, {skipped_count} existing skipped, {failed_count} failed skipped -> {out_root}"
     )
 

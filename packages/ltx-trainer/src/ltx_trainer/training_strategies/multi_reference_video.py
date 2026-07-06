@@ -42,6 +42,14 @@ class MultiReferenceVideoConfig(TrainingStrategyConfigBase):
         description="Directory containing per-sample stacked reference latents.",
     )
 
+    conditions_dir: str = Field(
+        default="conditions",
+        description=(
+            "Directory containing connector-input text/VLM condition features. "
+            "Use vlm_conditions for Stage 1 text-plus-reference-image VLM context."
+        ),
+    )
+
     gt_visual_tokens_dir: str | None = Field(
         default="gt_siglip_tokens",
         description=(
@@ -89,7 +97,7 @@ class MultiReferenceVideoConfig(TrainingStrategyConfigBase):
     def get_data_sources(self) -> dict[str, str]:
         data_sources = {
             "latents": "latents",
-            "conditions": "conditions",
+            self.conditions_dir: "conditions",
             self.reference_latents_dir: "multi_ref_latents",
         }
         if self.gt_visual_tokens_dir is not None:
