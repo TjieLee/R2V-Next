@@ -9,7 +9,7 @@ from typing import Any, Literal
 
 import torch
 from pydantic import BaseModel, ConfigDict, Field
-from torch import Tensor
+from torch import Tensor, nn
 
 from ltx_core.components.patchifiers import (
     AudioPatchifier,
@@ -34,7 +34,13 @@ class TrainingStrategyConfigBase(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    name: Literal["text_to_video", "video_to_video", "flexible", "multi_reference_video"] = Field(
+    name: Literal[
+        "text_to_video",
+        "video_to_video",
+        "flexible",
+        "multi_reference_video",
+        "multi_reference_planner_stage2",
+    ] = Field(
         description="Unique name identifying the training strategy type"
     )
 
@@ -79,6 +85,62 @@ class TrainingStrategy(ABC):
         self.config = config
         self._video_patchifier = VideoLatentPatchifier(patch_size=1)
         self._audio_patchifier = AudioPatchifier(patch_size=1)
+
+    def attach_models(
+        self,
+        *,
+        transformer: nn.Module,
+        embeddings_processor: nn.Module,
+        text_encoder: nn.Module | None = None,
+    ) -> None:
+        """Attach loaded model modules before optimizer construction.
+
+        Most strategies do not need this hook. Planner-style strategies use it
+        to initialize small trainable adapters from existing connector tokens.
+        """
+
+    def train_transformer(self) -> bool:
+        """Whether the transformer/LoRA parameters should be optimized."""
+        return True
+
+    def train_embeddings_processor(self) -> bool:
+        """Whether the text/audio embedding connector should be optimized."""
+        return False
+
+    def requires_text_encoder(self) -> bool:
+        """Whether the trainer must load Gemma/VLM for online strategy logic."""
+        return False
+
+    def train_text_encoder(self) -> bool:
+        """Whether trainable text encoder/VLM parameters should be optimized."""
+        return False
+
+    def get_trainable_modules(self) -> dict[str, nn.Module]:
+        """Extra strategy-owned modules that must be optimized and checkpointed."""
+        return {}
+
+    def set_trainable_modules(self, modules: dict[str, nn.Module]) -> None:
+        """Receive accelerator-prepared versions of strategy-owned modules."""
+
+    def prepare_conditions(self, batch: dict[str, Any], conditions: dict[str, Tensor]) -> dict[str, Tensor]:
+        """Optionally modify precomputed prompt features before connector processing."""
+        return conditions
+
+    def get_extra_checkpoint_state_dict(self, accelerator: Any) -> dict[str, Tensor]:
+        """Return extra strategy-owned weights for checkpoint saving."""
+        state_dict: dict[str, Tensor] = {}
+        for name, module in self.get_trainable_modules().items():
+            unwrapped = accelerator.unwrap_model(module, keep_torch_compile=False)
+            state_dict.update({f"training_strategy.{name}.{key}": value for key, value in unwrapped.state_dict().items()})
+        return state_dict
+
+    def load_extra_checkpoint_state_dict(self, state_dict: dict[str, Tensor]) -> None:
+        """Load extra strategy-owned weights from a checkpoint if present."""
+        for name, module in self.get_trainable_modules().items():
+            prefix = f"training_strategy.{name}."
+            module_state = {key.removeprefix(prefix): value for key, value in state_dict.items() if key.startswith(prefix)}
+            if module_state:
+                module.load_state_dict(module_state, strict=True)
 
     @abstractmethod
     def prepare_training_inputs(

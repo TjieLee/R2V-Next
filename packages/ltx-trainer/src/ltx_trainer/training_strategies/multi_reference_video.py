@@ -11,7 +11,7 @@ from typing import Any, Literal
 
 import torch
 from pydantic import Field
-from torch import Tensor
+from torch import Tensor, nn
 
 from ltx_core.model.transformer.modality import Modality
 from ltx_core.multicond.rope_mask_builder import build_multiref_sequence
@@ -42,6 +42,24 @@ class MultiReferenceVideoConfig(TrainingStrategyConfigBase):
         description="Directory containing per-sample stacked reference latents.",
     )
 
+    gt_visual_tokens_dir: str | None = Field(
+        default="gt_siglip_tokens",
+        description=(
+            "Directory containing frozen SigLIP/projector visual tokens. Set to null to disable the "
+            "Stage 1 text-condition expansion path."
+        ),
+    )
+
+    visual_token_key: str = Field(
+        default="visual_tokens",
+        description="Tensor key in gt_visual_tokens_dir files. Shape per sample: [K, D].",
+    )
+
+    visual_token_mask_key: str = Field(
+        default="visual_token_mask",
+        description="Optional bool mask key in gt_visual_tokens_dir files. Shape per sample: [K].",
+    )
+
     max_ref_images_per_sample: int | None = Field(
         default=None,
         description="Optional cap applied after loading. None keeps all references in each sample.",
@@ -55,11 +73,14 @@ class MultiReferenceVideoConfig(TrainingStrategyConfigBase):
     )
 
     def get_data_sources(self) -> dict[str, str]:
-        return {
+        data_sources = {
             "latents": "latents",
             "conditions": "conditions",
             self.reference_latents_dir: "multi_ref_latents",
         }
+        if self.gt_visual_tokens_dir is not None:
+            data_sources[self.gt_visual_tokens_dir] = "gt_visual_tokens"
+        return data_sources
 
 
 class MultiReferenceVideoStrategy(TrainingStrategy):
@@ -70,6 +91,24 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
     def __init__(self, config: MultiReferenceVideoConfig):
         super().__init__(config)
         self.reference_spatial_scale_factor: int | None = None
+        self._connector_register_count: int | None = None
+
+    def attach_models(
+        self,
+        *,
+        transformer: nn.Module,
+        embeddings_processor: nn.Module,
+        text_encoder: nn.Module | None = None,
+    ) -> None:
+        del transformer, text_encoder
+        video_connector = embeddings_processor.video_connector
+        self._connector_register_count = getattr(video_connector, "num_learnable_registers", None)
+
+    def prepare_conditions(self, batch: dict[str, Any], conditions: dict[str, Tensor]) -> dict[str, Tensor]:
+        if self.config.gt_visual_tokens_dir is None or "gt_visual_tokens" not in batch:
+            return conditions
+        visual_tokens, visual_mask = self._load_condition_visual_tokens(batch["gt_visual_tokens"], conditions)
+        return self._append_visual_tokens_to_conditions(conditions, visual_tokens, visual_mask)
 
     def prepare_training_inputs(
         self,
@@ -216,6 +255,84 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
         if latents.ndim == 6:
             return latents
         raise ValueError(f"Reference latents must be [B,C,F,H,W] or [B,R,C,F,H,W], got {tuple(latents.shape)}")
+
+    def _load_condition_visual_tokens(
+        self,
+        visual_data: dict[str, Any],
+        conditions: dict[str, Tensor],
+    ) -> tuple[Tensor, Tensor]:
+        video_feature_key = "video_prompt_embeds" if "video_prompt_embeds" in conditions else "prompt_embeds"
+        video_features = conditions[video_feature_key]
+        tokens = visual_data[self.config.visual_token_key].to(device=video_features.device, dtype=video_features.dtype)
+        if tokens.ndim != 3:
+            raise ValueError(f"GT visual tokens must be [B,K,D], got {tuple(tokens.shape)}")
+        if tokens.shape[-1] != video_features.shape[-1]:
+            raise ValueError(
+                f"GT visual token dim {tokens.shape[-1]} does not match prompt feature dim {video_features.shape[-1]}"
+            )
+
+        mask = visual_data.get(self.config.visual_token_mask_key)
+        if mask is None:
+            mask = torch.ones(tokens.shape[:2], dtype=torch.bool, device=tokens.device)
+        else:
+            mask = mask.to(device=tokens.device, dtype=torch.bool)
+        if mask.shape != tokens.shape[:2]:
+            raise ValueError(f"GT visual token mask must be [B,K], got {tuple(mask.shape)} for tokens {tuple(tokens.shape)}")
+        return tokens, mask
+
+    def _append_visual_tokens_to_conditions(
+        self,
+        conditions: dict[str, Tensor],
+        visual_tokens: Tensor,
+        visual_mask: Tensor,
+    ) -> dict[str, Tensor]:
+        conditions = dict(conditions)
+        video_feature_key = "video_prompt_embeds" if "video_prompt_embeds" in conditions else "prompt_embeds"
+        video_features = conditions[video_feature_key]
+        conditions[video_feature_key] = torch.cat([video_features, visual_tokens.to(dtype=video_features.dtype)], dim=1)
+
+        audio_features = conditions.get("audio_prompt_embeds")
+        if audio_features is not None:
+            audio_pad = torch.zeros(
+                audio_features.shape[0],
+                visual_tokens.shape[1],
+                audio_features.shape[-1],
+                dtype=audio_features.dtype,
+                device=audio_features.device,
+            )
+            conditions["audio_prompt_embeds"] = torch.cat([audio_features, audio_pad], dim=1)
+
+        prompt_mask = conditions["prompt_attention_mask"].to(device=visual_tokens.device, dtype=torch.bool)
+        conditions["prompt_attention_mask"] = torch.cat([prompt_mask, visual_mask], dim=1)
+        return self._pad_conditions_to_connector_multiple(conditions)
+
+    def _pad_conditions_to_connector_multiple(self, conditions: dict[str, Tensor]) -> dict[str, Tensor]:
+        if not self._connector_register_count:
+            return conditions
+        video_feature_key = "video_prompt_embeds" if "video_prompt_embeds" in conditions else "prompt_embeds"
+        seq_len = conditions[video_feature_key].shape[1]
+        remainder = seq_len % self._connector_register_count
+        if remainder == 0:
+            return conditions
+
+        pad_len = self._connector_register_count - remainder
+        for key in ("video_prompt_embeds", "prompt_embeds", "audio_prompt_embeds"):
+            features = conditions.get(key)
+            if features is None:
+                continue
+            pad = torch.zeros(
+                features.shape[0],
+                pad_len,
+                features.shape[-1],
+                dtype=features.dtype,
+                device=features.device,
+            )
+            conditions[key] = torch.cat([features, pad], dim=1)
+
+        mask = conditions["prompt_attention_mask"]
+        mask_pad = torch.zeros(mask.shape[0], pad_len, dtype=mask.dtype, device=mask.device)
+        conditions["prompt_attention_mask"] = torch.cat([mask, mask_pad], dim=1)
+        return conditions
 
     @staticmethod
     def _get_reference_valid_mask(ref_data: dict[str, Any], ref_latents: Tensor) -> Tensor:

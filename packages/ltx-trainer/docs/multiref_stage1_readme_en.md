@@ -140,4 +140,4 @@ accelerate launch scripts/train.py configs/multiref_stage1_lora.yaml
 
 ## Current Scope
 
-This implements the Stage 1 renderer adaptation path. The Gemma VLM planner modules are scaffolded through `SemanticQueryBridge`, `cfg_sampler`, and `factorized_cfg`, but Stage 2/3 planner training and inference pipelines are intentionally not wired into the main trainer yet.
+This file only covers the Stage 1 renderer adaptation path. For the updated Stage 1 + Stage 2 VLM planner flow, including GT SigLIP/projector visual tokens and fixed-count learnable planner placeholders, see `multiref_stage1_stage2_readme_en.md`.

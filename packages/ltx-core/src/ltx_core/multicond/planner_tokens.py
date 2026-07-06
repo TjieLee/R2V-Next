@@ -26,6 +26,7 @@ class SemanticQueryBridge(nn.Module):
         target_len: int,
         dim: int,
         num_heads: int,
+        source_dim: int | None = None,
         max_frames: int = 64,
     ) -> None:
         super().__init__()
@@ -36,6 +37,7 @@ class SemanticQueryBridge(nn.Module):
 
         self.target_len = target_len
         self.dim = dim
+        self.source_dim = source_dim or dim
 
         repeats = (target_len + base_tokens.shape[0] - 1) // base_tokens.shape[0]
         init_tokens = base_tokens.detach().float().repeat(repeats, 1)[:target_len]
@@ -44,6 +46,10 @@ class SemanticQueryBridge(nn.Module):
         else:
             self.base_projection = nn.Identity()
         self.base_tokens = nn.Parameter(init_tokens, requires_grad=True)
+        if self.source_dim != dim:
+            self.kv_projection = nn.Linear(self.source_dim, dim)
+        else:
+            self.kv_projection = nn.Identity()
 
         self.query_index_embed = nn.Embedding(target_len, dim)
         self.frame_index_embed = nn.Embedding(max_frames, dim)
@@ -62,6 +68,7 @@ class SemanticQueryBridge(nn.Module):
         planner_mask: Tensor | None = None,
         frame_ids: Tensor | None = None,
     ) -> PlannerTokenOutput:
+        planner_hidden = self.kv_projection(planner_hidden)
         batch_size = planner_hidden.shape[0]
         device = planner_hidden.device
 

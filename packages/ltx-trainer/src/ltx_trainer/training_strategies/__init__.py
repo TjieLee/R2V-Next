@@ -17,12 +17,22 @@ from ltx_trainer.training_strategies.base_strategy import (
     TrainingStrategyConfigBase,
 )
 from ltx_trainer.training_strategies.flexible import FlexibleStrategy, FlexibleStrategyConfig
+from ltx_trainer.training_strategies.multi_reference_planner_stage2 import (
+    MultiReferencePlannerStage2Config,
+    MultiReferencePlannerStage2Strategy,
+)
 from ltx_trainer.training_strategies.multi_reference_video import MultiReferenceVideoConfig, MultiReferenceVideoStrategy
 from ltx_trainer.training_strategies.text_to_video import TextToVideoConfig, TextToVideoStrategy
 from ltx_trainer.training_strategies.video_to_video import VideoToVideoConfig, VideoToVideoStrategy
 
 # Type alias for all strategy config types
-TrainingStrategyConfig = TextToVideoConfig | VideoToVideoConfig | FlexibleStrategyConfig | MultiReferenceVideoConfig
+TrainingStrategyConfig = (
+    TextToVideoConfig
+    | VideoToVideoConfig
+    | FlexibleStrategyConfig
+    | MultiReferenceVideoConfig
+    | MultiReferencePlannerStage2Config
+)
 
 __all__ = [
     "DEFAULT_FPS",
@@ -30,6 +40,8 @@ __all__ = [
     "FlexibleStrategy",
     "FlexibleStrategyConfig",
     "ModelInputs",
+    "MultiReferencePlannerStage2Config",
+    "MultiReferencePlannerStage2Strategy",
     "MultiReferenceVideoConfig",
     "MultiReferenceVideoStrategy",
     "TextToVideoConfig",
@@ -78,6 +90,8 @@ def get_training_strategy(config: TrainingStrategyConfig) -> TrainingStrategy:
             strategy = VideoToVideoStrategy(config)
         case FlexibleStrategyConfig():
             strategy = FlexibleStrategy(config)
+        case MultiReferencePlannerStage2Config():
+            strategy = MultiReferencePlannerStage2Strategy(config)
         case MultiReferenceVideoConfig():
             strategy = MultiReferenceVideoStrategy(config)
         case _:

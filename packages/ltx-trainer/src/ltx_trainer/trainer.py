@@ -38,7 +38,7 @@ from ltx_trainer.config_display import print_config
 from ltx_trainer.datasets import PrecomputedDataset, collate_precomputed_batch
 from ltx_trainer.gpu_utils import free_gpu_memory, get_gpu_memory_gb
 from ltx_trainer.hf_hub_utils import push_to_hub
-from ltx_trainer.model_loader import load_embeddings_processor, load_transformer
+from ltx_trainer.model_loader import load_embeddings_processor, load_text_encoder, load_transformer
 from ltx_trainer.progress import TrainingProgress
 from ltx_trainer.quantization import quantize_model
 from ltx_trainer.sigma_tracker import SigmaBucketTracker
@@ -208,7 +208,7 @@ class LtxvTrainer:
                     batch = next(data_iter)
 
                 step_start_time = time.time()
-                with self._accelerator.accumulate(self._transformer):
+                with self._accelerator.accumulate(*self._accumulation_models):
                     is_optimization_step = (step + 1) % cfg.optimization.gradient_accumulation_steps == 0
                     if is_optimization_step:
                         self._global_step += 1
@@ -351,6 +351,8 @@ class LtxvTrainer:
         """Perform a single training step using the configured strategy."""
         # Apply embedding connectors to transform pre-computed text embeddings
         conditions = batch["conditions"]
+        conditions = self._training_strategy.prepare_conditions(batch, conditions)
+        batch["conditions"] = conditions
 
         if "video_prompt_embeds" in conditions:
             # New format: separate video/audio features from precompute()
@@ -413,6 +415,18 @@ class LtxvTrainer:
             dtype=torch.bfloat16,
         )
         self._embeddings_processor.feature_extractor = None
+        self._embeddings_processor.requires_grad_(False)
+
+        self._text_encoder = None
+        if self._training_strategy.requires_text_encoder():
+            logger.debug("Loading Gemma/VLM text encoder for training strategy...")
+            self._text_encoder = load_text_encoder(
+                gemma_model_path=self._config.model.text_encoder_path,
+                device=init_device,
+                dtype=torch.bfloat16,
+                load_in_8bit=self._config.acceleration.load_text_encoder_in_8bit,
+            )
+            self._text_encoder.requires_grad_(False)
 
         transformer_dtype = torch.bfloat16 if self._config.model.training_mode == "lora" else torch.float32
         self._transformer = self._transformer.to(dtype=transformer_dtype)
@@ -428,19 +442,52 @@ class LtxvTrainer:
             )
 
         self._transformer.requires_grad_(False)
+        self._training_strategy.attach_models(
+            transformer=self._transformer,
+            embeddings_processor=self._embeddings_processor,
+            text_encoder=self._text_encoder,
+        )
 
     def _collect_trainable_params(self) -> None:
         """Collect trainable parameters based on training mode."""
+        self._train_transformer = self._training_strategy.train_transformer()
+        self._train_embeddings_processor = self._training_strategy.train_embeddings_processor()
+        self._train_text_encoder = self._training_strategy.train_text_encoder()
+
         if self._config.model.training_mode == "lora":
             # For LoRA training, first set up LoRA layers
             self._setup_lora()
+            if not self._train_transformer:
+                self._transformer.requires_grad_(False)
         elif self._config.model.training_mode == "full":
             # For full training, unfreeze all transformer parameters
-            self._transformer.requires_grad_(True)
+            self._transformer.requires_grad_(self._train_transformer)
         else:
             raise ValueError(f"Unknown training mode: {self._config.model.training_mode}")
 
+        self._embeddings_processor.requires_grad_(False)
+        if self._train_embeddings_processor:
+            self._embeddings_processor.video_connector.requires_grad_(True)
+        if self._text_encoder is not None and not self._train_text_encoder:
+            self._text_encoder.requires_grad_(False)
+
+        strategy_modules = self._training_strategy.get_trainable_modules()
+        for module in strategy_modules.values():
+            module.requires_grad_(True)
+
         self._trainable_params = [p for p in self._transformer.parameters() if p.requires_grad]
+        if self._train_embeddings_processor:
+            self._trainable_params.extend(p for p in self._embeddings_processor.parameters() if p.requires_grad)
+        if self._train_text_encoder:
+            if self._text_encoder is None:
+                raise ValueError("Training strategy requested text encoder training, but no text encoder was loaded.")
+            self._trainable_params.extend(p for p in self._text_encoder.parameters() if p.requires_grad)
+        for module in strategy_modules.values():
+            self._trainable_params.extend(p for p in module.parameters() if p.requires_grad)
+
+        if not self._trainable_params:
+            raise ValueError("No trainable parameters were found for the selected training strategy.")
+
         logger.debug(f"Trainable params count: {sum(p.numel() for p in self._trainable_params):,}")
 
     def _init_timestep_sampler(self) -> None:
@@ -487,23 +534,76 @@ class LtxvTrainer:
     def _load_full_checkpoint(self, checkpoint_path: Path) -> None:
         """Load full model checkpoint."""
         state_dict = load_file(checkpoint_path)
-        self._transformer.load_state_dict(state_dict, strict=True)
+        self._load_auxiliary_checkpoint_state(state_dict)
+
+        transformer_state = self._filter_auxiliary_checkpoint_state(state_dict)
+        if transformer_state:
+            self._transformer.load_state_dict(transformer_state, strict=True)
+        else:
+            logger.info("No full transformer weights found in checkpoint; loaded auxiliary weights only")
 
         logger.info("✅ Full model checkpoint loaded successfully")
 
     def _load_lora_checkpoint(self, checkpoint_path: Path) -> None:
         """Load LoRA checkpoint with DDP/FSDP compatibility."""
         state_dict = load_file(checkpoint_path)
+        self._load_auxiliary_checkpoint_state(state_dict)
 
         # Adjust layer names to match internal format.
         # (Weights are saved in ComfyUI-compatible format, with "diffusion_model." prefix)
-        state_dict = {k.replace("diffusion_model.", "", 1): v for k, v in state_dict.items()}
+        state_dict = {k.replace("diffusion_model.", "", 1): v for k, v in state_dict.items() if k.startswith("diffusion_model.")}
+
+        if not state_dict:
+            logger.info("No LoRA weights found in checkpoint; loaded auxiliary weights only")
+            return
 
         # Load LoRA weights and verify all weights were loaded
         base_model = self._transformer.get_base_model()
         set_peft_model_state_dict(base_model, state_dict)
 
         logger.info("✅ LoRA checkpoint loaded successfully")
+
+    @staticmethod
+    def _filter_auxiliary_checkpoint_state(state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
+        return {
+            key: value
+            for key, value in state_dict.items()
+            if not key.startswith("training_strategy.")
+            and not key.startswith("embeddings_processor.")
+            and not key.startswith("text_encoder.")
+        }
+
+    def _load_auxiliary_checkpoint_state(self, state_dict: dict[str, Tensor]) -> None:
+        self._training_strategy.load_extra_checkpoint_state_dict(state_dict)
+
+        processor_state = {
+            key.removeprefix("embeddings_processor."): value
+            for key, value in state_dict.items()
+            if key.startswith("embeddings_processor.")
+        }
+        if processor_state:
+            missing, unexpected = self._embeddings_processor.load_state_dict(processor_state, strict=False)
+            if missing:
+                logger.debug(f"Missing embeddings processor keys while loading auxiliary checkpoint: {missing}")
+            if unexpected:
+                logger.debug(f"Unexpected embeddings processor keys while loading auxiliary checkpoint: {unexpected}")
+            logger.info("✅ Embeddings processor checkpoint loaded successfully")
+
+        text_encoder_state = {
+            key.removeprefix("text_encoder."): value
+            for key, value in state_dict.items()
+            if key.startswith("text_encoder.")
+        }
+        if text_encoder_state:
+            if self._text_encoder is None:
+                logger.warning("Text encoder weights found in checkpoint but no text encoder is loaded")
+            else:
+                missing, unexpected = self._text_encoder.load_state_dict(text_encoder_state, strict=False)
+                if missing:
+                    logger.debug(f"Missing text encoder keys while loading auxiliary checkpoint: {missing}")
+                if unexpected:
+                    logger.debug(f"Unexpected text encoder keys while loading auxiliary checkpoint: {unexpected}")
+                logger.info("✅ Text encoder checkpoint loaded successfully")
 
     def _resolve_resume_state(self) -> tuple[int, TrainingState | None]:
         """Determine resume state by looking for a training state file next to the loaded checkpoint.
@@ -616,8 +716,38 @@ class LtxvTrainer:
 
         transformer.set_gradient_checkpointing(self._config.optimization.enable_gradient_checkpointing)
 
-        # noinspection PyTypeChecker
-        self._transformer = self._accelerator.prepare(self._transformer)
+        strategy_modules = self._training_strategy.get_trainable_modules()
+        models_to_prepare = [("transformer", self._transformer)]
+        if self._train_embeddings_processor:
+            models_to_prepare.append(("embeddings_processor", self._embeddings_processor))
+        if self._train_text_encoder:
+            models_to_prepare.append(("text_encoder", self._text_encoder))
+        models_to_prepare.extend((f"strategy.{name}", module) for name, module in strategy_modules.items())
+
+        prepared_models = self._accelerator.prepare(*(module for _, module in models_to_prepare))
+        if len(models_to_prepare) == 1:
+            prepared_models = (prepared_models,)
+
+        prepared_strategy_modules = {}
+        for (name, _module), prepared_module in zip(models_to_prepare, prepared_models, strict=True):
+            if name == "transformer":
+                self._transformer = prepared_module
+            elif name == "embeddings_processor":
+                self._embeddings_processor = prepared_module
+            elif name == "text_encoder":
+                self._text_encoder = prepared_module
+            elif name.startswith("strategy."):
+                prepared_strategy_modules[name.removeprefix("strategy.")] = prepared_module
+
+        if prepared_strategy_modules:
+            self._training_strategy.set_trainable_modules(prepared_strategy_modules)
+
+        self._accumulation_models = [self._transformer]
+        if self._train_embeddings_processor:
+            self._accumulation_models.append(self._embeddings_processor)
+        if self._train_text_encoder:
+            self._accumulation_models.append(self._text_encoder)
+        self._accumulation_models.extend(self._training_strategy.get_trainable_modules().values())
 
         # Log GPU memory usage after model preparation
         vram_usage_gb = torch.cuda.memory_allocated() / 1024**3
@@ -938,6 +1068,7 @@ class LtxvTrainer:
 
         # Determine save precision
         save_dtype = torch.bfloat16 if self._config.checkpoints.precision == "bfloat16" else torch.float32
+        auxiliary_state_dict = self._collect_auxiliary_checkpoint_state(save_dtype)
 
         # For LoRA: extract only adapter weights; for full: use as-is
         if is_lora:
@@ -953,6 +1084,7 @@ class LtxvTrainer:
 
             # Cast to configured precision
             state_dict = {k: v.to(save_dtype) if isinstance(v, Tensor) else v for k, v in state_dict.items()}
+            state_dict.update(auxiliary_state_dict)
 
             # Build metadata for safetensors file
             metadata = self._build_checkpoint_metadata()
@@ -962,6 +1094,7 @@ class LtxvTrainer:
         else:
             # Cast to configured precision
             full_state_dict = {k: v.to(save_dtype) if isinstance(v, Tensor) else v for k, v in full_state_dict.items()}
+            full_state_dict.update(auxiliary_state_dict)
 
             # Save to disk
             self._accelerator.save(full_state_dict, saved_weights_path)
@@ -975,6 +1108,24 @@ class LtxvTrainer:
         self._save_training_state(save_dir)
 
         return saved_weights_path
+
+    def _collect_auxiliary_checkpoint_state(self, save_dtype: torch.dtype) -> dict[str, Tensor]:
+        state_dict = self._training_strategy.get_extra_checkpoint_state_dict(self._accelerator)
+
+        if self._train_embeddings_processor:
+            processor_state = self._accelerator.get_state_dict(self._embeddings_processor)
+            state_dict.update({f"embeddings_processor.{key}": value for key, value in processor_state.items()})
+        if self._train_text_encoder and self._text_encoder is not None:
+            text_encoder_state = self._collect_trainable_text_encoder_state()
+            state_dict.update({f"text_encoder.{key}": value for key, value in text_encoder_state.items()})
+
+        return {key: value.to(save_dtype) if isinstance(value, Tensor) else value for key, value in state_dict.items()}
+
+    def _collect_trainable_text_encoder_state(self) -> dict[str, Tensor]:
+        unwrapped = self._accelerator.unwrap_model(self._text_encoder, keep_torch_compile=False)
+        trainable_names = {name for name, param in unwrapped.named_parameters() if param.requires_grad}
+        full_state = self._accelerator.get_state_dict(self._text_encoder)
+        return {key: value for key, value in full_state.items() if key in trainable_names}
 
     def _cleanup_checkpoints(self) -> None:
         """Clean up old checkpoints."""
