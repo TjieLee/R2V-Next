@@ -8,6 +8,24 @@ text embedding tokens + thinking/register tokens + visual tokens
 
 Stage 1 使用冻结 Gemma/SigLIP vision tower 和 multi-modal projector 从 target video 采样帧生成的 GT visual tokens。Stage 2 使用 VLM language model + 固定数量 learnable planner placeholder tokens 预测 visual tokens，并用 MSE 对齐 Stage 1 的 target-video GT SigLIP/projector visual tokens。`planner_token_count` 必须等于 `gt_siglip_tokens/*.pt` 中的 `num_visual_tokens`。
 
+## 不要混淆的视觉来源
+
+这版实现里有三类视觉信息，来源和用途不同：
+
+| 目录/数据 | 来源 | 进入哪里 | 作用 |
+| --- | --- | --- | --- |
+| `multi_reference_latents/` | `reference_images` 参考图 | DiT video latent stream，拼在 noisy target video latents 前面 | 多参考图的 VAE latent 条件 |
+| `planner_vlm_inputs/` | `reference_images` 参考图 + system/user prompt | VLM/Gemma 输入 | 让 VLM planner 看参考图和文本，预测 visual planner tokens |
+| `gt_siglip_tokens/` | `video` target video 的采样帧 | Stage 1 的 DiT condition tokens；Stage 2 的 MSE teacher | target-video GT SigLIP/projector visual tokens |
+
+关键约束：
+
+- `gt_siglip_tokens/` **只能从 target video 提取**，不能从 `reference_images` 提取。
+- Stage 1 的 DiT condition 是 `text/thinking tokens + target-video GT SigLIP/projector tokens`。
+- Stage 2 的 DiT condition 是 `text/thinking tokens + VLM predicted planner tokens`。
+- Stage 2 的 MSE teacher 是同一条样本的 `target-video GT SigLIP/projector tokens`。
+- `reference_images` 不作为 Stage 1 condition visual-token teacher，也不作为 Stage 2 MSE teacher；它们只进入 reference VAE latent stream 和 VLM 输入。
+
 ## 主要改动
 
 - `ltx_core.multicond.visual_tokens`：新增冻结 SigLIP/projector visual token 提取、Gemma image-token scatter、固定数量 `VisualPlannerTokens`。
@@ -96,17 +114,20 @@ python scripts/precompute_gt_siglip_tokens.py /mnt/workspace/litengjie/my_datase
   --text-encoder-path /mnt/workspace/litengjie/LTX-2/models/gemma-3-12b-it-qat-q4_0-unquantized \
   --output-dir /mnt/workspace/litengjie/my_dataset/.precomputed/gt_siglip_tokens \
   --video-column video \
-  --sample-fps 6 \
+  --num-sampled-frames 4 \
   --max-source-frames 81 \
+  --expected-token-count 1024 \
   --device cuda
 ```
 
-脚本会在 target video 的前 `81` 个源帧内按 `6fps` 抽帧，并打印检测到的 `num_visual_tokens`。把这个值填到 Stage 2 配置的：
+推荐固定从 target video 的前 `81` 个源帧内均匀抽 `4` 帧。Gemma/SigLIP 每帧产生 `256` 个 projected visual tokens，因此 `num_visual_tokens = 4 * 256 = 1024`。把这个值填到 Stage 2 配置的：
 
 ```yaml
 training_strategy:
-  planner_token_count: <num_visual_tokens>
+  planner_token_count: 1024
 ```
+
+如果你改成 `--num-sampled-frames N`，则 `planner_token_count = N * 256`。`--sample-fps 6` 也可以用，但 token 数会随源视频 fps 和 `--max-source-frames` 变化；为了 Stage 2 固定 planner placeholders，推荐用 `--num-sampled-frames`。
 
 5. 生成 Stage 2 VLM 输入：
 
@@ -117,8 +138,89 @@ python scripts/precompute_planner_vlm_inputs.py /mnt/workspace/litengjie/my_data
   --video-column video \
   --caption-column caption \
   --reference-column reference_images \
-  --planner-token-count <num_visual_tokens>
+  --planner-token-count 1024
 ```
+
+这里的 `planner-token-count` 必须和 `gt_siglip_tokens` 的 `num_visual_tokens` 完全一致。最多 `4` 张 reference images 只影响 VLM 能看到多少参考图，以及 `multi_reference_latents/` 中有多少参考 latent；它不决定 MSE teacher token 数。
+
+## 训练时的数据流
+
+Stage 1 每条样本的数据流：
+
+```text
+reference_images
+  -> precompute_multiref_images.py
+  -> multi_reference_latents
+  -> prepended clean reference latent tokens in DiT latent stream
+
+target video
+  -> precompute_gt_siglip_tokens.py
+  -> gt_siglip_tokens.visual_tokens
+  -> text connector input after text/thinking tokens
+  -> DiT condition tokens
+```
+
+Stage 2 每条样本的数据流：
+
+```text
+reference_images + system prompt + user prompt + fixed planner placeholders
+  -> VLM/Gemma language model
+  -> predicted planner visual tokens
+  -> text connector input after text/thinking tokens
+  -> DiT condition tokens
+
+target video
+  -> gt_siglip_tokens.visual_tokens
+  -> MSE teacher for predicted planner visual tokens
+```
+
+因此，Stage 1 和 Stage 2 的最大区别不是是否使用参考图，而是 DiT condition 里的 visual tokens 来源不同：
+
+- Stage 1：使用 target-video GT SigLIP/projector tokens。
+- Stage 2：使用 VLM + learnable planner placeholders 预测出来的 tokens，并用 target-video GT tokens 对齐。
+
+## Negative RoPE
+
+多参考图 VAE latents 会被拼到 target video latents 前面。参考图 latent token 的时间位置使用负向 T 维 RoPE：
+
+```text
+ref 1: T = -1 * reference_time_stride
+ref 2: T = -2 * reference_time_stride
+ref 3: T = -3 * reference_time_stride
+ref 4: T = -4 * reference_time_stride
+```
+
+默认 `reference_time_stride: 1.0`，也就是 `-1, -2, -3, -4`。这个负向时间位置只作用在 reference VAE latent stream 上；`gt_siglip_tokens` 和 VLM predicted planner tokens 是 text connector condition sequence，不使用这套 reference latent RoPE。
+
+## 预处理结果检查
+
+检查 `gt_siglip_tokens` 是否确实来自 target video：
+
+```bash
+python - <<'PY'
+import glob
+import torch
+
+p = glob.glob("/mnt/workspace/litengjie/my_dataset/.precomputed/gt_siglip_tokens/**/*.pt", recursive=True)[0]
+x = torch.load(p, map_location="cpu")
+print("file:", p)
+print("visual_tokens:", tuple(x["visual_tokens"].shape))
+print("num_visual_tokens:", int(x["num_visual_tokens"]))
+print("tokens_per_frame:", int(x["tokens_per_frame"]))
+print("sampled_frame_indices:", x["sampled_frame_indices"].tolist())
+PY
+```
+
+推荐输出应类似：
+
+```text
+visual_tokens: (1024, D)
+num_visual_tokens: 1024
+tokens_per_frame: 256
+sampled_frame_indices: [...]
+```
+
+路径应该镜像 `video` 字段的 target video 路径，而不是 reference image 路径。
 
 ## Stage 1 训练
 

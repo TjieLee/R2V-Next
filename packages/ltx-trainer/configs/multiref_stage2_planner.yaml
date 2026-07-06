@@ -11,7 +11,10 @@
 #   text/thinking tokens + visual tokens
 # Stage 1 uses target-video GT visual tokens from frozen SigLIP/projector.
 # Stage 2 replaces them with VLM-predicted visual tokens and aligns them to GT
-# with MSE. planner_token_count must equal the GT visual token count.
+# with MSE. planner_token_count must equal the target-video GT visual token count.
+# With the recommended precompute setting, planner_token_count = 4 target-video
+# frames * 256 SigLIP/projector tokens per frame = 1024. Reference image count
+# does not define this value.
 #
 # Required preprocessed layout:
 #   preprocessed_data_root/
@@ -76,7 +79,8 @@ training_strategy:
   freeze_vlm_multi_modal_projector: true
 
   # Set this to the exact num_visual_tokens detected by precompute_gt_siglip_tokens.py.
-  planner_token_count: 256
+  # Recommended default: 4 sampled target-video frames * 256 tokens/frame = 1024.
+  planner_token_count: 1024
   # Set this if the selected VLM hidden layer dim differs from the LTX connector input dim (default 3840).
   planner_source_dim: null
   predicted_visual_token_key: "predicted_visual_tokens"

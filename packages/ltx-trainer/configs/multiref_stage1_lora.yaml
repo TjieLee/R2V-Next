@@ -28,8 +28,9 @@
 #     --text-encoder-path /path/to/gemma-text-encoder \
 #     --output-dir /path/to/.precomputed/gt_siglip_tokens \
 #     --video-column video \
-#     --sample-fps 6 \
-#     --max-source-frames 81
+#     --num-sampled-frames 4 \
+#     --max-source-frames 81 \
+#     --expected-token-count 1024
 
 model:
   model_path: "path/to/ltx-2-model.safetensors"

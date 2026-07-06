@@ -8,6 +8,24 @@ text embedding tokens + thinking/register tokens + visual tokens
 
 Stage 1 uses target-video GT visual tokens produced by the frozen Gemma/SigLIP vision tower and frozen multi-modal projector from sampled target-video frames. Stage 2 replaces those GT visual tokens with VLM-predicted visual tokens from a fixed number of learnable planner placeholders, and aligns them to the Stage 1 target-video GT SigLIP/projector tokens with MSE. `planner_token_count` must exactly match `num_visual_tokens` in `gt_siglip_tokens/*.pt`.
 
+## Visual Sources That Must Not Be Confused
+
+This implementation uses three different visual data streams:
+
+| Directory/data | Source | Where it goes | Role |
+| --- | --- | --- | --- |
+| `multi_reference_latents/` | `reference_images` | DiT video latent stream, prepended before noisy target video latents | Multi-reference VAE latent conditioning |
+| `planner_vlm_inputs/` | `reference_images` plus system/user prompt | VLM/Gemma input | Lets the VLM planner see the reference images and text before predicting planner tokens |
+| `gt_siglip_tokens/` | sampled frames from `video`, the target video | Stage 1 DiT condition tokens; Stage 2 MSE teacher | Target-video GT SigLIP/projector visual tokens |
+
+Hard requirements:
+
+- `gt_siglip_tokens/` must be extracted from the target video only, never from `reference_images`.
+- Stage 1 DiT conditioning is `text/thinking tokens + target-video GT SigLIP/projector tokens`.
+- Stage 2 DiT conditioning is `text/thinking tokens + VLM-predicted planner tokens`.
+- The Stage 2 MSE teacher is the same sample's target-video GT SigLIP/projector tokens.
+- `reference_images` are not the Stage 1 condition visual-token teacher and are not the Stage 2 MSE teacher; they only enter the reference VAE latent stream and the VLM input.
+
 ## Main Changes
 
 - `ltx_core.multicond.visual_tokens`: frozen SigLIP/projector token extraction, Gemma image-token scatter, and fixed-count `VisualPlannerTokens`.
@@ -96,17 +114,20 @@ python scripts/precompute_gt_siglip_tokens.py /mnt/workspace/litengjie/my_datase
   --text-encoder-path /mnt/workspace/litengjie/LTX-2/models/gemma-3-12b-it-qat-q4_0-unquantized \
   --output-dir /mnt/workspace/litengjie/my_dataset/.precomputed/gt_siglip_tokens \
   --video-column video \
-  --sample-fps 6 \
+  --num-sampled-frames 4 \
   --max-source-frames 81 \
+  --expected-token-count 1024 \
   --device cuda
 ```
 
-The script samples target-video frames inside the same first `81` source frames used by the VAE latent bucket and logs the detected `num_visual_tokens`. Use that value in:
+The recommended setting samples `4` frames uniformly from the target video's first `81` source frames. Gemma/SigLIP produces `256` projected visual tokens per sampled frame, so `num_visual_tokens = 4 * 256 = 1024`. Use that value in:
 
 ```yaml
 training_strategy:
-  planner_token_count: <num_visual_tokens>
+  planner_token_count: 1024
 ```
+
+If you change this to `--num-sampled-frames N`, then `planner_token_count = N * 256`. `--sample-fps 6` is also supported, but the token count then depends on the source video fps and `--max-source-frames`; for fixed Stage 2 planner placeholders, prefer `--num-sampled-frames`.
 
 5. Build Stage 2 VLM inputs:
 
@@ -117,8 +138,89 @@ python scripts/precompute_planner_vlm_inputs.py /mnt/workspace/litengjie/my_data
   --video-column video \
   --caption-column caption \
   --reference-column reference_images \
-  --planner-token-count <num_visual_tokens>
+  --planner-token-count 1024
 ```
+
+`planner-token-count` must exactly match `num_visual_tokens` in `gt_siglip_tokens`. The maximum of `4` reference images only controls how many reference images the VLM can see and how many reference latents are stored in `multi_reference_latents/`; it does not define the MSE teacher token count.
+
+## Training Data Flow
+
+Stage 1 per-sample flow:
+
+```text
+reference_images
+  -> precompute_multiref_images.py
+  -> multi_reference_latents
+  -> prepended clean reference latent tokens in the DiT latent stream
+
+target video
+  -> precompute_gt_siglip_tokens.py
+  -> gt_siglip_tokens.visual_tokens
+  -> text connector input after text/thinking tokens
+  -> DiT condition tokens
+```
+
+Stage 2 per-sample flow:
+
+```text
+reference_images + system prompt + user prompt + fixed planner placeholders
+  -> VLM/Gemma language model
+  -> predicted planner visual tokens
+  -> text connector input after text/thinking tokens
+  -> DiT condition tokens
+
+target video
+  -> gt_siglip_tokens.visual_tokens
+  -> MSE teacher for predicted planner visual tokens
+```
+
+Therefore, the main Stage 1 vs Stage 2 difference is not whether reference images are used; it is where the DiT condition visual tokens come from:
+
+- Stage 1: target-video GT SigLIP/projector tokens.
+- Stage 2: VLM + learnable planner placeholder predicted tokens, aligned to the target-video GT tokens.
+
+## Negative RoPE
+
+Reference-image VAE latents are prepended before target video latents. Reference latent tokens use negative temporal RoPE positions:
+
+```text
+ref 1: T = -1 * reference_time_stride
+ref 2: T = -2 * reference_time_stride
+ref 3: T = -3 * reference_time_stride
+ref 4: T = -4 * reference_time_stride
+```
+
+The default `reference_time_stride: 1.0` gives `-1, -2, -3, -4`. This negative temporal position is only applied to the reference VAE latent stream. `gt_siglip_tokens` and VLM-predicted planner tokens are text-connector condition sequence tokens and do not use this reference-latent RoPE scheme.
+
+## Precompute Sanity Check
+
+Check that `gt_siglip_tokens` were extracted from target videos:
+
+```bash
+python - <<'PY'
+import glob
+import torch
+
+p = glob.glob("/mnt/workspace/litengjie/my_dataset/.precomputed/gt_siglip_tokens/**/*.pt", recursive=True)[0]
+x = torch.load(p, map_location="cpu")
+print("file:", p)
+print("visual_tokens:", tuple(x["visual_tokens"].shape))
+print("num_visual_tokens:", int(x["num_visual_tokens"]))
+print("tokens_per_frame:", int(x["tokens_per_frame"]))
+print("sampled_frame_indices:", x["sampled_frame_indices"].tolist())
+PY
+```
+
+Recommended output should look like:
+
+```text
+visual_tokens: (1024, D)
+num_visual_tokens: 1024
+tokens_per_frame: 256
+sampled_frame_indices: [...]
+```
+
+The output path should mirror the `video` target-video path, not a reference-image path.
 
 ## Stage 1 Training
 

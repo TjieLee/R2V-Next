@@ -164,6 +164,10 @@ def main(  # noqa: PLR0913
     device: str = typer.Option("cuda", help="Torch device for VAE encoding"),
     vae_tiling: bool = typer.Option(False, help="Enable spatial VAE tiling"),
     overwrite: bool = typer.Option(False, help="Recompute outputs even if they already exist"),
+    skip_missing_target_latents: bool = typer.Option(
+        True,
+        help="Skip rows whose target video latent is missing when --target-latents-dir is used.",
+    ),
 ) -> None:
     dataset_file = Path(dataset_path)
     data_root = dataset_file.parent
@@ -198,11 +202,18 @@ def main(  # noqa: PLR0913
             continue
 
         if target_latents_path is not None:
-            target_width, target_height = _target_resolution_from_latents(
-                target_path=target_path,
-                data_root=data_root,
-                target_latents_dir=target_latents_path,
-            )
+            try:
+                target_width, target_height = _target_resolution_from_latents(
+                    target_path=target_path,
+                    data_root=data_root,
+                    target_latents_dir=target_latents_path,
+                )
+            except FileNotFoundError as exc:
+                if not skip_missing_target_latents:
+                    raise
+                logger.warning(f"Skipping {target_path}: {exc}")
+                skipped += 1
+                continue
         else:
             target_width, target_height = fixed_resolution
 
