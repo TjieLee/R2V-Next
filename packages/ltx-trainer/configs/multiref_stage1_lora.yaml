@@ -73,6 +73,12 @@ training_strategy:
   visual_token_mask_key: "visual_token_mask"
   visual_tokens_per_frame_key: "tokens_per_frame"
   visual_token_frame_stride: 1
+  cfg_dropout_enabled: true
+  cfg_full_p: 0.7
+  cfg_drop_text_p: 0.1
+  cfg_drop_ref_p: 0.1
+  cfg_drop_planner_p: 0.1
+  cfg_text_conditions_dir: "conditions"
   max_ref_images_per_sample: null
   reference_time_stride: 1.0
   first_frame_conditioning_p: 0.0

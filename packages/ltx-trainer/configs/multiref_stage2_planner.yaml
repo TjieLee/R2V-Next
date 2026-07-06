@@ -2,11 +2,15 @@
 # LTX-2 Multi-Reference Image + Text Stage 2 VLM Planner Training
 # =============================================================================
 #
-# Stage 2 freezes the Stage 1 multi-reference renderer by default and trains:
-#   1. Gemma/VLM language model (SigLIP vision tower + image projector frozen)
+# Stage 2 freezes the Stage 1 multi-reference renderer and Gemma backbone by default.
+# It trains only the lightweight planner path:
+#   1. LTX thinking/register tokens through the video connector
 #   2. Baton-style <image_start> + <image_pad>*K + <image_end> planner slots
 #   3. zero-init cross-attention + FFN bridge whose Q is repeated LTX thinking/register tokens
 #   4. Optional LTX video text connector refinement
+#
+# Set training_strategy.train_gemma_backbone: true only when you explicitly want
+# to fine-tune the Gemma language-model backbone.
 #
 # The DiT condition sequence remains:
 #   VLM text/reference-image context tokens + visual tokens
@@ -66,6 +70,12 @@ training_strategy:
   visual_token_mask_key: "visual_token_mask"
   visual_tokens_per_frame_key: "tokens_per_frame"
   visual_token_frame_stride: 1
+  cfg_dropout_enabled: true
+  cfg_full_p: 0.7
+  cfg_drop_text_p: 0.1
+  cfg_drop_ref_p: 0.1
+  cfg_drop_planner_p: 0.1
+  cfg_text_conditions_dir: "conditions"
   planner_conditions_dir: "planner_conditions"
   use_online_vlm: true
   planner_vlm_inputs_dir: "planner_vlm_inputs"
@@ -77,7 +87,7 @@ training_strategy:
   vlm_hidden_layer: -1
   vlm_lm_labels_key: "labels"
   vlm_lm_loss_weight: 0.0
-  train_vlm_language_model: true
+  train_gemma_backbone: false
   freeze_vlm_vision_tower: true
   freeze_vlm_multi_modal_projector: true
 

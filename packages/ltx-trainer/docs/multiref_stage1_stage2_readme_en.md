@@ -1,12 +1,13 @@
 # LTX-2 Multi-Reference Image + Text + VLM Planner Training
 
-This branch extends the DiT conditioning sequence to:
+This branch does not remove LTX-2's original 128 thinking/register tokens. The implementation has two layers:
 
 ```text
-VLM context tokens + thinking/register tokens + visual tokens
+pre-connector features: VLM context tokens + visual tokens
+post-connector DiT context: VLM context tokens + LTX thinking/register tokens + visual tokens
 ```
 
-`VLM context tokens` are encoded from `system prompt -> user prompt -> reference images`. Stage 1 appends target-video GT SigLIP/projector visual tokens after that context. Stage 2/3 append a Baton-style target planning region after the same source context: `<image_start> + <image_pad> * planner_token_count + <image_end>`. The VLM produces hidden states at the `<image_pad>` positions; the planner bridge uses repeated LTX thinking/register tokens as Q and those hidden states as K/V, then applies zero-init cross-attention + zero-init FFN to produce planner visual tokens, which are aligned to target-video GT SigLIP/projector visual tokens with MSE. `planner_token_count` must exactly match `num_visual_tokens` in `gt_siglip_tokens/*.pt`.
+`VLM context tokens` are encoded from `system prompt -> user prompt -> reference images`. In Stage 1, target-video GT SigLIP/projector visual tokens are first appended after that context in the pre-connector feature sequence; the features then still pass through the native LTX `Embeddings1DConnector`, which injects/reuses the 128 learnable thinking/register tokens. Stage 2/3 append a Baton-style target planning region after the same source context: `<image_start> + <image_pad> * planner_token_count + <image_end>`. The VLM produces hidden states at the `<image_pad>` positions; the planner bridge uses repeated LTX thinking/register tokens as Q and those hidden states as K/V, then applies zero-init cross-attention + zero-init FFN to produce planner visual tokens, which are aligned to target-video GT SigLIP/projector visual tokens with MSE. `planner_token_count` must exactly match `num_visual_tokens` in `gt_siglip_tokens/*.pt`.
 
 ## Visual Sources That Must Not Be Confused
 
@@ -32,10 +33,24 @@ Hard requirements:
 - `ltx_core.multicond.visual_tokens`: frozen SigLIP/projector token extraction, Gemma image-token scatter, and fixed-count `VisualPlannerTokens`.
 - `ltx_trainer.training_strategies.multi_reference_video`: Stage 1 can read `vlm_conditions/` through `conditions_dir`, then append `gt_siglip_tokens/visual_tokens` after the VLM context features before the LTX text connector.
 - `ltx_trainer.training_strategies.multi_reference_planner_stage2`: Stage 2 uses fixed `planner_token_count` `<image_pad>` target placeholders. Their VLM hidden states act as K/V, repeated LTX thinking/register tokens act as Q, and a zero-init cross-attention + zero-init FFN bridge produces visual planner tokens that replace GT visual tokens in the DiT condition sequence and align to GT visual tokens with MSE.
+- `ltx_core.multicond.cfg_sampler` plus the multi-reference training strategies: per-sample CFG condition dropout with default `full/drop_text/drop_ref/drop_planner = 0.7/0.1/0.1/0.1`.
 - `scripts/precompute_gt_siglip_tokens.py`: builds `.precomputed/gt_siglip_tokens/` from sampled target-video frames.
 - `scripts/precompute_multiref_vlm_conditions.py`: builds Stage 1/2 `system prompt -> user prompt -> reference image tokens` VLM context conditions.
 - `scripts/precompute_planner_vlm_inputs.py`: builds Stage 2 VLM inputs in `system prompt -> user prompt -> reference image tokens -> <image_start> + <image_pad>*K + <image_end>` order.
 - `configs/multiref_stage1_lora.yaml` and `configs/multiref_stage2_planner.yaml`: Stage 1/2 configs.
+
+## CFG Training Dropout
+
+Stage 1 and Stage 2 both support training-time condition dropout for factorized CFG. Each sample uses exactly one mode:
+
+| Mode | Default probability | What changes |
+| --- | ---: | --- |
+| `full` | `0.7` | Keep text/VLM context, reference latents, and visual planner tokens |
+| `drop_text` | `0.1` | Zero the whole row in `video_prompt_embeds/prompt_embeds/audio_prompt_embeds` while preserving attention masks and sequence length |
+| `drop_ref` | `0.1` | Set DiT reference latent `ref_valid_mask` to false; when `cfg_text_conditions_dir` is available, swap `vlm_conditions/` to text-only `conditions/`; in Stage 2 online VLM, also mask the reference-image tokens inside `planner_vlm_inputs` |
+| `drop_planner` | `0.1` | Null/unconditional branch: zero text/VLM context, mask DiT reference latent tokens, mask reference-image tokens in Stage 2 online VLM, and zero the appended GT/predicted visual tokens |
+
+For Stage 2, `drop_planner` samples are excluded from the planner MSE and only train the flow branch. Non-dropped samples still align predicted planner tokens to target-video GT SigLIP/projector tokens. This gives inference the branches needed for full, text-dropped, reference-dropped, and null/unconditional CFG without making a zeroed planner target fight the MSE teacher.
 
 ## Preprocessed Layout
 
@@ -113,7 +128,7 @@ for i in 0 1 2 3 4 5 6 7; do
     --caption-column caption \
     --reference-column reference_images \
     --max-ref-images 4 \
-    --max-length 8192 \
+    --max-length 4096 \
     --device cuda \
     > /mnt/workspace/litengjie/my_dataset/logs/vlm_conditions_${i}.log 2>&1 &
 done
@@ -179,7 +194,7 @@ for i in 0 1 2 3 4 5 6 7; do
     --reference-column reference_images \
     --max-ref-images 4 \
     --planner-token-count 2048 \
-    --max-length 8192 \
+    --max-length 4096 \
     > /mnt/workspace/litengjie/my_dataset/logs/planner_vlm_inputs_${i}.log 2>&1 &
 done
 ```
@@ -329,6 +344,9 @@ Edit `configs/multiref_stage1_lora.yaml`:
 - `training_strategy.conditions_dir`: defaults to `vlm_conditions`, the VLM context encoded from `system + user + reference images`.
 - `training_strategy.gt_visual_tokens_dir`: defaults to `gt_siglip_tokens`.
 - `training_strategy.visual_token_frame_stride`: defaults to `1`. If you encoded target-video tokens at `6fps` and later want to use them as `3fps`, set it to `2` without rerunning SigLIP.
+- `training_strategy.cfg_dropout_enabled: true`: enables CFG condition dropout during training.
+- `training_strategy.cfg_full_p/drop_text_p/drop_ref_p/drop_planner_p`: defaults to `0.7/0.1/0.1/0.1`.
+- `training_strategy.cfg_text_conditions_dir: "conditions"`: when `drop_ref` is sampled, use text-only conditions instead of `vlm_conditions`, so reference-image semantics do not remain in the VLM context.
 - `output_dir`: Stage 1 output directory.
 
 Run:
@@ -347,13 +365,16 @@ Edit `configs/multiref_stage2_planner.yaml`:
 - `model.load_checkpoint`: Stage 1 checkpoint.
 - `training_strategy.conditions_dir`: keep this consistent with Stage 1, default `vlm_conditions`.
 - `training_strategy.planner_token_count`: must equal `num_visual_tokens` in `gt_siglip_tokens`.
+- `training_strategy.cfg_dropout_enabled: true`: enables CFG condition dropout during training.
+- `training_strategy.cfg_full_p/drop_text_p/drop_ref_p/drop_planner_p`: defaults to `0.7/0.1/0.1/0.1`.
+- `training_strategy.cfg_text_conditions_dir: "conditions"`: when `drop_ref` is sampled, use text-only conditions instead of `vlm_conditions`.
 - `training_strategy.planner_cross_attention_heads`: number of heads in the zero-init planner cross-attention bridge, default `16`.
 - `training_strategy.planner_zero_init_cross_attention: true`: zero-initialize the cross-attention output projection, so initialization is a residual over repeated thinking/register queries.
 - `training_strategy.planner_ffn_multiplier: 4.0`: hidden-dim multiplier for the planner FFN.
 - `training_strategy.planner_zero_init_ffn: true`: zero-initialize the FFN output projection, so initialization does not perturb the post-cross-attention residual.
 - `training_strategy.planner_slot_encoding: true`: add trainable slot/type encodings to query slots and VLM placeholder hidden states.
 - `training_strategy.visual_token_frame_stride`: must match Stage 1. If Stage 1 uses `2`, Stage 2 also uses `2`, and `planner_token_count` must be the downsampled token count.
-- `training_strategy.train_vlm_language_model: true`: train the Gemma language model.
+- `training_strategy.train_gemma_backbone: false`: freeze the Gemma language-model backbone by default and train only lightweight modules such as the planner bridge, LTX registers, and text connector. Set this to `true` only when you explicitly want Gemma joint fine-tuning.
 - `training_strategy.freeze_vlm_vision_tower: true`: freeze SigLIP.
 - `training_strategy.freeze_vlm_multi_modal_projector: true`: freeze the image projection.
 - `training_strategy.freeze_transformer: true`: freeze the Stage 1 DiT/LoRA by default.
@@ -375,6 +396,6 @@ Stage 3 should continue from the Stage 2 checkpoint and jointly fine-tune:
 - multi-reference latent conditioning,
 - VLM-predicted visual tokens,
 - text/thinking tokens,
-- the selected DiT LoRA modules, planner tokens, Gemma language model, and text connector.
+- the selected DiT LoRA modules, planner tokens, text connector, and optionally the Gemma language-model backbone.
 
-The SigLIP vision tower and multi-modal projector should remain frozen by default. The purpose is to jointly adapt the Stage 1 GT-token renderer and the Stage 2 predicted-token planner to the final controllable video generation objective.
+The SigLIP vision tower and multi-modal projector should remain frozen by default. Gemma can also stay frozen with `train_gemma_backbone: false`, so Stage 3 only trains register tokens, the planner bridge, MLP/connector modules, and DiT LoRA. If memory and data volume allow it, set `train_gemma_backbone: true` as an optional joint fine-tuning mode. The purpose is to jointly adapt the Stage 1 GT-token renderer and the Stage 2 predicted-token planner to the final controllable video generation objective.

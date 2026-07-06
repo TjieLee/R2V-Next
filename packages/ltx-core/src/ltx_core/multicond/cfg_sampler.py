@@ -5,7 +5,12 @@ import torch
 
 @dataclass(frozen=True)
 class CFGModeBatch:
-    """Per-sample condition dropout decisions for factorized CFG experiments."""
+    """Per-sample condition dropout decisions for factorized CFG experiments.
+
+    Multi-reference strategies interpret ``drop_planner`` as the null branch:
+    text/VLM context, reference latents, and planner visual tokens are all
+    removed from the DiT condition path.
+    """
 
     mode_id: torch.Tensor
     drop_text: torch.Tensor

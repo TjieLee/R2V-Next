@@ -68,9 +68,20 @@ class MultiReferencePlannerStage2Config(MultiReferenceVideoConfig):
         ge=0.0,
     )
 
-    train_vlm_language_model: bool = Field(
-        default=True,
-        description="Train Gemma language-model parameters during Stage 2.",
+    train_gemma_backbone: bool = Field(
+        default=False,
+        description=(
+            "Train the Gemma language-model backbone during planner training. Keep false for lightweight planner "
+            "training that only optimizes planner/register/connector parameters."
+        ),
+    )
+
+    train_vlm_language_model: bool | None = Field(
+        default=None,
+        description=(
+            "Deprecated alias for train_gemma_backbone. If set, it overrides train_gemma_backbone for backward "
+            "compatibility with older configs."
+        ),
     )
 
     freeze_vlm_vision_tower: bool = Field(
@@ -234,6 +245,8 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
         if self.config.use_online_vlm:
             if self.text_encoder is None:
                 raise ValueError("Stage 2 online VLM training requires a loaded Gemma text_encoder.")
+            if self.config.vlm_lm_loss_weight > 0 and not self._train_gemma_backbone():
+                raise ValueError("vlm_lm_loss_weight > 0 requires train_gemma_backbone: true.")
             self._configure_vlm_trainable_parameters(self.text_encoder)
 
     def train_transformer(self) -> bool:
@@ -247,7 +260,7 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
 
     def train_text_encoder(self) -> bool:
         return self.config.use_online_vlm and (
-            self.config.train_vlm_language_model
+            self._train_gemma_backbone()
             or not self.config.freeze_vlm_vision_tower
             or not self.config.freeze_vlm_multi_modal_projector
         )
@@ -268,25 +281,35 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
         self._last_planner_mse_loss = None
         self._last_vlm_lm_loss = None
 
+        conditions = self._apply_cfg_context_dropout(batch, conditions)
         gt_tokens, gt_mask = self._load_condition_visual_tokens(batch["gt_visual_tokens"], conditions)
         self._assert_token_count("GT visual tokens", gt_tokens, gt_mask)
 
         if self.config.use_online_vlm:
-            predicted_tokens, predicted_mask = self._run_online_vlm(batch["planner_vlm_inputs"], gt_tokens.device)
+            predicted_tokens, predicted_mask = self._run_online_vlm(batch, batch["planner_vlm_inputs"], gt_tokens.device)
         else:
             predicted_tokens, predicted_mask = self._load_offline_predicted_tokens(batch["planner_conditions"], gt_tokens)
 
         self._assert_token_count("Predicted visual tokens", predicted_tokens, predicted_mask)
         predicted_tokens = predicted_tokens.to(device=gt_tokens.device, dtype=gt_tokens.dtype)
         predicted_mask = predicted_mask.to(device=gt_tokens.device, dtype=torch.bool) & gt_mask
+        planner_drop_mask = self._cfg_drop_planner_mask(
+            batch,
+            batch_size=predicted_tokens.shape[0],
+            device=predicted_tokens.device,
+        )
 
         if self.config.planner_mse_weight > 0:
+            mse_mask = predicted_mask
+            if planner_drop_mask is not None and torch.any(planner_drop_mask):
+                mse_mask = mse_mask & ~planner_drop_mask[:, None]
             self._last_planner_mse_loss = self._compute_visual_alignment_loss(
                 predicted_tokens=predicted_tokens,
                 gt_tokens=gt_tokens,
-                mask=predicted_mask,
+                mask=mse_mask,
             )
 
+        predicted_tokens, predicted_mask = self._apply_cfg_planner_dropout(batch, predicted_tokens, predicted_mask)
         return self._append_visual_tokens_to_conditions(conditions, predicted_tokens, predicted_mask)
 
     def compute_loss(
@@ -323,22 +346,42 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
                 "freeze_transformer": self.config.freeze_transformer,
                 "train_text_connector": self.config.train_text_connector,
                 "use_online_vlm": self.config.use_online_vlm,
-                "train_vlm_language_model": self.config.train_vlm_language_model,
+                "train_gemma_backbone": self._train_gemma_backbone(),
                 "freeze_vlm_vision_tower": self.config.freeze_vlm_vision_tower,
                 "freeze_vlm_multi_modal_projector": self.config.freeze_vlm_multi_modal_projector,
             }
         )
         return metadata
 
-    def _run_online_vlm(self, planner_data: dict[str, Any], device: torch.device) -> tuple[Tensor, Tensor]:
+    def _run_online_vlm(
+        self,
+        batch: dict[str, Any],
+        planner_data: dict[str, Any],
+        device: torch.device,
+    ) -> tuple[Tensor, Tensor]:
         if self.text_encoder is None or self.planner_tokens is None or self._planner_query_registers is None:
             raise RuntimeError("Online VLM mode requires text_encoder, planner_tokens and query registers.")
 
         forward_inputs = self._build_vlm_forward_inputs(planner_data, device)
         placeholder_mask = planner_data[self.config.vlm_placeholder_mask_key].to(device=device, dtype=torch.bool)
         self._assert_placeholder_mask(placeholder_mask)
+        drop_ref_mask = self._cfg_drop_ref_mask(
+            batch,
+            batch_size=forward_inputs["input_ids"].shape[0],
+            device=device,
+        )
+        forward_inputs = self._apply_vlm_reference_dropout(
+            forward_inputs=forward_inputs,
+            planner_data=planner_data,
+            drop_ref_mask=drop_ref_mask,
+        )
 
-        inputs_embeds = self._build_vlm_inputs_embeds(forward_inputs, planner_data, placeholder_mask)
+        inputs_embeds = self._build_vlm_inputs_embeds(
+            forward_inputs,
+            planner_data,
+            placeholder_mask,
+            drop_ref_mask=drop_ref_mask,
+        )
         language_model = self._get_language_model()
         lm_inputs = {
             "inputs_embeds": inputs_embeds,
@@ -350,7 +393,8 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
             if key in forward_inputs:
                 lm_inputs[key] = forward_inputs[key]
 
-        outputs = language_model(**lm_inputs)
+        with torch.set_grad_enabled(self.train_text_encoder()):
+            outputs = language_model(**lm_inputs)
         hidden_states = self._extract_hidden_states(outputs)
         selected_hidden, selected_mask = self._select_masked_hidden(
             hidden_states[self.config.vlm_hidden_layer],
@@ -373,17 +417,29 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
         forward_inputs: dict[str, Tensor],
         planner_data: dict[str, Any],
         placeholder_mask: Tensor,
+        *,
+        drop_ref_mask: Tensor | None = None,
     ) -> Tensor:
         input_ids = forward_inputs["input_ids"]
         language_model = self._get_language_model()
         embed_tokens = self._get_input_embeddings(language_model)
         inputs_embeds = embed_tokens(input_ids)
+        dropped_image_token_mask = self._get_dropped_vlm_image_token_mask(
+            planner_data=planner_data,
+            drop_ref_mask=drop_ref_mask,
+            device=input_ids.device,
+        )
 
         pixel_values = forward_inputs.get("pixel_values")
         if pixel_values is not None:
             image_counts = planner_data.get("num_ref_images")
             if isinstance(image_counts, Tensor):
                 image_counts = image_counts.to(device=pixel_values.device, dtype=torch.long)
+                if dropped_image_token_mask is not None and drop_ref_mask is not None:
+                    image_counts = image_counts.masked_fill(drop_ref_mask.to(device=image_counts.device), 0)
+            scatter_exclusion_mask = placeholder_mask
+            if dropped_image_token_mask is not None:
+                scatter_exclusion_mask = scatter_exclusion_mask | dropped_image_token_mask
             visual_batch = extract_projected_visual_tokens(
                 self.text_encoder.model,
                 pixel_values,
@@ -395,10 +451,49 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
                 visual_tokens=visual_batch.tokens,
                 visual_mask=visual_batch.mask,
                 image_token_index=GEMMA3_CONFIG_FOR_LTX.image_token_index,
-                planner_placeholder_mask=placeholder_mask,
+                planner_placeholder_mask=scatter_exclusion_mask,
             )
 
+        if dropped_image_token_mask is not None:
+            inputs_embeds = inputs_embeds.masked_fill(dropped_image_token_mask.unsqueeze(-1), 0)
         return inputs_embeds
+
+    def _apply_vlm_reference_dropout(
+        self,
+        *,
+        forward_inputs: dict[str, Tensor],
+        planner_data: dict[str, Any],
+        drop_ref_mask: Tensor | None,
+    ) -> dict[str, Tensor]:
+        dropped_image_token_mask = self._get_dropped_vlm_image_token_mask(
+            planner_data=planner_data,
+            drop_ref_mask=drop_ref_mask,
+            device=forward_inputs["input_ids"].device,
+        )
+        if dropped_image_token_mask is None:
+            return forward_inputs
+        forward_inputs = dict(forward_inputs)
+        attention_mask = forward_inputs["attention_mask"].to(device=dropped_image_token_mask.device)
+        forward_inputs["attention_mask"] = attention_mask.masked_fill(dropped_image_token_mask, 0)
+        return forward_inputs
+
+    @staticmethod
+    def _get_dropped_vlm_image_token_mask(
+        *,
+        planner_data: dict[str, Any],
+        drop_ref_mask: Tensor | None,
+        device: torch.device,
+    ) -> Tensor | None:
+        if drop_ref_mask is None or not torch.any(drop_ref_mask):
+            return None
+        gt_image_token_mask = planner_data.get("gt_image_token_mask")
+        if gt_image_token_mask is None:
+            raise ValueError(
+                "Stage 2 cfg_drop_ref_p > 0 requires planner_vlm_inputs with gt_image_token_mask. "
+                "Regenerate planner VLM inputs with scripts/precompute_planner_vlm_inputs.py."
+            )
+        gt_image_token_mask = gt_image_token_mask.to(device=device, dtype=torch.bool)
+        return gt_image_token_mask & drop_ref_mask.to(device=device, dtype=torch.bool)[:, None]
 
     def _build_vlm_forward_inputs(self, planner_data: dict[str, Any], device: torch.device) -> dict[str, Tensor]:
         allowed_keys = {
@@ -444,11 +539,11 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
         gemma_model = text_encoder.model.model
 
         language_model = getattr(gemma_model, "language_model", None)
-        if language_model is not None and self.config.train_vlm_language_model:
+        if language_model is not None and self._train_gemma_backbone():
             language_model.requires_grad_(True)
 
         lm_head = getattr(text_encoder.model, "lm_head", None)
-        if lm_head is not None and self.config.train_vlm_language_model and self.config.vlm_lm_loss_weight > 0:
+        if lm_head is not None and self._train_gemma_backbone() and self.config.vlm_lm_loss_weight > 0:
             lm_head.requires_grad_(True)
 
         vision_tower = getattr(gemma_model, "vision_tower", None)
@@ -458,6 +553,11 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
         projector = getattr(gemma_model, "multi_modal_projector", None)
         if projector is not None:
             projector.requires_grad_(not self.config.freeze_vlm_multi_modal_projector)
+
+    def _train_gemma_backbone(self) -> bool:
+        if self.config.train_vlm_language_model is not None:
+            return self.config.train_vlm_language_model
+        return self.config.train_gemma_backbone
 
     def _assert_token_count(self, name: str, tokens: Tensor, mask: Tensor) -> None:
         if tokens.ndim != 3:

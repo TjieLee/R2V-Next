@@ -14,6 +14,7 @@ from pydantic import Field
 from torch import Tensor, nn
 
 from ltx_core.model.transformer.modality import Modality
+from ltx_core.multicond.cfg_sampler import CFGModeBatch, sample_cfg_modes
 from ltx_core.multicond.rope_mask_builder import build_multiref_sequence
 from ltx_trainer import logger
 from ltx_trainer.timestep_samplers import TimestepSampler
@@ -82,6 +83,52 @@ class MultiReferenceVideoConfig(TrainingStrategyConfigBase):
         ge=1,
     )
 
+    cfg_dropout_enabled: bool = Field(
+        default=False,
+        description=(
+            "Enable per-sample condition dropout for factorized CFG training. "
+            "Modes are mutually exclusive: full, drop_text, drop_ref, drop_planner."
+        ),
+    )
+
+    cfg_full_p: float = Field(
+        default=0.7,
+        description="Probability of keeping all conditions during CFG-dropout training.",
+        ge=0.0,
+    )
+
+    cfg_drop_text_p: float = Field(
+        default=0.1,
+        description="Probability of zeroing text/VLM context features while keeping sequence shape.",
+        ge=0.0,
+    )
+
+    cfg_drop_ref_p: float = Field(
+        default=0.1,
+        description=(
+            "Probability of dropping reference conditions. This masks reference latent tokens and, "
+            "when cfg_text_conditions_dir is available, swaps VLM context to text-only conditions."
+        ),
+        ge=0.0,
+    )
+
+    cfg_drop_planner_p: float = Field(
+        default=0.1,
+        description=(
+            "Probability of training the null planner/CFG branch: zero text/VLM context, "
+            "drop reference latents, and zero appended GT/planner visual condition tokens."
+        ),
+        ge=0.0,
+    )
+
+    cfg_text_conditions_dir: str | None = Field(
+        default="conditions",
+        description=(
+            "Text-only condition directory used for drop_ref. Keep this as the Stage 0/standard "
+            "conditions directory when conditions_dir points to vlm_conditions."
+        ),
+    )
+
     max_ref_images_per_sample: int | None = Field(
         default=None,
         description="Optional cap applied after loading. None keeps all references in each sample.",
@@ -102,6 +149,13 @@ class MultiReferenceVideoConfig(TrainingStrategyConfigBase):
         }
         if self.gt_visual_tokens_dir is not None:
             data_sources[self.gt_visual_tokens_dir] = "gt_visual_tokens"
+        if (
+            self.cfg_dropout_enabled
+            and self.cfg_drop_ref_p > 0
+            and self.cfg_text_conditions_dir is not None
+            and self.cfg_text_conditions_dir != self.conditions_dir
+        ):
+            data_sources[self.cfg_text_conditions_dir] = "cfg_text_conditions"
         return data_sources
 
 
@@ -127,9 +181,11 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
         self._connector_register_count = getattr(video_connector, "num_learnable_registers", None)
 
     def prepare_conditions(self, batch: dict[str, Any], conditions: dict[str, Tensor]) -> dict[str, Tensor]:
+        conditions = self._apply_cfg_context_dropout(batch, conditions)
         if self.config.gt_visual_tokens_dir is None or "gt_visual_tokens" not in batch:
             return conditions
         visual_tokens, visual_mask = self._load_condition_visual_tokens(batch["gt_visual_tokens"], conditions)
+        visual_tokens, visual_mask = self._apply_cfg_planner_dropout(batch, visual_tokens, visual_mask)
         return self._append_visual_tokens_to_conditions(conditions, visual_tokens, visual_mask)
 
     def prepare_training_inputs(
@@ -162,6 +218,7 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
 
         batch_size, num_refs, _channels, ref_frames, ref_height, ref_width = ref_latents.shape
         device = target_latents.device
+        ref_valid_mask = self._apply_cfg_reference_dropout(batch, ref_valid_mask, device=device)
 
         target_tokens = self._video_patchifier.patchify(target_latents)
         ref_tokens = self._video_patchifier.patchify(ref_latents.reshape(batch_size * num_refs, *ref_latents.shape[2:]))
@@ -261,10 +318,189 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
         masked = loss.mul(loss_mask)
         return masked.mean(dim=[-2, -1]) / loss_mask.mean(dim=[-2, -1]).clamp(min=1e-8)
 
+    def _cfg_probabilities(self) -> dict[str, float]:
+        return {
+            "full": self.config.cfg_full_p,
+            "drop_text": self.config.cfg_drop_text_p,
+            "drop_ref": self.config.cfg_drop_ref_p,
+            "drop_planner": self.config.cfg_drop_planner_p,
+        }
+
+    def _get_or_sample_cfg_modes(
+        self,
+        batch: dict[str, Any],
+        batch_size: int,
+        device: torch.device,
+    ) -> CFGModeBatch | None:
+        if not self.config.cfg_dropout_enabled:
+            return None
+
+        existing = batch.get("_cfg_modes")
+        if isinstance(existing, CFGModeBatch):
+            if existing.mode_id.device != device:
+                existing = CFGModeBatch(
+                    mode_id=existing.mode_id.to(device=device),
+                    drop_text=existing.drop_text.to(device=device),
+                    drop_ref=existing.drop_ref.to(device=device),
+                    drop_planner=existing.drop_planner.to(device=device),
+                    keep_full=existing.keep_full.to(device=device),
+                )
+                batch["_cfg_modes"] = existing
+            return existing
+
+        modes = sample_cfg_modes(
+            batch_size=batch_size,
+            probs=self._cfg_probabilities(),
+            device=device,
+        )
+        batch["_cfg_modes"] = modes
+        return modes
+
+    def _apply_cfg_context_dropout(
+        self,
+        batch: dict[str, Any],
+        conditions: dict[str, Tensor],
+    ) -> dict[str, Tensor]:
+        if not self.config.cfg_dropout_enabled:
+            return conditions
+
+        video_feature_key = "video_prompt_embeds" if "video_prompt_embeds" in conditions else "prompt_embeds"
+        video_features = conditions[video_feature_key]
+        modes = self._get_or_sample_cfg_modes(batch, video_features.shape[0], video_features.device)
+        if modes is None:
+            return conditions
+
+        out = dict(conditions)
+
+        if torch.any(modes.drop_ref) and "cfg_text_conditions" in batch:
+            out = self._select_condition_rows(
+                primary=out,
+                alternate=batch["cfg_text_conditions"],
+                use_alternate=modes.drop_ref,
+            )
+
+        drop_context = modes.drop_text | modes.drop_planner
+        if torch.any(drop_context):
+            out = self._zero_condition_feature_rows(out, drop_context)
+
+        return out
+
+    def _apply_cfg_reference_dropout(
+        self,
+        batch: dict[str, Any],
+        ref_valid_mask: Tensor,
+        *,
+        device: torch.device,
+    ) -> Tensor:
+        if not self.config.cfg_dropout_enabled:
+            return ref_valid_mask
+        modes = self._get_or_sample_cfg_modes(batch, ref_valid_mask.shape[0], device)
+        if modes is None:
+            return ref_valid_mask
+        drop_reference = modes.drop_ref | modes.drop_planner
+        if not torch.any(drop_reference):
+            return ref_valid_mask
+        ref_valid_mask = ref_valid_mask.clone()
+        ref_valid_mask[drop_reference] = False
+        return ref_valid_mask
+
+    def _apply_cfg_planner_dropout(
+        self,
+        batch: dict[str, Any],
+        visual_tokens: Tensor,
+        visual_mask: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        if not self.config.cfg_dropout_enabled:
+            return visual_tokens, visual_mask
+        modes = self._get_or_sample_cfg_modes(batch, visual_tokens.shape[0], visual_tokens.device)
+        if modes is None or not torch.any(modes.drop_planner):
+            return visual_tokens, visual_mask
+        visual_tokens = visual_tokens.clone()
+        visual_tokens[modes.drop_planner] = 0
+        return visual_tokens, visual_mask
+
+    def _cfg_drop_planner_mask(
+        self,
+        batch: dict[str, Any],
+        *,
+        batch_size: int,
+        device: torch.device,
+    ) -> Tensor | None:
+        modes = self._get_or_sample_cfg_modes(batch, batch_size, device)
+        if modes is None:
+            return None
+        return modes.drop_planner
+
+    def _cfg_drop_ref_mask(
+        self,
+        batch: dict[str, Any],
+        *,
+        batch_size: int,
+        device: torch.device,
+    ) -> Tensor | None:
+        modes = self._get_or_sample_cfg_modes(batch, batch_size, device)
+        if modes is None:
+            return None
+        return modes.drop_ref | modes.drop_planner
+
+    @classmethod
+    def _select_condition_rows(
+        cls,
+        *,
+        primary: dict[str, Tensor],
+        alternate: dict[str, Tensor],
+        use_alternate: Tensor,
+    ) -> dict[str, Tensor]:
+        out = dict(primary)
+        for key in ("video_prompt_embeds", "prompt_embeds", "audio_prompt_embeds", "prompt_attention_mask"):
+            primary_value = out.get(key)
+            alternate_value = alternate.get(key)
+            if primary_value is None or alternate_value is None:
+                continue
+
+            alternate_value = alternate_value.to(device=primary_value.device, dtype=primary_value.dtype)
+            max_len = max(primary_value.shape[1], alternate_value.shape[1])
+            primary_value = cls._pad_sequence_axis(primary_value, max_len)
+            alternate_value = cls._pad_sequence_axis(alternate_value, max_len)
+
+            selector = use_alternate.to(device=primary_value.device, dtype=torch.bool)
+            selector = selector.view(selector.shape[0], *([1] * (primary_value.ndim - 1)))
+            out[key] = torch.where(selector, alternate_value, primary_value)
+        return out
+
+    @staticmethod
+    def _zero_condition_feature_rows(conditions: dict[str, Tensor], row_mask: Tensor) -> dict[str, Tensor]:
+        out = dict(conditions)
+        for key in ("video_prompt_embeds", "prompt_embeds", "audio_prompt_embeds"):
+            features = out.get(key)
+            if features is None:
+                continue
+            mask = row_mask.to(device=features.device, dtype=torch.bool)
+            features = features.clone()
+            features[mask] = 0
+            out[key] = features
+        return out
+
+    @staticmethod
+    def _pad_sequence_axis(value: Tensor, target_len: int) -> Tensor:
+        if value.shape[1] == target_len:
+            return value
+        if value.shape[1] > target_len:
+            return value[:, :target_len]
+        pad_shape = (value.shape[0], target_len - value.shape[1], *value.shape[2:])
+        pad = torch.zeros(pad_shape, dtype=value.dtype, device=value.device)
+        return torch.cat([value, pad], dim=1)
+
     def get_checkpoint_metadata(self) -> dict[str, Any]:
         metadata: dict[str, Any] = {
             "conditioning": "multi_reference_video",
             "reference_time_stride": self.config.reference_time_stride,
+            "cfg_dropout_enabled": self.config.cfg_dropout_enabled,
+            "cfg_full_p": self.config.cfg_full_p,
+            "cfg_drop_text_p": self.config.cfg_drop_text_p,
+            "cfg_drop_ref_p": self.config.cfg_drop_ref_p,
+            "cfg_drop_planner_p": self.config.cfg_drop_planner_p,
+            "cfg_text_conditions_dir": self.config.cfg_text_conditions_dir,
         }
         if self.reference_spatial_scale_factor is not None:
             metadata["reference_spatial_scale_factor"] = self.reference_spatial_scale_factor
