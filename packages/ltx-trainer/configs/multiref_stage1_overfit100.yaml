@@ -1,0 +1,101 @@
+# =============================================================================
+# LTX-2 Multi-Reference Stage 1 100-Sample Overfit Test
+# =============================================================================
+# Edit model.model_path, model.text_encoder_path and data.preprocessed_data_root
+# before running on the training server.
+
+model:
+  model_path: "/mnt/workspace/litengjie/LTX-2/models/LTX-2.3/ltx-2.3-22b-dev.safetensors"
+  text_encoder_path: "/mnt/workspace/litengjie/LTX-2/models/gemma-3-12b-it-qat-q4_0-unquantized"
+  training_mode: "lora"
+  load_checkpoint: null
+
+lora:
+  rank: 32
+  alpha: 32
+  dropout: 0.0
+  target_modules:
+    - "attn1.to_k"
+    - "attn1.to_q"
+    - "attn1.to_v"
+    - "attn1.to_out.0"
+    - "attn2.to_k"
+    - "attn2.to_q"
+    - "attn2.to_v"
+    - "attn2.to_out.0"
+
+training_strategy:
+  name: "multi_reference_video"
+  conditions_dir: "vlm_conditions"
+  reference_latents_dir: "multi_reference_latents"
+  gt_visual_tokens_dir: "gt_siglip_tokens"
+  visual_token_key: "visual_tokens"
+  visual_token_mask_key: "visual_token_mask"
+  visual_tokens_per_frame_key: "tokens_per_frame"
+  visual_token_frame_stride: 1
+  cfg_dropout_enabled: true
+  cfg_full_p: 0.7
+  cfg_drop_text_p: 0.1
+  cfg_drop_ref_p: 0.1
+  cfg_drop_all_p: null
+  cfg_drop_planner_p: 0.1
+  cfg_text_conditions_dir: "conditions"
+  cfg_ref_only_conditions_dir: null
+  max_ref_images_per_sample: null
+  reference_time_stride: 1.0
+  first_frame_conditioning_p: 0.0
+
+optimization:
+  learning_rate: 1e-4
+  steps: 1000
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  optimizer_type: "adamw"
+  scheduler_type: "linear"
+  scheduler_params: {}
+  enable_gradient_checkpointing: true
+
+acceleration:
+  mixed_precision_mode: "bf16"
+  quantization: null
+  load_text_encoder_in_8bit: false
+  offload_optimizer_during_validation: false
+
+data:
+  preprocessed_data_root: "/mnt/workspace/litengjie/my_dataset/overfit_100/.precomputed"
+  num_dataloader_workers: 2
+
+validation:
+  interval: 100
+  skip_initial_validation: false
+  generate_audio: false
+  generate_video: true
+
+checkpoints:
+  interval: 100
+  keep_last_n: 3
+  precision: "bfloat16"
+  no_resume: false
+  save_training_state: "minimal"
+
+hub:
+  push_to_hub: false
+  hub_model_id: null
+
+flow_matching:
+  timestep_sampling_mode: "shifted_logit_normal"
+  timestep_sampling_params: {}
+
+wandb:
+  enabled: false
+  project: "ltx2-multiref-overfit"
+  entity: null
+  tags:
+    - "multi-reference"
+    - "stage1"
+    - "overfit100"
+  log_validation_videos: false
+
+seed: 42
+output_dir: "/mnt/workspace/litengjie/ltx2_multiref_overfit_stage1_100"
