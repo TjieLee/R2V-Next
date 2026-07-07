@@ -33,7 +33,7 @@ post-connector DiT context: VLM context tokens + LTX thinking/register tokens + 
 - `ltx_core.multicond.visual_tokens`：新增冻结 SigLIP/projector visual token 提取、Gemma image-token scatter、固定数量 `VisualPlannerTokens`。
 - `ltx_trainer.training_strategies.multi_reference_video`：Stage 1 可通过 `conditions_dir` 读取 `vlm_conditions/`，再在 VLM context features 后追加 `gt_siglip_tokens/visual_tokens`，统一进入 LTX text connector。
 - `ltx_trainer.training_strategies.multi_reference_planner_stage2`：Stage 2 使用固定 `planner_token_count` 个 `<image_pad>` target placeholders；VLM 的 placeholder hidden states 作为 K/V，repeated LTX thinking/register tokens 作为 Q，通过 zero-init cross-attention + zero-init FFN 生成 visual planner tokens，再替换 GT visual tokens 进入 DiT，并和 GT tokens 做 MSE。
-- `ltx_core.multicond.cfg_sampler` + multi-reference training strategies：新增 per-sample CFG condition dropout，默认 `full/drop_text/drop_ref/drop_planner = 0.7/0.1/0.1/0.1`。
+- `ltx_core.multicond.cfg_sampler` + multi-reference training strategies：新增 per-sample CFG condition dropout，默认 `full/drop_text/drop_ref/drop_all = 0.7/0.1/0.1/0.1`；旧字段 `drop_planner` 仅作为 `drop_all/null` 的兼容 alias。
 - `scripts/precompute_gt_siglip_tokens.py`：从 target video 采样帧生成 `.precomputed/gt_siglip_tokens/`。
 - `scripts/precompute_multiref_vlm_conditions.py`：为 Stage 1/2 生成 `system prompt -> user prompt -> reference image tokens` 的 VLM context conditions。
 - `scripts/precompute_planner_vlm_inputs.py`：按 `system prompt -> user prompt -> reference image tokens -> <image_start> + <image_pad>*K + <image_end>` 构建 Stage 2 VLM 输入。
@@ -46,11 +46,11 @@ Stage 1 和 Stage 2 都支持 factorized CFG 所需的训练期条件 dropout。
 | 模式 | 默认概率 | 实际操作 |
 | --- | ---: | --- |
 | `full` | `0.7` | 保留 text/VLM context、reference latents、visual planner tokens 全部条件 |
-| `drop_text` | `0.1` | 将 `video_prompt_embeds/prompt_embeds/audio_prompt_embeds` 的整行置零，但保持 attention mask 和序列长度不变 |
-| `drop_ref` | `0.1` | 将 DiT reference latent tokens 的 `ref_valid_mask` 置 false；如果存在 `cfg_text_conditions_dir`，同时把 `vlm_conditions/` 替换为 text-only `conditions/`；Stage 2 online VLM 还会屏蔽 `planner_vlm_inputs` 里的 reference image tokens |
-| `drop_planner` | `0.1` | 作为 null/uncond 分支：置零 text/VLM context，关掉 DiT reference latent tokens，Stage 2 online VLM 屏蔽 reference image tokens，并将追加到 condition 末尾的 GT/predicted visual tokens 置零 |
+| `drop_text` | `0.1` | 去掉文本条件。Stage 1/2 DiT context 若有 `cfg_ref_only_conditions_dir` 则替换为 ref-only conditions，否则 fallback 为清零混合 VLM context；Stage 2 online VLM 会屏蔽 `text_token_mask`，但保留 reference image tokens 和 planner slots |
+| `drop_ref` | `0.1` | 去掉 image/visual 条件：reference VAE latents 的 `ref_valid_mask` 置 false；VLM context 若有 `cfg_text_conditions_dir` 则替换为 text-only `conditions/`；Stage 2 online VLM 屏蔽 reference image tokens；Stage 1 GT SigLIP tokens 和 Stage 2 predicted planner visual tokens 都置零 |
+| `drop_all` / `null` | `0.1` | 去掉所有条件：text/VLM context 置零，reference VAE latents 关闭，Stage 2 online VLM 同时屏蔽 text tokens 和 reference image tokens，GT/predicted visual tokens 置零 |
 
-Stage 2 中，`drop_planner` 样本不会参与 planner MSE，对应样本只训练 flow 分支；未 drop 的样本继续用 target-video GT SigLIP/projector tokens 做 MSE teacher。这样推理时可以分别构造完整条件、去文本、去参考图、完全无条件/null 的 CFG 分支，而不会在训练目标上把“置空 planner”和“对齐 GT planner”混在一起。
+Stage 2 中，`drop_ref` 和 `drop_all/null` 样本不会参与 planner MSE，对应样本只训练 flow 分支；`full` 和 `drop_text` 样本继续用 target-video GT SigLIP/projector tokens 做 MSE teacher。这里没有独立的 `drop_planner_only` 分支；配置里的 `cfg_drop_planner_p` 只是旧名字，实际等价于 `cfg_drop_all_p/null`。
 
 ## 目录结构
 
@@ -345,8 +345,9 @@ sampled_frame_indices: [...]
 - `training_strategy.gt_visual_tokens_dir`：默认 `gt_siglip_tokens`。
 - `training_strategy.visual_token_frame_stride`：默认 `1`。如果你已经按 `6fps` 编码，后期想按 `3fps` 用，可以设为 `2`，无需重跑 SigLIP。
 - `training_strategy.cfg_dropout_enabled: true`：启用 CFG 训练期条件 dropout。
-- `training_strategy.cfg_full_p/drop_text_p/drop_ref_p/drop_planner_p`：默认 `0.7/0.1/0.1/0.1`。
+- `training_strategy.cfg_full_p/drop_text_p/drop_ref_p/drop_all_p`：默认 `0.7/0.1/0.1/0.1`；旧配置里的 `cfg_drop_planner_p` 仍可使用，但只是 `drop_all/null` alias。
 - `training_strategy.cfg_text_conditions_dir: "conditions"`：`drop_ref` 时使用 text-only conditions 替换 `vlm_conditions`，避免 VLM context 里仍残留 reference image 语义。
+- `training_strategy.cfg_ref_only_conditions_dir: null`：可选，未来生成 ref-only VLM conditions 后，`drop_text` 可替换为 ref-only；不设置时 fallback 为清零混合 VLM context。
 - `output_dir`：Stage 1 输出目录。
 
 启动：
@@ -366,8 +367,9 @@ Stage 1 的 DiT 输入区别是：visual tokens 来自 target video 的冻结 Si
 - `training_strategy.conditions_dir`：保持和 Stage 1 一致，默认 `vlm_conditions`。
 - `training_strategy.planner_token_count`：必须等于 `gt_siglip_tokens` 的 `num_visual_tokens`。
 - `training_strategy.cfg_dropout_enabled: true`：启用 CFG 训练期条件 dropout。
-- `training_strategy.cfg_full_p/drop_text_p/drop_ref_p/drop_planner_p`：默认 `0.7/0.1/0.1/0.1`。
+- `training_strategy.cfg_full_p/drop_text_p/drop_ref_p/drop_all_p`：默认 `0.7/0.1/0.1/0.1`；旧配置里的 `cfg_drop_planner_p` 仍可使用，但只是 `drop_all/null` alias。
 - `training_strategy.cfg_text_conditions_dir: "conditions"`：`drop_ref` 时使用 text-only conditions 替换 `vlm_conditions`。
+- `training_strategy.cfg_ref_only_conditions_dir: null`：可选 ref-only VLM conditions；不设置时 `drop_text` fallback 为清零混合 VLM context。
 - `training_strategy.planner_cross_attention_heads`：zero-init planner cross-attention 的 head 数，默认 `16`。
 - `training_strategy.planner_zero_init_cross_attention: true`：cross-attention 输出投影零初始化，初始时是 repeated thinking/register query 的 residual。
 - `training_strategy.planner_ffn_multiplier: 4.0`：planner FFN 的 hidden dim 倍率。

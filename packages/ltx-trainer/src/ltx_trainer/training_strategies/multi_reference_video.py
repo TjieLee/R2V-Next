@@ -87,7 +87,7 @@ class MultiReferenceVideoConfig(TrainingStrategyConfigBase):
         default=False,
         description=(
             "Enable per-sample condition dropout for factorized CFG training. "
-            "Modes are mutually exclusive: full, drop_text, drop_ref, drop_planner."
+            "Modes are mutually exclusive: full, drop_text, drop_ref, drop_all/null."
         ),
     )
 
@@ -106,8 +106,17 @@ class MultiReferenceVideoConfig(TrainingStrategyConfigBase):
     cfg_drop_ref_p: float = Field(
         default=0.1,
         description=(
-            "Probability of dropping reference conditions. This masks reference latent tokens and, "
-            "when cfg_text_conditions_dir is available, swaps VLM context to text-only conditions."
+            "Probability of dropping image/visual conditions. This masks reference latent tokens, zeros "
+            "GT/predicted visual condition tokens, and swaps VLM context to text-only conditions when "
+            "cfg_text_conditions_dir is available."
+        ),
+        ge=0.0,
+    )
+
+    cfg_drop_all_p: float | None = Field(
+        default=None,
+        description=(
+            "Probability of the null/drop_all branch. If unset, cfg_drop_planner_p is used as a deprecated alias."
         ),
         ge=0.0,
     )
@@ -115,8 +124,8 @@ class MultiReferenceVideoConfig(TrainingStrategyConfigBase):
     cfg_drop_planner_p: float = Field(
         default=0.1,
         description=(
-            "Probability of training the null planner/CFG branch: zero text/VLM context, "
-            "drop reference latents, and zero appended GT/planner visual condition tokens."
+            "Deprecated alias for cfg_drop_all_p / null branch. This is not a planner-only branch: it zeros "
+            "text/VLM context, drops reference latents, and zeros appended GT/predicted visual condition tokens."
         ),
         ge=0.0,
     )
@@ -126,6 +135,14 @@ class MultiReferenceVideoConfig(TrainingStrategyConfigBase):
         description=(
             "Text-only condition directory used for drop_ref. Keep this as the Stage 0/standard "
             "conditions directory when conditions_dir points to vlm_conditions."
+        ),
+    )
+
+    cfg_ref_only_conditions_dir: str | None = Field(
+        default=None,
+        description=(
+            "Optional reference-only VLM condition directory used for drop_text. If unset, drop_text falls back "
+            "to zeroing mixed text/reference VLM context because precomputed vlm_conditions cannot be separated."
         ),
     )
 
@@ -156,6 +173,13 @@ class MultiReferenceVideoConfig(TrainingStrategyConfigBase):
             and self.cfg_text_conditions_dir != self.conditions_dir
         ):
             data_sources[self.cfg_text_conditions_dir] = "cfg_text_conditions"
+        if (
+            self.cfg_dropout_enabled
+            and self.cfg_drop_text_p > 0
+            and self.cfg_ref_only_conditions_dir is not None
+            and self.cfg_ref_only_conditions_dir != self.conditions_dir
+        ):
+            data_sources[self.cfg_ref_only_conditions_dir] = "cfg_ref_only_conditions"
         return data_sources
 
 
@@ -323,8 +347,11 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
             "full": self.config.cfg_full_p,
             "drop_text": self.config.cfg_drop_text_p,
             "drop_ref": self.config.cfg_drop_ref_p,
-            "drop_planner": self.config.cfg_drop_planner_p,
+            "drop_all": self._cfg_drop_all_probability(),
         }
+
+    def _cfg_drop_all_probability(self) -> float:
+        return self.config.cfg_drop_all_p if self.config.cfg_drop_all_p is not None else self.config.cfg_drop_planner_p
 
     def _get_or_sample_cfg_modes(
         self,
@@ -342,7 +369,7 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
                     mode_id=existing.mode_id.to(device=device),
                     drop_text=existing.drop_text.to(device=device),
                     drop_ref=existing.drop_ref.to(device=device),
-                    drop_planner=existing.drop_planner.to(device=device),
+                    drop_all=existing.drop_all.to(device=device),
                     keep_full=existing.keep_full.to(device=device),
                 )
                 batch["_cfg_modes"] = existing
@@ -379,7 +406,19 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
                 use_alternate=modes.drop_ref,
             )
 
-        drop_context = modes.drop_text | modes.drop_planner
+        drop_text_fallback = modes.drop_text
+        if torch.any(modes.drop_text) and "cfg_ref_only_conditions" in batch:
+            out = self._select_condition_rows(
+                primary=out,
+                alternate=batch["cfg_ref_only_conditions"],
+                use_alternate=modes.drop_text,
+            )
+            drop_text_fallback = torch.zeros_like(modes.drop_text)
+
+        # Standard vlm_conditions mix system/user text and reference-image context.
+        # Without an optional ref-only cache, drop_text cannot remove only text, so
+        # it falls back to zeroing the whole mixed context row.
+        drop_context = drop_text_fallback | modes.drop_all
         if torch.any(drop_context):
             out = self._zero_condition_feature_rows(out, drop_context)
 
@@ -397,7 +436,7 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
         modes = self._get_or_sample_cfg_modes(batch, ref_valid_mask.shape[0], device)
         if modes is None:
             return ref_valid_mask
-        drop_reference = modes.drop_ref | modes.drop_planner
+        drop_reference = modes.drop_ref | modes.drop_all
         if not torch.any(drop_reference):
             return ref_valid_mask
         ref_valid_mask = ref_valid_mask.clone()
@@ -410,16 +449,22 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
         visual_tokens: Tensor,
         visual_mask: Tensor,
     ) -> tuple[Tensor, Tensor]:
+        """Zero visual condition tokens for drop_ref and drop_all/null.
+
+        The historical method name is kept for compatibility; this is not a
+        planner-only dropout branch.
+        """
+
         if not self.config.cfg_dropout_enabled:
             return visual_tokens, visual_mask
-        modes = self._get_or_sample_cfg_modes(batch, visual_tokens.shape[0], visual_tokens.device)
-        if modes is None or not torch.any(modes.drop_planner):
+        drop_visual = self._cfg_drop_visual_mask(batch, batch_size=visual_tokens.shape[0], device=visual_tokens.device)
+        if drop_visual is None or not torch.any(drop_visual):
             return visual_tokens, visual_mask
         visual_tokens = visual_tokens.clone()
-        visual_tokens[modes.drop_planner] = 0
+        visual_tokens[drop_visual] = 0
         return visual_tokens, visual_mask
 
-    def _cfg_drop_planner_mask(
+    def _cfg_drop_visual_mask(
         self,
         batch: dict[str, Any],
         *,
@@ -429,7 +474,28 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
         modes = self._get_or_sample_cfg_modes(batch, batch_size, device)
         if modes is None:
             return None
-        return modes.drop_planner
+        return modes.drop_ref | modes.drop_all
+
+    def _cfg_drop_planner_mask(
+        self,
+        batch: dict[str, Any],
+        *,
+        batch_size: int,
+        device: torch.device,
+    ) -> Tensor | None:
+        return self._cfg_drop_visual_mask(batch, batch_size=batch_size, device=device)
+
+    def _cfg_drop_all_mask(
+        self,
+        batch: dict[str, Any],
+        *,
+        batch_size: int,
+        device: torch.device,
+    ) -> Tensor | None:
+        modes = self._get_or_sample_cfg_modes(batch, batch_size, device)
+        if modes is None:
+            return None
+        return modes.drop_all
 
     def _cfg_drop_ref_mask(
         self,
@@ -441,7 +507,19 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
         modes = self._get_or_sample_cfg_modes(batch, batch_size, device)
         if modes is None:
             return None
-        return modes.drop_ref | modes.drop_planner
+        return modes.drop_ref | modes.drop_all
+
+    def _cfg_drop_text_mask(
+        self,
+        batch: dict[str, Any],
+        *,
+        batch_size: int,
+        device: torch.device,
+    ) -> Tensor | None:
+        modes = self._get_or_sample_cfg_modes(batch, batch_size, device)
+        if modes is None:
+            return None
+        return modes.drop_text | modes.drop_all
 
     @classmethod
     def _select_condition_rows(
@@ -499,8 +577,11 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
             "cfg_full_p": self.config.cfg_full_p,
             "cfg_drop_text_p": self.config.cfg_drop_text_p,
             "cfg_drop_ref_p": self.config.cfg_drop_ref_p,
+            "cfg_drop_all_p": self._cfg_drop_all_probability(),
             "cfg_drop_planner_p": self.config.cfg_drop_planner_p,
+            "cfg_drop_planner_p_is_legacy_drop_all_alias": True,
             "cfg_text_conditions_dir": self.config.cfg_text_conditions_dir,
+            "cfg_ref_only_conditions_dir": self.config.cfg_ref_only_conditions_dir,
         }
         if self.reference_spatial_scale_factor is not None:
             metadata["reference_spatial_scale_factor"] = self.reference_spatial_scale_factor

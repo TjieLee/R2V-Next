@@ -77,8 +77,11 @@ training_strategy:
   cfg_full_p: 0.7
   cfg_drop_text_p: 0.1
   cfg_drop_ref_p: 0.1
+  cfg_drop_all_p: null
+  # Deprecated alias for cfg_drop_all_p/null. Kept for older configs; this is not planner-only dropout.
   cfg_drop_planner_p: 0.1
   cfg_text_conditions_dir: "conditions"
+  cfg_ref_only_conditions_dir: null
   max_ref_images_per_sample: null
   reference_time_stride: 1.0
   first_frame_conditioning_p: 0.0

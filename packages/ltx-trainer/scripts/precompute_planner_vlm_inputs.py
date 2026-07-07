@@ -8,7 +8,9 @@ chat-template input expected by Gemma3Processor in the order:
     -> <image_start> -> <image_pad> * K -> <image_end>
 
 It stores tensors under ``planner_vlm_inputs/`` with the same relative paths as
-``latents/`` and ``conditions/``.
+``latents/`` and ``conditions/``. The saved masks separate source reference
+image tokens, text tokens, and target planner placeholder regions so Stage 2
+CFG dropout can remove text and image conditions independently.
 """
 
 from __future__ import annotations
@@ -203,9 +205,18 @@ def _append_planner_placeholders(
     tensor_data["planner_placeholder_mask"] = planner_placeholder_mask
     tensor_data["planner_boundary_mask"] = planner_boundary_mask
     tensor_data["planner_region_mask"] = planner_region_mask
-    tensor_data["gt_image_token_mask"] = (
-        (input_ids == GEMMA3_CONFIG_FOR_LTX.image_token_index) & ~planner_placeholder_mask
-    ).to(dtype=torch.bool)
+    ref_image_mask = (
+        (
+            (input_ids == GEMMA3_CONFIG_FOR_LTX.image_token_index)
+            | (input_ids == GEMMA3_CONFIG_FOR_LTX.boi_token_index)
+            | (input_ids == GEMMA3_CONFIG_FOR_LTX.eoi_token_index)
+        )
+        & ~planner_region_mask
+        & attention_mask.to(dtype=torch.bool)
+    )
+    text_token_mask = attention_mask.to(dtype=torch.bool) & ~ref_image_mask & ~planner_region_mask
+    tensor_data["gt_image_token_mask"] = ref_image_mask.to(dtype=torch.bool)
+    tensor_data["text_token_mask"] = text_token_mask.to(dtype=torch.bool)
     tensor_data["planner_token_count"] = torch.tensor(planner_token_count, dtype=torch.long)
     tensor_data["planner_placeholder_token_id"] = torch.tensor(placeholder_token_id, dtype=torch.long)
     tensor_data["planner_start_token_id"] = torch.tensor(start_token_id, dtype=torch.long)

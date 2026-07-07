@@ -293,7 +293,7 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
         self._assert_token_count("Predicted visual tokens", predicted_tokens, predicted_mask)
         predicted_tokens = predicted_tokens.to(device=gt_tokens.device, dtype=gt_tokens.dtype)
         predicted_mask = predicted_mask.to(device=gt_tokens.device, dtype=torch.bool) & gt_mask
-        planner_drop_mask = self._cfg_drop_planner_mask(
+        drop_visual_mask = self._cfg_drop_visual_mask(
             batch,
             batch_size=predicted_tokens.shape[0],
             device=predicted_tokens.device,
@@ -301,8 +301,8 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
 
         if self.config.planner_mse_weight > 0:
             mse_mask = predicted_mask
-            if planner_drop_mask is not None and torch.any(planner_drop_mask):
-                mse_mask = mse_mask & ~planner_drop_mask[:, None]
+            if drop_visual_mask is not None and torch.any(drop_visual_mask):
+                mse_mask = mse_mask & ~drop_visual_mask[:, None]
             self._last_planner_mse_loss = self._compute_visual_alignment_loss(
                 predicted_tokens=predicted_tokens,
                 gt_tokens=gt_tokens,
@@ -349,6 +349,8 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
                 "train_gemma_backbone": self._train_gemma_backbone(),
                 "freeze_vlm_vision_tower": self.config.freeze_vlm_vision_tower,
                 "freeze_vlm_multi_modal_projector": self.config.freeze_vlm_multi_modal_projector,
+                "cfg_drop_all_p": self._cfg_drop_all_probability(),
+                "cfg_drop_planner_p_is_legacy_drop_all_alias": True,
             }
         )
         return metadata
@@ -370,10 +372,16 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
             batch_size=forward_inputs["input_ids"].shape[0],
             device=device,
         )
-        forward_inputs = self._apply_vlm_reference_dropout(
+        drop_text_mask = self._cfg_drop_text_mask(
+            batch,
+            batch_size=forward_inputs["input_ids"].shape[0],
+            device=device,
+        )
+        forward_inputs = self._apply_vlm_condition_dropout(
             forward_inputs=forward_inputs,
             planner_data=planner_data,
             drop_ref_mask=drop_ref_mask,
+            drop_text_mask=drop_text_mask,
         )
 
         inputs_embeds = self._build_vlm_inputs_embeds(
@@ -381,6 +389,7 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
             planner_data,
             placeholder_mask,
             drop_ref_mask=drop_ref_mask,
+            drop_text_mask=drop_text_mask,
         )
         language_model = self._get_language_model()
         lm_inputs = {
@@ -419,6 +428,7 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
         placeholder_mask: Tensor,
         *,
         drop_ref_mask: Tensor | None = None,
+        drop_text_mask: Tensor | None = None,
     ) -> Tensor:
         input_ids = forward_inputs["input_ids"]
         language_model = self._get_language_model()
@@ -427,6 +437,12 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
         dropped_image_token_mask = self._get_dropped_vlm_image_token_mask(
             planner_data=planner_data,
             drop_ref_mask=drop_ref_mask,
+            device=input_ids.device,
+        )
+        dropped_text_token_mask = self._get_dropped_vlm_text_token_mask(
+            planner_data=planner_data,
+            forward_inputs=forward_inputs,
+            drop_text_mask=drop_text_mask,
             device=input_ids.device,
         )
 
@@ -456,7 +472,39 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
 
         if dropped_image_token_mask is not None:
             inputs_embeds = inputs_embeds.masked_fill(dropped_image_token_mask.unsqueeze(-1), 0)
+        if dropped_text_token_mask is not None:
+            inputs_embeds = inputs_embeds.masked_fill(dropped_text_token_mask.unsqueeze(-1), 0)
         return inputs_embeds
+
+    def _apply_vlm_condition_dropout(
+        self,
+        *,
+        forward_inputs: dict[str, Tensor],
+        planner_data: dict[str, Any],
+        drop_ref_mask: Tensor | None,
+        drop_text_mask: Tensor | None,
+    ) -> dict[str, Tensor]:
+        dropped_image_token_mask = self._get_dropped_vlm_image_token_mask(
+            planner_data=planner_data,
+            drop_ref_mask=drop_ref_mask,
+            device=forward_inputs["input_ids"].device,
+        )
+        dropped_text_token_mask = self._get_dropped_vlm_text_token_mask(
+            planner_data=planner_data,
+            forward_inputs=forward_inputs,
+            drop_text_mask=drop_text_mask,
+            device=forward_inputs["input_ids"].device,
+        )
+        if dropped_image_token_mask is None and dropped_text_token_mask is None:
+            return forward_inputs
+        forward_inputs = dict(forward_inputs)
+        attention_mask = forward_inputs["attention_mask"].to(device=forward_inputs["input_ids"].device)
+        if dropped_image_token_mask is not None:
+            attention_mask = attention_mask.masked_fill(dropped_image_token_mask, 0)
+        if dropped_text_token_mask is not None:
+            attention_mask = attention_mask.masked_fill(dropped_text_token_mask, 0)
+        forward_inputs["attention_mask"] = attention_mask
+        return forward_inputs
 
     def _apply_vlm_reference_dropout(
         self,
@@ -465,17 +513,12 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
         planner_data: dict[str, Any],
         drop_ref_mask: Tensor | None,
     ) -> dict[str, Tensor]:
-        dropped_image_token_mask = self._get_dropped_vlm_image_token_mask(
+        return self._apply_vlm_condition_dropout(
+            forward_inputs=forward_inputs,
             planner_data=planner_data,
             drop_ref_mask=drop_ref_mask,
-            device=forward_inputs["input_ids"].device,
+            drop_text_mask=None,
         )
-        if dropped_image_token_mask is None:
-            return forward_inputs
-        forward_inputs = dict(forward_inputs)
-        attention_mask = forward_inputs["attention_mask"].to(device=dropped_image_token_mask.device)
-        forward_inputs["attention_mask"] = attention_mask.masked_fill(dropped_image_token_mask, 0)
-        return forward_inputs
 
     @staticmethod
     def _get_dropped_vlm_image_token_mask(
@@ -494,6 +537,60 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
             )
         gt_image_token_mask = gt_image_token_mask.to(device=device, dtype=torch.bool)
         return gt_image_token_mask & drop_ref_mask.to(device=device, dtype=torch.bool)[:, None]
+
+    @staticmethod
+    def _get_dropped_vlm_text_token_mask(
+        *,
+        planner_data: dict[str, Any],
+        forward_inputs: dict[str, Tensor],
+        drop_text_mask: Tensor | None,
+        device: torch.device,
+    ) -> Tensor | None:
+        if drop_text_mask is None or not torch.any(drop_text_mask):
+            return None
+        text_token_mask = planner_data.get("text_token_mask")
+        if text_token_mask is None:
+            text_token_mask = MultiReferencePlannerStage2Strategy._infer_vlm_text_token_mask(
+                planner_data=planner_data,
+                forward_inputs=forward_inputs,
+                device=device,
+            )
+        else:
+            text_token_mask = text_token_mask.to(device=device, dtype=torch.bool)
+        return text_token_mask & drop_text_mask.to(device=device, dtype=torch.bool)[:, None]
+
+    @staticmethod
+    def _infer_vlm_text_token_mask(
+        *,
+        planner_data: dict[str, Any],
+        forward_inputs: dict[str, Tensor],
+        device: torch.device,
+    ) -> Tensor:
+        input_ids = forward_inputs["input_ids"].to(device=device)
+        active_mask = forward_inputs["attention_mask"].to(device=device, dtype=torch.bool)
+
+        planner_region_mask = planner_data.get("planner_region_mask")
+        if planner_region_mask is None:
+            placeholder_mask = planner_data.get("planner_placeholder_mask")
+            boundary_mask = planner_data.get("planner_boundary_mask")
+            planner_region_mask = torch.zeros_like(input_ids, dtype=torch.bool, device=device)
+            if placeholder_mask is not None:
+                planner_region_mask = planner_region_mask | placeholder_mask.to(device=device, dtype=torch.bool)
+            if boundary_mask is not None:
+                planner_region_mask = planner_region_mask | boundary_mask.to(device=device, dtype=torch.bool)
+        else:
+            planner_region_mask = planner_region_mask.to(device=device, dtype=torch.bool)
+
+        ref_image_mask = (
+            (input_ids == GEMMA3_CONFIG_FOR_LTX.image_token_index)
+            | (input_ids == GEMMA3_CONFIG_FOR_LTX.boi_token_index)
+            | (input_ids == GEMMA3_CONFIG_FOR_LTX.eoi_token_index)
+        ) & ~planner_region_mask
+        cached_ref_image_mask = planner_data.get("gt_image_token_mask")
+        if cached_ref_image_mask is not None:
+            ref_image_mask = ref_image_mask | cached_ref_image_mask.to(device=device, dtype=torch.bool)
+
+        return active_mask & ~ref_image_mask & ~planner_region_mask
 
     def _build_vlm_forward_inputs(self, planner_data: dict[str, Any], device: torch.device) -> dict[str, Tensor]:
         allowed_keys = {

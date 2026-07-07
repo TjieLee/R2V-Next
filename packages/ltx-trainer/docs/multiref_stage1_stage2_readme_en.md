@@ -33,7 +33,7 @@ Hard requirements:
 - `ltx_core.multicond.visual_tokens`: frozen SigLIP/projector token extraction, Gemma image-token scatter, and fixed-count `VisualPlannerTokens`.
 - `ltx_trainer.training_strategies.multi_reference_video`: Stage 1 can read `vlm_conditions/` through `conditions_dir`, then append `gt_siglip_tokens/visual_tokens` after the VLM context features before the LTX text connector.
 - `ltx_trainer.training_strategies.multi_reference_planner_stage2`: Stage 2 uses fixed `planner_token_count` `<image_pad>` target placeholders. Their VLM hidden states act as K/V, repeated LTX thinking/register tokens act as Q, and a zero-init cross-attention + zero-init FFN bridge produces visual planner tokens that replace GT visual tokens in the DiT condition sequence and align to GT visual tokens with MSE.
-- `ltx_core.multicond.cfg_sampler` plus the multi-reference training strategies: per-sample CFG condition dropout with default `full/drop_text/drop_ref/drop_planner = 0.7/0.1/0.1/0.1`.
+- `ltx_core.multicond.cfg_sampler` plus the multi-reference training strategies: per-sample CFG condition dropout with default `full/drop_text/drop_ref/drop_all = 0.7/0.1/0.1/0.1`; legacy `drop_planner` is only a compatibility alias for `drop_all/null`.
 - `scripts/precompute_gt_siglip_tokens.py`: builds `.precomputed/gt_siglip_tokens/` from sampled target-video frames.
 - `scripts/precompute_multiref_vlm_conditions.py`: builds Stage 1/2 `system prompt -> user prompt -> reference image tokens` VLM context conditions.
 - `scripts/precompute_planner_vlm_inputs.py`: builds Stage 2 VLM inputs in `system prompt -> user prompt -> reference image tokens -> <image_start> + <image_pad>*K + <image_end>` order.
@@ -46,11 +46,11 @@ Stage 1 and Stage 2 both support training-time condition dropout for factorized 
 | Mode | Default probability | What changes |
 | --- | ---: | --- |
 | `full` | `0.7` | Keep text/VLM context, reference latents, and visual planner tokens |
-| `drop_text` | `0.1` | Zero the whole row in `video_prompt_embeds/prompt_embeds/audio_prompt_embeds` while preserving attention masks and sequence length |
-| `drop_ref` | `0.1` | Set DiT reference latent `ref_valid_mask` to false; when `cfg_text_conditions_dir` is available, swap `vlm_conditions/` to text-only `conditions/`; in Stage 2 online VLM, also mask the reference-image tokens inside `planner_vlm_inputs` |
-| `drop_planner` | `0.1` | Null/unconditional branch: zero text/VLM context, mask DiT reference latent tokens, mask reference-image tokens in Stage 2 online VLM, and zero the appended GT/predicted visual tokens |
+| `drop_text` | `0.1` | Remove text conditions. Stage 1/2 DiT context uses `cfg_ref_only_conditions_dir` when available; otherwise it falls back to zeroing the mixed VLM context. Stage 2 online VLM masks `text_token_mask` while keeping reference image tokens and planner slots |
+| `drop_ref` | `0.1` | Remove image/visual conditions: set DiT reference latent `ref_valid_mask` to false; swap VLM context to text-only `conditions/` when `cfg_text_conditions_dir` is available; mask reference image tokens in Stage 2 online VLM; zero Stage 1 GT SigLIP tokens and Stage 2 predicted planner visual tokens |
+| `drop_all` / `null` | `0.1` | Remove all conditions: zero text/VLM context, mask reference latents, mask both text tokens and reference image tokens in Stage 2 online VLM, and zero GT/predicted visual tokens |
 
-For Stage 2, `drop_planner` samples are excluded from the planner MSE and only train the flow branch. Non-dropped samples still align predicted planner tokens to target-video GT SigLIP/projector tokens. This gives inference the branches needed for full, text-dropped, reference-dropped, and null/unconditional CFG without making a zeroed planner target fight the MSE teacher.
+For Stage 2, `drop_ref` and `drop_all/null` samples are excluded from the planner MSE and only train the flow branch. `full` and `drop_text` samples still align predicted planner tokens to target-video GT SigLIP/projector tokens. There is no independent `drop_planner_only` branch; `cfg_drop_planner_p` is only the old name for `cfg_drop_all_p/null`.
 
 ## Preprocessed Layout
 
@@ -345,8 +345,9 @@ Edit `configs/multiref_stage1_lora.yaml`:
 - `training_strategy.gt_visual_tokens_dir`: defaults to `gt_siglip_tokens`.
 - `training_strategy.visual_token_frame_stride`: defaults to `1`. If you encoded target-video tokens at `6fps` and later want to use them as `3fps`, set it to `2` without rerunning SigLIP.
 - `training_strategy.cfg_dropout_enabled: true`: enables CFG condition dropout during training.
-- `training_strategy.cfg_full_p/drop_text_p/drop_ref_p/drop_planner_p`: defaults to `0.7/0.1/0.1/0.1`.
+- `training_strategy.cfg_full_p/drop_text_p/drop_ref_p/drop_all_p`: defaults to `0.7/0.1/0.1/0.1`; old `cfg_drop_planner_p` configs still load, but it is only a `drop_all/null` alias.
 - `training_strategy.cfg_text_conditions_dir: "conditions"`: when `drop_ref` is sampled, use text-only conditions instead of `vlm_conditions`, so reference-image semantics do not remain in the VLM context.
+- `training_strategy.cfg_ref_only_conditions_dir: null`: optional ref-only VLM conditions for `drop_text`; when unset, `drop_text` falls back to zeroing the mixed VLM context.
 - `output_dir`: Stage 1 output directory.
 
 Run:
@@ -366,8 +367,9 @@ Edit `configs/multiref_stage2_planner.yaml`:
 - `training_strategy.conditions_dir`: keep this consistent with Stage 1, default `vlm_conditions`.
 - `training_strategy.planner_token_count`: must equal `num_visual_tokens` in `gt_siglip_tokens`.
 - `training_strategy.cfg_dropout_enabled: true`: enables CFG condition dropout during training.
-- `training_strategy.cfg_full_p/drop_text_p/drop_ref_p/drop_planner_p`: defaults to `0.7/0.1/0.1/0.1`.
+- `training_strategy.cfg_full_p/drop_text_p/drop_ref_p/drop_all_p`: defaults to `0.7/0.1/0.1/0.1`; old `cfg_drop_planner_p` configs still load, but it is only a `drop_all/null` alias.
 - `training_strategy.cfg_text_conditions_dir: "conditions"`: when `drop_ref` is sampled, use text-only conditions instead of `vlm_conditions`.
+- `training_strategy.cfg_ref_only_conditions_dir: null`: optional ref-only VLM conditions for `drop_text`; when unset, `drop_text` falls back to zeroing the mixed VLM context.
 - `training_strategy.planner_cross_attention_heads`: number of heads in the zero-init planner cross-attention bridge, default `16`.
 - `training_strategy.planner_zero_init_cross_attention: true`: zero-initialize the cross-attention output projection, so initialization is a residual over repeated thinking/register queries.
 - `training_strategy.planner_ffn_multiplier: 4.0`: hidden-dim multiplier for the planner FFN.

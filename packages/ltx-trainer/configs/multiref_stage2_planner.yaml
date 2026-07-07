@@ -36,6 +36,9 @@
 #     "attention_mask": LongTensor[L],
 #     "pixel_values": Optional Tensor[I, C, H, W],
 #     "planner_placeholder_mask": BoolTensor[L],  # exactly planner_token_count true values
+#     "planner_region_mask": BoolTensor[L],
+#     "gt_image_token_mask": BoolTensor[L],       # source reference image tokens/boundaries
+#     "text_token_mask": BoolTensor[L],           # system/user/template text tokens; old caches infer this at runtime
 #     "labels": Optional LongTensor[L],
 #     "num_ref_images": LongTensor[],
 #   }
@@ -74,8 +77,11 @@ training_strategy:
   cfg_full_p: 0.7
   cfg_drop_text_p: 0.1
   cfg_drop_ref_p: 0.1
+  cfg_drop_all_p: null
+  # Deprecated alias for cfg_drop_all_p/null. Kept for older configs; this is not planner-only dropout.
   cfg_drop_planner_p: 0.1
   cfg_text_conditions_dir: "conditions"
+  cfg_ref_only_conditions_dir: null
   planner_conditions_dir: "planner_conditions"
   use_online_vlm: true
   planner_vlm_inputs_dir: "planner_vlm_inputs"
