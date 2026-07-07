@@ -113,6 +113,10 @@ training_strategy:
   planner_ffn_dropout: 0.0
   planner_zero_init_ffn: true
   planner_slot_encoding: true
+  # Tiny random per-slot offset that breaks repeated LTX register-query symmetry.
+  # Set to 0.0 to recover the exact previous all-zero slot encoding behavior.
+  planner_slot_init_std: 1.0e-4
+  planner_slot_init_seed: 0
   # Set this if the selected VLM hidden layer dim differs from the LTX connector input dim (default 3840).
   planner_source_dim: null
   predicted_visual_token_key: "predicted_visual_tokens"

@@ -144,6 +144,23 @@ class MultiReferencePlannerStage2Config(MultiReferenceVideoConfig):
         description="Add trainable slot/type encodings to repeated query registers and planner hidden states.",
     )
 
+    planner_slot_init_std: float = Field(
+        default=1e-4,
+        description=(
+            "Small normal-init std for per-slot planner query/KV encodings. "
+            "Set to 0.0 to recover exact zero-initialized slot encodings."
+        ),
+        ge=0.0,
+    )
+
+    planner_slot_init_seed: int | None = Field(
+        default=0,
+        description=(
+            "Optional deterministic seed for planner slot encoding initialization. "
+            "Set to null to use the current torch RNG."
+        ),
+    )
+
     planner_source_dim: int | None = Field(
         default=None,
         description="Hidden size of the selected VLM layer. None assumes it equals the connector input dimension.",
@@ -236,6 +253,8 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
             dropout=self.config.planner_cross_attention_dropout,
             zero_init_output=self.config.planner_zero_init_cross_attention,
             use_slot_encoding=self.config.planner_slot_encoding,
+            slot_init_std=self.config.planner_slot_init_std,
+            slot_init_seed=self.config.planner_slot_init_seed,
             ffn_multiplier=self.config.planner_ffn_multiplier,
             ffn_dropout=self.config.planner_ffn_dropout,
             zero_init_ffn=self.config.planner_zero_init_ffn,
@@ -341,6 +360,8 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
                 "planner_ffn_multiplier": self.config.planner_ffn_multiplier,
                 "planner_zero_init_ffn": self.config.planner_zero_init_ffn,
                 "planner_slot_encoding": self.config.planner_slot_encoding,
+                "planner_slot_init_std": self.config.planner_slot_init_std,
+                "planner_slot_init_seed": self.config.planner_slot_init_seed,
                 "planner_mse_weight": self.config.planner_mse_weight,
                 "flow_loss_weight": self.config.flow_loss_weight,
                 "freeze_transformer": self.config.freeze_transformer,

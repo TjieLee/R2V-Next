@@ -395,7 +395,9 @@ Edit `configs/multiref_stage2_planner.yaml`:
 - `training_strategy.planner_zero_init_cross_attention: true`: zero-initialize the cross-attention output projection, so initialization is a residual over repeated thinking/register queries.
 - `training_strategy.planner_ffn_multiplier: 4.0`: hidden-dim multiplier for the planner FFN.
 - `training_strategy.planner_zero_init_ffn: true`: zero-initialize the FFN output projection, so initialization does not perturb the post-cross-attention residual.
-- `training_strategy.planner_slot_encoding: true`: add trainable slot/type encodings to query slots and VLM placeholder hidden states.
+- `training_strategy.planner_slot_encoding: true`: add trainable slot/type encodings to repeated LTX thinking/register query slots and VLM placeholder hidden states.
+- `training_strategy.planner_slot_init_std: 1e-4`: initialize per-slot encodings with a tiny random offset so repeated thinking/register tokens are not perfectly periodic at step 0; set this to `0.0` to recover all-zero initialization.
+- `training_strategy.planner_slot_init_seed: 0`: local random seed for slot encoding initialization; set to `null` to use the current torch RNG.
 - `training_strategy.visual_token_frame_stride`: must match Stage 1. If Stage 1 uses `2`, Stage 2 also uses `2`, and `planner_token_count` must be the downsampled token count.
 - `training_strategy.train_gemma_backbone: false`: freeze the Gemma language-model backbone by default and train only lightweight modules such as the planner bridge, LTX registers, and text connector. Set this to `true` only when you explicitly want Gemma joint fine-tuning.
 - `training_strategy.freeze_vlm_vision_tower: true`: freeze SigLIP.

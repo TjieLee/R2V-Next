@@ -395,7 +395,9 @@ Stage 1 的 DiT 输入区别是：visual tokens 来自 target video 的冻结 Si
 - `training_strategy.planner_zero_init_cross_attention: true`：cross-attention 输出投影零初始化，初始时是 repeated thinking/register query 的 residual。
 - `training_strategy.planner_ffn_multiplier: 4.0`：planner FFN 的 hidden dim 倍率。
 - `training_strategy.planner_zero_init_ffn: true`：FFN 输出投影零初始化，初始不扰动 cross-attention 后的 residual。
-- `training_strategy.planner_slot_encoding: true`：给 query slots 和 VLM placeholder hidden states 加可学习的 slot/type encoding，用于区分 token 位置和角色。
+- `training_strategy.planner_slot_encoding: true`：给 repeated LTX thinking/register query slots 和 VLM placeholder hidden states 加可学习 slot/type encoding，用于区分 token 位置和角色。
+- `training_strategy.planner_slot_init_std: 1e-4`：per-slot encoding 使用小随机初始化，初始就打破 repeated thinking/register tokens 的周期性对称；设为 `0.0` 可恢复全 0 初始化。
+- `training_strategy.planner_slot_init_seed: 0`：slot encoding 初始化的本地随机种子；设为 `null` 时使用当前 torch RNG。
 - `training_strategy.visual_token_frame_stride`：必须和 Stage 1 使用方式一致；如果 Stage 1 用 `2`，Stage 2 也用 `2`，并把 `planner_token_count` 改成降采样后的 token 数。
 - `training_strategy.train_gemma_backbone: false`：默认冻结 Gemma language model backbone，只训练 planner bridge、LTX register/text connector 等轻量模块。需要联合微调 Gemma 时才改成 `true`。
 - `training_strategy.freeze_vlm_vision_tower: true`：冻结 SigLIP。

@@ -36,6 +36,8 @@ class VisualPlannerTokens(nn.Module):
         dropout: float = 0.0,
         zero_init_output: bool = True,
         use_slot_encoding: bool = True,
+        slot_init_std: float = 1e-4,
+        slot_init_seed: int | None = 0,
         ffn_multiplier: float = 4.0,
         ffn_dropout: float = 0.0,
         zero_init_ffn: bool = True,
@@ -49,6 +51,8 @@ class VisualPlannerTokens(nn.Module):
             raise ValueError(f"dim={dim} must be divisible by num_heads={num_heads}")
         if ffn_multiplier <= 0:
             raise ValueError("ffn_multiplier must be positive")
+        if slot_init_std < 0:
+            raise ValueError("slot_init_std must be non-negative")
 
         self.token_count = token_count
         self.dim = dim
@@ -58,6 +62,8 @@ class VisualPlannerTokens(nn.Module):
         self.dropout = dropout
         self.ffn_dropout = ffn_dropout
         self.use_slot_encoding = use_slot_encoding
+        self.slot_init_std = slot_init_std
+        self.slot_init_seed = slot_init_seed
 
         self.query_norm = nn.LayerNorm(dim)
         self.kv_norm = nn.LayerNorm(self.source_dim)
@@ -81,12 +87,39 @@ class VisualPlannerTokens(nn.Module):
         if use_slot_encoding:
             self.query_slot_encoding = nn.Parameter(torch.zeros(token_count, dim))
             self.kv_slot_encoding = nn.Parameter(torch.zeros(token_count, self.source_dim))
+            self._init_slot_encodings(slot_init_std=slot_init_std, slot_init_seed=slot_init_seed)
         else:
             self.register_parameter("query_slot_encoding", None)
             self.register_parameter("kv_slot_encoding", None)
 
         self.query_type_encoding = nn.Parameter(torch.zeros(1, 1, dim))
         self.kv_type_encoding = nn.Parameter(torch.zeros(1, 1, self.source_dim))
+
+    def _init_slot_encodings(self, *, slot_init_std: float, slot_init_seed: int | None) -> None:
+        if slot_init_std == 0:
+            return
+
+        randn_kwargs: dict[str, Any] = {}
+        if slot_init_seed is not None:
+            generator = torch.Generator(device=self.query_slot_encoding.device)
+            generator.manual_seed(int(slot_init_seed))
+            randn_kwargs["generator"] = generator
+
+        with torch.no_grad():
+            query_noise = torch.randn(
+                self.query_slot_encoding.shape,
+                device=self.query_slot_encoding.device,
+                dtype=self.query_slot_encoding.dtype,
+                **randn_kwargs,
+            )
+            kv_noise = torch.randn(
+                self.kv_slot_encoding.shape,
+                device=self.kv_slot_encoding.device,
+                dtype=self.kv_slot_encoding.dtype,
+                **randn_kwargs,
+            )
+            self.query_slot_encoding.copy_(query_noise * slot_init_std)
+            self.kv_slot_encoding.copy_(kv_noise * slot_init_std)
 
     def forward(
         self,

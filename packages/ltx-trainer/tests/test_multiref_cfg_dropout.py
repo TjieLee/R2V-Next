@@ -4,6 +4,7 @@ from pathlib import Path
 import torch
 
 from ltx_core.multicond.cfg_sampler import CFGModeBatch, sample_cfg_modes
+from ltx_core.multicond.visual_tokens import VisualPlannerTokens
 from ltx_core.text_encoders.gemma.config import GEMMA3_CONFIG_FOR_LTX
 from ltx_trainer.training_strategies.multi_reference_planner_stage2 import (
     MultiReferencePlannerStage2Config,
@@ -239,3 +240,78 @@ def test_stage2_dropout_masks_are_built_from_original_attention_for_old_inputs()
     assert torch.equal(zeroed_embeds[1, 0], torch.zeros(3))
     assert torch.equal(zeroed_embeds[1, 4], torch.zeros(3))
     assert torch.equal(zeroed_embeds[1, 6], torch.ones(3))
+
+
+def test_visual_planner_slot_encodings_default_break_symmetry_but_keep_zero_init_adapters() -> None:
+    planner = VisualPlannerTokens(
+        token_count=4,
+        dim=8,
+        source_dim=10,
+        num_heads=2,
+        slot_init_std=1e-4,
+        slot_init_seed=0,
+    )
+
+    assert not torch.equal(planner.query_slot_encoding, torch.zeros_like(planner.query_slot_encoding))
+    assert not torch.equal(planner.kv_slot_encoding, torch.zeros_like(planner.kv_slot_encoding))
+    assert torch.equal(planner.query_type_encoding, torch.zeros_like(planner.query_type_encoding))
+    assert torch.equal(planner.kv_type_encoding, torch.zeros_like(planner.kv_type_encoding))
+    assert torch.equal(planner.output_projection.weight, torch.zeros_like(planner.output_projection.weight))
+    assert torch.equal(planner.output_projection.bias, torch.zeros_like(planner.output_projection.bias))
+    assert torch.equal(planner.ffn_fc2.weight, torch.zeros_like(planner.ffn_fc2.weight))
+    assert torch.equal(planner.ffn_fc2.bias, torch.zeros_like(planner.ffn_fc2.bias))
+
+
+def test_visual_planner_slot_init_std_zero_recovers_old_zero_slot_behavior() -> None:
+    planner = VisualPlannerTokens(
+        token_count=4,
+        dim=8,
+        source_dim=10,
+        num_heads=2,
+        slot_init_std=0.0,
+    )
+
+    assert torch.equal(planner.query_slot_encoding, torch.zeros_like(planner.query_slot_encoding))
+    assert torch.equal(planner.kv_slot_encoding, torch.zeros_like(planner.kv_slot_encoding))
+
+
+def test_visual_planner_slot_init_seed_controls_determinism() -> None:
+    first = VisualPlannerTokens(
+        token_count=4,
+        dim=8,
+        source_dim=10,
+        num_heads=2,
+        slot_init_std=1e-4,
+        slot_init_seed=123,
+    )
+    second = VisualPlannerTokens(
+        token_count=4,
+        dim=8,
+        source_dim=10,
+        num_heads=2,
+        slot_init_std=1e-4,
+        slot_init_seed=123,
+    )
+    different = VisualPlannerTokens(
+        token_count=4,
+        dim=8,
+        source_dim=10,
+        num_heads=2,
+        slot_init_std=1e-4,
+        slot_init_seed=124,
+    )
+
+    assert torch.equal(first.query_slot_encoding, second.query_slot_encoding)
+    assert torch.equal(first.kv_slot_encoding, second.kv_slot_encoding)
+    assert not torch.equal(first.query_slot_encoding, different.query_slot_encoding)
+    assert not torch.equal(first.kv_slot_encoding, different.kv_slot_encoding)
+
+
+def test_stage2_config_parses_planner_slot_init_fields_and_defaults() -> None:
+    default_config = MultiReferencePlannerStage2Config()
+    assert default_config.planner_slot_init_std == 1e-4
+    assert default_config.planner_slot_init_seed == 0
+
+    explicit_config = MultiReferencePlannerStage2Config(planner_slot_init_std=0.0, planner_slot_init_seed=None)
+    assert explicit_config.planner_slot_init_std == 0.0
+    assert explicit_config.planner_slot_init_seed is None
