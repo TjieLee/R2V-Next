@@ -138,11 +138,19 @@ def _tensorize_processor_output(processed: dict[str, Any]) -> dict[str, torch.Te
     return tensors
 
 
+def _compute_source_max_length(max_length: int, planner_token_count: int) -> int:
+    source_max_length = max_length - planner_token_count - 2
+    if source_max_length <= 0:
+        raise typer.BadParameter("--max-length must be greater than --planner-token-count + 2 boundary tokens")
+    return source_max_length
+
+
 def _append_planner_placeholders(
     tensor_data: dict[str, torch.Tensor],
     *,
     planner_token_count: int,
     max_length: int,
+    source_max_length: int,
     placeholder_token_id: int,
     start_token_id: int,
     end_token_id: int,
@@ -157,14 +165,11 @@ def _append_planner_placeholders(
         raise ValueError(f"Expected 1D input_ids after squeeze, got {tuple(input_ids.shape)}")
     planner_region_len = planner_token_count + 2
     if input_ids.shape[0] + planner_region_len > max_length:
-        keep = max_length - planner_region_len
-        if keep <= 0:
-            raise ValueError("max_length must be greater than planner_token_count + 2")
-        input_ids = input_ids[:keep]
-        attention_mask = attention_mask[:keep]
-        for key in ("token_type_ids", "position_ids", "cache_position"):
-            if key in tensor_data:
-                tensor_data[key] = tensor_data[key][:keep]
+        raise ValueError(
+            "Source VLM input exceeded the reserved planner budget. This should not happen when "
+            "processor(max_length=source_max_length) is respected; increase --max-length, reduce "
+            "--planner-token-count, reduce --max-ref-images, or shorten the caption."
+        )
 
     placeholder_ids = torch.full((planner_token_count,), placeholder_token_id, dtype=torch.long)
     placeholder_mask = torch.ones(planner_token_count, dtype=torch.bool)
@@ -205,23 +210,50 @@ def _append_planner_placeholders(
     tensor_data["planner_placeholder_mask"] = planner_placeholder_mask
     tensor_data["planner_boundary_mask"] = planner_boundary_mask
     tensor_data["planner_region_mask"] = planner_region_mask
-    ref_image_mask = (
+    active_mask = attention_mask.to(dtype=torch.bool)
+    ref_visual_token_mask = (
+        (input_ids == GEMMA3_CONFIG_FOR_LTX.image_token_index) & ~planner_region_mask & active_mask
+    )
+    ref_image_region_mask = (
         (
             (input_ids == GEMMA3_CONFIG_FOR_LTX.image_token_index)
             | (input_ids == GEMMA3_CONFIG_FOR_LTX.boi_token_index)
             | (input_ids == GEMMA3_CONFIG_FOR_LTX.eoi_token_index)
         )
         & ~planner_region_mask
-        & attention_mask.to(dtype=torch.bool)
+        & active_mask
     )
-    text_token_mask = attention_mask.to(dtype=torch.bool) & ~ref_image_mask & ~planner_region_mask
-    tensor_data["gt_image_token_mask"] = ref_image_mask.to(dtype=torch.bool)
+    text_token_mask = active_mask & ~ref_image_region_mask & ~planner_region_mask
+    tensor_data["ref_visual_token_mask"] = ref_visual_token_mask.to(dtype=torch.bool)
+    tensor_data["ref_image_region_mask"] = ref_image_region_mask.to(dtype=torch.bool)
+    # Backward-compatible name used by older Stage 2 code for drop_ref masking.
+    # It now represents the full reference image region, not only pure image-pad positions.
+    tensor_data["gt_image_token_mask"] = ref_image_region_mask.to(dtype=torch.bool)
     tensor_data["text_token_mask"] = text_token_mask.to(dtype=torch.bool)
+    tensor_data["source_max_length"] = torch.tensor(source_max_length, dtype=torch.long)
+    tensor_data["ref_visual_token_count"] = ref_visual_token_mask.sum().to(dtype=torch.long)
     tensor_data["planner_token_count"] = torch.tensor(planner_token_count, dtype=torch.long)
     tensor_data["planner_placeholder_token_id"] = torch.tensor(placeholder_token_id, dtype=torch.long)
     tensor_data["planner_start_token_id"] = torch.tensor(start_token_id, dtype=torch.long)
     tensor_data["planner_end_token_id"] = torch.tensor(end_token_id, dtype=torch.long)
     return tensor_data
+
+
+def _validate_reference_image_token_count(tensor_data: dict[str, torch.Tensor], num_ref_images: int) -> None:
+    expected = num_ref_images * GEMMA3_CONFIG_FOR_LTX.mm_tokens_per_image
+    actual_tensor = tensor_data.get("ref_visual_token_count")
+    if actual_tensor is None:
+        actual = int(tensor_data["ref_visual_token_mask"].sum().item())
+    elif isinstance(actual_tensor, torch.Tensor):
+        actual = int(actual_tensor.item())
+    else:
+        actual = int(actual_tensor)
+    if actual != expected:
+        raise ValueError(
+            "Reference image tokens were truncated or mismatched. Increase --max-length, reduce "
+            "--planner-token-count, reduce --max-ref-images, or shorten the caption. "
+            f"Expected {expected} reference image tokens for {num_ref_images} images, got {actual}."
+        )
 
 
 def _atomic_save(data: dict[str, torch.Tensor], output_file: Path) -> None:
@@ -265,8 +297,7 @@ def main(
         raise typer.BadParameter("--planner-token-count must be >= 1")
     if max_length < 1:
         raise typer.BadParameter("--max-length must be >= 1")
-    if planner_token_count + 2 >= max_length:
-        raise typer.BadParameter("--planner-token-count + 2 boundary tokens must be smaller than --max-length")
+    source_max_length = _compute_source_max_length(max_length=max_length, planner_token_count=planner_token_count)
 
     data_root = Path(root_dir) if root_dir is not None else dataset_path.parent
     out_root = Path(output_dir)
@@ -316,7 +347,7 @@ def main(
                 images=images if images else None,
                 return_tensors="pt",
                 padding=False,
-                max_length=max_length - planner_token_count,
+                max_length=source_max_length,
                 truncation=True,
             )
 
@@ -325,12 +356,14 @@ def main(
                 tensor_data,
                 planner_token_count=planner_token_count,
                 max_length=max_length,
+                source_max_length=source_max_length,
                 placeholder_token_id=GEMMA3_CONFIG_FOR_LTX.image_token_index,
                 start_token_id=GEMMA3_CONFIG_FOR_LTX.boi_token_index,
                 end_token_id=GEMMA3_CONFIG_FOR_LTX.eoi_token_index,
                 pad_token_id=pad_token_id,
             )
             tensor_data["num_ref_images"] = torch.tensor(len(images), dtype=torch.long)
+            _validate_reference_image_token_count(tensor_data, len(images))
             _atomic_save(tensor_data, output_file)
             processed_count += 1
         except Exception as exc:

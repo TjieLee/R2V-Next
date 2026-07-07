@@ -37,8 +37,13 @@
 #     "pixel_values": Optional Tensor[I, C, H, W],
 #     "planner_placeholder_mask": BoolTensor[L],  # exactly planner_token_count true values
 #     "planner_region_mask": BoolTensor[L],
-#     "gt_image_token_mask": BoolTensor[L],       # source reference image tokens/boundaries
+#     "planner_boundary_mask": BoolTensor[L],
+#     "ref_visual_token_mask": BoolTensor[L],     # pure source reference image-pad positions
+#     "ref_image_region_mask": BoolTensor[L],     # source reference image boundaries + image pads
+#     "gt_image_token_mask": BoolTensor[L],       # legacy alias for ref_image_region_mask
 #     "text_token_mask": BoolTensor[L],           # system/user/template text tokens; old caches infer this at runtime
+#     "source_max_length": LongTensor[],
+#     "ref_visual_token_count": LongTensor[],
 #     "labels": Optional LongTensor[L],
 #     "num_ref_images": LongTensor[],
 #   }

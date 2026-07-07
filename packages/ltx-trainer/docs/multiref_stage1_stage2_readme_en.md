@@ -207,7 +207,28 @@ If you regenerate GT tokens with fixed `4`-frame sampling and get `1024` GT toke
   --planner-token-count 1024
 ```
 
-For very long captions or heavier reference-image prompts, increase `--max-length` to `8192`.
+`precompute_planner_vlm_inputs.py` reserves `planner_token_count + 2` tokens for the target planner region:
+
+```text
+source_max_length = max_length - planner_token_count - 2
+```
+
+With `--max-length 4096` and `--planner-token-count 2048`, the system/user/ref-image source side gets at most `2046` tokens. For very long captions or heavier reference-image prompts, increase `--max-length` to `8192`. If the reference image token count does not equal `num_ref_images * 256`, the script skips the sample and tells you to increase `--max-length`, reduce `--planner-token-count`, reduce `--max-ref-images`, or shorten the caption.
+
+New `planner_vlm_inputs/*.pt` files contain:
+
+```text
+planner_placeholder_mask    # target <image_pad> positions
+planner_boundary_mask       # target <image_start>/<image_end>
+planner_region_mask         # placeholder + boundary
+ref_visual_token_mask       # pure source reference image-pad tokens
+ref_image_region_mask       # source reference image boundaries + image-pad tokens
+gt_image_token_mask         # legacy alias for ref_image_region_mask
+text_token_mask             # system/user/template text tokens, excluding ref/planner regions
+source_max_length
+ref_visual_token_count
+num_ref_images
+```
 
 ## VLM Prompt Order And System Prompt
 

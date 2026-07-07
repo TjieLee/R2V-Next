@@ -1,3 +1,6 @@
+import importlib.util
+from pathlib import Path
+
 import torch
 
 from ltx_core.multicond.cfg_sampler import CFGModeBatch, sample_cfg_modes
@@ -10,6 +13,13 @@ from ltx_trainer.training_strategies.multi_reference_video import (
     MultiReferenceVideoConfig,
     MultiReferenceVideoStrategy,
 )
+
+
+_PRECOMPUTE_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "precompute_planner_vlm_inputs.py"
+_SPEC = importlib.util.spec_from_file_location("precompute_planner_vlm_inputs", _PRECOMPUTE_SCRIPT)
+assert _SPEC is not None and _SPEC.loader is not None
+precompute_planner_vlm_inputs = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(precompute_planner_vlm_inputs)
 
 
 def _fixed_modes() -> CFGModeBatch:
@@ -91,3 +101,141 @@ def test_inferred_text_token_mask_does_not_cover_planner_placeholders() -> None:
         text_token_mask,
         torch.tensor([[True, False, True, False, False, False, False, False, False, False, False]]),
     )
+
+
+def test_planner_precompute_masks_separate_text_ref_and_planner_regions() -> None:
+    image = GEMMA3_CONFIG_FOR_LTX.image_token_index
+    boi = GEMMA3_CONFIG_FOR_LTX.boi_token_index
+    eoi = GEMMA3_CONFIG_FOR_LTX.eoi_token_index
+    tensor_data = {
+        "input_ids": torch.tensor([10, boi, image, eoi, 11]),
+        "attention_mask": torch.ones(5, dtype=torch.long),
+    }
+
+    out = precompute_planner_vlm_inputs._append_planner_placeholders(
+        tensor_data,
+        planner_token_count=2,
+        max_length=10,
+        source_max_length=6,
+        placeholder_token_id=image,
+        start_token_id=boi,
+        end_token_id=eoi,
+        pad_token_id=0,
+    )
+
+    ref_visual = out["ref_visual_token_mask"]
+    ref_region = out["ref_image_region_mask"]
+    text_mask = out["text_token_mask"]
+    planner_placeholder = out["planner_placeholder_mask"]
+    planner_boundary = out["planner_boundary_mask"]
+
+    assert torch.equal(ref_visual, torch.tensor([False, False, True, False, False, False, False, False, False, False]))
+    assert torch.equal(ref_region, torch.tensor([False, True, True, True, False, False, False, False, False, False]))
+    assert torch.equal(out["gt_image_token_mask"], ref_region)
+    assert bool(ref_visual[2])
+    assert not bool((ref_visual & (out["input_ids"] == boi)).any())
+    assert not bool((ref_visual & (out["input_ids"] == eoi)).any())
+    assert not bool((text_mask & planner_placeholder).any())
+    assert not bool((text_mask & planner_boundary).any())
+    assert not bool((text_mask & ref_region).any())
+    assert torch.equal(text_mask, torch.tensor([True, False, False, False, True, False, False, False, False, False]))
+
+
+def test_planner_precompute_source_length_budget_and_overflow() -> None:
+    assert precompute_planner_vlm_inputs._compute_source_max_length(max_length=4096, planner_token_count=2048) == 2046
+
+    raised = False
+    try:
+        precompute_planner_vlm_inputs._compute_source_max_length(max_length=10, planner_token_count=8)
+    except Exception:
+        raised = True
+    assert raised
+
+    image = GEMMA3_CONFIG_FOR_LTX.image_token_index
+    raised = False
+    try:
+        precompute_planner_vlm_inputs._append_planner_placeholders(
+            {"input_ids": torch.arange(7), "attention_mask": torch.ones(7, dtype=torch.long)},
+            planner_token_count=2,
+            max_length=10,
+            source_max_length=6,
+            placeholder_token_id=image,
+            start_token_id=GEMMA3_CONFIG_FOR_LTX.boi_token_index,
+            end_token_id=GEMMA3_CONFIG_FOR_LTX.eoi_token_index,
+            pad_token_id=0,
+        )
+    except ValueError:
+        raised = True
+    assert raised
+
+
+def test_reference_image_token_integrity_check_rejects_mismatched_count() -> None:
+    raised = False
+    try:
+        precompute_planner_vlm_inputs._validate_reference_image_token_count(
+            {"ref_visual_token_count": torch.tensor(GEMMA3_CONFIG_FOR_LTX.mm_tokens_per_image - 1)},
+            num_ref_images=1,
+        )
+    except ValueError as exc:
+        raised = True
+        assert "Reference image tokens were truncated or mismatched" in str(exc)
+    assert raised
+
+
+def test_stage2_dropout_masks_are_built_from_original_attention_for_old_inputs() -> None:
+    image = GEMMA3_CONFIG_FOR_LTX.image_token_index
+    boi = GEMMA3_CONFIG_FOR_LTX.boi_token_index
+    eoi = GEMMA3_CONFIG_FOR_LTX.eoi_token_index
+    input_ids = torch.tensor(
+        [
+            [10, boi, image, eoi, 11, boi, image, image, eoi, 0],
+            [10, boi, image, eoi, 11, boi, image, image, eoi, 0],
+        ]
+    )
+    original_attention = torch.tensor([[1, 1, 1, 1, 1, 1, 1, 1, 1, 0], [1, 1, 1, 1, 1, 1, 1, 1, 1, 0]])
+    planner_placeholder = torch.tensor(
+        [
+            [False, False, False, False, False, False, True, True, False, False],
+            [False, False, False, False, False, False, True, True, False, False],
+        ]
+    )
+    planner_boundary = torch.tensor(
+        [
+            [False, False, False, False, False, True, False, False, True, False],
+            [False, False, False, False, False, True, False, False, True, False],
+        ]
+    )
+    planner_data = {
+        "planner_placeholder_mask": planner_placeholder,
+        "planner_boundary_mask": planner_boundary,
+    }
+    forward_inputs = {"input_ids": input_ids, "attention_mask": original_attention}
+    strategy = MultiReferencePlannerStage2Strategy(MultiReferencePlannerStage2Config())
+
+    dropped_image, dropped_text = strategy._build_vlm_dropout_masks(
+        planner_data=planner_data,
+        forward_inputs=forward_inputs,
+        drop_ref_mask=torch.tensor([False, True]),
+        drop_text_mask=torch.tensor([False, True]),
+    )
+    assert dropped_image is not None
+    assert dropped_text is not None
+    assert torch.equal(dropped_image[1], torch.tensor([False, True, True, True, False, False, False, False, False, False]))
+    assert torch.equal(dropped_text[1], torch.tensor([True, False, False, False, True, False, False, False, False, False]))
+    assert not bool((dropped_text & planner_placeholder).any())
+    assert not bool((dropped_text & planner_boundary).any())
+    assert not bool((dropped_text & dropped_image).any())
+
+    dropped_forward = strategy._apply_vlm_condition_dropout(
+        forward_inputs=forward_inputs,
+        dropped_image_token_mask=dropped_image,
+        dropped_text_token_mask=dropped_text,
+    )
+    assert torch.equal(dropped_forward["attention_mask"][0], original_attention[0])
+    assert torch.equal(dropped_forward["attention_mask"][1], torch.tensor([0, 0, 0, 0, 0, 1, 1, 1, 1, 0]))
+
+    dummy_embeds = torch.ones(2, input_ids.shape[1], 3)
+    zeroed_embeds = dummy_embeds.masked_fill(dropped_text.unsqueeze(-1), 0)
+    assert torch.equal(zeroed_embeds[1, 0], torch.zeros(3))
+    assert torch.equal(zeroed_embeds[1, 4], torch.zeros(3))
+    assert torch.equal(zeroed_embeds[1, 6], torch.ones(3))

@@ -207,7 +207,28 @@ done
   --planner-token-count 1024
 ```
 
-如果 caption 很长或参考图 token 占用较多，可以把 `--max-length` 提到 `8192`。
+`precompute_planner_vlm_inputs.py` 会为 target planner region 预留 `planner_token_count + 2` 个 token，也就是：
+
+```text
+source_max_length = max_length - planner_token_count - 2
+```
+
+当 `--max-length 4096` 且 `--planner-token-count 2048` 时，system/user/ref-image source 部分最多是 `2046` tokens。如果 caption 很长或参考图 token 占用较多，可以把 `--max-length` 提到 `8192`；如果 reference image token 数和 `num_ref_images * 256` 不一致，脚本会跳过该样本并提示增大 `--max-length`、减少 `--planner-token-count`、减少 `--max-ref-images` 或缩短 caption。
+
+新生成的 `planner_vlm_inputs/*.pt` 会包含：
+
+```text
+planner_placeholder_mask    # target <image_pad> positions
+planner_boundary_mask       # target <image_start>/<image_end>
+planner_region_mask         # placeholder + boundary
+ref_visual_token_mask       # 只包含 source reference image 的 image pad tokens
+ref_image_region_mask       # source reference image 的 boundary + image pad tokens
+gt_image_token_mask         # 兼容旧代码，等价于 ref_image_region_mask
+text_token_mask             # system/user/template 文本 token，不覆盖 ref/planner 区域
+source_max_length
+ref_visual_token_count
+num_ref_images
+```
 
 ## VLM prompt 顺序和 system prompt
 
