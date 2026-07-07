@@ -25,6 +25,12 @@ The current `PrecomputedDataset` scans `.pt` files under `data.preprocessed_data
 
 Use a dedicated overfit `.precomputed` root containing symlinks for only the selected samples. This does not copy large files and does not alter the data format.
 
+## CFG and Validation Are Disabled by Default
+
+The 100-sample overfit configs are meant to verify whether the full-condition path can fit first. Therefore both overfit configs default to `cfg_dropout_enabled: false`, `cfg_full_p: 1.0`, and all drop probabilities set to `0.0`. This keeps text/ref/all dropout from obscuring whether the Stage 1 and Stage 2 full-condition pipeline is wired correctly.
+
+Automatic validation is also disabled by default: `validation.interval: null` and `validation.skip_initial_validation: true`. `generate_video: true` is preserved, but it will not trigger empty validation. Generate videos after the training check by packaging an existing validation output or delegating to a standalone inference command.
+
 ## 0. Paths
 
 ```bash
@@ -75,7 +81,7 @@ Check `configs/multiref_stage1_overfit100.yaml`:
 - `data.preprocessed_data_root = $OVERFIT_PRECOMP`
 - `output_dir = /mnt/workspace/litengjie/ltx2_multiref_overfit_stage1_100`
 
-Start with one GPU for easier debugging:
+Start with one GPU for easier loss debugging. Validation is not triggered by default, so the smoke test is not blocked by an empty validation setup or missing inference entrypoint:
 
 ```bash
 accelerate launch --num_processes 1 --mixed_precision bf16   scripts/train.py configs/multiref_stage1_overfit100.yaml
@@ -135,6 +141,10 @@ Outputs:
 ```
 
 ## 7. Package One Generated Sample
+
+`test_multiref_overfit_generation.py` is only a packaging/delegation script, not a complete multi-reference inference pipeline. It packages GT, references, and metadata, and can either copy an existing validation output or delegate to a standalone inference command you provide.
+
+If you do not have a standalone inference command or validation output, this workflow can complete the training check only; it cannot automatically create `generated.mp4`.
 
 If validation already produced a video:
 

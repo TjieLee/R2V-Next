@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import csv
 import json
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -108,7 +109,7 @@ def main(  # noqa: PLR0913
         None,
         help=(
             "Optional shell command template. Available placeholders: {checkpoint}, {config}, {manifest}, "
-            "{sample_index}, {sample_dir}, {generated}, {prompt}, {seed}."
+            "{sample_index}, {sample_dir}, {generated}, {prompt}, {seed}. {prompt} is shell-quoted."
         ),
     ),
     seed: int = typer.Option(42, help="Seed recorded in metadata and exposed to generation command templates."),
@@ -164,7 +165,7 @@ def main(  # noqa: PLR0913
                 "sample_index": str(sample_index),
                 "sample_dir": str(sample_dir),
                 "generated": str(generated_path),
-                "prompt": prompt,
+                "prompt": shlex.quote(prompt),
                 "seed": str(seed),
             },
         )

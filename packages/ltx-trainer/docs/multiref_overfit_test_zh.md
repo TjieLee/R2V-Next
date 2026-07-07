@@ -23,6 +23,12 @@
 
 当前 `PrecomputedDataset` 训练时扫描 `data.preprocessed_data_root` 下的 `.pt` 文件，不读取 manifest。因此只生成 `overfit_100.json` 不会限制训练集。推荐创建一个 overfit 专用 `.precomputed` 根目录，里面只放 100 条样本对应 `.pt` 的软链接。软链接不复制大文件，也不改变数据格式。
 
+## Overfit 默认关闭 CFG 和 validation
+
+100 条 overfit 的默认目标是先验证 full-condition 主链路能不能拟合，所以两个 overfit config 都默认关闭 CFG dropout：`cfg_dropout_enabled: false`、`cfg_full_p: 1.0`，所有 drop 概率为 `0.0`。这可以避免 text/ref/all dropout 干扰你判断 Stage 1 和 Stage 2 的完整条件链路是否正确。
+
+两个 overfit config 也默认关闭自动 validation：`validation.interval: null`、`validation.skip_initial_validation: true`。`generate_video: true` 会保留，但不会触发空 validation。生成视频应在训练检查通过后，用已有 validation output 或独立 inference command 单独打包。
+
 ## 0. 设置路径
 
 ```bash
@@ -73,7 +79,7 @@ Dataset check passed: 100/100 samples valid
 - `data.preprocessed_data_root = $OVERFIT_PRECOMP`
 - `output_dir = /mnt/workspace/litengjie/ltx2_multiref_overfit_stage1_100`
 
-建议先单卡跑，方便看 loss 和 validation：
+建议先单卡跑，方便看 loss。默认不会自动跑 validation，避免 overfit smoke test 被空 validation 或推理入口问题打断：
 
 ```bash
 accelerate launch --num_processes 1 --mixed_precision bf16   scripts/train.py configs/multiref_stage1_overfit100.yaml
@@ -133,6 +139,10 @@ accelerate launch --num_processes 1 --mixed_precision bf16   scripts/train.py co
 ```
 
 ## 7. 打包生成结果
+
+注意：`test_multiref_overfit_generation.py` 只是 packaging/delegation script，不是完整 multi-reference inference pipeline。它会打包 GT、reference、metadata，并可以复制已有 validation output 或委托你提供的独立 inference command。
+
+如果没有独立 inference command，也没有 validation output，这一步只能完成训练检查，不能自动生成 `generated.mp4`。
 
 如果 validation 已生成视频，用：
 
