@@ -34,7 +34,6 @@ from torch import Tensor
 from ltx_core.components.diffusion_steps import EulerDiffusionStep
 from ltx_core.components.schedulers import LTX2Scheduler
 from ltx_core.model.transformer.modality import Modality
-from ltx_core.model.transformer.model import X0Model
 from ltx_core.model.video_vae import SpatialTilingConfig, TemporalTilingConfig, TilingConfig
 from ltx_core.multicond.rope_mask_builder import build_multiref_sequence
 from ltx_core.text_encoders.gemma import convert_to_additive_mask
@@ -58,6 +57,31 @@ _DEFAULT_TILING = TilingConfig(
     spatial_config=SpatialTilingConfig(tile_size_in_pixels=192, tile_overlap_in_pixels=64),
     temporal_config=TemporalTilingConfig(tile_size_in_frames=48, tile_overlap_in_frames=24),
 )
+
+
+class _TupleSafeLoader(yaml.SafeLoader):
+    pass
+
+
+def _construct_python_tuple(loader: yaml.SafeLoader, node: yaml.Node) -> tuple:
+    return tuple(loader.construct_sequence(node))
+
+
+_TupleSafeLoader.add_constructor(
+    "tag:yaml.org,2002:python/tuple",
+    _construct_python_tuple,
+)
+
+
+def _velocity_to_denoised(latent: Tensor, velocity: Tensor, timesteps: Tensor) -> Tensor:
+    if latent.shape != velocity.shape:
+        raise ValueError(f"Velocity shape {list(velocity.shape)} does not match latent shape {list(latent.shape)}")
+    if timesteps.shape != latent.shape[:2]:
+        raise ValueError(
+            f"Timesteps shape {list(timesteps.shape)} must match packed token shape {list(latent.shape[:2])}"
+        )
+    denoise_timesteps = timesteps.unsqueeze(-1).to(device=latent.device, dtype=torch.float32)
+    return (latent.to(torch.float32) - velocity.to(torch.float32) * denoise_timesteps).to(latent.dtype)
 
 
 def _read_manifest_file(path: Path) -> list[dict[str, Any]]:
@@ -192,7 +216,7 @@ def _condition_feature_key(conditions: dict[str, Tensor]) -> str:
 def _load_config(config_path: Path) -> LtxTrainerConfig:
     if not config_path.is_file():
         raise FileNotFoundError(f"Config does not exist: {config_path}")
-    config_data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config_data = yaml.load(config_path.read_text(encoding="utf-8"), Loader=_TupleSafeLoader)
     cfg = LtxTrainerConfig(**config_data)
     if cfg.training_strategy.name != "multi_reference_video":
         raise ValueError(
@@ -436,7 +460,6 @@ def _denoise_stage1(
 
     sigmas = LTX2Scheduler().execute(steps=num_inference_steps).to(device=device).float()
     stepper = EulerDiffusionStep()
-    x0_model = X0Model(transformer)
     context_key = _condition_feature_key(conditions)
     context = conditions[context_key]
     context_mask = conditions["prompt_attention_mask"]
@@ -472,7 +495,10 @@ def _denoise_stage1(
                 context_mask=context_mask,
                 attention_mask=packed.attention_mask,
             )
-            denoised_video, _ = x0_model(video=video, audio=None, perturbations=None)
+            velocity_video, _ = transformer(video=video, audio=None, perturbations=None)
+            if velocity_video is None:
+                raise RuntimeError("Transformer returned no video velocity during Stage 1 inference")
+            denoised_video = _velocity_to_denoised(video.latent, velocity_video, packed.timesteps)
             next_packed = stepper.step(video.latent, denoised_video, sigmas, step_idx)
             target_tokens = next_packed[:, -target_seq_len:, :]
 

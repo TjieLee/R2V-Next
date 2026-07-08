@@ -530,3 +530,29 @@ def test_stage1_infer_batch_construction_and_gt_append_shape() -> None:
     assert out["video_prompt_embeds"].shape == (1, 6, 5)
     assert out["prompt_attention_mask"].shape == (1, 6)
     assert bool(out["prompt_attention_mask"][:, -4:].all())
+
+
+def test_stage1_infer_velocity_to_denoised_uses_per_token_timestep_broadcast() -> None:
+    latent = torch.randn(1, 2880, 128)
+    velocity = torch.randn(1, 2880, 128)
+    timesteps = torch.linspace(0, 1, 2880).reshape(1, 2880)
+
+    denoised = infer_multiref_stage1_overfit._velocity_to_denoised(latent, velocity, timesteps)
+    expected = latent.to(torch.float32) - velocity.to(torch.float32) * timesteps.unsqueeze(-1)
+
+    assert denoised.shape == (1, 2880, 128)
+    assert torch.allclose(denoised, expected.to(latent.dtype))
+
+
+def test_stage1_infer_old_timestep_broadcast_shape_would_fail() -> None:
+    latent = torch.randn(1, 2880, 128)
+    velocity = torch.randn(1, 2880, 128)
+    timesteps = torch.linspace(0, 1, 2880).reshape(1, 2880)
+
+    raised = False
+    try:
+        _ = latent - velocity * timesteps
+    except RuntimeError as exc:
+        raised = True
+        assert "must match" in str(exc)
+    assert raised
