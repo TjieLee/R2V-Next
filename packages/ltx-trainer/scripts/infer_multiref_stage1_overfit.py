@@ -249,10 +249,11 @@ def _load_checkpoint_weights(
     transformer: torch.nn.Module,
     embeddings_processor: torch.nn.Module,
     strategy: MultiReferenceVideoStrategy,
-) -> None:
+) -> dict[str, bool]:
     if not checkpoint_path.is_file():
         raise FileNotFoundError(f"Checkpoint does not exist: {checkpoint_path}")
     state_dict = load_file(checkpoint_path)
+    visual_projection_loaded = any(key.startswith("training_strategy.visual_token_projection.") for key in state_dict)
 
     strategy.load_extra_checkpoint_state_dict(state_dict)
 
@@ -261,9 +262,12 @@ def _load_checkpoint_weights(
         for key, value in state_dict.items()
         if key.startswith("embeddings_processor.")
     }
+    connector_checkpoint_loaded = bool(processor_state)
     if processor_state:
         embeddings_processor.load_state_dict(processor_state, strict=False)
         console.print("Loaded embeddings_processor auxiliary checkpoint state")
+    else:
+        console.print("[yellow]No embeddings_processor.* weights found in checkpoint; using base connector weights.[/yellow]")
 
     if cfg.model.training_mode == "full":
         transformer_state = {
@@ -275,7 +279,10 @@ def _load_checkpoint_weights(
         }
         if transformer_state:
             transformer.load_state_dict(transformer_state, strict=True)
-        return
+        return {
+            "connector_checkpoint_loaded": connector_checkpoint_loaded,
+            "visual_token_projection_checkpoint_loaded": visual_projection_loaded,
+        }
 
     lora_state = {
         key.replace("diffusion_model.", "", 1): value
@@ -284,10 +291,22 @@ def _load_checkpoint_weights(
     }
     if not lora_state:
         console.print("[yellow]No diffusion_model.* LoRA weights found; loaded auxiliary state only.[/yellow]")
-        return
+        return {
+            "connector_checkpoint_loaded": connector_checkpoint_loaded,
+            "visual_token_projection_checkpoint_loaded": visual_projection_loaded,
+        }
     base_model = transformer.get_base_model()
-    set_peft_model_state_dict(base_model, lora_state)
+    try:
+        set_peft_model_state_dict(base_model, lora_state)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "LoRA config does not match checkpoint. Use the original training config or matching rank/target_modules."
+        ) from exc
     console.print(f"Loaded LoRA checkpoint: {checkpoint_path}")
+    return {
+        "connector_checkpoint_loaded": connector_checkpoint_loaded,
+        "visual_token_projection_checkpoint_loaded": visual_projection_loaded,
+    }
 
 
 def _copy_sample_media(
@@ -354,6 +373,12 @@ def _prepare_condition_context(
     original_shape = _shape(conditions[key])
     raw_visual = batch["gt_visual_tokens"][strategy.config.visual_token_key]
     raw_visual_shape = _shape(raw_visual)
+    raw_loaded_visual, _ = strategy._load_raw_condition_visual_tokens(
+        batch["gt_visual_tokens"],
+        device=conditions[key].device,
+        dtype=conditions[key].dtype,
+    )
+    projected_visual_shape = _shape(strategy._project_visual_tokens(raw_loaded_visual, target_dim=conditions[key].shape[-1]))
 
     source_dim = strategy.config.visual_token_source_dim
     if source_dim is not None and raw_visual.shape[-1] != source_dim:
@@ -390,8 +415,11 @@ def _prepare_condition_context(
 
     shapes = {
         "original_condition_shape": original_shape,
+        "original_feature_shape": original_shape,
         "raw_gt_visual_shape": raw_visual_shape,
+        "projected_visual_shape": projected_visual_shape,
         "pre_connector_condition_shape": pre_connector_shape,
+        "post_connector_condition_shape": _shape(video_embeds),
         "transformer_condition_shape": _shape(video_embeds),
     }
     return conditions, shapes
@@ -533,7 +561,7 @@ def _load_models_and_strategy(
     checkpoint_path: Path,
     device: torch.device,
     dtype: torch.dtype,
-) -> tuple[torch.nn.Module, torch.nn.Module, torch.nn.Module, MultiReferenceVideoStrategy]:
+) -> tuple[torch.nn.Module, torch.nn.Module, torch.nn.Module, MultiReferenceVideoStrategy, dict[str, bool]]:
     transformer = load_transformer(cfg.model.model_path, device=device, dtype=dtype)
     embeddings_processor = load_embeddings_processor(cfg.model.model_path, device=device, dtype=dtype)
     embeddings_processor.feature_extractor = None
@@ -558,7 +586,7 @@ def _load_models_and_strategy(
 
     if cfg.model.training_mode == "lora":
         transformer = _setup_lora(transformer, cfg)
-    _load_checkpoint_weights(
+    checkpoint_flags = _load_checkpoint_weights(
         checkpoint_path=checkpoint_path,
         cfg=cfg,
         transformer=transformer,
@@ -572,7 +600,7 @@ def _load_models_and_strategy(
 
     vae_decoder = load_video_vae_decoder(cfg.model.model_path, device=device, dtype=dtype)
     vae_decoder.eval()
-    return transformer, embeddings_processor, vae_decoder, strategy
+    return transformer, embeddings_processor, vae_decoder, strategy, checkpoint_flags
 
 
 @app.command()
@@ -637,7 +665,7 @@ def main(  # noqa: PLR0913
         gt_visual_tokens=precomputed["gt_visual_tokens"],
     )
 
-    transformer, embeddings_processor, vae_decoder, strategy = _load_models_and_strategy(
+    transformer, embeddings_processor, vae_decoder, strategy, checkpoint_flags = _load_models_and_strategy(
         cfg=cfg,
         checkpoint_path=checkpoint_path,
         device=torch_device,
@@ -651,10 +679,11 @@ def main(  # noqa: PLR0913
         device=torch_device,
         dtype=dtype,
     )
-    console.print(f"original condition shape: {condition_shapes['original_condition_shape']}")
+    console.print(f"original feature shape: {condition_shapes['original_feature_shape']}")
     console.print(f"raw GT visual token shape: {condition_shapes['raw_gt_visual_shape']}")
+    console.print(f"projected visual token shape: {condition_shapes['projected_visual_shape']}")
     console.print(f"pre-connector final condition shape: {condition_shapes['pre_connector_condition_shape']}")
-    console.print(f"transformer condition shape: {condition_shapes['transformer_condition_shape']}")
+    console.print(f"post-connector transformer condition shape: {condition_shapes['post_connector_condition_shape']}")
 
     generated_latents = _denoise_stage1(
         transformer=transformer,
@@ -691,10 +720,15 @@ def main(  # noqa: PLR0913
         "seed": seed,
         "num_inference_steps": num_inference_steps,
         "guidance_scale": 1.0,
-        "condition_mode": "stage1_teacher_gt_siglip",
+        "condition_mode": "stage1_teacher_gt_siglip_pre_connector",
+        "connector_checkpoint_loaded": checkpoint_flags["connector_checkpoint_loaded"],
+        "visual_token_projection_checkpoint_loaded": checkpoint_flags["visual_token_projection_checkpoint_loaded"],
+        "original_feature_shape": condition_shapes["original_feature_shape"],
         "raw_gt_visual_shape": condition_shapes["raw_gt_visual_shape"],
+        "projected_visual_shape": condition_shapes["projected_visual_shape"],
         "pre_connector_condition_shape": condition_shapes["pre_connector_condition_shape"],
-        "final_condition_shape": condition_shapes["transformer_condition_shape"],
+        "post_connector_condition_shape": condition_shapes["post_connector_condition_shape"],
+        "final_condition_shape": condition_shapes["post_connector_condition_shape"],
         "reference_latent_shape": _shape(batch["multi_ref_latents"]["latents"]),
         "target_latent_shape": _shape(batch["latents"]["latents"]),
         "fps": output_fps,

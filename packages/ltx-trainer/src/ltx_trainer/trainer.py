@@ -557,9 +557,16 @@ class LtxvTrainer:
             logger.info("No LoRA weights found in checkpoint; loaded auxiliary weights only")
             return
 
-        # Load LoRA weights and verify all weights were loaded
+        # Load LoRA weights and verify all weights were loaded. Shape mismatches usually mean
+        # rank/target_modules differ from the checkpoint and must not be silently ignored.
         base_model = self._transformer.get_base_model()
-        set_peft_model_state_dict(base_model, state_dict)
+        try:
+            set_peft_model_state_dict(base_model, state_dict)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "LoRA config does not match checkpoint. Use the original training config or matching "
+                "rank/target_modules."
+            ) from exc
 
         logger.info("✅ LoRA checkpoint loaded successfully")
 
@@ -588,6 +595,8 @@ class LtxvTrainer:
             if unexpected:
                 logger.debug(f"Unexpected embeddings processor keys while loading auxiliary checkpoint: {unexpected}")
             logger.info("✅ Embeddings processor checkpoint loaded successfully")
+        else:
+            logger.info("No embeddings_processor.* weights found in checkpoint; using base connector weights.")
 
         text_encoder_state = {
             key.removeprefix("text_encoder."): value
@@ -1113,13 +1122,19 @@ class LtxvTrainer:
         state_dict = self._training_strategy.get_extra_checkpoint_state_dict(self._accelerator)
 
         if self._train_embeddings_processor:
-            processor_state = self._accelerator.get_state_dict(self._embeddings_processor)
+            processor_state = self._collect_trainable_embeddings_processor_state()
             state_dict.update({f"embeddings_processor.{key}": value for key, value in processor_state.items()})
         if self._train_text_encoder and self._text_encoder is not None:
             text_encoder_state = self._collect_trainable_text_encoder_state()
             state_dict.update({f"text_encoder.{key}": value for key, value in text_encoder_state.items()})
 
         return {key: value.to(save_dtype) if isinstance(value, Tensor) else value for key, value in state_dict.items()}
+
+    def _collect_trainable_embeddings_processor_state(self) -> dict[str, Tensor]:
+        unwrapped = self._accelerator.unwrap_model(self._embeddings_processor, keep_torch_compile=False)
+        trainable_names = {name for name, param in unwrapped.named_parameters() if param.requires_grad}
+        full_state = self._accelerator.get_state_dict(self._embeddings_processor)
+        return {key: value for key, value in full_state.items() if key in trainable_names}
 
     def _collect_trainable_text_encoder_state(self) -> dict[str, Tensor]:
         unwrapped = self._accelerator.unwrap_model(self._text_encoder, keep_torch_compile=False)

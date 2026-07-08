@@ -16,14 +16,14 @@ class VisualTokenBatch:
 
 
 class VisualPlannerTokens(nn.Module):
-    """Baton-style visual planner using LTX thinking/register tokens as queries.
+    """Baton-style visual planner/Q-former for fixed visual placeholder tokens.
 
-    The VLM input uses real Gemma image-placeholder token embeddings. This module
-    is the VA-planner bridge after the VLM: repeated LTX connector registers act
-    as video queries, while hidden states at the target ``<img_pad>`` positions
-    provide keys/values. The output projection is zero-initialized by default so
-    the cross-attention and FFN branches start as identity residuals over the
-    repeated register queries.
+    The default Stage 2 path uses internal learned query tokens in raw
+    SigLIP/Gemma-projector space, while the legacy path can still repeat external
+    connector register tokens as queries. Hidden states at the target
+    ``<img_pad>`` positions provide keys/values. The output projection and FFN
+    can be zero-initialized so the bridge starts as a small residual adapter over
+    the query tokens.
     """
 
     def __init__(
@@ -41,6 +41,8 @@ class VisualPlannerTokens(nn.Module):
         ffn_multiplier: float = 4.0,
         ffn_dropout: float = 0.0,
         zero_init_ffn: bool = True,
+        use_learned_query_tokens: bool = False,
+        query_init_std: float = 1e-4,
     ) -> None:
         super().__init__()
         if token_count <= 0:
@@ -53,6 +55,8 @@ class VisualPlannerTokens(nn.Module):
             raise ValueError("ffn_multiplier must be positive")
         if slot_init_std < 0:
             raise ValueError("slot_init_std must be non-negative")
+        if query_init_std < 0:
+            raise ValueError("query_init_std must be non-negative")
 
         self.token_count = token_count
         self.dim = dim
@@ -64,6 +68,14 @@ class VisualPlannerTokens(nn.Module):
         self.use_slot_encoding = use_slot_encoding
         self.slot_init_std = slot_init_std
         self.slot_init_seed = slot_init_seed
+        self.use_learned_query_tokens = use_learned_query_tokens
+        self.query_init_std = query_init_std
+
+        if use_learned_query_tokens:
+            self.query_tokens = nn.Parameter(torch.empty(token_count, dim))
+            self._init_query_tokens(query_init_std=query_init_std)
+        else:
+            self.register_parameter("query_tokens", None)
 
         self.query_norm = nn.LayerNorm(dim)
         self.kv_norm = nn.LayerNorm(self.source_dim)
@@ -95,6 +107,13 @@ class VisualPlannerTokens(nn.Module):
         self.query_type_encoding = nn.Parameter(torch.zeros(1, 1, dim))
         self.kv_type_encoding = nn.Parameter(torch.zeros(1, 1, self.source_dim))
 
+    def _init_query_tokens(self, *, query_init_std: float) -> None:
+        with torch.no_grad():
+            if query_init_std == 0:
+                self.query_tokens.zero_()
+            else:
+                nn.init.normal_(self.query_tokens, std=query_init_std)
+
     def _init_slot_encodings(self, *, slot_init_std: float, slot_init_seed: int | None) -> None:
         if slot_init_std == 0:
             return
@@ -125,25 +144,30 @@ class VisualPlannerTokens(nn.Module):
         self,
         *,
         planner_hidden: Tensor,
-        query_registers: Tensor,
+        query_registers: Tensor | None = None,
         planner_mask: Tensor | None = None,
     ) -> Tensor:
         if planner_hidden.ndim != 3:
             raise ValueError(f"planner_hidden must be [B,K,D], got {tuple(planner_hidden.shape)}")
         if planner_hidden.shape[1] != self.token_count:
             raise ValueError(f"planner_hidden token count {planner_hidden.shape[1]} != {self.token_count}")
-        if query_registers.ndim != 2:
-            raise ValueError(f"query_registers must be [R,D], got {tuple(query_registers.shape)}")
-        if query_registers.shape[-1] != self.dim:
-            raise ValueError(f"query_registers dim {query_registers.shape[-1]} != planner dim {self.dim}")
-
         batch_size = planner_hidden.shape[0]
-        query = self._repeat_query_registers(
-            query_registers=query_registers,
-            batch_size=batch_size,
-            device=planner_hidden.device,
-            dtype=planner_hidden.dtype,
-        )
+        if query_registers is None:
+            if self.query_tokens is None:
+                raise ValueError("query_registers is required when use_learned_query_tokens=False")
+            query = self.query_tokens.to(device=planner_hidden.device, dtype=planner_hidden.dtype)
+            query = query.unsqueeze(0).expand(batch_size, -1, -1)
+        else:
+            if query_registers.ndim != 2:
+                raise ValueError(f"query_registers must be [R,D], got {tuple(query_registers.shape)}")
+            if query_registers.shape[-1] != self.dim:
+                raise ValueError(f"query_registers dim {query_registers.shape[-1]} != planner dim {self.dim}")
+            query = self._repeat_query_registers(
+                query_registers=query_registers,
+                batch_size=batch_size,
+                device=planner_hidden.device,
+                dtype=planner_hidden.dtype,
+            )
         kv = planner_hidden
 
         if self.query_slot_encoding is not None:

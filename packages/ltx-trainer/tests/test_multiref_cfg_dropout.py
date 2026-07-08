@@ -412,12 +412,14 @@ def test_stage2_trainable_modules_include_visual_projection_and_planner_tokens()
     assert "planner_tokens" in modules
 
 
-def test_stage2_mse_uses_projected_gt_visual_tokens() -> None:
+def test_stage2_mse_uses_raw_siglip_tokens_then_appends_projected_tokens() -> None:
     strategy = MultiReferencePlannerStage2Strategy(
         MultiReferencePlannerStage2Config(
             use_online_vlm=False,
             planner_token_count=4,
             planner_mse_weight=1.0,
+            planner_source_dim=3840,
+            planner_output_dim=3840,
             visual_token_source_dim=3840,
             visual_token_target_dim=4096,
         )
@@ -428,10 +430,12 @@ def test_stage2_mse_uses_projected_gt_visual_tokens() -> None:
         text_encoder=None,
     )
     conditions = _projection_conditions(batch_size=1, seq_len=2, dim=4096)
+    gt_tokens = _projection_gt_tokens(batch_size=1, token_count=4, source_dim=3840)
+    predicted_raw = torch.zeros(1, 4, 3840)
     batch = {
-        "gt_visual_tokens": _projection_gt_tokens(batch_size=1, token_count=4, source_dim=3840),
+        "gt_visual_tokens": gt_tokens,
         "planner_conditions": {
-            "predicted_visual_tokens": torch.zeros(1, 4, 4096),
+            "predicted_visual_tokens": predicted_raw,
             "predicted_visual_token_mask": torch.ones(1, 4, dtype=torch.bool),
         },
     }
@@ -439,8 +443,10 @@ def test_stage2_mse_uses_projected_gt_visual_tokens() -> None:
     out = strategy.prepare_conditions(batch, conditions)
 
     assert out["video_prompt_embeds"].shape == (1, 6, 4096)
+    assert out["video_prompt_embeds"].shape[-1] == 4096
     assert strategy._last_planner_mse_loss is not None
-    assert strategy._last_planner_mse_loss.shape == (1,)
+    expected_loss = torch.mean((predicted_raw - gt_tokens["visual_tokens"]) ** 2, dim=[1, 2])
+    assert torch.allclose(strategy._last_planner_mse_loss, expected_loss)
 
 
 def test_visual_token_dim_mismatch_without_projection_raises_clear_error() -> None:
@@ -555,4 +561,121 @@ def test_stage1_infer_old_timestep_broadcast_shape_would_fail() -> None:
     except RuntimeError as exc:
         raised = True
         assert "must match" in str(exc)
+    assert raised
+
+def test_visual_planner_learned_query_mode_outputs_raw_siglip_dim() -> None:
+    planner = VisualPlannerTokens(
+        token_count=8,
+        dim=3840,
+        source_dim=3840,
+        num_heads=16,
+        ffn_multiplier=0.01,
+        use_learned_query_tokens=True,
+        query_init_std=1e-4,
+    )
+    planner_hidden = torch.randn(2, 8, 3840)
+
+    out = planner(planner_hidden=planner_hidden, query_registers=None)
+
+    assert out.shape == (2, 8, 3840)
+    assert planner.query_tokens is not None
+    assert planner.query_tokens.shape == (8, 3840)
+
+
+def test_visual_planner_legacy_external_query_mode_still_outputs_connector_dim() -> None:
+    planner = VisualPlannerTokens(
+        token_count=8,
+        dim=4096,
+        source_dim=3840,
+        num_heads=16,
+        ffn_multiplier=0.01,
+        use_learned_query_tokens=False,
+    )
+    planner_hidden = torch.randn(2, 8, 3840)
+    query_registers = torch.randn(128, 4096)
+
+    out = planner(planner_hidden=planner_hidden, query_registers=query_registers)
+
+    assert out.shape == (2, 8, 4096)
+
+
+def test_stage1_train_text_connector_flag_requests_embeddings_processor_training() -> None:
+    strategy = MultiReferenceVideoStrategy(MultiReferenceVideoConfig(train_text_connector=True))
+
+    assert strategy.train_embeddings_processor() is True
+
+
+def test_stage2_default_uses_learned_3840_query_tokens_not_connector_registers() -> None:
+    strategy = MultiReferencePlannerStage2Strategy(
+        MultiReferencePlannerStage2Config(
+            use_online_vlm=False,
+            planner_token_count=4,
+            planner_source_dim=3840,
+            planner_output_dim=3840,
+            visual_token_source_dim=3840,
+            visual_token_target_dim=4096,
+        )
+    )
+    strategy.attach_models(
+        transformer=nn.Identity(),
+        embeddings_processor=_FakeEmbeddingsProcessor(4096),
+        text_encoder=None,
+    )
+
+    assert strategy._planner_query_registers is None
+    assert strategy.planner_tokens is not None
+    assert strategy.planner_tokens.dim == 3840
+    assert strategy.planner_tokens.query_tokens is not None
+
+
+def test_stage2_connector_register_query_dim_mismatch_raises() -> None:
+    strategy = MultiReferencePlannerStage2Strategy(
+        MultiReferencePlannerStage2Config(
+            use_online_vlm=False,
+            planner_token_count=4,
+            planner_source_dim=3840,
+            planner_output_dim=3840,
+            use_connector_register_queries=True,
+            visual_token_source_dim=3840,
+            visual_token_target_dim=4096,
+        )
+    )
+
+    raised = False
+    try:
+        strategy.attach_models(
+            transformer=nn.Identity(),
+            embeddings_processor=_FakeEmbeddingsProcessor(4096),
+            text_encoder=None,
+        )
+    except ValueError as exc:
+        raised = True
+        assert "connector dim 4096 != planner_output_dim 3840" in str(exc)
+    assert raised
+
+
+def test_stage2_offline_predicted_tokens_reject_projected_4096_dim() -> None:
+    strategy = MultiReferencePlannerStage2Strategy(
+        MultiReferencePlannerStage2Config(
+            use_online_vlm=False,
+            planner_token_count=4,
+            planner_source_dim=3840,
+            planner_output_dim=3840,
+            visual_token_source_dim=3840,
+            visual_token_target_dim=4096,
+        )
+    )
+    gt_tokens = torch.randn(1, 4, 3840)
+    planner_data = {
+        "predicted_visual_tokens": torch.randn(1, 4, 4096),
+        "predicted_visual_token_mask": torch.ones(1, 4, dtype=torch.bool),
+    }
+
+    raised = False
+    try:
+        strategy._load_offline_predicted_tokens(planner_data, gt_tokens)
+    except ValueError as exc:
+        raised = True
+        assert "raw SigLIP-space tokens" in str(exc)
+        assert "got dim=4096" in str(exc)
     assert raised

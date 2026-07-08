@@ -31,6 +31,42 @@ The 100-sample overfit configs are meant to verify whether the full-condition pa
 
 Automatic validation is also disabled by default: `validation.interval: null` and `validation.skip_initial_validation: true`. `generate_video: true` is preserved, but it will not trigger empty validation. Generate videos after the training check by packaging an existing validation output or delegating to a standalone inference command.
 
+
+
+## Conditioning Dimensions and Checkpoint Compatibility
+
+The LTX text conditioning path has two stages: `feature_extractor` first turns Gemma/VLM hidden states into connector-input features, then `video_connector` / text connector produces the final DiT cross-attention condition features. The name `vlm_conditions/video_prompt_embeds` is therefore slightly misleading in this pipeline: it stores feature-extractor outputs before the connector, usually with dimension 4096, not final DiT conditions.
+
+Stage 1 keeps visual-token concatenation before the video connector. Raw target-video GT SigLIP/Gemma-projector tokens are 3840-dimensional; `training_strategy.visual_token_projection` maps them to the connector-input 4096-dimensional space before concatenating them with feature-extracted text/reference features. The combined sequence then enters `embeddings_processor.video_connector`, where connector padding slots are handled as learnable thinking/register tokens. With `train_text_connector: true`, Stage 1 trains and checkpoints `embeddings_processor.video_connector.*`; it does not train the feature extractor.
+
+Stage 2 planner/Q-former now predicts raw SigLIP-space tokens. Gemma planner placeholder hidden states `[B,K,3840]` feed newly initialized 3840-dimensional learned planner query tokens, producing `[B,K,3840]`; the MSE is computed only against raw GT SigLIP tokens `[B,K,3840]`. The predicted tokens are projected through the Stage 1 `visual_token_projection` (`3840 -> 4096`) only before appending them to the Stage 1 condition sequence. The default path does not use 4096-dimensional connector registers as planner queries; `use_connector_register_queries: true` is legacy-only.
+
+Checkpoint compatibility: old Stage 1 checkpoints without `embeddings_processor.*` still load and use the base LTX connector weights. New Stage 1 checkpoints with `train_text_connector: true` include `embeddings_processor.video_connector.*`. When resuming or inferencing from old checkpoints, LoRA `rank`, `alpha`, and `target_modules` must match the original training config; shape mismatches raise an error instead of being silently ignored.
+
+Inspect checkpoint contents:
+
+```bash
+python - <<'PY'
+from safetensors.torch import load_file
+
+p = "/path/to/lora_weights_step_XXXXX.safetensors"
+sd = load_file(p)
+
+for prefix in [
+    "diffusion_model.",
+    "training_strategy.",
+    "embeddings_processor.",
+    "text_encoder.",
+]:
+    keys = [k for k in sd if k.startswith(prefix)]
+    print(prefix, len(keys))
+    for k in keys[:10]:
+        print(" ", k, tuple(sd[k].shape), sd[k].dtype)
+PY
+```
+
+An old Stage 1 checkpoint usually has `diffusion_model.* > 0`, `training_strategy.*` containing at least the visual projection, `embeddings_processor.* = 0`, and `text_encoder.* = 0`. A new Stage 1 checkpoint with `train_text_connector: true` should have `embeddings_processor.* > 0`, especially `embeddings_processor.video_connector.*`.
+
 ## 0. Paths
 
 ```bash

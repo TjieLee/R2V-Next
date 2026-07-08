@@ -37,6 +37,7 @@ training_strategy:
   visual_token_frame_stride: 1
   visual_token_source_dim: 3840
   visual_token_target_dim: 4096
+  train_text_connector: true
   cfg_dropout_enabled: false
   cfg_full_p: 1.0
   cfg_drop_text_p: 0.0

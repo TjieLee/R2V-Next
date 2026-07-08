@@ -71,12 +71,15 @@ training_strategy:
   planner_slot_init_std: 1.0e-4
   planner_slot_init_seed: 0
   planner_source_dim: 3840
+  planner_output_dim: 3840
+  use_connector_register_queries: false
+  planner_query_init_std: 1.0e-4
   predicted_visual_token_key: "predicted_visual_tokens"
   predicted_visual_token_mask_key: "predicted_visual_token_mask"
   planner_mse_weight: 1.0
   flow_loss_weight: 1.0
   freeze_transformer: true
-  train_text_connector: true
+  train_text_connector: false  # Set true only for joint fine-tuning of the Stage 1 video_connector.
 
 optimization:
   learning_rate: 1e-5

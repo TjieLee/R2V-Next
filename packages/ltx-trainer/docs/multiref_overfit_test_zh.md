@@ -29,6 +29,42 @@
 
 两个 overfit config 也默认关闭自动 validation：`validation.interval: null`、`validation.skip_initial_validation: true`。`generate_video: true` 会保留，但不会触发空 validation。生成视频应在训练检查通过后，用已有 validation output 或独立 inference command 单独打包。
 
+
+
+## Conditioning 维度与 checkpoint 兼容
+
+当前 LTX text conditioning 是两段式：`feature_extractor` 先把 Gemma/VLM hidden states 变成 connector-input features，然后 `video_connector` / text connector 再生成送入 DiT cross-attention 的 condition features。`vlm_conditions/video_prompt_embeds` 这个名字容易误导；在这个 pipeline 里它表示 feature_extractor 输出后的 connector-input features，通常是 4096 维，不是最终 DiT condition。
+
+Stage 1 保持拼接位置在 video_connector 之前：raw target-video GT SigLIP/Gemma-projector tokens 是 3840 维，先经过 `training_strategy.visual_token_projection` 投到 connector-input 4096 维，再与 feature-extracted text/reference features 拼接。随后进入 `embeddings_processor.video_connector`，connector padding slots 会由 connector 替换/处理成 learnable thinking/register tokens。`train_text_connector: true` 时，Stage 1 会训练并保存 `embeddings_processor.video_connector.*`，不会训练 feature_extractor。
+
+Stage 2 planner/Q-former 现在预测 raw SigLIP-space tokens：Gemma planner placeholder hidden states `[B,K,3840]` 进入新初始化的 3840 维 learned query planner，输出 `[B,K,3840]`，MSE 也只和 raw GT SigLIP tokens `[B,K,3840]` 对齐。只有在 append 到 Stage 1 condition 前，才复用 Stage 1 的 `visual_token_projection` 做 `3840 -> 4096`。默认新路径不使用 4096 connector registers 作为 planner query；`use_connector_register_queries: true` 只是 legacy 选项。
+
+Checkpoint 兼容规则：旧 Stage 1 checkpoint 没有 `embeddings_processor.*` 也可以加载，connector 会使用 base LTX 初始化。新 Stage 1 如果 `train_text_connector: true`，checkpoint 会包含 `embeddings_processor.video_connector.*`。继续训练或推理旧 checkpoint 时，LoRA `rank`、`alpha`、`target_modules` 必须和原训练配置一致，shape mismatch 会报错而不是静默忽略。
+
+检查 checkpoint 内容：
+
+```bash
+python - <<'PY'
+from safetensors.torch import load_file
+
+p = "/path/to/lora_weights_step_XXXXX.safetensors"
+sd = load_file(p)
+
+for prefix in [
+    "diffusion_model.",
+    "training_strategy.",
+    "embeddings_processor.",
+    "text_encoder.",
+]:
+    keys = [k for k in sd if k.startswith(prefix)]
+    print(prefix, len(keys))
+    for k in keys[:10]:
+        print(" ", k, tuple(sd[k].shape), sd[k].dtype)
+PY
+```
+
+旧 Stage 1 checkpoint 通常是 `diffusion_model.* > 0`、`training_strategy.*` 至少包含 visual projection、`embeddings_processor.* = 0`、`text_encoder.* = 0`。新 Stage 1 且 `train_text_connector: true` 时，`embeddings_processor.* > 0`，重点应看到 `embeddings_processor.video_connector.*`。
+
 ## 0. 设置路径
 
 ```bash

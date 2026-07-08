@@ -163,8 +163,31 @@ class MultiReferencePlannerStage2Config(MultiReferenceVideoConfig):
 
     planner_source_dim: int | None = Field(
         default=None,
-        description="Hidden size of the selected VLM layer. None assumes it equals the connector input dimension.",
+        description="Hidden size of the selected VLM layer. None defaults to visual_token_source_dim when set.",
         ge=1,
+    )
+
+    planner_output_dim: int | None = Field(
+        default=None,
+        description=(
+            "Output dimension of the planner/Q-former. Defaults to visual_token_source_dim. "
+            "For SigLIP-space alignment this should be 3840."
+        ),
+        ge=1,
+    )
+
+    planner_query_init_std: float = Field(
+        default=1e-4,
+        description="Normal init std for learned planner query tokens in planner_output_dim space.",
+        ge=0.0,
+    )
+
+    use_connector_register_queries: bool = Field(
+        default=False,
+        description=(
+            "Legacy option. False uses new learned planner query tokens in planner_output_dim space. "
+            "Do not enable for SigLIP-space alignment when connector dim is 4096 and planner_output_dim is 3840."
+        ),
     )
 
     predicted_visual_token_key: str = Field(
@@ -234,21 +257,36 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
             text_encoder=text_encoder,
         )
         video_connector = embeddings_processor.video_connector
-        base_tokens = getattr(video_connector, "learnable_registers", None)
-        dim = getattr(video_connector, "inner_dim", None)
+        connector_param = next(video_connector.parameters(), None)
+        connector_device = connector_param.device if connector_param is not None else torch.device("cpu")
+        connector_dtype = connector_param.dtype if connector_param is not None else torch.float32
+        planner_source_dim = self._resolved_planner_source_dim()
+        planner_output_dim = self._resolved_planner_output_dim(planner_source_dim=planner_source_dim)
 
-        if base_tokens is None:
-            if dim is None:
-                raise ValueError("Cannot initialize planner tokens: video connector has no inner_dim")
-            base_tokens = torch.zeros(1, dim, device=next(video_connector.parameters()).device)
-        elif dim is None:
-            dim = base_tokens.shape[-1]
-        self._planner_query_registers = base_tokens
+        base_tokens = getattr(video_connector, "learnable_registers", None)
+        use_learned_query_tokens = not self.config.use_connector_register_queries
+        if self.config.use_connector_register_queries:
+            connector_dim = getattr(video_connector, "inner_dim", None)
+            if base_tokens is None:
+                if connector_dim is None:
+                    raise ValueError("Cannot initialize connector-register planner queries: video connector has no inner_dim")
+                base_tokens = torch.zeros(1, connector_dim, device=connector_device, dtype=connector_dtype)
+            elif connector_dim is None:
+                connector_dim = base_tokens.shape[-1]
+            if connector_dim != planner_output_dim:
+                raise ValueError(
+                    "Cannot use connector register queries: "
+                    f"connector dim {connector_dim} != planner_output_dim {planner_output_dim}. "
+                    "Set use_connector_register_queries=false."
+                )
+            self._planner_query_registers = base_tokens
+        else:
+            self._planner_query_registers = None
 
         self.planner_tokens = VisualPlannerTokens(
             token_count=self.config.planner_token_count,
-            dim=dim,
-            source_dim=self.config.planner_source_dim,
+            dim=planner_output_dim,
+            source_dim=planner_source_dim,
             num_heads=self.config.planner_cross_attention_heads,
             dropout=self.config.planner_cross_attention_dropout,
             zero_init_output=self.config.planner_zero_init_cross_attention,
@@ -258,7 +296,9 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
             ffn_multiplier=self.config.planner_ffn_multiplier,
             ffn_dropout=self.config.planner_ffn_dropout,
             zero_init_ffn=self.config.planner_zero_init_ffn,
-        ).to(device=base_tokens.device)
+            use_learned_query_tokens=use_learned_query_tokens,
+            query_init_std=self.config.planner_query_init_std,
+        ).to(device=connector_device, dtype=connector_dtype)
 
         self.text_encoder = text_encoder
         if self.config.use_online_vlm:
@@ -303,8 +343,16 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
         self._last_vlm_lm_loss = None
 
         conditions = self._apply_cfg_context_dropout(batch, conditions)
-        gt_tokens, gt_mask = self._load_condition_visual_tokens(batch["gt_visual_tokens"], conditions)
+        video_feature_key = "video_prompt_embeds" if "video_prompt_embeds" in conditions else "prompt_embeds"
+        video_features = conditions[video_feature_key]
+        gt_tokens, gt_mask = self._load_raw_condition_visual_tokens(
+            batch["gt_visual_tokens"],
+            device=video_features.device,
+            dtype=video_features.dtype,
+        )
         self._assert_token_count("GT visual tokens", gt_tokens, gt_mask)
+        planner_output_dim = self._resolved_planner_output_dim(planner_source_dim=self._resolved_planner_source_dim())
+        self._assert_visual_token_dim("GT visual tokens", gt_tokens, planner_output_dim)
 
         if self.config.use_online_vlm:
             predicted_tokens, predicted_mask = self._run_online_vlm(batch, batch["planner_vlm_inputs"], gt_tokens.device)
@@ -314,6 +362,12 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
         self._assert_token_count("Predicted visual tokens", predicted_tokens, predicted_mask)
         predicted_tokens = predicted_tokens.to(device=gt_tokens.device, dtype=gt_tokens.dtype)
         predicted_mask = predicted_mask.to(device=gt_tokens.device, dtype=torch.bool) & gt_mask
+        self._assert_visual_token_dim("Predicted visual tokens", predicted_tokens, planner_output_dim)
+        if predicted_tokens.shape[-1] != gt_tokens.shape[-1]:
+            raise ValueError(
+                f"Predicted raw visual dim {predicted_tokens.shape[-1]} must match raw GT dim {gt_tokens.shape[-1]} "
+                "for Stage 2 planner MSE."
+            )
         drop_visual_mask = self._cfg_drop_visual_mask(
             batch,
             batch_size=predicted_tokens.shape[0],
@@ -330,8 +384,9 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
                 mask=mse_mask,
             )
 
-        predicted_tokens, predicted_mask = self._apply_cfg_planner_dropout(batch, predicted_tokens, predicted_mask)
-        return self._append_visual_tokens_to_conditions(conditions, predicted_tokens, predicted_mask)
+        projected_tokens = self._project_visual_tokens(predicted_tokens, target_dim=video_features.shape[-1])
+        projected_tokens, predicted_mask = self._apply_cfg_planner_dropout(batch, projected_tokens, predicted_mask)
+        return self._append_visual_tokens_to_conditions(conditions, projected_tokens, predicted_mask)
 
     def compute_loss(
         self,
@@ -364,6 +419,9 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
                 "planner_slot_encoding": self.config.planner_slot_encoding,
                 "planner_slot_init_std": self.config.planner_slot_init_std,
                 "planner_slot_init_seed": self.config.planner_slot_init_seed,
+                "planner_output_dim": self._resolved_planner_output_dim(planner_source_dim=self._resolved_planner_source_dim()),
+                "planner_query_init_std": self.config.planner_query_init_std,
+                "use_connector_register_queries": self.config.use_connector_register_queries,
                 "planner_mse_weight": self.config.planner_mse_weight,
                 "flow_loss_weight": self.config.flow_loss_weight,
                 "freeze_transformer": self.config.freeze_transformer,
@@ -384,8 +442,8 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
         planner_data: dict[str, Any],
         device: torch.device,
     ) -> tuple[Tensor, Tensor]:
-        if self.text_encoder is None or self.planner_tokens is None or self._planner_query_registers is None:
-            raise RuntimeError("Online VLM mode requires text_encoder, planner_tokens and query registers.")
+        if self.text_encoder is None or self.planner_tokens is None:
+            raise RuntimeError("Online VLM mode requires text_encoder and planner_tokens.")
 
         forward_inputs = self._build_vlm_forward_inputs(planner_data, device)
         placeholder_mask = planner_data[self.config.vlm_placeholder_mask_key].to(device=device, dtype=torch.bool)
@@ -705,12 +763,38 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
         gt_tokens: Tensor,
     ) -> tuple[Tensor, Tensor]:
         tokens = planner_data[self.config.predicted_visual_token_key].to(device=gt_tokens.device, dtype=gt_tokens.dtype)
+        if tokens.ndim != 3:
+            raise ValueError(f"Offline predicted visual tokens must be [B,K,D], got {tuple(tokens.shape)}")
+        expected_dim = self._resolved_planner_output_dim(planner_source_dim=self._resolved_planner_source_dim())
+        if tokens.shape[-1] != expected_dim:
+            raise ValueError(
+                "Offline predicted visual tokens must be raw SigLIP-space tokens "
+                f"with dim={expected_dim}; got dim={tokens.shape[-1]}. "
+                "Regenerate planner_conditions or set compatible planner_output_dim."
+            )
         mask = planner_data.get(self.config.predicted_visual_token_mask_key)
         if mask is None:
             mask = torch.ones(tokens.shape[:2], dtype=torch.bool, device=tokens.device)
         else:
             mask = mask.to(device=tokens.device, dtype=torch.bool)
         return tokens, mask
+
+    def _resolved_planner_source_dim(self) -> int:
+        dim = self.config.planner_source_dim or self.config.visual_token_source_dim
+        if dim is None:
+            raise ValueError("Set planner_source_dim or visual_token_source_dim for Stage 2 planner training.")
+        return dim
+
+    def _resolved_planner_output_dim(self, *, planner_source_dim: int | None = None) -> int:
+        dim = self.config.planner_output_dim or self.config.visual_token_source_dim or planner_source_dim
+        if dim is None:
+            raise ValueError("Set planner_output_dim or visual_token_source_dim for Stage 2 planner training.")
+        return dim
+
+    @staticmethod
+    def _assert_visual_token_dim(name: str, tokens: Tensor, expected_dim: int) -> None:
+        if tokens.shape[-1] != expected_dim:
+            raise ValueError(f"{name} dim {tokens.shape[-1]} must equal planner_output_dim={expected_dim}.")
 
     def _configure_vlm_trainable_parameters(self, text_encoder: nn.Module) -> None:
         text_encoder.requires_grad_(False)

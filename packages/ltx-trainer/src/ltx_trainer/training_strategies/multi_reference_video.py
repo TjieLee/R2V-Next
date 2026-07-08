@@ -101,6 +101,14 @@ class MultiReferenceVideoConfig(TrainingStrategyConfigBase):
         ge=1,
     )
 
+    train_text_connector: bool = Field(
+        default=False,
+        description=(
+            "Train the LTX video text connector on top of precomputed feature-extractor outputs. "
+            "When true, embeddings_processor.video_connector is optimized and checkpointed."
+        ),
+    )
+
     cfg_dropout_enabled: bool = Field(
         default=False,
         description=(
@@ -258,6 +266,9 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
             projection = projection.to(device=param.device, dtype=param.dtype)
         self._visual_token_projection = projection
 
+    def train_embeddings_processor(self) -> bool:
+        return self.config.train_text_connector
+
     def get_trainable_modules(self) -> dict[str, nn.Module]:
         modules: dict[str, nn.Module] = {}
         if self._visual_token_projection is not None:
@@ -267,6 +278,18 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
     def set_trainable_modules(self, modules: dict[str, nn.Module]) -> None:
         if "visual_token_projection" in modules:
             self._visual_token_projection = modules["visual_token_projection"]
+
+    def load_extra_checkpoint_state_dict(self, state_dict: dict[str, Tensor]) -> None:
+        for name, module in self.get_trainable_modules().items():
+            prefix = f"training_strategy.{name}."
+            module_state = {key.removeprefix(prefix): value for key, value in state_dict.items() if key.startswith(prefix)}
+            if module_state:
+                module.load_state_dict(module_state, strict=True)
+            elif name == "visual_token_projection":
+                logger.warning(
+                    "visual_token_projection not found in checkpoint; using initialized "
+                    f"{self._visual_token_source_dim}->{self._visual_token_target_dim} adapter."
+                )
 
     def prepare_conditions(self, batch: dict[str, Any], conditions: dict[str, Tensor]) -> dict[str, Tensor]:
         conditions = self._apply_cfg_context_dropout(batch, conditions)
@@ -649,6 +672,7 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
             "visual_token_source_dim": self.config.visual_token_source_dim,
             "visual_token_target_dim": self.config.visual_token_target_dim,
             "visual_token_projection_enabled": self._visual_token_projection is not None,
+            "train_text_connector": self.config.train_text_connector,
         }
         if self.reference_spatial_scale_factor is not None:
             metadata["reference_spatial_scale_factor"] = self.reference_spatial_scale_factor
@@ -662,14 +686,14 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
             return latents
         raise ValueError(f"Reference latents must be [B,C,F,H,W] or [B,R,C,F,H,W], got {tuple(latents.shape)}")
 
-    def _load_condition_visual_tokens(
+    def _load_raw_condition_visual_tokens(
         self,
         visual_data: dict[str, Any],
-        conditions: dict[str, Tensor],
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
     ) -> tuple[Tensor, Tensor]:
-        video_feature_key = "video_prompt_embeds" if "video_prompt_embeds" in conditions else "prompt_embeds"
-        video_features = conditions[video_feature_key]
-        tokens = visual_data[self.config.visual_token_key].to(device=video_features.device, dtype=video_features.dtype)
+        tokens = visual_data[self.config.visual_token_key].to(device=device, dtype=dtype)
         if tokens.ndim != 3:
             raise ValueError(f"GT visual tokens must be [B,K,D], got {tuple(tokens.shape)}")
 
@@ -680,7 +704,20 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
             mask = mask.to(device=tokens.device, dtype=torch.bool)
         if mask.shape != tokens.shape[:2]:
             raise ValueError(f"GT visual token mask must be [B,K], got {tuple(mask.shape)} for tokens {tuple(tokens.shape)}")
-        tokens, mask = self._downsample_visual_tokens_by_frame(tokens, mask, visual_data)
+        return self._downsample_visual_tokens_by_frame(tokens, mask, visual_data)
+
+    def _load_condition_visual_tokens(
+        self,
+        visual_data: dict[str, Any],
+        conditions: dict[str, Tensor],
+    ) -> tuple[Tensor, Tensor]:
+        video_feature_key = "video_prompt_embeds" if "video_prompt_embeds" in conditions else "prompt_embeds"
+        video_features = conditions[video_feature_key]
+        tokens, mask = self._load_raw_condition_visual_tokens(
+            visual_data,
+            device=video_features.device,
+            dtype=video_features.dtype,
+        )
         tokens = self._project_visual_tokens(tokens, target_dim=video_features.shape[-1])
         return tokens, mask
 
