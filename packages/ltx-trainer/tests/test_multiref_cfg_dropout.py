@@ -23,6 +23,12 @@ assert _SPEC is not None and _SPEC.loader is not None
 precompute_planner_vlm_inputs = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(precompute_planner_vlm_inputs)
 
+_STAGE1_INFER_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "infer_multiref_stage1_overfit.py"
+_STAGE1_SPEC = importlib.util.spec_from_file_location("infer_multiref_stage1_overfit", _STAGE1_INFER_SCRIPT)
+assert _STAGE1_SPEC is not None and _STAGE1_SPEC.loader is not None
+infer_multiref_stage1_overfit = importlib.util.module_from_spec(_STAGE1_SPEC)
+_STAGE1_SPEC.loader.exec_module(infer_multiref_stage1_overfit)
+
 
 def _fixed_modes() -> CFGModeBatch:
     return CFGModeBatch(
@@ -455,3 +461,72 @@ def test_visual_token_dim_mismatch_without_projection_raises_clear_error() -> No
         assert "visual_token_source_dim" in str(exc)
         assert "visual_token_target_dim" in str(exc)
     assert raised
+
+
+def test_stage1_infer_manifest_readers_support_json_jsonl_and_csv(tmp_path) -> None:
+    json_path = tmp_path / "samples.json"
+    json_path.write_text('[{"video": "a.mp4"}, {"video": "b.mp4"}]', encoding="utf-8")
+    assert [row["video"] for row in infer_multiref_stage1_overfit._read_manifest(json_path)] == ["a.mp4", "b.mp4"]
+
+    jsonl_path = tmp_path / "samples.jsonl"
+    jsonl_path.write_text('{"video": "c.mp4"}\n{"video": "d.mp4"}\n', encoding="utf-8")
+    assert [row["video"] for row in infer_multiref_stage1_overfit._read_manifest(jsonl_path)] == ["c.mp4", "d.mp4"]
+
+    csv_path = tmp_path / "samples.csv"
+    csv_path.write_text("video,caption\ne.mp4,hello\n", encoding="utf-8")
+    assert infer_multiref_stage1_overfit._read_manifest(csv_path)[0]["video"] == "e.mp4"
+
+
+def test_stage1_infer_precomputed_relative_path_matches_absolute_video_path() -> None:
+    manifest_root = Path("/tmp/manifest_root")
+    video_path = Path("/mnt/workspace/public/dataset/phantom_data/part_000/demo/demo.mp4")
+    rel_path = infer_multiref_stage1_overfit._output_relative(video_path, manifest_root).with_suffix(".pt")
+
+    assert rel_path == Path("mnt/workspace/public/dataset/phantom_data/part_000/demo/demo.pt")
+
+
+def test_stage1_infer_batch_construction_and_gt_append_shape() -> None:
+    latents = {
+        "latents": torch.randn(128, 1, 2, 2),
+        "num_frames": 1,
+        "height": 2,
+        "width": 2,
+        "fps": 6.0,
+    }
+    conditions = {
+        "video_prompt_embeds": torch.randn(2, 5),
+        "prompt_attention_mask": torch.ones(2, dtype=torch.bool),
+    }
+    multi_reference_latents = {
+        "latents": torch.randn(1, 128, 1, 2, 2),
+        "ref_valid_mask": torch.ones(1, dtype=torch.bool),
+        "num_refs": 1,
+    }
+    gt_visual_tokens = {
+        "visual_tokens": torch.randn(4, 3),
+        "visual_token_mask": torch.ones(4, dtype=torch.bool),
+    }
+    batch = infer_multiref_stage1_overfit._build_single_sample_batch(
+        latents=latents,
+        conditions=conditions,
+        multi_reference_latents=multi_reference_latents,
+        gt_visual_tokens=gt_visual_tokens,
+    )
+
+    assert batch["latents"]["latents"].shape == (1, 128, 1, 2, 2)
+    assert batch["conditions"]["video_prompt_embeds"].shape == (1, 2, 5)
+    assert batch["gt_visual_tokens"]["visual_tokens"].shape == (1, 4, 3)
+
+    strategy = MultiReferenceVideoStrategy(
+        MultiReferenceVideoConfig(visual_token_source_dim=3, visual_token_target_dim=5)
+    )
+    strategy.attach_models(
+        transformer=nn.Identity(),
+        embeddings_processor=_FakeEmbeddingsProcessor(5),
+        text_encoder=None,
+    )
+    out = strategy.prepare_conditions(batch, batch["conditions"])
+
+    assert out["video_prompt_embeds"].shape == (1, 6, 5)
+    assert out["prompt_attention_mask"].shape == (1, 6)
+    assert bool(out["prompt_attention_mask"][:, -4:].all())

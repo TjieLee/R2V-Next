@@ -169,6 +169,42 @@ $OVERFIT_DIR/eval_stage2/sample_0/
   metadata.json
 ```
 
+## 7A. Stage 1 Teacher-Forcing In-Domain Inference
+
+`scripts/infer_multiref_stage1_overfit.py` is a real Stage 1 multi-reference teacher-forcing inference entrypoint for checking a Stage 1 checkpoint. It reads `vlm_conditions/`, `multi_reference_latents/`, `gt_siglip_tokens/`, and target `latents/`, loads the Stage 1 checkpoint, and generates `generated.mp4` with target-video GT SigLIP tokens as visual conditions.
+
+It is still not the final Stage 2 planner inference path: it does not run Gemma/VLM online, does not use planner placeholders, and does not predict visual tokens. It uses precomputed target-video GT SigLIP tokens, so use it to verify that Stage 1 learned to consume the full condition path, not as the deployable final inference endpoint.
+
+Example:
+
+```bash
+python scripts/infer_multiref_stage1_overfit.py \
+  --config configs/multiref_stage1_overfit100.yaml \
+  --checkpoint /mnt/workspace/litengjie/ltx2_multiref_overfit_stage1_100/checkpoints/lora_weights_step_00500.safetensors \
+  --manifest $OVERFIT_JSON \
+  --precomputed-root $OVERFIT_PRECOMP \
+  --sample-index 0 \
+  --output-dir $OVERFIT_DIR/eval_stage1_teacher \
+  --device cuda:0 \
+  --num-inference-steps 50 \
+  --video-column video \
+  --caption-column caption \
+  --reference-column reference_images
+```
+
+Output layout:
+
+```text
+$OVERFIT_DIR/eval_stage1_teacher/sample_0/
+  generated.mp4
+  gt.mp4
+  ref_0.jpg
+  ref_1.jpg
+  metadata.json
+```
+
+`metadata.json` records the original VLM condition shape, raw GT SigLIP token shape, the pre-connector shape after appending GT tokens, and the final condition shape sent to the DiT after the LTX text connector/register tokens. CFG, negative prompts, ValidationRunner, and online VLM are not used.
+
 ## 8. Build the HTML Report
 
 ```bash

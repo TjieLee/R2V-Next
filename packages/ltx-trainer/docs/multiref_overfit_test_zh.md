@@ -167,6 +167,42 @@ $OVERFIT_DIR/eval_stage2/sample_0/
   metadata.json
 ```
 
+## 7A. Stage 1 teacher-forcing 域内推理
+
+新增 `scripts/infer_multiref_stage1_overfit.py` 可以直接检查 Stage 1 checkpoint。它是真正的 Stage 1 multi-reference teacher-forcing 推理入口：读取 `vlm_conditions/`、`multi_reference_latents/`、`gt_siglip_tokens/` 和目标 `latents/`，加载 Stage 1 checkpoint，然后用 target-video GT SigLIP tokens 作为视觉条件生成 `generated.mp4`。
+
+注意它仍然不是最终 Stage 2 planner 推理：它不在线跑 Gemma/VLM，不使用 planner placeholders，也不预测 visual tokens；它使用的是已经预计算好的 target-video GT SigLIP tokens。因此这个脚本用于确认 Stage 1 是否学会消费完整条件，不用于报告最终可部署效果。
+
+示例：
+
+```bash
+python scripts/infer_multiref_stage1_overfit.py \
+  --config configs/multiref_stage1_overfit100.yaml \
+  --checkpoint /mnt/workspace/litengjie/ltx2_multiref_overfit_stage1_100/checkpoints/lora_weights_step_00500.safetensors \
+  --manifest $OVERFIT_JSON \
+  --precomputed-root $OVERFIT_PRECOMP \
+  --sample-index 0 \
+  --output-dir $OVERFIT_DIR/eval_stage1_teacher \
+  --device cuda:0 \
+  --num-inference-steps 50 \
+  --video-column video \
+  --caption-column caption \
+  --reference-column reference_images
+```
+
+输出结构：
+
+```text
+$OVERFIT_DIR/eval_stage1_teacher/sample_0/
+  generated.mp4
+  gt.mp4
+  ref_0.jpg
+  ref_1.jpg
+  metadata.json
+```
+
+`metadata.json` 会记录原始 VLM condition shape、raw GT SigLIP token shape、拼接 GT tokens 后的 pre-connector shape、经过 LTX text connector/register tokens 后送入 DiT 的 final condition shape。这里没有 CFG、negative prompt、ValidationRunner 或在线 VLM。
+
 ## 8. 生成 HTML 对比页
 
 ```bash
