@@ -1,18 +1,18 @@
 # =============================================================================
-# LTX-2 Multi-Reference Stage 2 Planner 100-Sample Overfit Test
+# LTX-2 Multi-Reference Stage 1 100-Sample Overfit Test
 # =============================================================================
-# Edit model.model_path, model.text_encoder_path, model.load_checkpoint and
-# data.preprocessed_data_root before running on the training server.
+# Edit model.model_path, model.text_encoder_path and data.preprocessed_data_root
+# before running on the training server.
 
 model:
   model_path: "/mnt/workspace/litengjie/LTX-2/models/LTX-2.3/ltx-2.3-22b-dev.safetensors"
   text_encoder_path: "/mnt/workspace/litengjie/LTX-2/models/gemma-3-12b-it-qat-q4_0-unquantized"
   training_mode: "lora"
-  load_checkpoint: "/mnt/workspace/litengjie/ltx2_multiref_overfit_stage1_100/checkpoints"
+  load_checkpoint: null
 
 lora:
-  rank: 128
-  alpha: 128
+  rank: 32
+  alpha: 32
   dropout: 0.0
   target_modules:
     - "attn1.to_k"
@@ -23,9 +23,11 @@ lora:
     - "attn2.to_q"
     - "attn2.to_v"
     - "attn2.to_out.0"
+    - "ff.net.0.proj"
+    - "ff.net.2"
 
 training_strategy:
-  name: "multi_reference_planner_stage2"
+  name: "multi_reference_video"
   conditions_dir: "vlm_conditions"
   reference_latents_dir: "multi_reference_latents"
   gt_visual_tokens_dir: "gt_siglip_tokens"
@@ -35,51 +37,22 @@ training_strategy:
   visual_token_frame_stride: 1
   visual_token_source_dim: 3840
   visual_token_target_dim: 4096
-  cfg_dropout_enabled: true
-  cfg_full_p: 0.85
+  cfg_dropout_enabled: false
+  cfg_full_p: 1.0
   cfg_drop_text_p: 0.0
   cfg_drop_ref_p: 0.0
-  cfg_drop_all_p: 0.15
+  cfg_drop_all_p: 0.0
   cfg_drop_planner_p: 0.0
   cfg_text_conditions_dir: "conditions"
   cfg_ref_only_conditions_dir: null
-  planner_conditions_dir: "planner_conditions"
-  use_online_vlm: true
-  planner_vlm_inputs_dir: "planner_vlm_inputs"
   max_ref_images_per_sample: null
   reference_time_stride: 1.0
   first_frame_conditioning_p: 0.0
 
-  vlm_placeholder_mask_key: "planner_placeholder_mask"
-  vlm_hidden_layer: -1
-  vlm_lm_labels_key: "labels"
-  vlm_lm_loss_weight: 0.0
-  train_gemma_backbone: false
-  freeze_vlm_vision_tower: true
-  freeze_vlm_multi_modal_projector: true
-
-  planner_token_count: 2048
-  planner_cross_attention_heads: 16
-  planner_cross_attention_dropout: 0.0
-  planner_zero_init_cross_attention: true
-  planner_ffn_multiplier: 4.0
-  planner_ffn_dropout: 0.0
-  planner_zero_init_ffn: true
-  planner_slot_encoding: true
-  planner_slot_init_std: 1.0e-4
-  planner_slot_init_seed: 0
-  planner_source_dim: 3840
-  predicted_visual_token_key: "predicted_visual_tokens"
-  predicted_visual_token_mask_key: "predicted_visual_token_mask"
-  planner_mse_weight: 1.0
-  flow_loss_weight: 1.0
-  freeze_transformer: true
-  train_text_connector: true
-
 optimization:
-  learning_rate: 5e-5
-  steps: 5000
-  batch_size: 8
+  learning_rate: 2e-5
+  steps: 10000
+  batch_size: 4
   gradient_accumulation_steps: 1
   max_grad_norm: 1.0
   optimizer_type: "adamw"
@@ -124,9 +97,9 @@ wandb:
   entity: null
   tags:
     - "multi-reference"
-    - "stage2-planner"
+    - "stage1"
     - "overfit100"
   log_validation_videos: false
 
 seed: 42
-output_dir: "/mnt/workspace/litengjie/ltx2_multiref_overfit_stage2_100"
+output_dir: "/mnt/workspace/litengjie/ltx2_multiref_overfit_stage1_100"
