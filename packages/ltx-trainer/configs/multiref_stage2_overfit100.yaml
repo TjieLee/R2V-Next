@@ -33,6 +33,8 @@ training_strategy:
   visual_token_mask_key: "visual_token_mask"
   visual_tokens_per_frame_key: "tokens_per_frame"
   visual_token_frame_stride: 1
+  visual_token_source_dim: 3840
+  visual_token_target_dim: 4096
   cfg_dropout_enabled: false
   cfg_full_p: 1.0
   cfg_drop_text_p: 0.0
@@ -66,7 +68,7 @@ training_strategy:
   planner_slot_encoding: true
   planner_slot_init_std: 1.0e-4
   planner_slot_init_seed: 0
-  planner_source_dim: null
+  planner_source_dim: 3840
   predicted_visual_token_key: "predicted_visual_tokens"
   predicted_visual_token_mask_key: "predicted_visual_token_mask"
   planner_mse_weight: 1.0

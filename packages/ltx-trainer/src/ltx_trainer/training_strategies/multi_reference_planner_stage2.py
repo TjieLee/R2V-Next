@@ -285,11 +285,13 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
         )
 
     def get_trainable_modules(self) -> dict[str, nn.Module]:
-        if self.planner_tokens is None:
-            return {}
-        return {"planner_tokens": self.planner_tokens}
+        modules = super().get_trainable_modules()
+        if self.planner_tokens is not None:
+            modules["planner_tokens"] = self.planner_tokens
+        return modules
 
     def set_trainable_modules(self, modules: dict[str, nn.Module]) -> None:
+        super().set_trainable_modules(modules)
         if "planner_tokens" in modules:
             self.planner_tokens = modules["planner_tokens"]
 

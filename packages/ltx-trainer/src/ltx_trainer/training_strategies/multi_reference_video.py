@@ -10,7 +10,7 @@ offsets.
 from typing import Any, Literal
 
 import torch
-from pydantic import Field
+from pydantic import Field, model_validator
 from torch import Tensor, nn
 
 from ltx_core.model.transformer.modality import Modality
@@ -79,6 +79,24 @@ class MultiReferenceVideoConfig(TrainingStrategyConfigBase):
         description=(
             "Optional post-encoding temporal downsampling for target-video SigLIP tokens. "
             "For example, stride=2 uses every other sampled frame without rerunning SigLIP."
+        ),
+        ge=1,
+    )
+
+    visual_token_source_dim: int | None = Field(
+        default=None,
+        description=(
+            "Optional source dim of raw GT SigLIP/projector visual tokens before appending to LTX condition "
+            "features. Set with visual_token_target_dim to create a trainable projection, e.g. 3840 -> 4096."
+        ),
+        ge=1,
+    )
+
+    visual_token_target_dim: int | None = Field(
+        default=None,
+        description=(
+            "Optional target dim of visual condition tokens after projection. Must match video_prompt_embeds / "
+            "LTX connector input dim, e.g. 4096."
         ),
         ge=1,
     )
@@ -158,6 +176,17 @@ class MultiReferenceVideoConfig(TrainingStrategyConfigBase):
         gt=0.0,
     )
 
+    @model_validator(mode="after")
+    def _validate_visual_token_projection_dims(self) -> "MultiReferenceVideoConfig":
+        has_source = self.visual_token_source_dim is not None
+        has_target = self.visual_token_target_dim is not None
+        if has_source != has_target:
+            raise ValueError(
+                "visual_token_source_dim and visual_token_target_dim must be set together, "
+                "e.g. 3840 and 4096, or both left unset to require matching dims."
+            )
+        return self
+
     def get_data_sources(self) -> dict[str, str]:
         data_sources = {
             "latents": "latents",
@@ -192,6 +221,9 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
         super().__init__(config)
         self.reference_spatial_scale_factor: int | None = None
         self._connector_register_count: int | None = None
+        self._visual_token_projection: nn.Module | None = None
+        self._visual_token_source_dim: int | None = None
+        self._visual_token_target_dim: int | None = None
 
     def attach_models(
         self,
@@ -203,6 +235,38 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
         del transformer, text_encoder
         video_connector = embeddings_processor.video_connector
         self._connector_register_count = getattr(video_connector, "num_learnable_registers", None)
+        self._init_visual_token_projection(video_connector)
+
+    def _init_visual_token_projection(self, video_connector: nn.Module) -> None:
+        self._visual_token_projection = None
+        self._visual_token_source_dim = self.config.visual_token_source_dim
+        self._visual_token_target_dim = self.config.visual_token_target_dim
+        if self._visual_token_source_dim is None or self._visual_token_target_dim is None:
+            return
+        if self._visual_token_source_dim == self._visual_token_target_dim:
+            return
+
+        projection = nn.Linear(self._visual_token_source_dim, self._visual_token_target_dim, bias=False)
+        with torch.no_grad():
+            projection.weight.zero_()
+            dim = min(self._visual_token_source_dim, self._visual_token_target_dim)
+            eye = torch.eye(dim, dtype=projection.weight.dtype, device=projection.weight.device)
+            projection.weight[:dim, :dim].copy_(eye)
+
+        param = next(video_connector.parameters(), None)
+        if param is not None:
+            projection = projection.to(device=param.device, dtype=param.dtype)
+        self._visual_token_projection = projection
+
+    def get_trainable_modules(self) -> dict[str, nn.Module]:
+        modules: dict[str, nn.Module] = {}
+        if self._visual_token_projection is not None:
+            modules["visual_token_projection"] = self._visual_token_projection
+        return modules
+
+    def set_trainable_modules(self, modules: dict[str, nn.Module]) -> None:
+        if "visual_token_projection" in modules:
+            self._visual_token_projection = modules["visual_token_projection"]
 
     def prepare_conditions(self, batch: dict[str, Any], conditions: dict[str, Tensor]) -> dict[str, Tensor]:
         conditions = self._apply_cfg_context_dropout(batch, conditions)
@@ -582,6 +646,9 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
             "cfg_drop_planner_p_is_legacy_drop_all_alias": True,
             "cfg_text_conditions_dir": self.config.cfg_text_conditions_dir,
             "cfg_ref_only_conditions_dir": self.config.cfg_ref_only_conditions_dir,
+            "visual_token_source_dim": self.config.visual_token_source_dim,
+            "visual_token_target_dim": self.config.visual_token_target_dim,
+            "visual_token_projection_enabled": self._visual_token_projection is not None,
         }
         if self.reference_spatial_scale_factor is not None:
             metadata["reference_spatial_scale_factor"] = self.reference_spatial_scale_factor
@@ -605,10 +672,6 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
         tokens = visual_data[self.config.visual_token_key].to(device=video_features.device, dtype=video_features.dtype)
         if tokens.ndim != 3:
             raise ValueError(f"GT visual tokens must be [B,K,D], got {tuple(tokens.shape)}")
-        if tokens.shape[-1] != video_features.shape[-1]:
-            raise ValueError(
-                f"GT visual token dim {tokens.shape[-1]} does not match prompt feature dim {video_features.shape[-1]}"
-            )
 
         mask = visual_data.get(self.config.visual_token_mask_key)
         if mask is None:
@@ -618,7 +681,27 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
         if mask.shape != tokens.shape[:2]:
             raise ValueError(f"GT visual token mask must be [B,K], got {tuple(mask.shape)} for tokens {tuple(tokens.shape)}")
         tokens, mask = self._downsample_visual_tokens_by_frame(tokens, mask, visual_data)
+        tokens = self._project_visual_tokens(tokens, target_dim=video_features.shape[-1])
         return tokens, mask
+
+    def _project_visual_tokens(self, tokens: Tensor, target_dim: int) -> Tensor:
+        source_dim = tokens.shape[-1]
+        if source_dim == target_dim:
+            return tokens
+
+        if self._visual_token_projection is None:
+            raise ValueError(
+                f"GT visual token dim {source_dim} does not match prompt feature dim {target_dim}. "
+                "Set training_strategy.visual_token_source_dim and visual_token_target_dim, "
+                "e.g. 3840 and 4096, to enable trainable projection."
+            )
+
+        if source_dim != self._visual_token_source_dim or target_dim != self._visual_token_target_dim:
+            raise ValueError(
+                f"GT visual token dim {source_dim} and prompt feature dim {target_dim} do not match configured "
+                f"projection {self._visual_token_source_dim}->{self._visual_token_target_dim}."
+            )
+        return self._visual_token_projection(tokens)
 
     def _downsample_visual_tokens_by_frame(
         self,

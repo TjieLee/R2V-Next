@@ -2,6 +2,7 @@ import importlib.util
 from pathlib import Path
 
 import torch
+from torch import nn
 
 from ltx_core.multicond.cfg_sampler import CFGModeBatch, sample_cfg_modes
 from ltx_core.multicond.visual_tokens import VisualPlannerTokens
@@ -315,3 +316,142 @@ def test_stage2_config_parses_planner_slot_init_fields_and_defaults() -> None:
     explicit_config = MultiReferencePlannerStage2Config(planner_slot_init_std=0.0, planner_slot_init_seed=None)
     assert explicit_config.planner_slot_init_std == 0.0
     assert explicit_config.planner_slot_init_seed is None
+
+
+class _FakeVideoConnector(nn.Module):
+    def __init__(self, dim: int = 4096):
+        super().__init__()
+        self.inner_dim = dim
+        self.num_learnable_registers = 1
+        self.learnable_registers = nn.Parameter(torch.zeros(1, dim))
+
+
+class _FakeEmbeddingsProcessor(nn.Module):
+    def __init__(self, dim: int = 4096):
+        super().__init__()
+        self.video_connector = _FakeVideoConnector(dim)
+
+
+def _projection_conditions(batch_size: int = 2, seq_len: int = 3, dim: int = 4096) -> dict[str, torch.Tensor]:
+    return {
+        "video_prompt_embeds": torch.randn(batch_size, seq_len, dim),
+        "prompt_attention_mask": torch.ones(batch_size, seq_len, dtype=torch.bool),
+    }
+
+
+def _projection_gt_tokens(batch_size: int = 2, token_count: int = 4, source_dim: int = 3840) -> dict[str, torch.Tensor]:
+    return {
+        "visual_tokens": torch.randn(batch_size, token_count, source_dim),
+        "visual_token_mask": torch.ones(batch_size, token_count, dtype=torch.bool),
+    }
+
+
+def test_stage1_projects_gt_visual_tokens_before_append() -> None:
+    strategy = MultiReferenceVideoStrategy(
+        MultiReferenceVideoConfig(visual_token_source_dim=3840, visual_token_target_dim=4096)
+    )
+    strategy.attach_models(
+        transformer=nn.Identity(),
+        embeddings_processor=_FakeEmbeddingsProcessor(4096),
+        text_encoder=None,
+    )
+    conditions = _projection_conditions(batch_size=2, seq_len=3, dim=4096)
+    batch = {"gt_visual_tokens": _projection_gt_tokens(batch_size=2, token_count=4, source_dim=3840)}
+
+    out = strategy.prepare_conditions(batch, conditions)
+
+    assert out["video_prompt_embeds"].shape == (2, 7, 4096)
+    assert out["prompt_attention_mask"].shape == (2, 7)
+    assert bool(out["prompt_attention_mask"][:, -4:].all())
+
+
+def test_visual_token_projection_module_registered_and_identity_pad_initialized() -> None:
+    strategy = MultiReferenceVideoStrategy(
+        MultiReferenceVideoConfig(visual_token_source_dim=3840, visual_token_target_dim=4096)
+    )
+    strategy.attach_models(
+        transformer=nn.Identity(),
+        embeddings_processor=_FakeEmbeddingsProcessor(4096),
+        text_encoder=None,
+    )
+
+    modules = strategy.get_trainable_modules()
+
+    assert "visual_token_projection" in modules
+    projection = modules["visual_token_projection"]
+    assert projection.weight.shape == (4096, 3840)
+    assert torch.allclose(projection.weight[:3840, :3840], torch.eye(3840, dtype=projection.weight.dtype))
+    assert torch.equal(projection.weight[3840:, :], torch.zeros_like(projection.weight[3840:, :]))
+
+
+def test_stage2_trainable_modules_include_visual_projection_and_planner_tokens() -> None:
+    strategy = MultiReferencePlannerStage2Strategy(
+        MultiReferencePlannerStage2Config(
+            use_online_vlm=False,
+            planner_token_count=4,
+            planner_source_dim=3840,
+            visual_token_source_dim=3840,
+            visual_token_target_dim=4096,
+        )
+    )
+    strategy.attach_models(
+        transformer=nn.Identity(),
+        embeddings_processor=_FakeEmbeddingsProcessor(4096),
+        text_encoder=None,
+    )
+
+    modules = strategy.get_trainable_modules()
+
+    assert "visual_token_projection" in modules
+    assert "planner_tokens" in modules
+
+
+def test_stage2_mse_uses_projected_gt_visual_tokens() -> None:
+    strategy = MultiReferencePlannerStage2Strategy(
+        MultiReferencePlannerStage2Config(
+            use_online_vlm=False,
+            planner_token_count=4,
+            planner_mse_weight=1.0,
+            visual_token_source_dim=3840,
+            visual_token_target_dim=4096,
+        )
+    )
+    strategy.attach_models(
+        transformer=nn.Identity(),
+        embeddings_processor=_FakeEmbeddingsProcessor(4096),
+        text_encoder=None,
+    )
+    conditions = _projection_conditions(batch_size=1, seq_len=2, dim=4096)
+    batch = {
+        "gt_visual_tokens": _projection_gt_tokens(batch_size=1, token_count=4, source_dim=3840),
+        "planner_conditions": {
+            "predicted_visual_tokens": torch.zeros(1, 4, 4096),
+            "predicted_visual_token_mask": torch.ones(1, 4, dtype=torch.bool),
+        },
+    }
+
+    out = strategy.prepare_conditions(batch, conditions)
+
+    assert out["video_prompt_embeds"].shape == (1, 6, 4096)
+    assert strategy._last_planner_mse_loss is not None
+    assert strategy._last_planner_mse_loss.shape == (1,)
+
+
+def test_visual_token_dim_mismatch_without_projection_raises_clear_error() -> None:
+    strategy = MultiReferenceVideoStrategy(MultiReferenceVideoConfig())
+    strategy.attach_models(
+        transformer=nn.Identity(),
+        embeddings_processor=_FakeEmbeddingsProcessor(4096),
+        text_encoder=None,
+    )
+    conditions = _projection_conditions(batch_size=1, seq_len=2, dim=4096)
+    batch = {"gt_visual_tokens": _projection_gt_tokens(batch_size=1, token_count=4, source_dim=3840)}
+
+    raised = False
+    try:
+        strategy.prepare_conditions(batch, conditions)
+    except ValueError as exc:
+        raised = True
+        assert "visual_token_source_dim" in str(exc)
+        assert "visual_token_target_dim" in str(exc)
+    assert raised

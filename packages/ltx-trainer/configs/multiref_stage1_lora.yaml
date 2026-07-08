@@ -73,6 +73,8 @@ training_strategy:
   visual_token_mask_key: "visual_token_mask"
   visual_tokens_per_frame_key: "tokens_per_frame"
   visual_token_frame_stride: 1
+  visual_token_source_dim: 3840
+  visual_token_target_dim: 4096
   cfg_dropout_enabled: true
   cfg_full_p: 0.7
   cfg_drop_text_p: 0.1

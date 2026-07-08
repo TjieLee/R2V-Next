@@ -7,6 +7,21 @@ pre-connector features: VLM context tokens + visual tokens
 post-connector DiT context: VLM context tokens + LTX thinking/register tokens + visual tokens
 ```
 
+## Visual Token Dimensional Projection
+
+Raw target-video `gt_siglip_tokens/visual_tokens` precomputed by the Gemma/SigLIP vision tower plus multi-modal projector are `3840`-dimensional. LTX-side `vlm_conditions/video_prompt_embeds` have already gone through `embeddings_processor.feature_extractor` and are `4096`-dimensional connector-input condition features. Stage 1 and Stage 2 therefore use a trainable strategy-owned `visual_token_projection` to map GT visual tokens from `3840 -> 4096`. You do not need to regenerate `gt_siglip_tokens/`, and no precomputed file format changes.
+
+The projection uses identity-pad initialization: the first `3840` dimensions initially copy the raw token and the extra `256` dimensions start at `0`. It is registered as a trainable strategy module, so it enters the optimizer and checkpoint save/load path. In Stage 2, VLM placeholder hidden states are still Gemma hidden-space `3840`, so `planner_source_dim: 3840`; the planner bridge output and DiT condition visual tokens are `4096`. The Stage 2 MSE teacher is the projected `4096`-dimensional GT visual token tensor: `MSE(predicted_tokens_4096, projected_gt_tokens_4096)`.
+
+Use these config fields:
+
+```yaml
+training_strategy:
+  visual_token_source_dim: 3840
+  visual_token_target_dim: 4096
+  planner_source_dim: 3840  # Stage 2 only
+```
+
 `VLM context tokens` are encoded from `system prompt -> user prompt -> reference images`. In Stage 1, target-video GT SigLIP/projector visual tokens are first appended after that context in the pre-connector feature sequence; the features then still pass through the native LTX `Embeddings1DConnector`, which injects/reuses the 128 learnable thinking/register tokens. Stage 2/3 append a Baton-style target planning region after the same source context: `<image_start> + <image_pad> * planner_token_count + <image_end>`. The VLM produces hidden states at the `<image_pad>` positions; the planner bridge uses repeated LTX thinking/register tokens as Q and those hidden states as K/V, then applies zero-init cross-attention + zero-init FFN to produce planner visual tokens, which are aligned to target-video GT SigLIP/projector visual tokens with MSE. `planner_token_count` must exactly match `num_visual_tokens` in `gt_siglip_tokens/*.pt`.
 
 ## Visual Sources That Must Not Be Confused
@@ -31,8 +46,8 @@ Hard requirements:
 ## Main Changes
 
 - `ltx_core.multicond.visual_tokens`: frozen SigLIP/projector token extraction, Gemma image-token scatter, and fixed-count `VisualPlannerTokens`.
-- `ltx_trainer.training_strategies.multi_reference_video`: Stage 1 can read `vlm_conditions/` through `conditions_dir`, then append `gt_siglip_tokens/visual_tokens` after the VLM context features before the LTX text connector.
-- `ltx_trainer.training_strategies.multi_reference_planner_stage2`: Stage 2 uses fixed `planner_token_count` `<image_pad>` target placeholders. Their VLM hidden states act as K/V, repeated LTX thinking/register tokens act as Q, and a zero-init cross-attention + zero-init FFN bridge produces visual planner tokens that replace GT visual tokens in the DiT condition sequence and align to GT visual tokens with MSE.
+- `ltx_trainer.training_strategies.multi_reference_video`: Stage 1 can read `vlm_conditions/` through `conditions_dir`, project raw `gt_siglip_tokens/visual_tokens` from `3840` to `4096`, then append them after the VLM context features before the LTX text connector.
+- `ltx_trainer.training_strategies.multi_reference_planner_stage2`: Stage 2 uses fixed `planner_token_count` `<image_pad>` target placeholders. Their `3840`-dimensional VLM hidden states act as K/V, repeated LTX thinking/register tokens act as Q, and a zero-init cross-attention + zero-init FFN bridge produces `4096`-dimensional visual planner tokens that replace GT visual tokens in the DiT condition sequence and align to projected `4096`-dimensional GT visual tokens with MSE.
 - `ltx_core.multicond.cfg_sampler` plus the multi-reference training strategies: per-sample CFG condition dropout with default `full/drop_text/drop_ref/drop_all = 0.7/0.1/0.1/0.1`; legacy `drop_planner` is only a compatibility alias for `drop_all/null`.
 - `scripts/precompute_gt_siglip_tokens.py`: builds `.precomputed/gt_siglip_tokens/` from sampled target-video frames.
 - `scripts/precompute_multiref_vlm_conditions.py`: builds Stage 1/2 `system prompt -> user prompt -> reference image tokens` VLM context conditions.
@@ -302,6 +317,7 @@ reference_images + system prompt + user prompt + <image_start> + <image_pad>*K +
 
 target video
   -> gt_siglip_tokens.visual_tokens
+  -> visual_token_projection 3840 -> 4096
   -> MSE teacher for predicted planner visual tokens
 ```
 
@@ -412,7 +428,7 @@ accelerate launch --num_processes 8 --num_machines 1 \
   scripts/train.py configs/multiref_stage2_planner.yaml
 ```
 
-Stage 2 feeds the cross-attention + FFN output from VLM `<image_pad>` hidden states and repeated LTX thinking/register queries to the DiT condition path. The MSE loss keeps those predicted tokens aligned with the exact target-video GT SigLIP/projector token count and feature space learned by Stage 1.
+Stage 2 feeds the cross-attention + FFN output from VLM `<image_pad>` hidden states and repeated LTX thinking/register queries to the DiT condition path. The MSE loss keeps those predicted tokens aligned with the exact target-video GT SigLIP/projector token count and the same `4096`-dimensional feature space learned by Stage 1; the teacher is the GT token tensor after `visual_token_projection`.
 
 ## Stage 3 Target
 
