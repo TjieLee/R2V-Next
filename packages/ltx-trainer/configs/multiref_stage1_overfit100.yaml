@@ -50,7 +50,7 @@ training_strategy:
 optimization:
   learning_rate: 1e-4
   steps: 5000
-  batch_size: 1
+  batch_size: 8
   gradient_accumulation_steps: 1
   max_grad_norm: 1.0
   optimizer_type: "adamw"
