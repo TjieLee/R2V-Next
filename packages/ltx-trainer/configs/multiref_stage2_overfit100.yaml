@@ -11,8 +11,8 @@ model:
   load_checkpoint: "/mnt/workspace/litengjie/ltx2_multiref_overfit_stage1_100/checkpoints"
 
 lora:
-  rank: 128
-  alpha: 128
+  rank: 32
+  alpha: 32
   dropout: 0.0
   target_modules:
     - "attn1.to_k"
@@ -23,6 +23,8 @@ lora:
     - "attn2.to_q"
     - "attn2.to_v"
     - "attn2.to_out.0"
+    - "ff.net.0.proj"
+    - "ff.net.2"
 
 training_strategy:
   name: "multi_reference_planner_stage2"
@@ -35,11 +37,11 @@ training_strategy:
   visual_token_frame_stride: 1
   visual_token_source_dim: 3840
   visual_token_target_dim: 4096
-  cfg_dropout_enabled: true
-  cfg_full_p: 0.85
+  cfg_dropout_enabled: false
+  cfg_full_p: 1.0
   cfg_drop_text_p: 0.0
   cfg_drop_ref_p: 0.0
-  cfg_drop_all_p: 0.15
+  cfg_drop_all_p: 0.0
   cfg_drop_planner_p: 0.0
   cfg_text_conditions_dir: "conditions"
   cfg_ref_only_conditions_dir: null
@@ -77,9 +79,9 @@ training_strategy:
   train_text_connector: true
 
 optimization:
-  learning_rate: 5e-5
-  steps: 5000
-  batch_size: 8
+  learning_rate: 1e-5
+  steps: 10000
+  batch_size: 4
   gradient_accumulation_steps: 1
   max_grad_norm: 1.0
   optimizer_type: "adamw"
