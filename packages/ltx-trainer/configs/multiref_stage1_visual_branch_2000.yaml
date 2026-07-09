@@ -11,8 +11,8 @@ model:
   load_checkpoint: null
 
 lora:
-  rank: 32
-  alpha: 32
+  rank: 128
+  alpha: 128
   dropout: 0.0
   target_modules:
     - "attn1.to_k"
@@ -65,8 +65,8 @@ training_strategy:
   first_frame_conditioning_p: 0.0
 
 optimization:
-  learning_rate: 1e-5
-  steps: 20000
+  learning_rate: 5e-5
+  steps: 10000
   batch_size: 4
   gradient_accumulation_steps: 1
   max_grad_norm: 1.0
