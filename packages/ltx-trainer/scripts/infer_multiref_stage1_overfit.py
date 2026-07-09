@@ -3,9 +3,10 @@
 
 This is not the final Stage 2 planner inference path. It uses precomputed
 target-video GT SigLIP visual tokens for the positive/full-condition branch.
-Optional inference-time CFG is supported: the positive branch uses full Stage 1
-teacher conditions, while the negative branch uses original LTX-2
-negative-prompt text conditioning without appended SigLIP tokens.
+Optional inference-time CFG/STG is supported: the positive branch uses full
+Stage 1 teacher conditions, the negative branch uses original LTX-2
+negative-prompt text conditioning without appended SigLIP tokens, and the STG
+branch perturbs the positive/full-condition transformer path.
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ import csv
 import json
 import shutil
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import torch
 import typer
@@ -28,6 +29,12 @@ from torch import Tensor
 
 from ltx_core.components.diffusion_steps import EulerDiffusionStep
 from ltx_core.components.schedulers import LTX2Scheduler
+from ltx_core.guidance.perturbations import (
+    BatchedPerturbationConfig,
+    Perturbation,
+    PerturbationConfig,
+    PerturbationType,
+)
 from ltx_core.model.transformer.modality import Modality
 from ltx_core.model.video_vae import SpatialTilingConfig, TemporalTilingConfig, TilingConfig
 from ltx_core.multicond.rope_mask_builder import build_multiref_sequence
@@ -81,6 +88,61 @@ def _velocity_to_denoised(latent: Tensor, velocity: Tensor, timesteps: Tensor) -
 
 def _combine_cfg_denoised(denoised_pos: Tensor, denoised_neg: Tensor, guidance_scale: float) -> Tensor:
     return denoised_pos + (guidance_scale - 1.0) * (denoised_pos - denoised_neg)
+
+
+def _stg_enabled(stg_scale: float) -> bool:
+    return stg_scale != 0.0
+
+
+def _parse_stg_blocks(value: str | None) -> list[int] | None:
+    if value is None:
+        return [29]
+    text = value.strip().lower()
+    if text in {"", "none", "all"}:
+        return None
+    blocks: list[int] = []
+    for part in text.split(","):
+        part = part.strip()
+        if part:
+            blocks.append(int(part))
+    return blocks or None
+
+
+def _build_stg_perturbation_config(stg_blocks: list[int] | None) -> BatchedPerturbationConfig:
+    return BatchedPerturbationConfig(
+        perturbations=[
+            PerturbationConfig(
+                perturbations=[
+                    Perturbation(
+                        type=PerturbationType.SKIP_VIDEO_SELF_ATTN,
+                        blocks=stg_blocks,
+                    )
+                ]
+            )
+        ]
+    )
+
+
+def _combine_cfg_stg_denoised(
+    *,
+    denoised_pos: Tensor,
+    denoised_neg: Tensor | None,
+    denoised_stg: Tensor | None,
+    guidance_scale: float,
+    stg_scale: float,
+) -> Tensor:
+    if _cfg_enabled(guidance_scale):
+        if denoised_neg is None:
+            raise ValueError("guidance_scale > 1.0 requires denoised_neg")
+        guided = denoised_neg + guidance_scale * (denoised_pos - denoised_neg)
+    else:
+        guided = denoised_pos
+
+    if _stg_enabled(stg_scale):
+        if denoised_stg is None:
+            raise ValueError("stg_scale != 0.0 requires denoised_stg")
+        guided = guided + stg_scale * (denoised_pos - denoised_stg)
+    return guided
 
 
 def _condition_shape(conditions: dict[str, Tensor | None] | None) -> list[int] | None:
@@ -486,6 +548,8 @@ def _denoise_stage1(
     negative_conditions: dict[str, Tensor | None] | None,
     guidance_scale: float,
     cfg_drop_ref_latents_in_negative: bool,
+    stg_scale: float,
+    stg_blocks: list[int] | None,
     num_inference_steps: int,
     seed: int,
     device: torch.device,
@@ -555,6 +619,7 @@ def _denoise_stage1(
     else:
         neg_context = None
         neg_context_mask = None
+    stg_perturbation_config = _build_stg_perturbation_config(stg_blocks) if _stg_enabled(stg_scale) else None
 
     transformer.eval()
     with torch.inference_mode():
@@ -590,7 +655,9 @@ def _denoise_stage1(
             velocity_pos, _ = transformer(video=video_pos, audio=None, perturbations=None)
             if velocity_pos is None:
                 raise RuntimeError("Transformer returned no video velocity during Stage 1 inference")
-            denoised_video = _velocity_to_denoised(video_pos.latent, velocity_pos, packed.timesteps)
+            denoised_pos = _velocity_to_denoised(video_pos.latent, velocity_pos, packed.timesteps)
+            denoised_neg = None
+            denoised_stg = None
 
             if _cfg_enabled(guidance_scale):
                 negative_ref_valid_mask = _negative_ref_valid_mask(
@@ -624,8 +691,20 @@ def _denoise_stage1(
                 if velocity_neg is None:
                     raise RuntimeError("Transformer returned no negative-branch video velocity during Stage 1 CFG")
                 denoised_neg = _velocity_to_denoised(video_neg.latent, velocity_neg, packed_neg.timesteps)
-                denoised_video = _combine_cfg_denoised(denoised_video, denoised_neg, guidance_scale)
 
+            if _stg_enabled(stg_scale):
+                velocity_stg, _ = transformer(video=video_pos, audio=None, perturbations=stg_perturbation_config)
+                if velocity_stg is None:
+                    raise RuntimeError("Transformer returned no STG-branch video velocity during Stage 1 STG")
+                denoised_stg = _velocity_to_denoised(video_pos.latent, velocity_stg, packed.timesteps)
+
+            denoised_video = _combine_cfg_stg_denoised(
+                denoised_pos=denoised_pos,
+                denoised_neg=denoised_neg,
+                denoised_stg=denoised_stg,
+                guidance_scale=guidance_scale,
+                stg_scale=stg_scale,
+            )
             next_packed = stepper.step(packed.latents, denoised_video, sigmas, step_idx)
             target_tokens = next_packed[:, -target_seq_len:, :]
 
@@ -741,6 +820,24 @@ def main(  # noqa: PLR0913
             "Default false keeps reference latents shared between positive and negative branches."
         ),
     ),
+    stg_scale: float = typer.Option(
+        0.0,
+        "--stg-scale",
+        help="STG scale. 0.0 disables STG. Final formula adds stg_scale * (x_prompt - x_stg).",
+    ),
+    stg_blocks: str | None = typer.Option(
+        "29",
+        "--stg-blocks",
+        help=(
+            "Comma-separated transformer block indices for STG video self-attention skipping. "
+            "Use empty string, none, or all to apply to all blocks if supported."
+        ),
+    ),
+    stg_mode: Literal["stg_v"] = typer.Option(
+        "stg_v",
+        "--stg-mode",
+        help="STG mode for this video-only Stage1 inference script. Only stg_v is supported.",
+    ),
 ) -> None:
     if sample_index < 0:
         raise typer.BadParameter("--sample-index must be >= 0")
@@ -748,8 +845,13 @@ def main(  # noqa: PLR0913
         raise typer.BadParameter("--num-inference-steps must be >= 1")
     if guidance_scale < 1.0:
         raise typer.BadParameter("--guidance-scale must be >= 1.0")
+    if stg_scale < 0.0:
+        raise typer.BadParameter("--stg-scale must be >= 0.0")
+    if stg_mode != "stg_v":
+        raise typer.BadParameter("--stg-mode currently only supports 'stg_v'")
     if cfg_negative_mode != "negative_prompt_no_siglip":
         raise typer.BadParameter("--cfg-negative-mode currently only supports 'negative_prompt_no_siglip'")
+    parsed_stg_blocks = _parse_stg_blocks(stg_blocks)
 
     cfg = _load_config(Path(config))
     checkpoint_path = Path(checkpoint)
@@ -836,6 +938,8 @@ def main(  # noqa: PLR0913
         negative_conditions=negative_conditions,
         guidance_scale=guidance_scale,
         cfg_drop_ref_latents_in_negative=cfg_drop_ref_latents_in_negative,
+        stg_scale=stg_scale,
+        stg_blocks=parsed_stg_blocks,
         num_inference_steps=num_inference_steps,
         seed=seed,
         device=torch_device,
@@ -871,10 +975,19 @@ def main(  # noqa: PLR0913
         "cfg_negative_mode": cfg_negative_mode,
         "cfg_drop_ref_latents_in_negative": cfg_drop_ref_latents_in_negative,
         "negative_condition_shape": _condition_shape(negative_conditions),
+        "stg_scale": stg_scale,
+        "stg_enabled": _stg_enabled(stg_scale),
+        "stg_blocks": parsed_stg_blocks,
+        "stg_mode": stg_mode,
+        "guidance_formula": "x_null + cfg * (x_prompt - x_null) + stg * (x_prompt - x_stg)",
         "condition_mode": (
             "stage1_teacher_gt_siglip_full_condition"
-            if not _cfg_enabled(guidance_scale)
+            if not _cfg_enabled(guidance_scale) and not _stg_enabled(stg_scale)
             else "stage1_teacher_cfg_full_vs_negative_prompt_no_siglip"
+            if _cfg_enabled(guidance_scale) and not _stg_enabled(stg_scale)
+            else "stage1_teacher_stg_full_condition"
+            if not _cfg_enabled(guidance_scale) and _stg_enabled(stg_scale)
+            else "stage1_teacher_cfg_stg_full_vs_negative_prompt_no_siglip"
         ),
         "connector_checkpoint_loaded": checkpoint_flags["connector_checkpoint_loaded"],
         "visual_token_projection_checkpoint_loaded": checkpoint_flags["visual_token_projection_checkpoint_loaded"],

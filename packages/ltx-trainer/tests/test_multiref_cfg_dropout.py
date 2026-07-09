@@ -689,9 +689,70 @@ def test_stage1_infer_cfg_combine_formula_matches_ltx_guidance() -> None:
     assert torch.equal(infer_multiref_stage1_overfit._combine_cfg_denoised(pos, neg, 2.0), 2 * pos - neg)
 
 
+def test_stage1_infer_cfg_stg_combine_formula_matches_expected_guidance() -> None:
+    pos = torch.tensor([[[2.0, 4.0]]])
+    neg = torch.tensor([[[1.0, 3.0]]])
+    stg = torch.tensor([[[0.5, 2.0]]])
+
+    actual = infer_multiref_stage1_overfit._combine_cfg_stg_denoised(
+        denoised_pos=pos,
+        denoised_neg=neg,
+        denoised_stg=stg,
+        guidance_scale=1.5,
+        stg_scale=0.4,
+    )
+    expected = neg + 1.5 * (pos - neg) + 0.4 * (pos - stg)
+
+    assert torch.allclose(actual, expected)
+
+
+def test_stage1_infer_cfg_stg_combine_handles_disabled_branches() -> None:
+    pos = torch.tensor([[[2.0, 4.0]]])
+    neg = torch.tensor([[[1.0, 3.0]]])
+    stg = torch.tensor([[[0.5, 2.0]]])
+
+    no_guidance = infer_multiref_stage1_overfit._combine_cfg_stg_denoised(
+        denoised_pos=pos,
+        denoised_neg=None,
+        denoised_stg=None,
+        guidance_scale=1.0,
+        stg_scale=0.0,
+    )
+    stg_only = infer_multiref_stage1_overfit._combine_cfg_stg_denoised(
+        denoised_pos=pos,
+        denoised_neg=None,
+        denoised_stg=stg,
+        guidance_scale=1.0,
+        stg_scale=0.5,
+    )
+    cfg_only = infer_multiref_stage1_overfit._combine_cfg_stg_denoised(
+        denoised_pos=pos,
+        denoised_neg=neg,
+        denoised_stg=None,
+        guidance_scale=1.5,
+        stg_scale=0.0,
+    )
+
+    assert torch.equal(no_guidance, pos)
+    assert torch.allclose(stg_only, pos + 0.5 * (pos - stg))
+    assert torch.allclose(cfg_only, neg + 1.5 * (pos - neg))
+
+
 def test_stage1_infer_cfg_enabled_only_when_guidance_scale_not_one() -> None:
     assert infer_multiref_stage1_overfit._cfg_enabled(1.0) is False
     assert infer_multiref_stage1_overfit._cfg_enabled(1.2) is True
+
+
+def test_stage1_infer_stg_helpers_parse_blocks_and_config() -> None:
+    assert infer_multiref_stage1_overfit._stg_enabled(0.0) is False
+    assert infer_multiref_stage1_overfit._stg_enabled(0.5) is True
+    assert infer_multiref_stage1_overfit._parse_stg_blocks(None) == [29]
+    assert infer_multiref_stage1_overfit._parse_stg_blocks("29, 30") == [29, 30]
+    assert infer_multiref_stage1_overfit._parse_stg_blocks("none") is None
+
+    cfg = infer_multiref_stage1_overfit._build_stg_perturbation_config([29])
+    assert len(cfg.perturbations) == 1
+    assert cfg.perturbations[0].perturbations[0].blocks == [29]
 
 
 def test_stage1_infer_negative_ref_valid_mask_can_keep_or_drop_references() -> None:
