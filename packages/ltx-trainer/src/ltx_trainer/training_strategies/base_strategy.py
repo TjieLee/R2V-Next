@@ -202,7 +202,7 @@ class TrainingStrategy(ABC):
         height: int,
         width: int,
         batch_size: int,
-        fps: float,
+        fps: float | Tensor,
         device: torch.device,
     ) -> Tensor:
         """Generate video position embeddings using ltx_core's native implementation.
@@ -234,8 +234,17 @@ class TrainingStrategy(ABC):
             causal_fix=True,
         ).float()
 
-        # Scale temporal dimension by 1/fps to get time in seconds
-        pixel_coords[:, 0, ...] = pixel_coords[:, 0, ...] / fps
+        # Scale temporal dimension by 1/fps to get time in seconds.
+        if isinstance(fps, Tensor):
+            fps_values = fps.to(device=device, dtype=pixel_coords.dtype).flatten()
+            if fps_values.numel() == 1 and batch_size > 1:
+                fps_values = fps_values.expand(batch_size)
+            if fps_values.numel() != batch_size:
+                raise ValueError(f"fps has {fps_values.numel()} values, expected {batch_size}")
+            fps_values = fps_values.clamp(min=1.0e-6)
+            pixel_coords[:, 0, ...] = pixel_coords[:, 0, ...] / fps_values.view(batch_size, 1, 1)
+        else:
+            pixel_coords[:, 0, ...] = pixel_coords[:, 0, ...] / max(float(fps), 1.0e-6)
 
         return pixel_coords
 

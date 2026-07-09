@@ -456,11 +456,10 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
         width = latents["width"][0].item()
 
         fps = latents.get("fps", None)
-        if fps is not None and not torch.all(fps == fps[0]):
-            logger.warning(
-                f"Different FPS values found in the batch. Found: {fps.tolist()}, using the first one: {fps[0].item()}"
-            )
-        fps = fps[0].item() if fps is not None else DEFAULT_FPS
+        if fps is None:
+            fps_for_positions: float | Tensor = float(DEFAULT_FPS)
+        else:
+            fps_for_positions = fps.to(device=target_latents.device, dtype=torch.float32).flatten()
 
         ref_data = batch["multi_ref_latents"]
         ref_latents = self._normalize_reference_latents(ref_data["latents"])
@@ -507,7 +506,7 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
             height=height,
             width=width,
             batch_size=batch_size,
-            fps=fps,
+            fps=fps_for_positions,
             device=device,
         )
 

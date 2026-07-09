@@ -505,6 +505,40 @@ def test_visual_3d_resampler_shape_and_mask() -> None:
     assert torch.isfinite(out).all()
 
 
+def test_video_positions_support_per_sample_fps_tensor() -> None:
+    strategy = MultiReferenceVideoStrategy(MultiReferenceVideoConfig(visual_branch_enabled=False))
+    fps = torch.tensor([24.0, 60.0])
+
+    mixed = strategy._get_video_positions(
+        num_frames=2,
+        height=2,
+        width=2,
+        batch_size=2,
+        fps=fps,
+        device=torch.device("cpu"),
+    )
+    scalar_24 = strategy._get_video_positions(
+        num_frames=2,
+        height=2,
+        width=2,
+        batch_size=2,
+        fps=24.0,
+        device=torch.device("cpu"),
+    )
+    scalar_60 = strategy._get_video_positions(
+        num_frames=2,
+        height=2,
+        width=2,
+        batch_size=2,
+        fps=60.0,
+        device=torch.device("cpu"),
+    )
+
+    assert torch.allclose(mixed[0, 0], scalar_24[0, 0])
+    assert torch.allclose(mixed[1, 0], scalar_60[1, 0])
+    assert not torch.allclose(mixed[0, 0], mixed[1, 0])
+
+
 def test_stage1_visual_position_builders_are_monotonic_and_in_range() -> None:
     strategy = MultiReferenceVideoStrategy(
         MultiReferenceVideoConfig(
