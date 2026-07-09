@@ -368,6 +368,12 @@ class _FakeEmbeddingsProcessor(nn.Module):
         self.video_connector = _FakeVideoConnector(dim, num_learnable_registers=num_learnable_registers)
 
 
+class _FakeDDP(nn.Module):
+    def __init__(self, module: nn.Module):
+        super().__init__()
+        self.module = module
+
+
 def _projection_conditions(batch_size: int = 2, seq_len: int = 3, dim: int = 4096) -> dict[str, torch.Tensor]:
     return {
         "video_prompt_embeds": torch.randn(batch_size, seq_len, dim),
@@ -442,6 +448,36 @@ def test_stage1_visual_tokens_append_after_connector_not_before() -> None:
     unique_values = set(post_connector["prompt_attention_mask"].unique().tolist())
     assert unique_values.issubset({0, 1})
     assert bool(post_connector["prompt_attention_mask"][:, -4:].bool().all())
+
+
+def test_stage1_visual_gate_allows_ddp_wrapped_module() -> None:
+    strategy = MultiReferenceVideoStrategy(
+        MultiReferenceVideoConfig(
+            visual_token_source_dim=64,
+            visual_token_target_dim=64,
+            visual_context_spatial_grid=2,
+            visual_context_max_tokens=16,
+            visual_resampler_num_heads=8,
+            visual_connector_enabled=False,
+        )
+    )
+    strategy.attach_models(
+        transformer=nn.Identity(),
+        embeddings_processor=_FakeEmbeddingsProcessor(64),
+        text_encoder=None,
+    )
+    assert strategy._visual_gate is not None
+    strategy._visual_gate = _FakeDDP(strategy._visual_gate)
+    conditions = _projection_conditions(batch_size=1, seq_len=3, dim=64)
+    batch = {
+        "gt_visual_tokens": _projection_gt_tokens(batch_size=1, token_count=4, source_dim=64),
+        "latents": {"height": torch.tensor([8]), "width": torch.tensor([8])},
+    }
+
+    pre_connector = strategy.prepare_conditions(batch, conditions)
+    post_connector = strategy.postprocess_conditions_after_connector(batch, pre_connector)
+
+    assert post_connector["video_prompt_embeds"].shape == (1, 7, 64)
 
 
 def test_visual_3d_resampler_shape_and_mask() -> None:

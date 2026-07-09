@@ -289,6 +289,9 @@ class ScalarParameterModule(nn.Module):
     def forward(self) -> Tensor:
         return self.value
 
+    def get_value(self) -> Tensor:
+        return self.value
+
 
 class MultiReferenceVideoStrategy(TrainingStrategy):
     """Video-only multi-reference strategy with target-only flow matching loss."""
@@ -306,6 +309,10 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
         self._visual_connector: nn.Module | None = None
         self._visual_gate: ScalarParameterModule | None = None
         self._last_visual_context_shape: list[int] | None = None
+
+    @staticmethod
+    def _unwrap_strategy_module(module: nn.Module) -> nn.Module:
+        return getattr(module, "module", module)
 
     def attach_models(
         self,
@@ -788,7 +795,8 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
         if self._visual_connector is not None:
             visual_context, visual_mask = self._run_visual_connector(visual_context, visual_mask)
         if self._visual_gate is not None:
-            gate = self._visual_gate.value.to(device=visual_context.device, dtype=visual_context.dtype)
+            gate_module = self._unwrap_strategy_module(self._visual_gate)
+            gate = gate_module.get_value().to(device=visual_context.device, dtype=visual_context.dtype)
             visual_context = visual_context * gate
 
         shape = list(visual_context.shape)
