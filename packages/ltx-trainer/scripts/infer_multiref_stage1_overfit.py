@@ -2,15 +2,10 @@
 """Stage 1 multi-reference teacher-forcing inference for overfit samples.
 
 This is not the final Stage 2 planner inference path. It uses precomputed
-target-video GT SigLIP visual tokens as teacher visual conditions, so it can
-check whether a Stage 1 checkpoint learned to consume:
-
-- vlm_conditions
-- gt_siglip_tokens
-- multi_reference_latents
-
-CFG, negative prompts, ValidationRunner and online Gemma/VLM are intentionally
-not used here.
+target-video GT SigLIP visual tokens for the positive/full-condition branch.
+Optional inference-time CFG is supported: the positive branch uses full Stage 1
+teacher conditions, while the negative branch uses original LTX-2
+negative-prompt text conditioning without appended SigLIP tokens.
 """
 
 from __future__ import annotations
@@ -40,7 +35,7 @@ from ltx_core.text_encoders.gemma import convert_to_additive_mask
 from ltx_core.types import VideoLatentShape
 from ltx_trainer.config import LtxTrainerConfig
 from ltx_trainer.datasets import PrecomputedDataset
-from ltx_trainer.model_loader import load_embeddings_processor, load_transformer, load_video_vae_decoder
+from ltx_trainer.model_loader import load_embeddings_processor, load_text_encoder, load_transformer, load_video_vae_decoder
 from ltx_trainer.training_strategies import get_training_strategy
 from ltx_trainer.training_strategies.multi_reference_video import MultiReferenceVideoStrategy
 from ltx_trainer.utils import open_image_as_srgb
@@ -82,6 +77,26 @@ def _velocity_to_denoised(latent: Tensor, velocity: Tensor, timesteps: Tensor) -
         )
     denoise_timesteps = timesteps.unsqueeze(-1).to(device=latent.device, dtype=torch.float32)
     return (latent.to(torch.float32) - velocity.to(torch.float32) * denoise_timesteps).to(latent.dtype)
+
+
+def _combine_cfg_denoised(denoised_pos: Tensor, denoised_neg: Tensor, guidance_scale: float) -> Tensor:
+    return denoised_pos + (guidance_scale - 1.0) * (denoised_pos - denoised_neg)
+
+
+def _condition_shape(conditions: dict[str, Tensor | None] | None) -> list[int] | None:
+    if conditions is None:
+        return None
+    context_key = _condition_feature_key(conditions)
+    context = conditions[context_key]
+    return _shape(context) if isinstance(context, Tensor) else None
+
+
+def _cfg_enabled(guidance_scale: float) -> bool:
+    return guidance_scale != 1.0
+
+
+def _negative_ref_valid_mask(ref_valid_mask: Tensor, *, drop_ref_latents: bool) -> Tensor:
+    return torch.zeros_like(ref_valid_mask) if drop_ref_latents else ref_valid_mask
 
 
 def _read_manifest_file(path: Path) -> list[dict[str, Any]]:
@@ -224,7 +239,11 @@ def _load_config(config_path: Path) -> LtxTrainerConfig:
             f"got {cfg.training_strategy.name!r}."
         )
     if cfg.training_strategy.cfg_dropout_enabled:
-        console.print("[yellow]Stage1 teacher inference runs without CFG; overriding cfg_dropout_enabled=false.[/yellow]")
+        console.print(
+            "[yellow]Stage1 teacher inference does not use training-time CFG dropout; "
+            "overriding training_strategy.cfg_dropout_enabled=false. "
+            "Inference-time CFG is controlled by --guidance-scale.[/yellow]"
+        )
         cfg.training_strategy.cfg_dropout_enabled = False
     return cfg
 
@@ -425,12 +444,48 @@ def _prepare_condition_context(
     return conditions, shapes
 
 
+def _encode_negative_prompt_condition(
+    *,
+    cfg: LtxTrainerConfig,
+    embeddings_processor: torch.nn.Module,
+    negative_prompt: str,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> dict[str, Tensor | None]:
+    if cfg.model.text_encoder_path is None:
+        raise ValueError("--guidance-scale > 1.0 requires model.text_encoder_path to encode the negative prompt.")
+    text_encoder = load_text_encoder(
+        gemma_model_path=cfg.model.text_encoder_path,
+        device=device,
+        dtype=dtype,
+        load_in_8bit=cfg.acceleration.load_text_encoder_in_8bit,
+    )
+    text_encoder.eval()
+    with torch.inference_mode():
+        neg_hs, neg_mask = text_encoder.encode([negative_prompt])[0]
+        neg_out = embeddings_processor.process_hidden_states(neg_hs, neg_mask)
+    conditions: dict[str, Tensor | None] = {
+        "video_prompt_embeds": neg_out.video_encoding.to(device=device, dtype=dtype),
+        "audio_prompt_embeds": (
+            neg_out.audio_encoding.to(device=device, dtype=dtype) if neg_out.audio_encoding is not None else None
+        ),
+        "prompt_attention_mask": None,
+    }
+    del text_encoder
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return conditions
+
+
 def _denoise_stage1(
     *,
     transformer: torch.nn.Module,
     strategy: MultiReferenceVideoStrategy,
     batch: dict[str, Any],
-    conditions: dict[str, Tensor],
+    positive_conditions: dict[str, Tensor],
+    negative_conditions: dict[str, Tensor | None] | None,
+    guidance_scale: float,
+    cfg_drop_ref_latents_in_negative: bool,
     num_inference_steps: int,
     seed: int,
     device: torch.device,
@@ -488,9 +543,18 @@ def _denoise_stage1(
 
     sigmas = LTX2Scheduler().execute(steps=num_inference_steps).to(device=device).float()
     stepper = EulerDiffusionStep()
-    context_key = _condition_feature_key(conditions)
-    context = conditions[context_key]
-    context_mask = conditions["prompt_attention_mask"]
+    pos_context_key = _condition_feature_key(positive_conditions)
+    pos_context = positive_conditions[pos_context_key]
+    pos_context_mask = positive_conditions.get("prompt_attention_mask")
+    if _cfg_enabled(guidance_scale):
+        if negative_conditions is None:
+            raise ValueError("guidance_scale > 1.0 requires negative_conditions")
+        neg_context_key = _condition_feature_key(negative_conditions)
+        neg_context = negative_conditions[neg_context_key]
+        neg_context_mask = negative_conditions.get("prompt_attention_mask")
+    else:
+        neg_context = None
+        neg_context_mask = None
 
     transformer.eval()
     with torch.inference_mode():
@@ -513,21 +577,56 @@ def _denoise_stage1(
                 target_loss_mask=target_loss_mask,
                 reference_time_stride=strategy.config.reference_time_stride,
             )
-            video = Modality(
+            video_pos = Modality(
                 enabled=True,
                 latent=packed.latents,
                 sigma=sigma_batch,
                 timesteps=packed.timesteps,
                 positions=packed.positions,
-                context=context,
-                context_mask=context_mask,
+                context=pos_context,
+                context_mask=pos_context_mask,
                 attention_mask=packed.attention_mask,
             )
-            velocity_video, _ = transformer(video=video, audio=None, perturbations=None)
-            if velocity_video is None:
+            velocity_pos, _ = transformer(video=video_pos, audio=None, perturbations=None)
+            if velocity_pos is None:
                 raise RuntimeError("Transformer returned no video velocity during Stage 1 inference")
-            denoised_video = _velocity_to_denoised(video.latent, velocity_video, packed.timesteps)
-            next_packed = stepper.step(video.latent, denoised_video, sigmas, step_idx)
+            denoised_video = _velocity_to_denoised(video_pos.latent, velocity_pos, packed.timesteps)
+
+            if _cfg_enabled(guidance_scale):
+                negative_ref_valid_mask = _negative_ref_valid_mask(
+                    ref_valid_mask,
+                    drop_ref_latents=cfg_drop_ref_latents_in_negative,
+                )
+                if cfg_drop_ref_latents_in_negative:
+                    packed_neg = build_multiref_sequence(
+                        ref_tokens=ref_tokens,
+                        ref_positions=ref_positions,
+                        ref_valid_mask=negative_ref_valid_mask,
+                        target_tokens=target_tokens,
+                        target_positions=target_positions,
+                        target_timesteps=target_timesteps,
+                        target_loss_mask=target_loss_mask,
+                        reference_time_stride=strategy.config.reference_time_stride,
+                    )
+                else:
+                    packed_neg = packed
+                video_neg = Modality(
+                    enabled=True,
+                    latent=packed_neg.latents,
+                    sigma=sigma_batch,
+                    timesteps=packed_neg.timesteps,
+                    positions=packed_neg.positions,
+                    context=neg_context,
+                    context_mask=neg_context_mask,
+                    attention_mask=packed_neg.attention_mask,
+                )
+                velocity_neg, _ = transformer(video=video_neg, audio=None, perturbations=None)
+                if velocity_neg is None:
+                    raise RuntimeError("Transformer returned no negative-branch video velocity during Stage 1 CFG")
+                denoised_neg = _velocity_to_denoised(video_neg.latent, velocity_neg, packed_neg.timesteps)
+                denoised_video = _combine_cfg_denoised(denoised_video, denoised_neg, guidance_scale)
+
+            next_packed = stepper.step(packed.latents, denoised_video, sigmas, step_idx)
             target_tokens = next_packed[:, -target_seq_len:, :]
 
     return strategy._video_patchifier.unpatchify(
@@ -564,7 +663,6 @@ def _load_models_and_strategy(
 ) -> tuple[torch.nn.Module, torch.nn.Module, torch.nn.Module, MultiReferenceVideoStrategy, dict[str, bool]]:
     transformer = load_transformer(cfg.model.model_path, device=device, dtype=dtype)
     embeddings_processor = load_embeddings_processor(cfg.model.model_path, device=device, dtype=dtype)
-    embeddings_processor.feature_extractor = None
     embeddings_processor.requires_grad_(False)
 
     strategy = get_training_strategy(cfg.training_strategy)
@@ -620,11 +718,38 @@ def main(  # noqa: PLR0913
     root_dir: str | None = typer.Option(None, help="Root for relative manifest media paths. Defaults to manifest parent."),
     fps: float | None = typer.Option(None, help="Override output fps. Defaults to latent metadata fps."),
     decode_tile: bool = typer.Option(True, "--decode-tile/--no-decode-tile", help="Use tiled VAE decode."),
+    guidance_scale: float = typer.Option(
+        1.0,
+        "--guidance-scale",
+        help="CFG guidance scale. 1.0 disables CFG. Recommended 1.2-2.0 for Stage1 checkpoints trained without CFG.",
+    ),
+    negative_prompt: str | None = typer.Option(
+        None,
+        "--negative-prompt",
+        help="Negative prompt for CFG. Defaults to config.validation.negative_prompt.",
+    ),
+    cfg_negative_mode: str = typer.Option(
+        "negative_prompt_no_siglip",
+        "--cfg-negative-mode",
+        help="CFG negative branch mode. Currently supports 'negative_prompt_no_siglip'.",
+    ),
+    cfg_drop_ref_latents_in_negative: bool = typer.Option(
+        False,
+        "--cfg-drop-ref-latents-in-negative/--cfg-keep-ref-latents-in-negative",
+        help=(
+            "If true, negative branch masks reference latent tokens as well. "
+            "Default false keeps reference latents shared between positive and negative branches."
+        ),
+    ),
 ) -> None:
     if sample_index < 0:
         raise typer.BadParameter("--sample-index must be >= 0")
     if num_inference_steps < 1:
         raise typer.BadParameter("--num-inference-steps must be >= 1")
+    if guidance_scale < 1.0:
+        raise typer.BadParameter("--guidance-scale must be >= 1.0")
+    if cfg_negative_mode != "negative_prompt_no_siglip":
+        raise typer.BadParameter("--cfg-negative-mode currently only supports 'negative_prompt_no_siglip'")
 
     cfg = _load_config(Path(config))
     checkpoint_path = Path(checkpoint)
@@ -685,11 +810,32 @@ def main(  # noqa: PLR0913
     console.print(f"pre-connector final condition shape: {condition_shapes['pre_connector_condition_shape']}")
     console.print(f"post-connector transformer condition shape: {condition_shapes['post_connector_condition_shape']}")
 
+    effective_negative_prompt = negative_prompt or cfg.validation.negative_prompt
+    if _cfg_enabled(guidance_scale):
+        negative_conditions = _encode_negative_prompt_condition(
+            cfg=cfg,
+            embeddings_processor=embeddings_processor,
+            negative_prompt=effective_negative_prompt,
+            device=torch_device,
+            dtype=dtype,
+        )
+        console.print(f"negative condition shape: {_condition_shape(negative_conditions)}")
+    else:
+        negative_conditions = None
+        effective_negative_prompt = None
+
+    embeddings_processor.feature_extractor = None
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     generated_latents = _denoise_stage1(
         transformer=transformer,
         strategy=strategy,
         batch=batch,
-        conditions=conditions,
+        positive_conditions=conditions,
+        negative_conditions=negative_conditions,
+        guidance_scale=guidance_scale,
+        cfg_drop_ref_latents_in_negative=cfg_drop_ref_latents_in_negative,
         num_inference_steps=num_inference_steps,
         seed=seed,
         device=torch_device,
@@ -719,8 +865,17 @@ def main(  # noqa: PLR0913
         "precomputed_relative_path": str(rel_path),
         "seed": seed,
         "num_inference_steps": num_inference_steps,
-        "guidance_scale": 1.0,
-        "condition_mode": "stage1_teacher_gt_siglip_pre_connector",
+        "guidance_scale": guidance_scale,
+        "cfg_enabled": _cfg_enabled(guidance_scale),
+        "negative_prompt": effective_negative_prompt if _cfg_enabled(guidance_scale) else None,
+        "cfg_negative_mode": cfg_negative_mode,
+        "cfg_drop_ref_latents_in_negative": cfg_drop_ref_latents_in_negative,
+        "negative_condition_shape": _condition_shape(negative_conditions),
+        "condition_mode": (
+            "stage1_teacher_gt_siglip_full_condition"
+            if not _cfg_enabled(guidance_scale)
+            else "stage1_teacher_cfg_full_vs_negative_prompt_no_siglip"
+        ),
         "connector_checkpoint_loaded": checkpoint_flags["connector_checkpoint_loaded"],
         "visual_token_projection_checkpoint_loaded": checkpoint_flags["visual_token_projection_checkpoint_loaded"],
         "original_feature_shape": condition_shapes["original_feature_shape"],

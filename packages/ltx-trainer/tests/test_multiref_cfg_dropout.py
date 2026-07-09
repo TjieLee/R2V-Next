@@ -679,3 +679,26 @@ def test_stage2_offline_predicted_tokens_reject_projected_4096_dim() -> None:
         assert "raw SigLIP-space tokens" in str(exc)
         assert "got dim=4096" in str(exc)
     assert raised
+
+
+def test_stage1_infer_cfg_combine_formula_matches_ltx_guidance() -> None:
+    pos = torch.tensor([[[2.0, 4.0]]])
+    neg = torch.tensor([[[1.0, 3.0]]])
+
+    assert torch.equal(infer_multiref_stage1_overfit._combine_cfg_denoised(pos, neg, 1.0), pos)
+    assert torch.equal(infer_multiref_stage1_overfit._combine_cfg_denoised(pos, neg, 2.0), 2 * pos - neg)
+
+
+def test_stage1_infer_cfg_enabled_only_when_guidance_scale_not_one() -> None:
+    assert infer_multiref_stage1_overfit._cfg_enabled(1.0) is False
+    assert infer_multiref_stage1_overfit._cfg_enabled(1.2) is True
+
+
+def test_stage1_infer_negative_ref_valid_mask_can_keep_or_drop_references() -> None:
+    ref_mask = torch.tensor([[True, False, True]])
+
+    kept = infer_multiref_stage1_overfit._negative_ref_valid_mask(ref_mask, drop_ref_latents=False)
+    dropped = infer_multiref_stage1_overfit._negative_ref_valid_mask(ref_mask, drop_ref_latents=True)
+
+    assert torch.equal(kept, ref_mask)
+    assert torch.equal(dropped, torch.zeros_like(ref_mask))
