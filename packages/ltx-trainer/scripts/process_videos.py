@@ -18,6 +18,7 @@ import os
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+from tqdm import tqdm
 
 import numpy as np
 import pandas as pd
@@ -225,7 +226,7 @@ class MediaDataset(Dataset):
         valid_main_media_paths = []
         min_frames_required = min(self.resolution_buckets, key=lambda x: x[0])[0]
 
-        for i, video_path in enumerate(self.video_paths):
+        for i, video_path in enumerate(tqdm(self.video_paths, desc="Checking videos")):
             if video_path.suffix.lower() in [".png", ".jpg", ".jpeg"]:
                 valid_video_paths.append(video_path)
                 valid_main_media_paths.append(self.main_media_paths[i])
