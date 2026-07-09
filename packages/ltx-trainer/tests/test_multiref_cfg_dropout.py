@@ -352,20 +352,20 @@ def test_stage2_config_parses_planner_slot_init_fields_and_defaults() -> None:
 
 
 class _FakeVideoConnector(nn.Module):
-    def __init__(self, dim: int = 4096):
+    def __init__(self, dim: int = 4096, num_learnable_registers: int = 1):
         super().__init__()
         self.inner_dim = dim
-        self.num_learnable_registers = 1
-        self.learnable_registers = nn.Parameter(torch.zeros(1, dim))
+        self.num_learnable_registers = num_learnable_registers
+        self.learnable_registers = nn.Parameter(torch.zeros(num_learnable_registers, dim))
 
     def forward(self, hidden_states: torch.Tensor, additive_attention_mask: torch.Tensor):
         return hidden_states, additive_attention_mask
 
 
 class _FakeEmbeddingsProcessor(nn.Module):
-    def __init__(self, dim: int = 4096):
+    def __init__(self, dim: int = 4096, num_learnable_registers: int = 1):
         super().__init__()
-        self.video_connector = _FakeVideoConnector(dim)
+        self.video_connector = _FakeVideoConnector(dim, num_learnable_registers=num_learnable_registers)
 
 
 def _projection_conditions(batch_size: int = 2, seq_len: int = 3, dim: int = 4096) -> dict[str, torch.Tensor]:
@@ -389,6 +389,24 @@ def _projection_gt_tokens(
         "sampled_frame_indices": torch.arange(frame_count).repeat(batch_size, 1),
         "source_fps": torch.ones(batch_size),
     }
+
+
+def test_stage1_prepare_conditions_pads_text_to_connector_multiple() -> None:
+    strategy = MultiReferenceVideoStrategy(MultiReferenceVideoConfig(visual_branch_enabled=False))
+    strategy.attach_models(
+        transformer=nn.Identity(),
+        embeddings_processor=_FakeEmbeddingsProcessor(64, num_learnable_registers=8),
+        text_encoder=None,
+    )
+    conditions = _projection_conditions(batch_size=2, seq_len=5, dim=64)
+
+    pre = strategy.prepare_conditions({}, conditions)
+
+    assert pre["video_prompt_embeds"].shape == (2, 8, 64)
+    assert pre["prompt_attention_mask"].shape == (2, 8)
+    assert bool(pre["prompt_attention_mask"][:, :5].all())
+    assert not bool(pre["prompt_attention_mask"][:, 5:].any())
+    assert torch.equal(pre["video_prompt_embeds"][:, 5:], torch.zeros_like(pre["video_prompt_embeds"][:, 5:]))
 
 
 def test_stage1_visual_tokens_append_after_connector_not_before() -> None:

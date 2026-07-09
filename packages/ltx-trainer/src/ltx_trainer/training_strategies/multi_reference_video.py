@@ -418,7 +418,8 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
                 logger.warning(f"{name} not found in checkpoint; using initialized Stage 1 visual-branch weights.")
 
     def prepare_conditions(self, batch: dict[str, Any], conditions: dict[str, Tensor]) -> dict[str, Tensor]:
-        return self._apply_cfg_preconnector_context_switch(batch, conditions)
+        conditions = self._apply_cfg_preconnector_context_switch(batch, conditions)
+        return self._pad_conditions_to_connector_multiple(conditions)
 
     def postprocess_conditions_after_connector(
         self,

@@ -511,11 +511,19 @@ def _prepare_condition_context(
             f"Final pre-connector condition dim {conditions[pre_connector_key].shape[-1]} does not match "
             f"config target dim {target_dim}"
         )
-    if conditions[pre_connector_key].shape[1] != original_shape[1]:
+    if conditions[pre_connector_key].shape[1] < original_shape[1]:
         raise ValueError(
-            "Stage1 visual branch expects prepare_conditions() to leave text/VLM sequence length unchanged before "
+            "Stage1 visual branch expects prepare_conditions() not to shrink text/VLM sequence length before "
             f"the connector: original {original_shape}, final {pre_connector_shape}"
         )
+    added = conditions[pre_connector_key].shape[1] - original_shape[1]
+    if added > 0:
+        mask = conditions["prompt_attention_mask"]
+        if bool(mask[:, original_shape[1] :].any()):
+            raise ValueError(
+                "Pre-connector added tokens must be padding-only. "
+                "SigLIP/visual tokens must not be appended before the text connector."
+            )
 
     video_features = conditions[pre_connector_key]
     audio_features = conditions.get("audio_prompt_embeds")
