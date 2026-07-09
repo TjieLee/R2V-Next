@@ -437,7 +437,11 @@ def test_stage1_visual_tokens_append_after_connector_not_before() -> None:
     assert pre_connector["video_prompt_embeds"].shape == (2, 3, 64)
     assert post_connector["video_prompt_embeds"].shape == (2, 7, 64)
     assert post_connector["prompt_attention_mask"].shape == (2, 7)
-    assert bool(post_connector["prompt_attention_mask"][:, -4:].all())
+    assert post_connector["prompt_attention_mask"].dtype in (torch.long, torch.int64, torch.int32)
+    assert post_connector["prompt_attention_mask"].dtype != torch.bool
+    unique_values = set(post_connector["prompt_attention_mask"].unique().tolist())
+    assert unique_values.issubset({0, 1})
+    assert bool(post_connector["prompt_attention_mask"][:, -4:].bool().all())
 
 
 def test_visual_3d_resampler_shape_and_mask() -> None:
@@ -701,7 +705,11 @@ def test_stage1_infer_batch_construction_and_postconnector_visual_shape() -> Non
     assert pre_connector["video_prompt_embeds"].shape == (1, 2, 6)
     assert out["video_prompt_embeds"].shape == (1, 6, 6)
     assert out["prompt_attention_mask"].shape == (1, 6)
-    assert bool(out["prompt_attention_mask"][:, -4:].all())
+    assert out["prompt_attention_mask"].dtype in (torch.long, torch.int64, torch.int32)
+    assert out["prompt_attention_mask"].dtype != torch.bool
+    unique_values = set(out["prompt_attention_mask"].unique().tolist())
+    assert unique_values.issubset({0, 1})
+    assert bool(out["prompt_attention_mask"][:, -4:].bool().all())
 
 
 def test_stage1_infer_velocity_to_denoised_uses_per_token_timestep_broadcast() -> None:

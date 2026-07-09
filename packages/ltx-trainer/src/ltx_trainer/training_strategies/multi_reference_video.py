@@ -868,8 +868,9 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
             )
             out["audio_prompt_embeds"] = torch.cat([audio_context, audio_pad], dim=1)
 
-        prompt_mask = out["prompt_attention_mask"].to(device=visual_mask.device, dtype=torch.bool)
-        out["prompt_attention_mask"] = torch.cat([prompt_mask, visual_mask.to(dtype=torch.bool)], dim=1)
+        prompt_mask = out["prompt_attention_mask"].to(device=visual_mask.device, dtype=torch.long)
+        visual_mask = visual_mask.to(device=prompt_mask.device, dtype=torch.long)
+        out["prompt_attention_mask"] = torch.cat([prompt_mask, visual_mask], dim=1)
         return out
 
     def _build_visual_token_positions(
