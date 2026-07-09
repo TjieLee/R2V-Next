@@ -511,11 +511,10 @@ def _prepare_condition_context(
             f"Final pre-connector condition dim {conditions[pre_connector_key].shape[-1]} does not match "
             f"config target dim {target_dim}"
         )
-    appended_tokens = conditions[pre_connector_key].shape[1] - original_shape[1]
-    if appended_tokens < raw_visual.shape[1]:
+    if conditions[pre_connector_key].shape[1] != original_shape[1]:
         raise ValueError(
-            "Final condition sequence did not append the expected GT visual tokens: "
-            f"original {original_shape}, raw GT {raw_visual_shape}, final {pre_connector_shape}"
+            "Stage1 visual branch expects prepare_conditions() to leave text/VLM sequence length unchanged before "
+            f"the connector: original {original_shape}, final {pre_connector_shape}"
         )
 
     video_features = conditions[pre_connector_key]
@@ -531,14 +530,22 @@ def _prepare_condition_context(
         conditions["audio_prompt_embeds"] = audio_embeds
     conditions["prompt_attention_mask"] = attention_mask
 
+    text_context_shape = _shape(video_embeds)
+    batch["conditions"] = conditions
+    conditions = strategy.postprocess_conditions_after_connector(batch, conditions)
+    visual_context_shape = batch.get("_visual_context_shape")
+
     shapes = {
         "original_condition_shape": original_shape,
         "original_feature_shape": original_shape,
         "raw_gt_visual_shape": raw_visual_shape,
         "projected_visual_shape": projected_visual_shape,
         "pre_connector_condition_shape": pre_connector_shape,
-        "post_connector_condition_shape": _shape(video_embeds),
-        "transformer_condition_shape": _shape(video_embeds),
+        "post_connector_text_condition_shape": text_context_shape,
+        "visual_context_shape": visual_context_shape,
+        "visual_context_token_count": batch.get("_visual_context_token_count"),
+        "post_connector_condition_shape": _shape(conditions["video_prompt_embeds"]),
+        "transformer_condition_shape": _shape(conditions["video_prompt_embeds"]),
     }
     return conditions, shapes
 
@@ -997,6 +1004,9 @@ def main(  # noqa: PLR0913
             "post_connector_condition_shape": text_condition_shape,
             "transformer_condition_shape": text_condition_shape,
             "text_only_prompt_condition_shape": text_condition_shape,
+            "post_connector_text_condition_shape": text_condition_shape,
+            "visual_context_shape": None,
+            "visual_context_token_count": 0,
         }
 
     console.print(f"positive condition mode: {condition_mode}")
@@ -1004,6 +1014,8 @@ def main(  # noqa: PLR0913
     console.print(f"raw GT visual token shape: {condition_shapes.get('raw_gt_visual_shape')}")
     console.print(f"projected visual token shape: {condition_shapes.get('projected_visual_shape')}")
     console.print(f"pre-connector final condition shape: {condition_shapes.get('pre_connector_condition_shape')}")
+    console.print(f"post-connector text condition shape: {condition_shapes.get('post_connector_text_condition_shape')}")
+    console.print(f"visual context shape: {condition_shapes.get('visual_context_shape')}")
     console.print(f"post-connector transformer condition shape: {condition_shapes.get('post_connector_condition_shape')}")
 
     effective_negative_prompt = negative_prompt or cfg.validation.negative_prompt
@@ -1085,6 +1097,14 @@ def main(  # noqa: PLR0913
         "uses_text_only_prompt_condition": condition_mode == "text_only_no_siglip",
         "keeps_reference_latent_condition": True,
         "text_only_prompt_condition_shape": condition_shapes.get("text_only_prompt_condition_shape"),
+        "visual_branch_enabled": bool(getattr(strategy.config, "visual_branch_enabled", False)) and condition_mode == "full_siglip",
+        "visual_context_shape": condition_shapes.get("visual_context_shape"),
+        "visual_context_token_count": condition_shapes.get("visual_context_token_count"),
+        "visual_gate": (
+            float(strategy._visual_gate.value.detach().float().cpu().item())
+            if getattr(strategy, "_visual_gate", None) is not None
+            else None
+        ),
         "connector_checkpoint_loaded": checkpoint_flags["connector_checkpoint_loaded"],
         "visual_token_projection_checkpoint_loaded": checkpoint_flags["visual_token_projection_checkpoint_loaded"],
         "original_feature_shape": condition_shapes["original_feature_shape"],

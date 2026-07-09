@@ -5,7 +5,7 @@ import torch
 from torch import nn
 
 from ltx_core.multicond.cfg_sampler import CFGModeBatch, sample_cfg_modes
-from ltx_core.multicond.visual_tokens import VisualPlannerTokens
+from ltx_core.multicond.visual_tokens import Visual3DResampler, VisualPlannerTokens
 from ltx_core.text_encoders.gemma.config import GEMMA3_CONFIG_FOR_LTX
 from ltx_trainer.training_strategies.multi_reference_planner_stage2 import (
     MultiReferencePlannerStage2Config,
@@ -331,6 +331,9 @@ class _FakeVideoConnector(nn.Module):
         self.num_learnable_registers = 1
         self.learnable_registers = nn.Parameter(torch.zeros(1, dim))
 
+    def forward(self, hidden_states: torch.Tensor, additive_attention_mask: torch.Tensor):
+        return hidden_states, additive_attention_mask
+
 
 class _FakeEmbeddingsProcessor(nn.Module):
     def __init__(self, dim: int = 4096):
@@ -345,35 +348,121 @@ def _projection_conditions(batch_size: int = 2, seq_len: int = 3, dim: int = 409
     }
 
 
-def _projection_gt_tokens(batch_size: int = 2, token_count: int = 4, source_dim: int = 3840) -> dict[str, torch.Tensor]:
+def _projection_gt_tokens(
+    batch_size: int = 2,
+    token_count: int = 4,
+    source_dim: int = 3840,
+    tokens_per_frame: int = 4,
+) -> dict[str, torch.Tensor]:
+    frame_count = token_count // tokens_per_frame
     return {
         "visual_tokens": torch.randn(batch_size, token_count, source_dim),
         "visual_token_mask": torch.ones(batch_size, token_count, dtype=torch.bool),
+        "tokens_per_frame": torch.tensor(tokens_per_frame),
+        "sampled_frame_indices": torch.arange(frame_count).repeat(batch_size, 1),
+        "source_fps": torch.ones(batch_size),
     }
 
 
-def test_stage1_projects_gt_visual_tokens_before_append() -> None:
+def test_stage1_visual_tokens_append_after_connector_not_before() -> None:
     strategy = MultiReferenceVideoStrategy(
-        MultiReferenceVideoConfig(visual_token_source_dim=3840, visual_token_target_dim=4096)
+        MultiReferenceVideoConfig(
+            visual_token_source_dim=64,
+            visual_token_target_dim=64,
+            visual_context_spatial_grid=2,
+            visual_context_max_tokens=16,
+            visual_resampler_num_heads=8,
+            visual_connector_enabled=False,
+        )
     )
     strategy.attach_models(
         transformer=nn.Identity(),
-        embeddings_processor=_FakeEmbeddingsProcessor(4096),
+        embeddings_processor=_FakeEmbeddingsProcessor(64),
         text_encoder=None,
     )
-    conditions = _projection_conditions(batch_size=2, seq_len=3, dim=4096)
-    batch = {"gt_visual_tokens": _projection_gt_tokens(batch_size=2, token_count=4, source_dim=3840)}
+    conditions = _projection_conditions(batch_size=2, seq_len=3, dim=64)
+    batch = {
+        "gt_visual_tokens": _projection_gt_tokens(batch_size=2, token_count=4, source_dim=64),
+        "latents": {"height": torch.tensor([8, 8]), "width": torch.tensor([8, 8])},
+    }
 
-    out = strategy.prepare_conditions(batch, conditions)
+    pre_connector = strategy.prepare_conditions(batch, conditions)
+    post_connector = strategy.postprocess_conditions_after_connector(batch, pre_connector)
 
-    assert out["video_prompt_embeds"].shape == (2, 7, 4096)
-    assert out["prompt_attention_mask"].shape == (2, 7)
-    assert bool(out["prompt_attention_mask"][:, -4:].all())
+    assert pre_connector["video_prompt_embeds"].shape == (2, 3, 4096)
+    assert post_connector["video_prompt_embeds"].shape == (2, 7, 64)
+    assert post_connector["prompt_attention_mask"].shape == (2, 7)
+    assert bool(post_connector["prompt_attention_mask"][:, -4:].all())
+
+
+def test_visual_3d_resampler_shape_and_mask() -> None:
+    resampler = Visual3DResampler(
+        dim=64,
+        max_query_tokens=128,
+        num_heads=8,
+        depth=1,
+        ffn_multiplier=0.5,
+    )
+    tokens = torch.randn(2, 2048, 64)
+    token_positions = torch.zeros(2, 3, 2048, 2)
+    token_mask = torch.ones(2, 2048, dtype=torch.bool)
+    query_positions = torch.zeros(2, 3, 32, 2)
+
+    out, mask = resampler(
+        tokens=tokens,
+        token_positions=token_positions,
+        token_mask=token_mask,
+        query_positions=query_positions,
+    )
+
+    assert out.shape == (2, 32, 64)
+    assert mask.shape == (2, 32)
+    assert torch.isfinite(out).all()
+
+
+def test_stage1_visual_position_builders_are_monotonic_and_in_range() -> None:
+    strategy = MultiReferenceVideoStrategy(
+        MultiReferenceVideoConfig(
+            visual_token_source_dim=4,
+            visual_token_target_dim=4,
+            visual_context_spatial_grid=2,
+        )
+    )
+    visual_data = _projection_gt_tokens(batch_size=1, token_count=8, source_dim=4, tokens_per_frame=4)
+    visual_data["sampled_frame_indices"] = torch.tensor([[0, 6]])
+    visual_data["source_fps"] = torch.tensor([6.0])
+    latents_data = {"height": torch.tensor([8]), "width": torch.tensor([16])}
+
+    token_positions = strategy._build_visual_token_positions(
+        visual_data,
+        latents_data,
+        token_count=8,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    query_positions = strategy._build_visual_query_positions(
+        visual_data,
+        latents_data,
+        output_grid=2,
+        frame_stride=1,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    assert token_positions.shape == (1, 3, 8, 2)
+    assert query_positions.shape == (1, 3, 8, 2)
+    assert torch.all(token_positions[:, 0, 4:, 0] >= token_positions[:, 0, :4, 0])
+    assert float(query_positions[:, 1, :, 0].max()) <= 8.0
+    assert float(query_positions[:, 2, :, 0].max()) <= 16.0
 
 
 def test_visual_token_projection_module_registered_and_identity_pad_initialized() -> None:
     strategy = MultiReferenceVideoStrategy(
-        MultiReferenceVideoConfig(visual_token_source_dim=3840, visual_token_target_dim=4096)
+        MultiReferenceVideoConfig(
+            visual_token_source_dim=3840,
+            visual_token_target_dim=4096,
+            visual_branch_enabled=False,
+        )
     )
     strategy.attach_models(
         transformer=nn.Identity(),
@@ -450,18 +539,29 @@ def test_stage2_mse_uses_raw_siglip_tokens_then_appends_projected_tokens() -> No
 
 
 def test_visual_token_dim_mismatch_without_projection_raises_clear_error() -> None:
-    strategy = MultiReferenceVideoStrategy(MultiReferenceVideoConfig())
+    strategy = MultiReferenceVideoStrategy(
+        MultiReferenceVideoConfig(
+            visual_resampler_num_heads=1,
+            visual_context_spatial_grid=2,
+            visual_context_max_tokens=4,
+            visual_connector_enabled=False,
+        )
+    )
     strategy.attach_models(
         transformer=nn.Identity(),
-        embeddings_processor=_FakeEmbeddingsProcessor(4096),
+        embeddings_processor=_FakeEmbeddingsProcessor(5),
         text_encoder=None,
     )
-    conditions = _projection_conditions(batch_size=1, seq_len=2, dim=4096)
-    batch = {"gt_visual_tokens": _projection_gt_tokens(batch_size=1, token_count=4, source_dim=3840)}
+    conditions = _projection_conditions(batch_size=1, seq_len=2, dim=5)
+    batch = {
+        "gt_visual_tokens": _projection_gt_tokens(batch_size=1, token_count=4, source_dim=3),
+        "latents": {"height": torch.tensor([2]), "width": torch.tensor([2])},
+    }
 
     raised = False
     try:
-        strategy.prepare_conditions(batch, conditions)
+        pre_connector = strategy.prepare_conditions(batch, conditions)
+        strategy.postprocess_conditions_after_connector(batch, pre_connector)
     except ValueError as exc:
         raised = True
         assert "visual_token_source_dim" in str(exc)
@@ -491,7 +591,7 @@ def test_stage1_infer_precomputed_relative_path_matches_absolute_video_path() ->
     assert rel_path == Path("mnt/workspace/public/dataset/phantom_data/part_000/demo/demo.pt")
 
 
-def test_stage1_infer_batch_construction_and_gt_append_shape() -> None:
+def test_stage1_infer_batch_construction_and_postconnector_visual_shape() -> None:
     latents = {
         "latents": torch.randn(128, 1, 2, 2),
         "num_frames": 1,
@@ -511,6 +611,9 @@ def test_stage1_infer_batch_construction_and_gt_append_shape() -> None:
     gt_visual_tokens = {
         "visual_tokens": torch.randn(4, 3),
         "visual_token_mask": torch.ones(4, dtype=torch.bool),
+        "tokens_per_frame": torch.tensor(4),
+        "sampled_frame_indices": torch.tensor([0]),
+        "source_fps": torch.tensor(1.0),
     }
     batch = infer_multiref_stage1_overfit._build_single_sample_batch(
         latents=latents,
@@ -524,15 +627,24 @@ def test_stage1_infer_batch_construction_and_gt_append_shape() -> None:
     assert batch["gt_visual_tokens"]["visual_tokens"].shape == (1, 4, 3)
 
     strategy = MultiReferenceVideoStrategy(
-        MultiReferenceVideoConfig(visual_token_source_dim=3, visual_token_target_dim=5)
+        MultiReferenceVideoConfig(
+            visual_token_source_dim=3,
+            visual_token_target_dim=5,
+            visual_context_spatial_grid=2,
+            visual_context_max_tokens=4,
+            visual_resampler_num_heads=1,
+            visual_connector_enabled=False,
+        )
     )
     strategy.attach_models(
         transformer=nn.Identity(),
         embeddings_processor=_FakeEmbeddingsProcessor(5),
         text_encoder=None,
     )
-    out = strategy.prepare_conditions(batch, batch["conditions"])
+    pre_connector = strategy.prepare_conditions(batch, batch["conditions"])
+    out = strategy.postprocess_conditions_after_connector(batch, pre_connector)
 
+    assert pre_connector["video_prompt_embeds"].shape == (1, 2, 5)
     assert out["video_prompt_embeds"].shape == (1, 6, 5)
     assert out["prompt_attention_mask"].shape == (1, 6)
     assert bool(out["prompt_attention_mask"][:, -4:].all())

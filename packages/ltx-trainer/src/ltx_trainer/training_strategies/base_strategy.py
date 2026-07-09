@@ -126,6 +126,14 @@ class TrainingStrategy(ABC):
         """Optionally modify precomputed prompt features before connector processing."""
         return conditions
 
+    def postprocess_conditions_after_connector(
+        self,
+        batch: dict[str, Any],
+        conditions: dict[str, Tensor],
+    ) -> dict[str, Tensor]:
+        """Optionally modify prompt context after embedding connector processing."""
+        return conditions
+
     def get_extra_checkpoint_state_dict(self, accelerator: Any) -> dict[str, Tensor]:
         """Return extra strategy-owned weights for checkpoint saving."""
         state_dict: dict[str, Tensor] = {}

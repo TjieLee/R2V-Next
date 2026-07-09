@@ -373,6 +373,9 @@ class LtxvTrainer:
         conditions["audio_prompt_embeds"] = audio_embeds
         conditions["prompt_attention_mask"] = attention_mask
 
+        conditions = self._training_strategy.postprocess_conditions_after_connector(batch, conditions)
+        batch["conditions"] = conditions
+
         # Use strategy to prepare training inputs (returns ModelInputs with Modality objects)
         model_inputs = self._training_strategy.prepare_training_inputs(batch, self._timestep_sampler)
 

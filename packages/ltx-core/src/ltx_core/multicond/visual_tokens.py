@@ -8,6 +8,13 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from ltx_core.model.transformer.rope import (
+    LTXRopeType,
+    apply_rotary_emb,
+    generate_freq_grid_pytorch,
+    precompute_freqs_cis,
+)
+
 
 @dataclass(frozen=True)
 class VisualTokenBatch:
@@ -43,6 +50,9 @@ class VisualPlannerTokens(nn.Module):
         zero_init_ffn: bool = True,
         use_learned_query_tokens: bool = False,
         query_init_std: float = 1e-4,
+        positional_embedding_theta: float = 10000.0,
+        positional_embedding_max_pos: list[int] | None = None,
+        rope_type: LTXRopeType = LTXRopeType.SPLIT,
     ) -> None:
         super().__init__()
         if token_count <= 0:
@@ -225,6 +235,177 @@ class VisualPlannerTokens(nn.Module):
         batch_size, _heads, seq_len, head_dim = value.shape
         return value.transpose(1, 2).reshape(batch_size, seq_len, -1)
 
+
+
+class Visual3DResampler(nn.Module):
+    """Position-aware Perceiver/Q-former resampler for target-video SigLIP tokens.
+
+    The module keeps DiT untouched: it compresses raw visual tokens into a
+    smaller set of connector-space tokens before they are concatenated to the
+    normal post-connector text/VLM context.
+    """
+
+    def __init__(
+        self,
+        *,
+        dim: int,
+        max_query_tokens: int = 2048,
+        num_heads: int = 16,
+        depth: int = 1,
+        ffn_multiplier: float = 4.0,
+        dropout: float = 0.0,
+        zero_init_output: bool = True,
+        gate_init: float = 0.0,
+        query_init_std: float = 1e-4,
+        positional_embedding_theta: float = 10000.0,
+        positional_embedding_max_pos: list[int] | None = None,
+        rope_type: LTXRopeType = LTXRopeType.SPLIT,
+    ) -> None:
+        super().__init__()
+        if dim <= 0:
+            raise ValueError("dim must be positive")
+        if max_query_tokens <= 0:
+            raise ValueError("max_query_tokens must be positive")
+        if num_heads <= 0:
+            raise ValueError("num_heads must be positive")
+        if dim % num_heads != 0:
+            raise ValueError(f"dim={dim} must be divisible by num_heads={num_heads}")
+        if depth <= 0:
+            raise ValueError("depth must be positive")
+        if ffn_multiplier <= 0:
+            raise ValueError("ffn_multiplier must be positive")
+
+        self.dim = dim
+        self.max_query_tokens = max_query_tokens
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.depth = depth
+        self.dropout = dropout
+        self.positional_embedding_theta = positional_embedding_theta
+        self.positional_embedding_max_pos = positional_embedding_max_pos or [20, 2048, 2048]
+        self.rope_type = rope_type
+
+        self.query_tokens = nn.Parameter(torch.empty(max_query_tokens, dim))
+        nn.init.normal_(self.query_tokens, std=query_init_std)
+        self.query_position_proj = nn.Linear(6, dim)
+        self.key_position_proj = nn.Linear(6, dim)
+        self.query_type_encoding = nn.Parameter(torch.zeros(1, 1, dim))
+        self.key_type_encoding = nn.Parameter(torch.zeros(1, 1, dim))
+
+        self.query_norms = nn.ModuleList(nn.LayerNorm(dim) for _ in range(depth))
+        self.key_norms = nn.ModuleList(nn.LayerNorm(dim) for _ in range(depth))
+        self.query_projections = nn.ModuleList(nn.Linear(dim, dim) for _ in range(depth))
+        self.key_projections = nn.ModuleList(nn.Linear(dim, dim) for _ in range(depth))
+        self.value_projections = nn.ModuleList(nn.Linear(dim, dim) for _ in range(depth))
+        self.output_projections = nn.ModuleList(nn.Linear(dim, dim) for _ in range(depth))
+        self.ffn_norms = nn.ModuleList(nn.LayerNorm(dim) for _ in range(depth))
+        ffn_hidden_dim = max(1, int(dim * ffn_multiplier))
+        self.ffn_fc1 = nn.ModuleList(nn.Linear(dim, ffn_hidden_dim) for _ in range(depth))
+        self.ffn_fc2 = nn.ModuleList(nn.Linear(ffn_hidden_dim, dim) for _ in range(depth))
+        self.output_norm = nn.LayerNorm(dim)
+        self.residual_gate = nn.Parameter(torch.tensor(float(gate_init), dtype=torch.float32))
+
+        if zero_init_output:
+            for projection in self.output_projections:
+                nn.init.zeros_(projection.weight)
+                nn.init.zeros_(projection.bias)
+            for fc2 in self.ffn_fc2:
+                nn.init.zeros_(fc2.weight)
+                nn.init.zeros_(fc2.bias)
+
+    def forward(
+        self,
+        *,
+        tokens: Tensor,
+        token_positions: Tensor,
+        token_mask: Tensor | None,
+        query_positions: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        if tokens.ndim != 3:
+            raise ValueError(f"tokens must be [B,K,D], got {tuple(tokens.shape)}")
+        if token_positions.shape[:3] != (tokens.shape[0], 3, tokens.shape[1]):
+            raise ValueError(
+                f"token_positions must be [B,3,K,2], got {tuple(token_positions.shape)} for tokens {tuple(tokens.shape)}"
+            )
+        if query_positions.ndim != 4 or query_positions.shape[0] != tokens.shape[0] or query_positions.shape[1] != 3:
+            raise ValueError(f"query_positions must be [B,3,M,2], got {tuple(query_positions.shape)}")
+        query_count = query_positions.shape[2]
+        if query_count > self.max_query_tokens:
+            raise ValueError(f"query token count {query_count} exceeds max_query_tokens={self.max_query_tokens}")
+        if tokens.shape[-1] != self.dim:
+            raise ValueError(f"tokens dim {tokens.shape[-1]} != resampler dim {self.dim}")
+        if token_mask is not None and token_mask.shape != tokens.shape[:2]:
+            raise ValueError(f"token_mask must be [B,K], got {tuple(token_mask.shape)}")
+
+        batch_size = tokens.shape[0]
+        query = self.query_tokens[:query_count].to(device=tokens.device, dtype=tokens.dtype)
+        query = query.unsqueeze(0).expand(batch_size, -1, -1)
+        query = query + self.query_type_encoding.to(device=tokens.device, dtype=tokens.dtype)
+        query = query + self.query_position_proj(self._flatten_positions(query_positions, dtype=tokens.dtype))
+
+        kv = tokens + self.key_type_encoding.to(device=tokens.device, dtype=tokens.dtype)
+        kv = kv + self.key_position_proj(self._flatten_positions(token_positions, dtype=tokens.dtype))
+        residual_query = query
+
+        for idx in range(self.depth):
+            q = self.query_projections[idx](self.query_norms[idx](query))
+            k = self.key_projections[idx](self.key_norms[idx](kv))
+            v = self.value_projections[idx](self.key_norms[idx](kv))
+            q = self._split_heads(q)
+            k = self._split_heads(k)
+            v = self._split_heads(v)
+            q_pe = self._rope_for_positions(query_positions, dtype=q.dtype)
+            k_pe = self._rope_for_positions(token_positions, dtype=k.dtype)
+            q = apply_rotary_emb(q, q_pe, self.rope_type)
+            k = apply_rotary_emb(k, k_pe, self.rope_type)
+            scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            if token_mask is not None:
+                mask = token_mask.to(device=scores.device, dtype=torch.bool)
+                scores = scores.masked_fill(~mask[:, None, None, :], torch.finfo(scores.dtype).min)
+            attn = torch.softmax(scores, dim=-1)
+            if self.training and self.dropout > 0:
+                attn = F.dropout(attn, p=self.dropout)
+            attended = self._merge_heads(torch.matmul(attn, v))
+            delta = self.output_projections[idx](attended)
+            query = query + self.residual_gate.to(dtype=query.dtype) * delta
+
+            ffn_hidden = self.ffn_fc1[idx](self.ffn_norms[idx](query))
+            ffn_hidden = F.gelu(ffn_hidden)
+            if self.training and self.dropout > 0:
+                ffn_hidden = F.dropout(ffn_hidden, p=self.dropout)
+            ffn_delta = self.ffn_fc2[idx](ffn_hidden)
+            query = query + self.residual_gate.to(dtype=query.dtype) * ffn_delta
+
+        visual_mask = torch.ones(batch_size, query_count, dtype=torch.bool, device=tokens.device)
+        return self.output_norm(query + 0.0 * residual_query), visual_mask
+
+    def _rope_for_positions(self, positions: Tensor, *, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
+        return precompute_freqs_cis(
+            indices_grid=positions[..., 0],
+            dim=self.dim,
+            out_dtype=dtype,
+            theta=self.positional_embedding_theta,
+            max_pos=self.positional_embedding_max_pos,
+            num_attention_heads=self.num_heads,
+            rope_type=self.rope_type,
+            freq_grid_generator=generate_freq_grid_pytorch,
+        )
+
+    @staticmethod
+    def _flatten_positions(positions: Tensor, *, dtype: torch.dtype) -> Tensor:
+        # [B,3,N,2] -> [B,N,6], normalized lightly for stable MLP inputs.
+        flat = positions.permute(0, 2, 1, 3).reshape(positions.shape[0], positions.shape[2], 6).to(dtype=dtype)
+        scale = flat.detach().abs().amax(dim=1, keepdim=True).clamp(min=1.0)
+        return flat / scale
+
+    def _split_heads(self, value: Tensor) -> Tensor:
+        batch_size, seq_len, _dim = value.shape
+        return value.reshape(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+
+    @staticmethod
+    def _merge_heads(value: Tensor) -> Tensor:
+        batch_size, _heads, seq_len, head_dim = value.shape
+        return value.transpose(1, 2).reshape(batch_size, seq_len, -1)
 
 def extract_projected_visual_tokens(
     gemma_causal_lm: nn.Module,

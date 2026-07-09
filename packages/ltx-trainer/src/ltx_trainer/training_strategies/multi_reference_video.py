@@ -7,6 +7,8 @@ matching target, and reference entities are separated by negative temporal RoPE
 offsets.
 """
 
+import copy
+import math
 from typing import Any, Literal
 
 import torch
@@ -16,6 +18,8 @@ from torch import Tensor, nn
 from ltx_core.model.transformer.modality import Modality
 from ltx_core.multicond.cfg_sampler import CFGModeBatch, sample_cfg_modes
 from ltx_core.multicond.rope_mask_builder import build_multiref_sequence
+from ltx_core.multicond.visual_tokens import Visual3DResampler
+from ltx_core.text_encoders.gemma import convert_to_additive_mask
 from ltx_trainer import logger
 from ltx_trainer.timestep_samplers import TimestepSampler
 from ltx_trainer.training_strategies.base_strategy import (
@@ -107,6 +111,49 @@ class MultiReferenceVideoConfig(TrainingStrategyConfigBase):
             "Train the LTX video text connector on top of precomputed feature-extractor outputs. "
             "When true, embeddings_processor.video_connector is optimized and checkpointed."
         ),
+    )
+
+    visual_branch_enabled: bool = Field(
+        default=True,
+        description="Enable independent post-connector target-video SigLIP visual branch.",
+    )
+
+    visual_context_spatial_grid: int = Field(
+        default=8,
+        description=(
+            "Spatial grid size for compressed visual context per sampled frame. "
+            "With 8 frames and grid=8, this yields 512 visual context tokens."
+        ),
+        ge=1,
+    )
+
+    visual_context_frame_stride: int = Field(
+        default=1,
+        description="Temporal stride applied to sampled SigLIP frames before building compressed visual context.",
+        ge=1,
+    )
+
+    visual_context_max_tokens: int = Field(
+        default=2048,
+        description="Maximum query tokens reserved by the visual 3D resampler.",
+        ge=1,
+    )
+
+    visual_resampler_num_heads: int = Field(default=16, ge=1)
+    visual_resampler_depth: int = Field(default=1, ge=1)
+    visual_resampler_ffn_multiplier: float = Field(default=4.0, gt=0.0)
+    visual_resampler_dropout: float = Field(default=0.0, ge=0.0)
+    visual_resampler_zero_init_output: bool = Field(default=True)
+    visual_resampler_gate_init: float = Field(default=0.0)
+
+    visual_connector_enabled: bool = Field(
+        default=True,
+        description="Use a trainable visual connector initialized from embeddings_processor.video_connector.",
+    )
+
+    visual_gate_init: float = Field(
+        default=0.0,
+        description="Initial scalar gate for visual_context before concatenating to DiT context.",
     )
 
     cfg_dropout_enabled: bool = Field(
@@ -220,6 +267,17 @@ class MultiReferenceVideoConfig(TrainingStrategyConfigBase):
         return data_sources
 
 
+class ScalarParameterModule(nn.Module):
+    """Small wrapper so a single Parameter can be optimizer/checkpoint managed."""
+
+    def __init__(self, value: nn.Parameter):
+        super().__init__()
+        self.value = value
+
+    def forward(self) -> Tensor:
+        return self.value
+
+
 class MultiReferenceVideoStrategy(TrainingStrategy):
     """Video-only multi-reference strategy with target-only flow matching loss."""
 
@@ -232,6 +290,10 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
         self._visual_token_projection: nn.Module | None = None
         self._visual_token_source_dim: int | None = None
         self._visual_token_target_dim: int | None = None
+        self._visual_resampler: Visual3DResampler | None = None
+        self._visual_connector: nn.Module | None = None
+        self._visual_gate: ScalarParameterModule | None = None
+        self._last_visual_context_shape: list[int] | None = None
 
     def attach_models(
         self,
@@ -240,10 +302,45 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
         embeddings_processor: nn.Module,
         text_encoder: nn.Module | None = None,
     ) -> None:
-        del transformer, text_encoder
+        del text_encoder
         video_connector = embeddings_processor.video_connector
         self._connector_register_count = getattr(video_connector, "num_learnable_registers", None)
         self._init_visual_token_projection(video_connector)
+        self._init_visual_branch(transformer, video_connector)
+
+    def _init_visual_branch(self, transformer: nn.Module, video_connector: nn.Module) -> None:
+        self._visual_resampler = None
+        self._visual_connector = None
+        self._visual_gate = None
+        if not self.config.visual_branch_enabled:
+            return
+
+        param = next(video_connector.parameters(), None)
+        device = param.device if param is not None else torch.device("cpu")
+        dtype = param.dtype if param is not None and param.is_floating_point() else torch.float32
+        connector_dim = getattr(video_connector, "inner_dim", None)
+        if connector_dim is None:
+            connector_dim = param.shape[-1] if param is not None and param.ndim > 0 else self.config.visual_token_target_dim
+        if connector_dim is None:
+            raise ValueError("Cannot infer visual branch connector dimension from embeddings_processor.video_connector")
+
+        self._visual_resampler = Visual3DResampler(
+            dim=int(connector_dim),
+            max_query_tokens=self.config.visual_context_max_tokens,
+            num_heads=self.config.visual_resampler_num_heads,
+            depth=self.config.visual_resampler_depth,
+            ffn_multiplier=self.config.visual_resampler_ffn_multiplier,
+            dropout=self.config.visual_resampler_dropout,
+            zero_init_output=self.config.visual_resampler_zero_init_output,
+            gate_init=self.config.visual_resampler_gate_init,
+        ).to(device=device, dtype=dtype)
+
+        if self.config.visual_connector_enabled:
+            self._visual_connector = copy.deepcopy(video_connector).to(device=device, dtype=dtype)
+            self._visual_connector.requires_grad_(True)
+
+        gate = nn.Parameter(torch.tensor(float(self.config.visual_gate_init), device=device, dtype=torch.float32))
+        self._visual_gate = ScalarParameterModule(gate)
 
     def _init_visual_token_projection(self, video_connector: nn.Module) -> None:
         self._visual_token_projection = None
@@ -273,11 +370,23 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
         modules: dict[str, nn.Module] = {}
         if self._visual_token_projection is not None:
             modules["visual_token_projection"] = self._visual_token_projection
+        if self._visual_resampler is not None:
+            modules["visual_resampler"] = self._visual_resampler
+        if self._visual_connector is not None:
+            modules["visual_connector"] = self._visual_connector
+        if self._visual_gate is not None:
+            modules["visual_gate"] = self._visual_gate
         return modules
 
     def set_trainable_modules(self, modules: dict[str, nn.Module]) -> None:
         if "visual_token_projection" in modules:
             self._visual_token_projection = modules["visual_token_projection"]
+        if "visual_resampler" in modules:
+            self._visual_resampler = modules["visual_resampler"]
+        if "visual_connector" in modules:
+            self._visual_connector = modules["visual_connector"]
+        if "visual_gate" in modules:
+            self._visual_gate = modules["visual_gate"]
 
     def load_extra_checkpoint_state_dict(self, state_dict: dict[str, Tensor]) -> None:
         for name, module in self.get_trainable_modules().items():
@@ -290,14 +399,26 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
                     "visual_token_projection not found in checkpoint; using initialized "
                     f"{self._visual_token_source_dim}->{self._visual_token_target_dim} adapter."
                 )
+            else:
+                logger.warning(f"{name} not found in checkpoint; using initialized Stage 1 visual-branch weights.")
 
     def prepare_conditions(self, batch: dict[str, Any], conditions: dict[str, Tensor]) -> dict[str, Tensor]:
-        conditions = self._apply_cfg_context_dropout(batch, conditions)
+        return self._apply_cfg_preconnector_context_switch(batch, conditions)
+
+    def postprocess_conditions_after_connector(
+        self,
+        batch: dict[str, Any],
+        conditions: dict[str, Tensor],
+    ) -> dict[str, Tensor]:
+        conditions = self._apply_cfg_postconnector_text_dropout(batch, conditions)
+        if not self.config.visual_branch_enabled:
+            return conditions
         if self.config.gt_visual_tokens_dir is None or "gt_visual_tokens" not in batch:
             return conditions
-        visual_tokens, visual_mask = self._load_condition_visual_tokens(batch["gt_visual_tokens"], conditions)
-        visual_tokens, visual_mask = self._apply_cfg_planner_dropout(batch, visual_tokens, visual_mask)
-        return self._append_visual_tokens_to_conditions(conditions, visual_tokens, visual_mask)
+
+        visual_context, visual_mask = self._build_visual_context_after_connector(batch, conditions)
+        visual_context, visual_mask = self._apply_cfg_visual_dropout_after_connector(batch, visual_context, visual_mask)
+        return self._append_postconnector_visual_context(conditions, visual_context, visual_mask)
 
     def prepare_training_inputs(
         self,
@@ -470,7 +591,7 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
         batch["_cfg_modes"] = modes
         return modes
 
-    def _apply_cfg_context_dropout(
+    def _apply_cfg_preconnector_context_switch(
         self,
         batch: dict[str, Any],
         conditions: dict[str, Tensor],
@@ -493,22 +614,15 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
                 use_alternate=modes.drop_ref,
             )
 
-        drop_text_fallback = modes.drop_text
         if torch.any(modes.drop_text) and "cfg_ref_only_conditions" in batch:
             out = self._select_condition_rows(
                 primary=out,
                 alternate=batch["cfg_ref_only_conditions"],
                 use_alternate=modes.drop_text,
             )
-            drop_text_fallback = torch.zeros_like(modes.drop_text)
 
-        # Standard vlm_conditions mix system/user text and reference-image context.
-        # Without an optional ref-only cache, drop_text cannot remove only text, so
-        # it falls back to zeroing the whole mixed context row.
-        drop_context = drop_text_fallback | modes.drop_all
-        if torch.any(drop_context):
-            out = self._zero_condition_feature_rows(out, drop_context)
-
+        # drop_text/drop_all text zeroing happens after the frozen connector so
+        # connector registers/FFN do not synthesize a nonzero null pattern.
         return out
 
     def _apply_cfg_reference_dropout(
@@ -673,6 +787,14 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
             "visual_token_target_dim": self.config.visual_token_target_dim,
             "visual_token_projection_enabled": self._visual_token_projection is not None,
             "train_text_connector": self.config.train_text_connector,
+            "visual_branch_enabled": self.config.visual_branch_enabled,
+            "visual_context_spatial_grid": self.config.visual_context_spatial_grid,
+            "visual_context_frame_stride": self.config.visual_context_frame_stride,
+            "visual_context_token_count": self._last_visual_context_shape[1] if self._last_visual_context_shape else None,
+            "visual_resampler_depth": self.config.visual_resampler_depth,
+            "visual_resampler_num_heads": self.config.visual_resampler_num_heads,
+            "visual_connector_enabled": self.config.visual_connector_enabled,
+            "visual_gate_init": self.config.visual_gate_init,
         }
         if self.reference_spatial_scale_factor is not None:
             metadata["reference_spatial_scale_factor"] = self.reference_spatial_scale_factor
