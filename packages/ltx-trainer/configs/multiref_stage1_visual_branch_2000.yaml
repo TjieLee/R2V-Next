@@ -41,19 +41,21 @@ training_strategy:
   visual_branch_enabled: true
   visual_context_spatial_grid: 8
   visual_context_frame_stride: 1
-  visual_context_max_tokens: 2048
+  visual_context_max_tokens: 512
   visual_resampler_num_heads: 16
   visual_resampler_depth: 1
   visual_resampler_ffn_multiplier: 4.0
   visual_resampler_dropout: 0.05
   visual_resampler_zero_init_output: true
-  visual_resampler_gate_init: 0.0
+  visual_resampler_gate_init: 1.0e-3
   visual_connector_enabled: true
-  visual_gate_init: 0.0
+  visual_gate_init: 1.0e-2
   cfg_dropout_enabled: true
-  cfg_full_p: 0.45
+  cfg_full_p: 0.40
   cfg_drop_text_p: 0.30
-  cfg_drop_ref_p: 0.15
+  cfg_drop_siglip_p: 0.15
+  cfg_drop_ref_latents_p: 0.05
+  cfg_drop_ref_p: 0.0
   cfg_drop_all_p: 0.10
   cfg_drop_planner_p: 0.10
   cfg_text_conditions_dir: "conditions"

@@ -32,19 +32,21 @@ _STAGE1_SPEC.loader.exec_module(infer_multiref_stage1_overfit)
 
 def _fixed_modes() -> CFGModeBatch:
     return CFGModeBatch(
-        mode_id=torch.tensor([0, 1, 2, 3]),
-        drop_text=torch.tensor([False, True, False, False]),
-        drop_ref=torch.tensor([False, False, True, False]),
-        drop_all=torch.tensor([False, False, False, True]),
-        keep_full=torch.tensor([True, False, False, False]),
+        mode_id=torch.tensor([0, 1, 2, 3, 4]),
+        drop_text=torch.tensor([False, True, False, False, False]),
+        drop_siglip=torch.tensor([False, False, True, False, False]),
+        drop_ref_latents=torch.tensor([False, False, False, True, False]),
+        drop_all=torch.tensor([False, False, False, False, True]),
+        keep_full=torch.tensor([True, False, False, False, False]),
     )
 
 
-def test_sample_cfg_modes_supports_four_modes_and_legacy_alias() -> None:
+def test_sample_cfg_modes_supports_split_modes_and_legacy_alias() -> None:
     cases = {
         "full": "keep_full",
         "drop_text": "drop_text",
-        "drop_ref": "drop_ref",
+        "drop_siglip": "drop_siglip",
+        "drop_ref_latents": "drop_ref_latents",
         "drop_all": "drop_all",
         "null": "drop_all",
         "drop_planner": "drop_all",
@@ -55,31 +57,56 @@ def test_sample_cfg_modes_supports_four_modes_and_legacy_alias() -> None:
         if field_name == "drop_all":
             assert bool(modes.drop_planner.all())
 
+    legacy = sample_cfg_modes(4, probs={"drop_ref": 1.0})
+    assert bool(legacy.drop_siglip.all())
+    assert not bool(legacy.drop_ref_latents.any())
+    assert bool(legacy.drop_ref.all())
 
-def test_drop_ref_and_drop_all_zero_visual_tokens() -> None:
+
+def test_drop_siglip_and_drop_all_zero_visual_tokens() -> None:
     strategy = MultiReferenceVideoStrategy(MultiReferenceVideoConfig(cfg_dropout_enabled=True))
     batch = {"_cfg_modes": _fixed_modes()}
-    visual_tokens = torch.ones(4, 2, 3)
-    visual_mask = torch.ones(4, 2, dtype=torch.bool)
+    visual_tokens = torch.ones(5, 2, 3)
+    visual_mask = torch.ones(5, 2, dtype=torch.bool)
 
     dropped_tokens, dropped_mask = strategy._apply_cfg_planner_dropout(batch, visual_tokens, visual_mask)
 
     assert torch.equal(dropped_tokens[0], visual_tokens[0])
     assert torch.equal(dropped_tokens[1], visual_tokens[1])
     assert torch.equal(dropped_tokens[2], torch.zeros_like(visual_tokens[2]))
-    assert torch.equal(dropped_tokens[3], torch.zeros_like(visual_tokens[3]))
+    assert torch.equal(dropped_tokens[3], visual_tokens[3])
+    assert torch.equal(dropped_tokens[4], torch.zeros_like(visual_tokens[4]))
     assert torch.equal(dropped_mask, visual_mask)
 
 
-def test_stage2_visual_drop_mask_excludes_drop_ref_and_drop_all_from_mse() -> None:
+def test_cfg_split_masks_decouple_siglip_and_reference_latents() -> None:
+    strategy = MultiReferenceVideoStrategy(MultiReferenceVideoConfig(cfg_dropout_enabled=True))
+    batch = {"_cfg_modes": _fixed_modes()}
+
+    drop_visual = strategy._cfg_drop_visual_mask(batch, batch_size=5, device=torch.device("cpu"))
+    drop_ref_latents = strategy._cfg_drop_ref_latents_mask(batch, batch_size=5, device=torch.device("cpu"))
+    drop_text = strategy._cfg_drop_text_mask(batch, batch_size=5, device=torch.device("cpu"))
+
+    assert torch.equal(drop_visual, torch.tensor([False, False, True, False, True]))
+    assert torch.equal(drop_ref_latents, torch.tensor([False, False, False, True, True]))
+    assert torch.equal(drop_text, torch.tensor([False, True, False, False, True]))
+
+    ref_valid_mask = torch.ones(5, 3, dtype=torch.bool)
+    dropped_ref_mask = strategy._apply_cfg_reference_dropout(batch, ref_valid_mask, device=torch.device("cpu"))
+    assert torch.equal(dropped_ref_mask[2], ref_valid_mask[2])
+    assert torch.equal(dropped_ref_mask[3], torch.zeros_like(ref_valid_mask[3]))
+    assert torch.equal(dropped_ref_mask[4], torch.zeros_like(ref_valid_mask[4]))
+
+
+def test_stage2_visual_drop_mask_excludes_drop_ref_latents_from_mse() -> None:
     strategy = MultiReferencePlannerStage2Strategy(
         MultiReferencePlannerStage2Config(cfg_dropout_enabled=True, cfg_drop_planner_p=0.25)
     )
     batch = {"_cfg_modes": _fixed_modes()}
 
-    drop_visual = strategy._cfg_drop_visual_mask(batch, batch_size=4, device=torch.device("cpu"))
+    drop_visual = strategy._cfg_drop_visual_mask(batch, batch_size=5, device=torch.device("cpu"))
 
-    assert torch.equal(drop_visual, torch.tensor([False, False, True, True]))
+    assert torch.equal(drop_visual, torch.tensor([False, False, True, False, True]))
     assert strategy._cfg_drop_all_probability() == 0.25
 
 
@@ -389,7 +416,7 @@ def test_stage1_visual_tokens_append_after_connector_not_before() -> None:
     pre_connector = strategy.prepare_conditions(batch, conditions)
     post_connector = strategy.postprocess_conditions_after_connector(batch, pre_connector)
 
-    assert pre_connector["video_prompt_embeds"].shape == (2, 3, 4096)
+    assert pre_connector["video_prompt_embeds"].shape == (2, 3, 64)
     assert post_connector["video_prompt_embeds"].shape == (2, 7, 64)
     assert post_connector["prompt_attention_mask"].shape == (2, 7)
     assert bool(post_connector["prompt_attention_mask"][:, -4:].all())
@@ -499,6 +526,15 @@ def test_stage2_trainable_modules_include_visual_projection_and_planner_tokens()
 
     assert "visual_token_projection" in modules
     assert "planner_tokens" in modules
+
+
+def test_stage2_postconnector_hook_is_noop_for_legacy_planner_path() -> None:
+    strategy = MultiReferencePlannerStage2Strategy(MultiReferencePlannerStage2Config(use_online_vlm=False))
+    conditions = _projection_conditions(batch_size=1, seq_len=2, dim=8)
+
+    out = strategy.postprocess_conditions_after_connector({}, conditions)
+
+    assert out is conditions
 
 
 def test_stage2_mse_uses_raw_siglip_tokens_then_appends_projected_tokens() -> None:

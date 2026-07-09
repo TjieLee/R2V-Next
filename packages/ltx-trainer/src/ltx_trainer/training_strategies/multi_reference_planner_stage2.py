@@ -32,6 +32,11 @@ class MultiReferencePlannerStage2Config(MultiReferenceVideoConfig):
 
     name: Literal["multi_reference_planner_stage2"] = "multi_reference_planner_stage2"
 
+    visual_branch_enabled: bool = Field(
+        default=False,
+        description="Stage 2 keeps the legacy pre-connector planner-token path; disable Stage 1 post-connector visual branch.",
+    )
+
     use_online_vlm: bool = Field(
         default=True,
         description="Run Gemma/VLM online during training. Offline mode expects precomputed predicted visual tokens.",
@@ -342,7 +347,7 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
         self._last_planner_mse_loss = None
         self._last_vlm_lm_loss = None
 
-        conditions = self._apply_cfg_context_dropout(batch, conditions)
+        conditions = self._apply_cfg_preconnector_context_switch(batch, conditions)
         video_feature_key = "video_prompt_embeds" if "video_prompt_embeds" in conditions else "prompt_embeds"
         video_features = conditions[video_feature_key]
         gt_tokens, gt_mask = self._load_raw_condition_visual_tokens(
@@ -387,6 +392,14 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
         projected_tokens = self._project_visual_tokens(predicted_tokens, target_dim=video_features.shape[-1])
         projected_tokens, predicted_mask = self._apply_cfg_planner_dropout(batch, projected_tokens, predicted_mask)
         return self._append_visual_tokens_to_conditions(conditions, projected_tokens, predicted_mask)
+
+    def postprocess_conditions_after_connector(
+        self,
+        batch: dict[str, Any],
+        conditions: dict[str, Tensor],
+    ) -> dict[str, Tensor]:
+        del batch
+        return conditions
 
     def compute_loss(
         self,
@@ -448,11 +461,9 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
         forward_inputs = self._build_vlm_forward_inputs(planner_data, device)
         placeholder_mask = planner_data[self.config.vlm_placeholder_mask_key].to(device=device, dtype=torch.bool)
         self._assert_placeholder_mask(placeholder_mask)
-        drop_ref_mask = self._cfg_drop_ref_mask(
-            batch,
-            batch_size=forward_inputs["input_ids"].shape[0],
-            device=device,
-        )
+        # Split CFG has no VLM-reference-image dropout mode. Reference-latent
+        # dropout is handled only in the DiT packed latent stream.
+        drop_ref_mask = None
         drop_text_mask = self._cfg_drop_text_mask(
             batch,
             batch_size=forward_inputs["input_ids"].shape[0],

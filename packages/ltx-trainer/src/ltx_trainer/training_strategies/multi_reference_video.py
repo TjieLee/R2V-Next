@@ -16,6 +16,7 @@ from pydantic import Field, model_validator
 from torch import Tensor, nn
 
 from ltx_core.model.transformer.modality import Modality
+from ltx_core.model.transformer.rope import LTXRopeType
 from ltx_core.multicond.cfg_sampler import CFGModeBatch, sample_cfg_modes
 from ltx_core.multicond.rope_mask_builder import build_multiref_sequence
 from ltx_core.multicond.visual_tokens import Visual3DResampler
@@ -134,7 +135,7 @@ class MultiReferenceVideoConfig(TrainingStrategyConfigBase):
     )
 
     visual_context_max_tokens: int = Field(
-        default=2048,
+        default=512,
         description="Maximum query tokens reserved by the visual 3D resampler.",
         ge=1,
     )
@@ -144,7 +145,7 @@ class MultiReferenceVideoConfig(TrainingStrategyConfigBase):
     visual_resampler_ffn_multiplier: float = Field(default=4.0, gt=0.0)
     visual_resampler_dropout: float = Field(default=0.0, ge=0.0)
     visual_resampler_zero_init_output: bool = Field(default=True)
-    visual_resampler_gate_init: float = Field(default=0.0)
+    visual_resampler_gate_init: float = Field(default=1.0e-3)
 
     visual_connector_enabled: bool = Field(
         default=True,
@@ -152,7 +153,7 @@ class MultiReferenceVideoConfig(TrainingStrategyConfigBase):
     )
 
     visual_gate_init: float = Field(
-        default=0.0,
+        default=1.0e-2,
         description="Initial scalar gate for visual_context before concatenating to DiT context.",
     )
 
@@ -160,7 +161,7 @@ class MultiReferenceVideoConfig(TrainingStrategyConfigBase):
         default=False,
         description=(
             "Enable per-sample condition dropout for factorized CFG training. "
-            "Modes are mutually exclusive: full, drop_text, drop_ref, drop_all/null."
+            "Modes are mutually exclusive: full, drop_text, drop_siglip, drop_ref_latents, drop_all/null."
         ),
     )
 
@@ -176,12 +177,23 @@ class MultiReferenceVideoConfig(TrainingStrategyConfigBase):
         ge=0.0,
     )
 
+    cfg_drop_siglip_p: float = Field(
+        default=0.15,
+        description="Probability of dropping only the target-video SigLIP visual branch.",
+        ge=0.0,
+    )
+
+    cfg_drop_ref_latents_p: float = Field(
+        default=0.05,
+        description="Probability of dropping only DiT packed reference latent tokens.",
+        ge=0.0,
+    )
+
     cfg_drop_ref_p: float = Field(
-        default=0.1,
+        default=0.0,
         description=(
-            "Probability of dropping image/visual conditions. This masks reference latent tokens, zeros "
-            "GT/predicted visual condition tokens, and swaps VLM context to text-only conditions when "
-            "cfg_text_conditions_dir is available."
+            "Legacy alias. If nonzero in an old config that does not set cfg_drop_siglip_p or "
+            "cfg_drop_ref_latents_p, it is treated as cfg_drop_siglip_p only."
         ),
         ge=0.0,
     )
@@ -333,6 +345,9 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
             dropout=self.config.visual_resampler_dropout,
             zero_init_output=self.config.visual_resampler_zero_init_output,
             gate_init=self.config.visual_resampler_gate_init,
+            positional_embedding_theta=getattr(transformer, "positional_embedding_theta", 10000.0),
+            positional_embedding_max_pos=getattr(transformer, "positional_embedding_max_pos", [20, 2048, 2048]),
+            rope_type=getattr(transformer, "rope_type", LTXRopeType.SPLIT),
         ).to(device=device, dtype=dtype)
 
         if self.config.visual_connector_enabled:
@@ -551,10 +566,19 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
         return masked.mean(dim=[-2, -1]) / loss_mask.mean(dim=[-2, -1]).clamp(min=1e-8)
 
     def _cfg_probabilities(self) -> dict[str, float]:
+        explicit_fields = getattr(self.config, "model_fields_set", set())
+        uses_legacy_ref = (
+            self.config.cfg_drop_ref_p > 0
+            and "cfg_drop_siglip_p" not in explicit_fields
+            and "cfg_drop_ref_latents_p" not in explicit_fields
+        )
+        drop_siglip = self.config.cfg_drop_ref_p if uses_legacy_ref else self.config.cfg_drop_siglip_p
+        drop_ref_latents = 0.0 if uses_legacy_ref else self.config.cfg_drop_ref_latents_p
         return {
             "full": self.config.cfg_full_p,
             "drop_text": self.config.cfg_drop_text_p,
-            "drop_ref": self.config.cfg_drop_ref_p,
+            "drop_siglip": drop_siglip,
+            "drop_ref_latents": drop_ref_latents,
             "drop_all": self._cfg_drop_all_probability(),
         }
 
@@ -576,7 +600,8 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
                 existing = CFGModeBatch(
                     mode_id=existing.mode_id.to(device=device),
                     drop_text=existing.drop_text.to(device=device),
-                    drop_ref=existing.drop_ref.to(device=device),
+                    drop_siglip=existing.drop_siglip.to(device=device),
+                    drop_ref_latents=existing.drop_ref_latents.to(device=device),
                     drop_all=existing.drop_all.to(device=device),
                     keep_full=existing.keep_full.to(device=device),
                 )
@@ -596,34 +621,11 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
         batch: dict[str, Any],
         conditions: dict[str, Tensor],
     ) -> dict[str, Tensor]:
-        if not self.config.cfg_dropout_enabled:
-            return conditions
-
-        video_feature_key = "video_prompt_embeds" if "video_prompt_embeds" in conditions else "prompt_embeds"
-        video_features = conditions[video_feature_key]
-        modes = self._get_or_sample_cfg_modes(batch, video_features.shape[0], video_features.device)
-        if modes is None:
-            return conditions
-
-        out = dict(conditions)
-
-        if torch.any(modes.drop_ref) and "cfg_text_conditions" in batch:
-            out = self._select_condition_rows(
-                primary=out,
-                alternate=batch["cfg_text_conditions"],
-                use_alternate=modes.drop_ref,
-            )
-
-        if torch.any(modes.drop_text) and "cfg_ref_only_conditions" in batch:
-            out = self._select_condition_rows(
-                primary=out,
-                alternate=batch["cfg_ref_only_conditions"],
-                use_alternate=modes.drop_text,
-            )
-
-        # drop_text/drop_all text zeroing happens after the frozen connector so
-        # connector registers/FFN do not synthesize a nonzero null pattern.
-        return out
+        del batch
+        # Split CFG keeps the VLM/reference-image context intact before the
+        # connector. Text/null dropout is applied after the connector; reference
+        # latent dropout is applied only to the DiT packed latent stream.
+        return conditions
 
     def _apply_cfg_reference_dropout(
         self,
@@ -634,11 +636,8 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
     ) -> Tensor:
         if not self.config.cfg_dropout_enabled:
             return ref_valid_mask
-        modes = self._get_or_sample_cfg_modes(batch, ref_valid_mask.shape[0], device)
-        if modes is None:
-            return ref_valid_mask
-        drop_reference = modes.drop_ref | modes.drop_all
-        if not torch.any(drop_reference):
+        drop_reference = self._cfg_drop_ref_latents_mask(batch, batch_size=ref_valid_mask.shape[0], device=device)
+        if drop_reference is None or not torch.any(drop_reference):
             return ref_valid_mask
         ref_valid_mask = ref_valid_mask.clone()
         ref_valid_mask[drop_reference] = False
@@ -650,11 +649,7 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
         visual_tokens: Tensor,
         visual_mask: Tensor,
     ) -> tuple[Tensor, Tensor]:
-        """Zero visual condition tokens for drop_ref and drop_all/null.
-
-        The historical method name is kept for compatibility; this is not a
-        planner-only dropout branch.
-        """
+        """Zero predicted/GT visual condition tokens for drop_siglip and drop_all/null."""
 
         if not self.config.cfg_dropout_enabled:
             return visual_tokens, visual_mask
@@ -675,7 +670,7 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
         modes = self._get_or_sample_cfg_modes(batch, batch_size, device)
         if modes is None:
             return None
-        return modes.drop_ref | modes.drop_all
+        return modes.drop_siglip | modes.drop_all
 
     def _cfg_drop_planner_mask(
         self,
@@ -698,7 +693,7 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
             return None
         return modes.drop_all
 
-    def _cfg_drop_ref_mask(
+    def _cfg_drop_ref_latents_mask(
         self,
         batch: dict[str, Any],
         *,
@@ -708,7 +703,16 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
         modes = self._get_or_sample_cfg_modes(batch, batch_size, device)
         if modes is None:
             return None
-        return modes.drop_ref | modes.drop_all
+        return modes.drop_ref_latents | modes.drop_all
+
+    def _cfg_drop_ref_mask(
+        self,
+        batch: dict[str, Any],
+        *,
+        batch_size: int,
+        device: torch.device,
+    ) -> Tensor | None:
+        return self._cfg_drop_ref_latents_mask(batch, batch_size=batch_size, device=device)
 
     def _cfg_drop_text_mask(
         self,
@@ -721,6 +725,345 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
         if modes is None:
             return None
         return modes.drop_text | modes.drop_all
+
+    def _apply_cfg_postconnector_text_dropout(
+        self,
+        batch: dict[str, Any],
+        conditions: dict[str, Tensor],
+    ) -> dict[str, Tensor]:
+        if not self.config.cfg_dropout_enabled:
+            return conditions
+        key = "video_prompt_embeds" if "video_prompt_embeds" in conditions else "prompt_embeds"
+        features = conditions[key]
+        drop_text = self._cfg_drop_text_mask(batch, batch_size=features.shape[0], device=features.device)
+        if drop_text is None or not torch.any(drop_text):
+            return conditions
+
+        out = dict(conditions)
+        out[key] = features.clone()
+        out[key][drop_text] = 0
+        if out.get("audio_prompt_embeds") is not None:
+            audio_features = out["audio_prompt_embeds"].clone()
+            audio_features[drop_text] = 0
+            out["audio_prompt_embeds"] = audio_features
+        return out
+
+    def _build_visual_context_after_connector(
+        self,
+        batch: dict[str, Any],
+        conditions: dict[str, Tensor],
+    ) -> tuple[Tensor, Tensor]:
+        if self._visual_resampler is None:
+            raise RuntimeError("visual_branch_enabled=True requires initialized Visual3DResampler.")
+
+        key = "video_prompt_embeds" if "video_prompt_embeds" in conditions else "prompt_embeds"
+        features = conditions[key]
+        raw_tokens, raw_mask = self._load_raw_condition_visual_tokens(
+            batch["gt_visual_tokens"],
+            device=features.device,
+            dtype=features.dtype,
+        )
+        projected_tokens = self._project_visual_tokens(raw_tokens, target_dim=features.shape[-1])
+        token_positions = self._build_visual_token_positions(
+            batch["gt_visual_tokens"],
+            batch["latents"],
+            token_count=projected_tokens.shape[1],
+            device=projected_tokens.device,
+            dtype=torch.float32,
+        )
+        query_positions = self._build_visual_query_positions(
+            batch["gt_visual_tokens"],
+            batch["latents"],
+            token_count=projected_tokens.shape[1],
+            device=projected_tokens.device,
+            dtype=torch.float32,
+        )
+        visual_context, visual_mask = self._visual_resampler(
+            tokens=projected_tokens,
+            token_positions=token_positions,
+            token_mask=raw_mask,
+            query_positions=query_positions,
+        )
+        if self._visual_connector is not None:
+            visual_context, visual_mask = self._run_visual_connector(visual_context, visual_mask)
+        if self._visual_gate is not None:
+            gate = self._visual_gate.value.to(device=visual_context.device, dtype=visual_context.dtype)
+            visual_context = visual_context * gate
+
+        shape = list(visual_context.shape)
+        self._last_visual_context_shape = shape
+        batch["_visual_context_shape"] = shape
+        batch["_visual_context_token_count"] = int(visual_context.shape[1])
+        return visual_context, visual_mask
+
+    def _run_visual_connector(self, visual_context: Tensor, visual_mask: Tensor) -> tuple[Tensor, Tensor]:
+        if self._visual_connector is None:
+            return visual_context, visual_mask
+        visual_context, visual_mask = self._pad_visual_context_to_connector_multiple(visual_context, visual_mask)
+        additive_mask = convert_to_additive_mask(visual_mask.to(device=visual_context.device), visual_context.dtype)
+        connected_context, connected_mask = self._visual_connector(visual_context, additive_mask)
+        if connected_mask is None:
+            return connected_context, visual_mask
+        if connected_mask.ndim == 4:
+            binary_mask = connected_mask[:, 0, 0, :] >= 0
+        elif connected_mask.ndim == 2:
+            binary_mask = connected_mask.to(device=connected_context.device, dtype=torch.bool)
+        else:
+            raise ValueError(f"Visual connector returned unsupported mask shape {tuple(connected_mask.shape)}")
+        return connected_context, binary_mask.to(device=connected_context.device, dtype=torch.bool)
+
+    def _pad_visual_context_to_connector_multiple(self, visual_context: Tensor, visual_mask: Tensor) -> tuple[Tensor, Tensor]:
+        register_count = getattr(self._visual_connector, "num_learnable_registers", None) or self._connector_register_count
+        if not register_count:
+            return visual_context, visual_mask
+        remainder = visual_context.shape[1] % int(register_count)
+        if remainder == 0:
+            return visual_context, visual_mask
+        pad_len = int(register_count) - remainder
+        context_pad = torch.zeros(
+            visual_context.shape[0],
+            pad_len,
+            visual_context.shape[-1],
+            dtype=visual_context.dtype,
+            device=visual_context.device,
+        )
+        mask_pad = torch.zeros(visual_mask.shape[0], pad_len, dtype=torch.bool, device=visual_mask.device)
+        return torch.cat([visual_context, context_pad], dim=1), torch.cat([visual_mask, mask_pad], dim=1)
+
+    def _apply_cfg_visual_dropout_after_connector(
+        self,
+        batch: dict[str, Any],
+        visual_context: Tensor,
+        visual_mask: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        if not self.config.cfg_dropout_enabled:
+            return visual_context, visual_mask
+        drop_visual = self._cfg_drop_visual_mask(batch, batch_size=visual_context.shape[0], device=visual_context.device)
+        if drop_visual is None or not torch.any(drop_visual):
+            return visual_context, visual_mask
+        visual_context = visual_context.clone()
+        visual_context[drop_visual] = 0
+        return visual_context, visual_mask
+
+    def _append_postconnector_visual_context(
+        self,
+        conditions: dict[str, Tensor],
+        visual_context: Tensor,
+        visual_mask: Tensor,
+    ) -> dict[str, Tensor]:
+        out = dict(conditions)
+        key = "video_prompt_embeds" if "video_prompt_embeds" in out else "prompt_embeds"
+        text_context = out[key]
+        out[key] = torch.cat([text_context, visual_context.to(device=text_context.device, dtype=text_context.dtype)], dim=1)
+
+        audio_context = out.get("audio_prompt_embeds")
+        if audio_context is not None:
+            audio_pad = torch.zeros(
+                audio_context.shape[0],
+                visual_context.shape[1],
+                audio_context.shape[-1],
+                dtype=audio_context.dtype,
+                device=audio_context.device,
+            )
+            out["audio_prompt_embeds"] = torch.cat([audio_context, audio_pad], dim=1)
+
+        prompt_mask = out["prompt_attention_mask"].to(device=visual_mask.device, dtype=torch.bool)
+        out["prompt_attention_mask"] = torch.cat([prompt_mask, visual_mask.to(dtype=torch.bool)], dim=1)
+        return out
+
+    def _build_visual_token_positions(
+        self,
+        visual_data: dict[str, Any],
+        latents_data: dict[str, Any],
+        *,
+        token_count: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tensor:
+        tokens_per_frame = self._visual_tokens_per_frame(visual_data, token_count=token_count)
+        if token_count % tokens_per_frame != 0:
+            raise ValueError(f"Visual token count {token_count} is not divisible by tokens_per_frame={tokens_per_frame}")
+        frame_count = token_count // tokens_per_frame
+        spatial_grid = int(math.isqrt(tokens_per_frame))
+        if spatial_grid * spatial_grid != tokens_per_frame:
+            raise ValueError(f"tokens_per_frame={tokens_per_frame} must be a perfect square for 3D visual positions")
+        times = self._visual_sample_times(
+            visual_data,
+            frame_count=frame_count,
+            batch_size=self._visual_batch_size(visual_data, latents_data),
+            device=device,
+            dtype=dtype,
+        )
+        height, width = self._visual_target_hw(latents_data, device=device, dtype=dtype)
+        return self._make_visual_positions(times, height=height, width=width, spatial_grid=spatial_grid, dtype=dtype)
+
+    def _build_visual_query_positions(
+        self,
+        visual_data: dict[str, Any],
+        latents_data: dict[str, Any],
+        *,
+        token_count: int | None = None,
+        output_grid: int | None = None,
+        frame_stride: int | None = None,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tensor:
+        output_grid = int(output_grid or self.config.visual_context_spatial_grid)
+        frame_stride = int(frame_stride or self.config.visual_context_frame_stride)
+        if token_count is None:
+            token_count = self._infer_visual_token_count(visual_data)
+        tokens_per_frame = self._visual_tokens_per_frame(visual_data, token_count=token_count)
+        if token_count % tokens_per_frame != 0:
+            raise ValueError(f"Visual token count {token_count} is not divisible by tokens_per_frame={tokens_per_frame}")
+        frame_count = token_count // tokens_per_frame
+        times = self._visual_sample_times(
+            visual_data,
+            frame_count=frame_count,
+            batch_size=self._visual_batch_size(visual_data, latents_data),
+            device=device,
+            dtype=dtype,
+        )[:, ::frame_stride]
+        if times.shape[1] == 0:
+            raise ValueError("visual_context_frame_stride selected zero query frames")
+        query_count = times.shape[1] * output_grid * output_grid
+        if query_count > self.config.visual_context_max_tokens:
+            raise ValueError(
+                f"Visual query token count {query_count} exceeds visual_context_max_tokens="
+                f"{self.config.visual_context_max_tokens}. Increase the max or reduce grid/frame count."
+            )
+        height, width = self._visual_target_hw(latents_data, device=device, dtype=dtype)
+        return self._make_visual_positions(times, height=height, width=width, spatial_grid=output_grid, dtype=dtype)
+
+    def _visual_tokens_per_frame(self, visual_data: dict[str, Any], *, token_count: int) -> int:
+        value = visual_data.get(self.config.visual_tokens_per_frame_key)
+        if value is None:
+            raise ValueError("GT visual-token metadata must include tokens_per_frame to build 3D positions.")
+        if isinstance(value, Tensor):
+            flat = value.flatten()
+            if flat.numel() == 0:
+                raise ValueError("tokens_per_frame tensor is empty")
+            if not torch.all(flat == flat[0]):
+                raise ValueError(f"Mixed tokens_per_frame in batch: {flat.tolist()}")
+            value = int(flat[0].item())
+        else:
+            value = int(value)
+        if value <= 0:
+            raise ValueError(f"tokens_per_frame must be positive, got {value}")
+        if token_count % value != 0:
+            raise ValueError(f"Visual token count {token_count} is not divisible by tokens_per_frame={value}")
+        return value
+
+    def _visual_sample_times(
+        self,
+        visual_data: dict[str, Any],
+        *,
+        frame_count: int,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tensor:
+        sampled = visual_data.get("sampled_frame_indices")
+        if sampled is None:
+            sampled_indices = torch.arange(frame_count, device=device, dtype=dtype).unsqueeze(0).expand(batch_size, -1)
+        else:
+            sampled_indices = sampled.to(device=device, dtype=dtype)
+            if sampled_indices.ndim == 1:
+                sampled_indices = sampled_indices.unsqueeze(0)
+            if sampled_indices.shape[0] == 1 and batch_size > 1:
+                sampled_indices = sampled_indices.expand(batch_size, -1)
+            if sampled_indices.shape[0] != batch_size:
+                raise ValueError(
+                    f"sampled_frame_indices batch {sampled_indices.shape[0]} does not match batch_size={batch_size}"
+                )
+            if sampled_indices.shape[1] != frame_count:
+                strided = sampled_indices[:, :: self.config.visual_token_frame_stride]
+                if strided.shape[1] < frame_count:
+                    raise ValueError(
+                        f"sampled_frame_indices has {sampled_indices.shape[1]} frames; cannot match visual frame_count="
+                        f"{frame_count} after stride={self.config.visual_token_frame_stride}"
+                    )
+                sampled_indices = strided[:, :frame_count]
+
+        fps = visual_data.get("source_fps")
+        if fps is None:
+            fps_values = torch.full((batch_size,), float(DEFAULT_FPS), device=device, dtype=dtype)
+        else:
+            fps_values = fps.to(device=device, dtype=dtype).flatten()
+            if fps_values.numel() == 1 and batch_size > 1:
+                fps_values = fps_values.expand(batch_size)
+            if fps_values.numel() != batch_size:
+                raise ValueError(f"source_fps has {fps_values.numel()} values, expected {batch_size}")
+        fps_values = fps_values.clamp(min=1.0e-6)
+        return sampled_indices[:, :frame_count] / fps_values[:, None]
+
+    def _visual_target_hw(
+        self,
+        latents_data: dict[str, Any],
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[Tensor, Tensor]:
+        height = latents_data.get("height")
+        width = latents_data.get("width")
+        if height is None or width is None:
+            raise ValueError("latents metadata must include height and width to build visual positions")
+        height_tensor = height.to(device=device, dtype=dtype).flatten() if isinstance(height, Tensor) else torch.tensor([height], device=device, dtype=dtype)
+        width_tensor = width.to(device=device, dtype=dtype).flatten() if isinstance(width, Tensor) else torch.tensor([width], device=device, dtype=dtype)
+        return height_tensor, width_tensor
+
+    def _visual_batch_size(self, visual_data: dict[str, Any], latents_data: dict[str, Any]) -> int:
+        tokens = visual_data.get(self.config.visual_token_key)
+        if isinstance(tokens, Tensor) and tokens.ndim >= 3:
+            return int(tokens.shape[0])
+        height = latents_data.get("height")
+        if isinstance(height, Tensor):
+            return int(height.flatten().numel())
+        return 1
+
+    def _infer_visual_token_count(self, visual_data: dict[str, Any]) -> int:
+        tokens = visual_data.get(self.config.visual_token_key)
+        if not isinstance(tokens, Tensor) or tokens.ndim < 2:
+            raise ValueError("Cannot infer visual token count without a visual_tokens tensor")
+        return int(tokens.shape[-2])
+
+    @staticmethod
+    def _make_visual_positions(
+        times: Tensor,
+        *,
+        height: Tensor,
+        width: Tensor,
+        spatial_grid: int,
+        dtype: torch.dtype,
+    ) -> Tensor:
+        batch_size, frame_count = times.shape
+        device = times.device
+        if height.numel() == 1 and batch_size > 1:
+            height = height.expand(batch_size)
+        if width.numel() == 1 and batch_size > 1:
+            width = width.expand(batch_size)
+        if height.numel() != batch_size or width.numel() != batch_size:
+            raise ValueError(f"height/width metadata must have 1 or {batch_size} values")
+
+        grid = torch.arange(spatial_grid, device=device, dtype=dtype) + 0.5
+        y_unit, x_unit = torch.meshgrid(grid / spatial_grid, grid / spatial_grid, indexing="ij")
+        y_unit = y_unit.reshape(-1)
+        x_unit = x_unit.reshape(-1)
+
+        y_coords = height[:, None, None] * y_unit[None, None, :]
+        x_coords = width[:, None, None] * x_unit[None, None, :]
+        t_coords = times[:, :, None].expand(batch_size, frame_count, spatial_grid * spatial_grid)
+        y_coords = y_coords.expand(batch_size, frame_count, spatial_grid * spatial_grid)
+        x_coords = x_coords.expand(batch_size, frame_count, spatial_grid * spatial_grid)
+
+        coords = torch.stack(
+            [
+                t_coords.reshape(batch_size, -1),
+                y_coords.reshape(batch_size, -1),
+                x_coords.reshape(batch_size, -1),
+            ],
+            dim=1,
+        ).to(dtype=dtype)
+        return torch.stack([coords, coords], dim=-1)
 
     @classmethod
     def _select_condition_rows(
@@ -777,7 +1120,10 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
             "cfg_dropout_enabled": self.config.cfg_dropout_enabled,
             "cfg_full_p": self.config.cfg_full_p,
             "cfg_drop_text_p": self.config.cfg_drop_text_p,
+            "cfg_drop_siglip_p": self._cfg_probabilities()["drop_siglip"],
+            "cfg_drop_ref_latents_p": self._cfg_probabilities()["drop_ref_latents"],
             "cfg_drop_ref_p": self.config.cfg_drop_ref_p,
+            "cfg_drop_ref_p_is_legacy_drop_siglip_alias": True,
             "cfg_drop_all_p": self._cfg_drop_all_probability(),
             "cfg_drop_planner_p": self.config.cfg_drop_planner_p,
             "cfg_drop_planner_p_is_legacy_drop_all_alias": True,
