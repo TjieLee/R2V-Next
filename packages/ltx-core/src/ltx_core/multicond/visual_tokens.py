@@ -279,6 +279,11 @@ class Visual3DResampler(nn.Module):
         self.max_query_tokens = max_query_tokens
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
+        if rope_type == LTXRopeType.SPLIT and self.head_dim % 2 != 0:
+            raise ValueError(
+                "Visual3DResampler requires even head_dim for split RoPE, got "
+                f"dim={dim}, num_heads={num_heads}, head_dim={self.head_dim}"
+            )
         self.depth = depth
         self.dropout = dropout
         self.positional_embedding_theta = positional_embedding_theta

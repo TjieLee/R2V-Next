@@ -869,8 +869,9 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
                 f"Predicted visual tokens {tuple(predicted_tokens.shape)} must match GT {tuple(gt_tokens.shape)}"
             )
         loss = F.mse_loss(predicted_tokens, gt_tokens, reduction="none")
-        loss_mask = mask.unsqueeze(-1).to(dtype=loss.dtype)
-        return loss.mul(loss_mask).sum(dim=[1, 2]) / loss_mask.sum(dim=[1, 2]).clamp(min=1.0)
+        token_loss = loss.mean(dim=-1)
+        loss_mask = mask.to(dtype=token_loss.dtype)
+        return token_loss.mul(loss_mask).sum(dim=1) / loss_mask.sum(dim=1).clamp(min=1.0)
 
     def _compute_lm_loss(self, final_hidden: Tensor, labels: Tensor) -> Tensor:
         lm_head = getattr(self.text_encoder.model, "lm_head", None)

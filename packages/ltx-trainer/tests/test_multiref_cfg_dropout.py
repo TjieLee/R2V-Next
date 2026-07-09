@@ -585,10 +585,10 @@ def test_visual_token_dim_mismatch_without_projection_raises_clear_error() -> No
     )
     strategy.attach_models(
         transformer=nn.Identity(),
-        embeddings_processor=_FakeEmbeddingsProcessor(5),
+        embeddings_processor=_FakeEmbeddingsProcessor(6),
         text_encoder=None,
     )
-    conditions = _projection_conditions(batch_size=1, seq_len=2, dim=5)
+    conditions = _projection_conditions(batch_size=1, seq_len=2, dim=6)
     batch = {
         "gt_visual_tokens": _projection_gt_tokens(batch_size=1, token_count=4, source_dim=3),
         "latents": {"height": torch.tensor([2]), "width": torch.tensor([2])},
@@ -636,7 +636,7 @@ def test_stage1_infer_batch_construction_and_postconnector_visual_shape() -> Non
         "fps": 6.0,
     }
     conditions = {
-        "video_prompt_embeds": torch.randn(2, 5),
+        "video_prompt_embeds": torch.randn(2, 6),
         "prompt_attention_mask": torch.ones(2, dtype=torch.bool),
     }
     multi_reference_latents = {
@@ -659,13 +659,13 @@ def test_stage1_infer_batch_construction_and_postconnector_visual_shape() -> Non
     )
 
     assert batch["latents"]["latents"].shape == (1, 128, 1, 2, 2)
-    assert batch["conditions"]["video_prompt_embeds"].shape == (1, 2, 5)
+    assert batch["conditions"]["video_prompt_embeds"].shape == (1, 2, 6)
     assert batch["gt_visual_tokens"]["visual_tokens"].shape == (1, 4, 3)
 
     strategy = MultiReferenceVideoStrategy(
         MultiReferenceVideoConfig(
             visual_token_source_dim=3,
-            visual_token_target_dim=5,
+            visual_token_target_dim=6,
             visual_context_spatial_grid=2,
             visual_context_max_tokens=4,
             visual_resampler_num_heads=1,
@@ -674,14 +674,14 @@ def test_stage1_infer_batch_construction_and_postconnector_visual_shape() -> Non
     )
     strategy.attach_models(
         transformer=nn.Identity(),
-        embeddings_processor=_FakeEmbeddingsProcessor(5),
+        embeddings_processor=_FakeEmbeddingsProcessor(6),
         text_encoder=None,
     )
     pre_connector = strategy.prepare_conditions(batch, batch["conditions"])
     out = strategy.postprocess_conditions_after_connector(batch, pre_connector)
 
-    assert pre_connector["video_prompt_embeds"].shape == (1, 2, 5)
-    assert out["video_prompt_embeds"].shape == (1, 6, 5)
+    assert pre_connector["video_prompt_embeds"].shape == (1, 2, 6)
+    assert out["video_prompt_embeds"].shape == (1, 6, 6)
     assert out["prompt_attention_mask"].shape == (1, 6)
     assert bool(out["prompt_attention_mask"][:, -4:].all())
 
