@@ -763,3 +763,65 @@ def test_stage1_infer_negative_ref_valid_mask_can_keep_or_drop_references() -> N
 
     assert torch.equal(kept, ref_mask)
     assert torch.equal(dropped, torch.zeros_like(ref_mask))
+
+
+
+def test_stage1_infer_condition_mode_detail_tracks_ablation_and_guidance() -> None:
+    assert (
+        infer_multiref_stage1_overfit._condition_mode_detail(
+            "full_siglip",
+            guidance_scale=1.0,
+            stg_scale=0.0,
+        )
+        == "stage1_teacher_gt_siglip_full_condition"
+    )
+    assert (
+        infer_multiref_stage1_overfit._condition_mode_detail(
+            "text_only_no_siglip",
+            guidance_scale=1.0,
+            stg_scale=0.0,
+        )
+        == "stage1_text_only_no_siglip_with_reference_latents"
+    )
+    assert (
+        infer_multiref_stage1_overfit._condition_mode_detail(
+            "text_only_no_siglip",
+            guidance_scale=1.5,
+            stg_scale=0.5,
+        )
+        == "stage1_text_only_no_siglip_cfg_stg"
+    )
+
+
+def test_stage1_text_only_batch_omits_vlm_and_gt_siglip_entries() -> None:
+    batch = infer_multiref_stage1_overfit._build_single_sample_batch(
+        latents={"latents": torch.zeros(2, 1, 1, 1)},
+        multi_reference_latents={"latents": torch.zeros(1, 2, 1, 1, 1)},
+    )
+
+    assert "latents" in batch
+    assert "multi_ref_latents" in batch
+    assert "conditions" not in batch
+    assert "gt_visual_tokens" not in batch
+
+
+def test_stage1_text_only_precompute_loading_does_not_require_siglip_or_vlm(tmp_path: Path) -> None:
+    precomputed_root = tmp_path / ".precomputed"
+    rel_path = Path("clip.pt")
+    latents_path = precomputed_root / "latents" / rel_path
+    ref_path = precomputed_root / "multi_reference_latents" / rel_path
+    latents_path.parent.mkdir(parents=True)
+    ref_path.parent.mkdir(parents=True)
+    torch.save({"latents": torch.zeros(2, 1, 1, 1)}, latents_path)
+    torch.save({"latents": torch.zeros(1, 2, 1, 1, 1)}, ref_path)
+
+    loaded_rel_path, precomputed = infer_multiref_stage1_overfit._load_sample_precomputed(
+        row={"video": "clip.mp4"},
+        manifest_root=tmp_path,
+        precomputed_root=precomputed_root,
+        video_column="video",
+        condition_mode="text_only_no_siglip",
+    )
+
+    assert loaded_rel_path == rel_path
+    assert set(precomputed) == {"latents", "multi_reference_latents"}

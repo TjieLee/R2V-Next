@@ -3,10 +3,9 @@
 
 This is not the final Stage 2 planner inference path. It uses precomputed
 target-video GT SigLIP visual tokens for the positive/full-condition branch.
-Optional inference-time CFG/STG is supported: the positive branch uses full
-Stage 1 teacher conditions, the negative branch uses original LTX-2
-negative-prompt text conditioning without appended SigLIP tokens, and the STG
-branch perturbs the positive/full-condition transformer path.
+It also supports a text-only/no-SigLIP ablation branch that keeps the DiT
+multi-reference latent stream while replacing the positive condition with
+plain LTX text conditioning. Optional inference-time CFG/STG is supported.
 """
 
 from __future__ import annotations
@@ -161,6 +160,35 @@ def _negative_ref_valid_mask(ref_valid_mask: Tensor, *, drop_ref_latents: bool) 
     return torch.zeros_like(ref_valid_mask) if drop_ref_latents else ref_valid_mask
 
 
+_POSITIVE_CONDITION_MODES = {"full_siglip", "text_only_no_siglip"}
+
+
+def _uses_full_siglip_condition(condition_mode: str) -> bool:
+    return condition_mode == "full_siglip"
+
+
+def _condition_mode_detail(condition_mode: str, *, guidance_scale: float, stg_scale: float) -> str:
+    if condition_mode == "full_siglip":
+        if _cfg_enabled(guidance_scale) and _stg_enabled(stg_scale):
+            return "stage1_full_siglip_cfg_stg"
+        if _cfg_enabled(guidance_scale):
+            return "stage1_teacher_cfg_full_vs_negative_prompt_no_siglip"
+        if _stg_enabled(stg_scale):
+            return "stage1_teacher_stg_full_condition"
+        return "stage1_teacher_gt_siglip_full_condition"
+
+    if condition_mode == "text_only_no_siglip":
+        if _cfg_enabled(guidance_scale) and _stg_enabled(stg_scale):
+            return "stage1_text_only_no_siglip_cfg_stg"
+        if _cfg_enabled(guidance_scale):
+            return "stage1_text_only_no_siglip_cfg"
+        if _stg_enabled(stg_scale):
+            return "stage1_text_only_no_siglip_stg"
+        return "stage1_text_only_no_siglip_with_reference_latents"
+
+    raise ValueError(f"Unsupported condition mode: {condition_mode}")
+
+
 def _read_manifest_file(path: Path) -> list[dict[str, Any]]:
     suffix = path.suffix.lower()
     if suffix == ".json":
@@ -256,17 +284,20 @@ def _unsqueeze_sample_dim(data: dict[str, Any]) -> dict[str, Any]:
 def _build_single_sample_batch(
     *,
     latents: dict[str, Any],
-    conditions: dict[str, Any],
     multi_reference_latents: dict[str, Any],
-    gt_visual_tokens: dict[str, Any],
+    conditions: dict[str, Any] | None = None,
+    gt_visual_tokens: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     latents = PrecomputedDataset._normalize_video_latents(latents)
-    return {
+    batch = {
         "latents": _unsqueeze_sample_dim(latents),
-        "conditions": _unsqueeze_sample_dim(conditions),
         "multi_ref_latents": _unsqueeze_sample_dim(multi_reference_latents),
-        "gt_visual_tokens": _unsqueeze_sample_dim(gt_visual_tokens),
     }
+    if conditions is not None:
+        batch["conditions"] = _unsqueeze_sample_dim(conditions)
+    if gt_visual_tokens is not None:
+        batch["gt_visual_tokens"] = _unsqueeze_sample_dim(gt_visual_tokens)
+    return batch
 
 
 def _move_nested_to_device(data: dict[str, Any], *, device: torch.device, dtype: torch.dtype | None = None) -> dict[str, Any]:
@@ -286,7 +317,7 @@ def _shape(value: Tensor) -> list[int]:
     return list(value.shape)
 
 
-def _condition_feature_key(conditions: dict[str, Tensor]) -> str:
+def _condition_feature_key(conditions: dict[str, Tensor | None]) -> str:
     return "video_prompt_embeds" if "video_prompt_embeds" in conditions else "prompt_embeds"
 
 
@@ -426,15 +457,21 @@ def _load_sample_precomputed(
     manifest_root: Path,
     precomputed_root: Path,
     video_column: str,
+    condition_mode: str,
 ) -> tuple[Path, dict[str, dict[str, Any]]]:
     video_path = _resolve_path(str(row[video_column]), manifest_root)
     rel_path = _output_relative(video_path, manifest_root).with_suffix(".pt")
     files = {
         "latents": precomputed_root / "latents" / rel_path,
-        "conditions": precomputed_root / "vlm_conditions" / rel_path,
         "multi_reference_latents": precomputed_root / "multi_reference_latents" / rel_path,
-        "gt_visual_tokens": precomputed_root / "gt_siglip_tokens" / rel_path,
     }
+    if _uses_full_siglip_condition(condition_mode):
+        files.update(
+            {
+                "conditions": precomputed_root / "vlm_conditions" / rel_path,
+                "gt_visual_tokens": precomputed_root / "gt_siglip_tokens" / rel_path,
+            }
+        )
     return rel_path, {key: _load_pt_file(path) for key, path in files.items()}
 
 
@@ -506,6 +543,39 @@ def _prepare_condition_context(
     return conditions, shapes
 
 
+def _encode_text_prompt_condition(
+    *,
+    cfg: LtxTrainerConfig,
+    embeddings_processor: torch.nn.Module,
+    prompt: str,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> dict[str, Tensor | None]:
+    if cfg.model.text_encoder_path is None:
+        raise ValueError("text_only_no_siglip requires model.text_encoder_path to encode the text prompt.")
+    text_encoder = load_text_encoder(
+        gemma_model_path=cfg.model.text_encoder_path,
+        device=device,
+        dtype=dtype,
+        load_in_8bit=cfg.acceleration.load_text_encoder_in_8bit,
+    )
+    text_encoder.eval()
+    with torch.inference_mode():
+        hidden_states, attention_mask = text_encoder.encode([prompt])[0]
+        out = embeddings_processor.process_hidden_states(hidden_states, attention_mask)
+    conditions: dict[str, Tensor | None] = {
+        "video_prompt_embeds": out.video_encoding.to(device=device, dtype=dtype),
+        "audio_prompt_embeds": (
+            out.audio_encoding.to(device=device, dtype=dtype) if out.audio_encoding is not None else None
+        ),
+        "prompt_attention_mask": None,
+    }
+    del text_encoder
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return conditions
+
+
 def _encode_negative_prompt_condition(
     *,
     cfg: LtxTrainerConfig,
@@ -516,27 +586,13 @@ def _encode_negative_prompt_condition(
 ) -> dict[str, Tensor | None]:
     if cfg.model.text_encoder_path is None:
         raise ValueError("--guidance-scale > 1.0 requires model.text_encoder_path to encode the negative prompt.")
-    text_encoder = load_text_encoder(
-        gemma_model_path=cfg.model.text_encoder_path,
+    return _encode_text_prompt_condition(
+        cfg=cfg,
+        embeddings_processor=embeddings_processor,
+        prompt=negative_prompt,
         device=device,
         dtype=dtype,
-        load_in_8bit=cfg.acceleration.load_text_encoder_in_8bit,
     )
-    text_encoder.eval()
-    with torch.inference_mode():
-        neg_hs, neg_mask = text_encoder.encode([negative_prompt])[0]
-        neg_out = embeddings_processor.process_hidden_states(neg_hs, neg_mask)
-    conditions: dict[str, Tensor | None] = {
-        "video_prompt_embeds": neg_out.video_encoding.to(device=device, dtype=dtype),
-        "audio_prompt_embeds": (
-            neg_out.audio_encoding.to(device=device, dtype=dtype) if neg_out.audio_encoding is not None else None
-        ),
-        "prompt_attention_mask": None,
-    }
-    del text_encoder
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    return conditions
 
 
 def _denoise_stage1(
@@ -838,6 +894,14 @@ def main(  # noqa: PLR0913
         "--stg-mode",
         help="STG mode for this video-only Stage1 inference script. Only stg_v is supported.",
     ),
+    condition_mode: str = typer.Option(
+        "full_siglip",
+        "--condition-mode",
+        help=(
+            "Positive condition mode. full_siglip uses Stage1 full teacher condition with GT SigLIP tokens. "
+            "text_only_no_siglip uses text-only Gemma/LTX condition and keeps reference latents."
+        ),
+    ),
 ) -> None:
     if sample_index < 0:
         raise typer.BadParameter("--sample-index must be >= 0")
@@ -851,6 +915,10 @@ def main(  # noqa: PLR0913
         raise typer.BadParameter("--stg-mode currently only supports 'stg_v'")
     if cfg_negative_mode != "negative_prompt_no_siglip":
         raise typer.BadParameter("--cfg-negative-mode currently only supports 'negative_prompt_no_siglip'")
+    if condition_mode not in _POSITIVE_CONDITION_MODES:
+        raise typer.BadParameter(
+            "--condition-mode must be one of: " + ", ".join(sorted(_POSITIVE_CONDITION_MODES))
+        )
     parsed_stg_blocks = _parse_stg_blocks(stg_blocks)
 
     cfg = _load_config(Path(config))
@@ -884,12 +952,13 @@ def main(  # noqa: PLR0913
         manifest_root=manifest_root,
         precomputed_root=_normalize_precomputed_root(Path(precomputed_root)),
         video_column=video_column,
+        condition_mode=condition_mode,
     )
     batch = _build_single_sample_batch(
         latents=precomputed["latents"],
-        conditions=precomputed["conditions"],
         multi_reference_latents=precomputed["multi_reference_latents"],
-        gt_visual_tokens=precomputed["gt_visual_tokens"],
+        conditions=precomputed.get("conditions"),
+        gt_visual_tokens=precomputed.get("gt_visual_tokens"),
     )
 
     transformer, embeddings_processor, vae_decoder, strategy, checkpoint_flags = _load_models_and_strategy(
@@ -899,18 +968,43 @@ def main(  # noqa: PLR0913
         dtype=dtype,
     )
 
-    conditions, condition_shapes = _prepare_condition_context(
-        strategy=strategy,
-        embeddings_processor=embeddings_processor,
-        batch=batch,
-        device=torch_device,
-        dtype=dtype,
-    )
-    console.print(f"original feature shape: {condition_shapes['original_feature_shape']}")
-    console.print(f"raw GT visual token shape: {condition_shapes['raw_gt_visual_shape']}")
-    console.print(f"projected visual token shape: {condition_shapes['projected_visual_shape']}")
-    console.print(f"pre-connector final condition shape: {condition_shapes['pre_connector_condition_shape']}")
-    console.print(f"post-connector transformer condition shape: {condition_shapes['post_connector_condition_shape']}")
+    positive_prompt = str(sample.get(caption_column, ""))
+    if condition_mode == "full_siglip":
+        conditions, condition_shapes = _prepare_condition_context(
+            strategy=strategy,
+            embeddings_processor=embeddings_processor,
+            batch=batch,
+            device=torch_device,
+            dtype=dtype,
+        )
+    else:
+        if not positive_prompt.strip():
+            raise ValueError(f"Sample has empty prompt in caption column {caption_column!r}")
+        conditions = _encode_text_prompt_condition(
+            cfg=cfg,
+            embeddings_processor=embeddings_processor,
+            prompt=positive_prompt,
+            device=torch_device,
+            dtype=dtype,
+        )
+        text_condition_shape = _condition_shape(conditions)
+        condition_shapes = {
+            "original_condition_shape": None,
+            "original_feature_shape": None,
+            "raw_gt_visual_shape": None,
+            "projected_visual_shape": None,
+            "pre_connector_condition_shape": None,
+            "post_connector_condition_shape": text_condition_shape,
+            "transformer_condition_shape": text_condition_shape,
+            "text_only_prompt_condition_shape": text_condition_shape,
+        }
+
+    console.print(f"positive condition mode: {condition_mode}")
+    console.print(f"original feature shape: {condition_shapes.get('original_feature_shape')}")
+    console.print(f"raw GT visual token shape: {condition_shapes.get('raw_gt_visual_shape')}")
+    console.print(f"projected visual token shape: {condition_shapes.get('projected_visual_shape')}")
+    console.print(f"pre-connector final condition shape: {condition_shapes.get('pre_connector_condition_shape')}")
+    console.print(f"post-connector transformer condition shape: {condition_shapes.get('post_connector_condition_shape')}")
 
     effective_negative_prompt = negative_prompt or cfg.validation.negative_prompt
     if _cfg_enabled(guidance_scale):
@@ -954,7 +1048,7 @@ def main(  # noqa: PLR0913
 
     latent_fps = strategy._first_scalar(batch["latents"].get("fps"), default=24.0)
     output_fps = float(fps) if fps is not None else float(latent_fps)
-    generated_path = sample_dir / "generated.mp4"
+    generated_path = sample_dir / f"generated_{condition_mode}.mp4"
     save_video(video_tensor=decoded, output_path=generated_path, fps=output_fps, video_format="FCHW")
 
     metadata = {
@@ -980,15 +1074,17 @@ def main(  # noqa: PLR0913
         "stg_blocks": parsed_stg_blocks,
         "stg_mode": stg_mode,
         "guidance_formula": "x_null + cfg * (x_prompt - x_null) + stg * (x_prompt - x_stg)",
-        "condition_mode": (
-            "stage1_teacher_gt_siglip_full_condition"
-            if not _cfg_enabled(guidance_scale) and not _stg_enabled(stg_scale)
-            else "stage1_teacher_cfg_full_vs_negative_prompt_no_siglip"
-            if _cfg_enabled(guidance_scale) and not _stg_enabled(stg_scale)
-            else "stage1_teacher_stg_full_condition"
-            if not _cfg_enabled(guidance_scale) and _stg_enabled(stg_scale)
-            else "stage1_teacher_cfg_stg_full_vs_negative_prompt_no_siglip"
+        "condition_mode": condition_mode,
+        "condition_mode_detail": _condition_mode_detail(
+            condition_mode,
+            guidance_scale=guidance_scale,
+            stg_scale=stg_scale,
         ),
+        "uses_gt_siglip_visual_tokens": condition_mode == "full_siglip",
+        "uses_vlm_reference_image_context": condition_mode == "full_siglip",
+        "uses_text_only_prompt_condition": condition_mode == "text_only_no_siglip",
+        "keeps_reference_latent_condition": True,
+        "text_only_prompt_condition_shape": condition_shapes.get("text_only_prompt_condition_shape"),
         "connector_checkpoint_loaded": checkpoint_flags["connector_checkpoint_loaded"],
         "visual_token_projection_checkpoint_loaded": checkpoint_flags["visual_token_projection_checkpoint_loaded"],
         "original_feature_shape": condition_shapes["original_feature_shape"],
