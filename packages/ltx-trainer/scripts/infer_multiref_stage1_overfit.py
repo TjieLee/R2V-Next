@@ -95,7 +95,7 @@ def _stg_enabled(stg_scale: float) -> bool:
 
 def _parse_stg_blocks(value: str | None) -> list[int] | None:
     if value is None:
-        return [29]
+        return [28]
     text = value.strip().lower()
     if text in {"", "none", "all"}:
         return None
@@ -131,6 +131,8 @@ def _combine_multidirectional_denoised(
     guidance_scale: float,
     ref_guidance_scale: float,
     stg_scale: float,
+    guidance_rescale: float,
+    target_seq_len: int | None = None,
 ) -> Tensor:
     if _cfg_enabled(guidance_scale):
         if denoised_neg is None:
@@ -148,6 +150,19 @@ def _combine_multidirectional_denoised(
         if denoised_stg is None:
             raise ValueError("stg_scale != 0.0 requires denoised_stg")
         guided = guided + stg_scale * (denoised_pos - denoised_stg)
+
+    if guidance_rescale != 0.0:
+        if target_seq_len is None or target_seq_len <= 0:
+            raise ValueError("guidance_rescale requires a positive target_seq_len")
+
+        cond_target = denoised_pos[:, -target_seq_len:, :].float()
+        guided_target = guided[:, -target_seq_len:, :].float()
+        cond_std = cond_target.std()
+        guided_std = guided_target.std().clamp(min=1.0e-8)
+        factor = cond_std / guided_std
+        factor = guidance_rescale * factor + (1.0 - guidance_rescale)
+        guided = guided * factor.to(device=guided.device, dtype=guided.dtype)
+
     return guided
 
 
@@ -161,6 +176,11 @@ def _condition_shape(conditions: dict[str, Tensor | None] | None) -> list[int] |
 
 def _cfg_enabled(guidance_scale: float) -> bool:
     return guidance_scale != 1.0
+
+
+def _validate_guidance_rescale(guidance_rescale: float) -> None:
+    if not 0.0 <= guidance_rescale <= 1.0:
+        raise typer.BadParameter("--guidance-rescale must be in [0, 1]")
 
 
 def _negative_ref_valid_mask(ref_valid_mask: Tensor, *, drop_ref_latents: bool) -> Tensor:
@@ -627,6 +647,7 @@ def _denoise_stage1(
     guidance_scale: float,
     cfg_drop_ref_latents_in_negative: bool,
     ref_guidance_scale: float,
+    guidance_rescale: float,
     stg_scale: float,
     stg_blocks: list[int] | None,
     num_inference_steps: int,
@@ -822,6 +843,8 @@ def _denoise_stage1(
                 guidance_scale=guidance_scale,
                 ref_guidance_scale=ref_guidance_scale,
                 stg_scale=stg_scale,
+                guidance_rescale=guidance_rescale,
+                target_seq_len=target_seq_len,
             )
             next_packed = stepper.step(packed.latents, denoised_video, sigmas, step_idx)
             target_tokens = next_packed[:, -target_seq_len:, :]
@@ -929,6 +952,15 @@ def main(  # noqa: PLR0913
             "0 disables this branch."
         ),
     ),
+    guidance_rescale: float = typer.Option(
+        0.0,
+        "--guidance-rescale",
+        help=(
+            "Rescale the final guided prediction toward the standard deviation "
+            "of the full conditional prediction. 0 disables. "
+            "LTX-2.3 standard default is 0.7."
+        ),
+    ),
     negative_prompt: str | None = typer.Option(
         None,
         "--negative-prompt",
@@ -953,7 +985,7 @@ def main(  # noqa: PLR0913
         help="STG scale. 0.0 disables STG. Final formula adds stg_scale * (x_prompt - x_stg).",
     ),
     stg_blocks: str | None = typer.Option(
-        "29",
+        "28",
         "--stg-blocks",
         help=(
             "Comma-separated transformer block indices for STG video self-attention skipping. "
@@ -982,6 +1014,7 @@ def main(  # noqa: PLR0913
         raise typer.BadParameter("--guidance-scale must be >= 1.0")
     if ref_guidance_scale < 0.0:
         raise typer.BadParameter("--ref-guidance-scale must be >= 0.0")
+    _validate_guidance_rescale(guidance_rescale)
     if ref_guidance_scale != 0.0 and cfg_drop_ref_latents_in_negative:
         raise typer.BadParameter(
             "--ref-guidance-scale requires --cfg-keep-ref-latents-in-negative so the CFG negative branch is N_R"
@@ -1115,6 +1148,7 @@ def main(  # noqa: PLR0913
         guidance_scale=guidance_scale,
         cfg_drop_ref_latents_in_negative=cfg_drop_ref_latents_in_negative,
         ref_guidance_scale=ref_guidance_scale,
+        guidance_rescale=guidance_rescale,
         stg_scale=stg_scale,
         stg_blocks=parsed_stg_blocks,
         num_inference_steps=num_inference_steps,
@@ -1154,6 +1188,8 @@ def main(  # noqa: PLR0913
         "negative_condition_shape": _condition_shape(negative_conditions),
         "ref_guidance_scale": ref_guidance_scale,
         "ref_guidance_enabled": ref_guidance_scale != 0.0,
+        "guidance_rescale": guidance_rescale,
+        "guidance_rescale_enabled": guidance_rescale != 0.0,
         "stg_scale": stg_scale,
         "stg_enabled": _stg_enabled(stg_scale),
         "stg_blocks": parsed_stg_blocks,

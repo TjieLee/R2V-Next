@@ -3,6 +3,7 @@ from pathlib import Path
 
 import torch
 from torch import nn
+from typer.testing import CliRunner
 
 from ltx_core.multicond.cfg_sampler import CFGModeBatch, sample_cfg_modes
 from ltx_core.multicond.visual_tokens import Visual3DResampler, VisualPlannerTokens
@@ -947,6 +948,7 @@ def test_stage1_infer_multidirectional_guidance_formula() -> None:
         guidance_scale=2.5,
         ref_guidance_scale=1.0,
         stg_scale=0.5,
+        guidance_rescale=0.0,
     )
 
     assert torch.equal(actual, torch.tensor(26.0))
@@ -966,6 +968,7 @@ def test_stage1_infer_multidirectional_guidance_handles_disabled_branches() -> N
         guidance_scale=1.0,
         ref_guidance_scale=0.0,
         stg_scale=0.0,
+        guidance_rescale=0.0,
     )
     stg_only = infer_multiref_stage1_overfit._combine_multidirectional_denoised(
         denoised_pos=pos,
@@ -975,6 +978,7 @@ def test_stage1_infer_multidirectional_guidance_handles_disabled_branches() -> N
         guidance_scale=1.0,
         ref_guidance_scale=0.0,
         stg_scale=0.5,
+        guidance_rescale=0.0,
     )
     cfg_only = infer_multiref_stage1_overfit._combine_multidirectional_denoised(
         denoised_pos=pos,
@@ -984,6 +988,7 @@ def test_stage1_infer_multidirectional_guidance_handles_disabled_branches() -> N
         guidance_scale=1.5,
         ref_guidance_scale=0.0,
         stg_scale=0.0,
+        guidance_rescale=0.0,
     )
     ref_only = infer_multiref_stage1_overfit._combine_multidirectional_denoised(
         denoised_pos=pos,
@@ -993,6 +998,7 @@ def test_stage1_infer_multidirectional_guidance_handles_disabled_branches() -> N
         guidance_scale=1.0,
         ref_guidance_scale=0.75,
         stg_scale=0.0,
+        guidance_rescale=0.0,
     )
 
     assert torch.equal(no_guidance, pos)
@@ -1012,11 +1018,102 @@ def test_stage1_infer_ref_guidance_requires_no_ref_prediction() -> None:
             guidance_scale=1.0,
             ref_guidance_scale=1.0,
             stg_scale=0.0,
+            guidance_rescale=0.0,
         )
     except ValueError as exc:
         raised = True
         assert "requires denoised_no_ref" in str(exc)
     assert raised
+
+
+def test_stage1_infer_guidance_rescale_moves_target_std_toward_conditional() -> None:
+    pos = torch.tensor([[[100.0], [200.0], [1.0], [3.0], [5.0]]])
+    neg = torch.tensor([[[-100.0], [-200.0], [-3.0], [1.0], [9.0]]])
+
+    unscaled = infer_multiref_stage1_overfit._combine_multidirectional_denoised(
+        denoised_pos=pos,
+        denoised_neg=neg,
+        denoised_no_ref=None,
+        denoised_stg=None,
+        guidance_scale=2.5,
+        ref_guidance_scale=0.0,
+        stg_scale=0.0,
+        guidance_rescale=0.0,
+        target_seq_len=3,
+    )
+    rescaled = infer_multiref_stage1_overfit._combine_multidirectional_denoised(
+        denoised_pos=pos,
+        denoised_neg=neg,
+        denoised_no_ref=None,
+        denoised_stg=None,
+        guidance_scale=2.5,
+        ref_guidance_scale=0.0,
+        stg_scale=0.0,
+        guidance_rescale=0.7,
+        target_seq_len=3,
+    )
+
+    cond_std = pos[:, -3:, :].float().std()
+    unscaled_std = unscaled[:, -3:, :].float().std()
+    rescaled_std = rescaled[:, -3:, :].float().std()
+    assert abs(rescaled_std - cond_std) < abs(unscaled_std - cond_std)
+
+
+def test_stage1_infer_guidance_rescale_ignores_reference_prefix_scale() -> None:
+    pos_a = torch.tensor([[[10.0], [20.0], [1.0], [3.0], [5.0]]])
+    neg_a = torch.tensor([[[-10.0], [-20.0], [-3.0], [1.0], [9.0]]])
+    pos_b = pos_a.clone()
+    neg_b = neg_a.clone()
+    pos_b[:, :2, :] *= 1000.0
+    neg_b[:, :2, :] *= 1000.0
+
+    kwargs = {
+        "denoised_no_ref": None,
+        "denoised_stg": None,
+        "guidance_scale": 2.5,
+        "ref_guidance_scale": 0.0,
+        "stg_scale": 0.0,
+        "guidance_rescale": 0.7,
+        "target_seq_len": 3,
+    }
+    result_a = infer_multiref_stage1_overfit._combine_multidirectional_denoised(
+        denoised_pos=pos_a,
+        denoised_neg=neg_a,
+        **kwargs,
+    )
+    result_b = infer_multiref_stage1_overfit._combine_multidirectional_denoised(
+        denoised_pos=pos_b,
+        denoised_neg=neg_b,
+        **kwargs,
+    )
+
+    assert torch.allclose(result_a[:, -3:, :], result_b[:, -3:, :])
+
+
+def test_stage1_infer_guidance_rescale_validation_rejects_out_of_range_values() -> None:
+    runner = CliRunner()
+    required_args = [
+        "--config",
+        "missing-config.yaml",
+        "--checkpoint",
+        "missing-checkpoint.safetensors",
+        "--manifest",
+        "missing-manifest.json",
+        "--precomputed-root",
+        "missing-precomputed",
+        "--output-dir",
+        "missing-output",
+    ]
+    for invalid_value in (-0.1, 1.1):
+        result = runner.invoke(
+            infer_multiref_stage1_overfit.app,
+            [*required_args, "--guidance-rescale", str(invalid_value)],
+        )
+        assert result.exit_code != 0
+        assert "--guidance-rescale must be in [0, 1]" in result.output
+
+    infer_multiref_stage1_overfit._validate_guidance_rescale(0.0)
+    infer_multiref_stage1_overfit._validate_guidance_rescale(1.0)
 
 
 def test_stage1_infer_cfg_enabled_only_when_guidance_scale_not_one() -> None:
@@ -1027,7 +1124,7 @@ def test_stage1_infer_cfg_enabled_only_when_guidance_scale_not_one() -> None:
 def test_stage1_infer_stg_helpers_parse_blocks_and_config() -> None:
     assert infer_multiref_stage1_overfit._stg_enabled(0.0) is False
     assert infer_multiref_stage1_overfit._stg_enabled(0.5) is True
-    assert infer_multiref_stage1_overfit._parse_stg_blocks(None) == [29]
+    assert infer_multiref_stage1_overfit._parse_stg_blocks(None) == [28]
     assert infer_multiref_stage1_overfit._parse_stg_blocks("29, 30") == [29, 30]
     assert infer_multiref_stage1_overfit._parse_stg_blocks("none") is None
 
