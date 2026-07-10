@@ -446,10 +446,23 @@ def _load_checkpoint_weights(
     visual_full_encoder_loaded = any(
         key.startswith("training_strategy.visual_full_encoder.") for key in state_dict
     )
+    projection_required = (
+        cfg.training_strategy.visual_token_source_dim
+        != cfg.training_strategy.visual_token_target_dim
+    )
     if cfg.training_strategy.visual_context_mode == "full_tokens_3d_sa" and not visual_full_encoder_loaded:
         raise ValueError(
             "Stage 1 inference with visual_context_mode='full_tokens_3d_sa' requires checkpoint keys under "
             "training_strategy.visual_full_encoder.*. Do not use a legacy Q-former checkpoint."
+        )
+    if (
+        cfg.training_strategy.visual_context_mode == "full_tokens_3d_sa"
+        and projection_required
+        and not visual_projection_loaded
+    ):
+        raise ValueError(
+            "Stage 1 full-token inference requires checkpoint keys under "
+            "training_strategy.visual_token_projection.*."
         )
 
     strategy.load_extra_checkpoint_state_dict(state_dict)
