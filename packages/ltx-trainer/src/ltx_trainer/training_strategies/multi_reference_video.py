@@ -19,7 +19,7 @@ from ltx_core.model.transformer.modality import Modality
 from ltx_core.model.transformer.rope import LTXRopeType
 from ltx_core.multicond.cfg_sampler import CFGModeBatch, sample_cfg_modes
 from ltx_core.multicond.rope_mask_builder import build_multiref_sequence
-from ltx_core.multicond.visual_tokens import Visual3DResampler
+from ltx_core.multicond.visual_tokens import Visual3DResampler, Visual3DTokenEncoder
 from ltx_core.text_encoders.gemma import convert_to_additive_mask
 from ltx_trainer import logger
 from ltx_trainer.timestep_samplers import TimestepSampler
@@ -117,6 +117,25 @@ class MultiReferenceVideoConfig(TrainingStrategyConfigBase):
     visual_branch_enabled: bool = Field(
         default=True,
         description="Enable independent post-connector target-video SigLIP visual branch.",
+    )
+
+    visual_context_mode: Literal["qformer_512", "full_tokens_3d_sa"] = Field(
+        default="qformer_512",
+        description="Visual context architecture. The default preserves legacy Q-former checkpoints.",
+    )
+
+    visual_full_sa_num_heads: int = Field(default=32, ge=1)
+    visual_full_sa_depth: int = Field(default=1, ge=1)
+    visual_full_sa_ffn_multiplier: float = Field(default=2.0, gt=0.0)
+    visual_full_sa_dropout: float = Field(default=0.0, ge=0.0, lt=1.0)
+    visual_full_sa_residual_init_gain: float = Field(default=0.1, gt=0.0)
+    visual_full_sa_use_middle_positions: bool = Field(default=True)
+    visual_context_expected_tokens: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Optional strict expected visual token count. Use 2048 for 8 frames * 16 * 16 tokens."
+        ),
     )
 
     visual_context_spatial_grid: int = Field(
@@ -252,6 +271,27 @@ class MultiReferenceVideoConfig(TrainingStrategyConfigBase):
                 "visual_token_source_dim and visual_token_target_dim must be set together, "
                 "e.g. 3840 and 4096, or both left unset to require matching dims."
             )
+        if self.visual_context_mode == "full_tokens_3d_sa":
+            if self.visual_connector_enabled:
+                raise ValueError(
+                    "visual_connector_enabled must be false when visual_context_mode='full_tokens_3d_sa'"
+                )
+            if self.visual_token_target_dim is None:
+                raise ValueError(
+                    "visual_token_target_dim must be set when visual_context_mode='full_tokens_3d_sa'"
+                )
+            if self.visual_token_target_dim % self.visual_full_sa_num_heads != 0:
+                raise ValueError(
+                    f"visual_token_target_dim={self.visual_token_target_dim} must be divisible by "
+                    f"visual_full_sa_num_heads={self.visual_full_sa_num_heads}"
+                )
+            head_dim = self.visual_token_target_dim // self.visual_full_sa_num_heads
+            if head_dim % 2 != 0:
+                raise ValueError(
+                    "full_tokens_3d_sa requires even head_dim for split RoPE, got "
+                    f"target_dim={self.visual_token_target_dim}, num_heads={self.visual_full_sa_num_heads}, "
+                    f"head_dim={head_dim}"
+                )
         return self
 
     def get_data_sources(self) -> dict[str, str]:
@@ -306,6 +346,7 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
         self._visual_token_source_dim: int | None = None
         self._visual_token_target_dim: int | None = None
         self._visual_resampler: Visual3DResampler | None = None
+        self._visual_full_encoder: Visual3DTokenEncoder | None = None
         self._visual_connector: nn.Module | None = None
         self._visual_gate: ScalarParameterModule | None = None
         self._last_visual_context_shape: list[int] | None = None
@@ -329,6 +370,7 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
 
     def _init_visual_branch(self, transformer: nn.Module, video_connector: nn.Module) -> None:
         self._visual_resampler = None
+        self._visual_full_encoder = None
         self._visual_connector = None
         self._visual_gate = None
         if not self.config.visual_branch_enabled:
@@ -342,6 +384,30 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
             connector_dim = param.shape[-1] if param is not None and param.ndim > 0 else self.config.visual_token_target_dim
         if connector_dim is None:
             raise ValueError("Cannot infer visual branch connector dimension from embeddings_processor.video_connector")
+
+        if self.config.visual_context_mode == "full_tokens_3d_sa":
+            if int(connector_dim) != self.config.visual_token_target_dim:
+                raise ValueError(
+                    "full_tokens_3d_sa connector dimension must match visual_token_target_dim, got "
+                    f"connector_dim={connector_dim}, visual_token_target_dim={self.config.visual_token_target_dim}"
+                )
+            self._visual_full_encoder = Visual3DTokenEncoder(
+                dim=int(connector_dim),
+                num_heads=self.config.visual_full_sa_num_heads,
+                depth=self.config.visual_full_sa_depth,
+                ffn_multiplier=self.config.visual_full_sa_ffn_multiplier,
+                dropout=self.config.visual_full_sa_dropout,
+                residual_init_gain=self.config.visual_full_sa_residual_init_gain,
+                positional_embedding_theta=getattr(transformer, "positional_embedding_theta", 10000.0),
+                positional_embedding_max_pos=getattr(
+                    transformer,
+                    "positional_embedding_max_pos",
+                    [20, 2048, 2048],
+                ),
+                rope_type=getattr(transformer, "rope_type", LTXRopeType.SPLIT),
+                use_middle_positions=self.config.visual_full_sa_use_middle_positions,
+            ).to(device=device, dtype=dtype)
+            return
 
         self._visual_resampler = Visual3DResampler(
             dim=int(connector_dim),
@@ -394,6 +460,8 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
             modules["visual_token_projection"] = self._visual_token_projection
         if self._visual_resampler is not None:
             modules["visual_resampler"] = self._visual_resampler
+        if self._visual_full_encoder is not None:
+            modules["visual_full_encoder"] = self._visual_full_encoder
         if self._visual_connector is not None:
             modules["visual_connector"] = self._visual_connector
         if self._visual_gate is not None:
@@ -405,12 +473,37 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
             self._visual_token_projection = modules["visual_token_projection"]
         if "visual_resampler" in modules:
             self._visual_resampler = modules["visual_resampler"]
+        if "visual_full_encoder" in modules:
+            self._visual_full_encoder = modules["visual_full_encoder"]
         if "visual_connector" in modules:
             self._visual_connector = modules["visual_connector"]
         if "visual_gate" in modules:
             self._visual_gate = modules["visual_gate"]
 
     def load_extra_checkpoint_state_dict(self, state_dict: dict[str, Tensor]) -> None:
+        has_legacy_visual_state = any(
+            key.startswith(
+                (
+                    "training_strategy.visual_resampler.",
+                    "training_strategy.visual_connector.",
+                    "training_strategy.visual_gate.",
+                )
+            )
+            for key in state_dict
+        )
+        has_full_visual_state = any(
+            key.startswith("training_strategy.visual_full_encoder.") for key in state_dict
+        )
+        if self.config.visual_context_mode == "full_tokens_3d_sa" and has_legacy_visual_state:
+            raise ValueError(
+                "Cannot load legacy Q-former visual_resampler/visual_connector/visual_gate weights into "
+                "visual_context_mode='full_tokens_3d_sa'. Start the new visual branch from scratch."
+            )
+        if self.config.visual_context_mode == "qformer_512" and has_full_visual_state:
+            raise ValueError(
+                "Cannot load visual_full_encoder weights into visual_context_mode='qformer_512'. "
+                "Use the checkpoint's matching visual_context_mode."
+            )
         for name, module in self.get_trainable_modules().items():
             prefix = f"training_strategy.{name}."
             module_state = {key.removeprefix(prefix): value for key, value in state_dict.items() if key.startswith(prefix)}
@@ -760,9 +853,6 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
         batch: dict[str, Any],
         conditions: dict[str, Tensor],
     ) -> tuple[Tensor, Tensor]:
-        if self._visual_resampler is None:
-            raise RuntimeError("visual_branch_enabled=True requires initialized Visual3DResampler.")
-
         key = "video_prompt_embeds" if "video_prompt_embeds" in conditions else "prompt_embeds"
         features = conditions[key]
         raw_tokens, raw_mask = self._load_raw_condition_visual_tokens(
@@ -778,19 +868,36 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
             device=projected_tokens.device,
             dtype=torch.float32,
         )
-        query_positions = self._build_visual_query_positions(
-            batch["gt_visual_tokens"],
-            batch["latents"],
-            token_count=projected_tokens.shape[1],
-            device=projected_tokens.device,
-            dtype=torch.float32,
-        )
-        visual_context, visual_mask = self._visual_resampler(
-            tokens=projected_tokens,
-            token_positions=token_positions,
-            token_mask=raw_mask,
-            query_positions=query_positions,
-        )
+        if self.config.visual_context_mode == "full_tokens_3d_sa":
+            if self._visual_full_encoder is None:
+                raise RuntimeError(
+                    "visual_context_mode='full_tokens_3d_sa' requires initialized Visual3DTokenEncoder"
+                )
+            self._validate_full_visual_token_layout(
+                batch["gt_visual_tokens"],
+                token_count=projected_tokens.shape[1],
+            )
+            visual_context, visual_mask = self._visual_full_encoder(
+                tokens=projected_tokens,
+                token_positions=token_positions,
+                token_mask=raw_mask,
+            )
+        else:
+            if self._visual_resampler is None:
+                raise RuntimeError("visual_branch_enabled=True requires initialized Visual3DResampler.")
+            query_positions = self._build_visual_query_positions(
+                batch["gt_visual_tokens"],
+                batch["latents"],
+                token_count=projected_tokens.shape[1],
+                device=projected_tokens.device,
+                dtype=torch.float32,
+            )
+            visual_context, visual_mask = self._visual_resampler(
+                tokens=projected_tokens,
+                token_positions=token_positions,
+                token_mask=raw_mask,
+                query_positions=query_positions,
+            )
         if self._visual_connector is not None:
             visual_context, visual_mask = self._run_visual_connector(visual_context, visual_mask)
         if self._visual_gate is not None:
@@ -803,6 +910,25 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
         batch["_visual_context_shape"] = shape
         batch["_visual_context_token_count"] = int(visual_context.shape[1])
         return visual_context, visual_mask
+
+    def _validate_full_visual_token_layout(self, visual_data: dict[str, Any], *, token_count: int) -> None:
+        expected_tokens = self.config.visual_context_expected_tokens
+        if expected_tokens is not None and token_count != expected_tokens:
+            raise ValueError(
+                f"Full visual context expected {expected_tokens} tokens, got {token_count}"
+            )
+        tokens_per_frame = self._visual_tokens_per_frame(visual_data, token_count=token_count)
+        frame_count = token_count // tokens_per_frame
+        spatial_grid = math.isqrt(tokens_per_frame)
+        if spatial_grid * spatial_grid != tokens_per_frame:
+            raise ValueError(
+                f"Full visual context tokens_per_frame={tokens_per_frame} must form a square spatial grid"
+            )
+        if expected_tokens == 2048 and (tokens_per_frame, frame_count, spatial_grid) != (256, 8, 16):
+            raise ValueError(
+                "Expected 2048-token layout as 8 frames * 16 * 16 tokens, got "
+                f"frame_count={frame_count}, spatial_grid={spatial_grid}, tokens_per_frame={tokens_per_frame}"
+            )
 
     def _run_visual_connector(self, visual_context: Tensor, visual_mask: Tensor) -> tuple[Tensor, Tensor]:
         if self._visual_connector is None:
@@ -1143,6 +1269,8 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
             "visual_token_projection_enabled": self._visual_token_projection is not None,
             "train_text_connector": self.config.train_text_connector,
             "visual_branch_enabled": self.config.visual_branch_enabled,
+            "visual_context_mode": self.config.visual_context_mode,
+            "visual_context_expected_tokens": self.config.visual_context_expected_tokens,
             "visual_context_spatial_grid": self.config.visual_context_spatial_grid,
             "visual_context_frame_stride": self.config.visual_context_frame_stride,
             "visual_context_token_count": self._last_visual_context_shape[1] if self._last_visual_context_shape else None,
@@ -1150,6 +1278,8 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
             "visual_resampler_num_heads": self.config.visual_resampler_num_heads,
             "visual_connector_enabled": self.config.visual_connector_enabled,
             "visual_gate_init": self.config.visual_gate_init,
+            "visual_full_sa_num_heads": self.config.visual_full_sa_num_heads,
+            "visual_full_sa_depth": self.config.visual_full_sa_depth,
         }
         if self.reference_spatial_scale_factor is not None:
             metadata["reference_spatial_scale_factor"] = self.reference_spatial_scale_factor

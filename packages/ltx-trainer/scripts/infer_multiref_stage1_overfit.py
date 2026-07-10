@@ -443,6 +443,14 @@ def _load_checkpoint_weights(
         raise FileNotFoundError(f"Checkpoint does not exist: {checkpoint_path}")
     state_dict = load_file(checkpoint_path)
     visual_projection_loaded = any(key.startswith("training_strategy.visual_token_projection.") for key in state_dict)
+    visual_full_encoder_loaded = any(
+        key.startswith("training_strategy.visual_full_encoder.") for key in state_dict
+    )
+    if cfg.training_strategy.visual_context_mode == "full_tokens_3d_sa" and not visual_full_encoder_loaded:
+        raise ValueError(
+            "Stage 1 inference with visual_context_mode='full_tokens_3d_sa' requires checkpoint keys under "
+            "training_strategy.visual_full_encoder.*. Do not use a legacy Q-former checkpoint."
+        )
 
     strategy.load_extra_checkpoint_state_dict(state_dict)
 
@@ -471,6 +479,7 @@ def _load_checkpoint_weights(
         return {
             "connector_checkpoint_loaded": connector_checkpoint_loaded,
             "visual_token_projection_checkpoint_loaded": visual_projection_loaded,
+            "visual_full_encoder_checkpoint_loaded": visual_full_encoder_loaded,
         }
 
     lora_state = {
@@ -483,6 +492,7 @@ def _load_checkpoint_weights(
         return {
             "connector_checkpoint_loaded": connector_checkpoint_loaded,
             "visual_token_projection_checkpoint_loaded": visual_projection_loaded,
+            "visual_full_encoder_checkpoint_loaded": visual_full_encoder_loaded,
         }
     base_model = transformer.get_base_model()
     try:
@@ -495,6 +505,7 @@ def _load_checkpoint_weights(
     return {
         "connector_checkpoint_loaded": connector_checkpoint_loaded,
         "visual_token_projection_checkpoint_loaded": visual_projection_loaded,
+        "visual_full_encoder_checkpoint_loaded": visual_full_encoder_loaded,
     }
 
 
@@ -1348,8 +1359,11 @@ def main(  # noqa: PLR0913
         "keeps_reference_latent_condition": True,
         "text_only_prompt_condition_shape": condition_shapes.get("text_only_prompt_condition_shape"),
         "visual_branch_enabled": bool(getattr(strategy.config, "visual_branch_enabled", False)) and condition_mode == "full_siglip",
+        "visual_context_mode": strategy.config.visual_context_mode,
         "visual_context_shape": condition_shapes.get("visual_context_shape"),
         "visual_context_token_count": condition_shapes.get("visual_context_token_count"),
+        "visual_full_sa_num_heads": strategy.config.visual_full_sa_num_heads,
+        "visual_full_sa_depth": strategy.config.visual_full_sa_depth,
         "visual_gate": (
             float(strategy._visual_gate.value.detach().float().cpu().item())
             if getattr(strategy, "_visual_gate", None) is not None
@@ -1357,6 +1371,7 @@ def main(  # noqa: PLR0913
         ),
         "connector_checkpoint_loaded": checkpoint_flags["connector_checkpoint_loaded"],
         "visual_token_projection_checkpoint_loaded": checkpoint_flags["visual_token_projection_checkpoint_loaded"],
+        "visual_full_encoder_checkpoint_loaded": checkpoint_flags["visual_full_encoder_checkpoint_loaded"],
         "original_feature_shape": condition_shapes["original_feature_shape"],
         "raw_gt_visual_shape": condition_shapes["raw_gt_visual_shape"],
         "projected_visual_shape": condition_shapes["projected_visual_shape"],

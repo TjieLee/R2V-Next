@@ -236,6 +236,186 @@ class VisualPlannerTokens(nn.Module):
         return value.transpose(1, 2).reshape(batch_size, seq_len, -1)
 
 
+class _Visual3DSelfAttentionBlock(nn.Module):
+    def __init__(
+        self,
+        *,
+        dim: int,
+        num_heads: int,
+        ffn_multiplier: float,
+        dropout: float,
+        residual_init_gain: float,
+    ) -> None:
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.dropout = dropout
+
+        self.norm1 = nn.RMSNorm(dim, eps=1.0e-6, elementwise_affine=True)
+        self.qkv = nn.Linear(dim, 3 * dim, bias=False)
+        self.attn_out = nn.Linear(dim, dim, bias=False)
+        self.norm2 = nn.RMSNorm(dim, eps=1.0e-6, elementwise_affine=True)
+        hidden_dim = max(1, int(dim * ffn_multiplier))
+        self.ffn_fc1 = nn.Linear(dim, hidden_dim, bias=False)
+        self.ffn_fc2 = nn.Linear(hidden_dim, dim, bias=False)
+
+        nn.init.ones_(self.norm1.weight)
+        nn.init.ones_(self.norm2.weight)
+        nn.init.xavier_uniform_(self.qkv.weight, gain=1.0)
+        nn.init.xavier_uniform_(self.attn_out.weight, gain=residual_init_gain)
+        nn.init.xavier_uniform_(self.ffn_fc1.weight, gain=1.0)
+        nn.init.xavier_uniform_(self.ffn_fc2.weight, gain=residual_init_gain)
+
+    def forward(
+        self,
+        x: Tensor,
+        *,
+        freqs_cis: tuple[Tensor, Tensor],
+        token_mask: Tensor,
+        rope_type: LTXRopeType,
+    ) -> Tensor:
+        batch_size, seq_len, _dim = x.shape
+        qkv = self.qkv(self.norm1(x))
+        q, k, v = qkv.chunk(3, dim=-1)
+        q = q.reshape(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.reshape(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.reshape(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        q = apply_rotary_emb(q, freqs_cis, rope_type)
+        k = apply_rotary_emb(k, freqs_cis, rope_type)
+
+        safe_key_mask = token_mask
+        no_valid_keys = ~safe_key_mask.any(dim=1)
+        if torch.any(no_valid_keys):
+            safe_key_mask = safe_key_mask.clone()
+            safe_key_mask[no_valid_keys, 0] = True
+        attended = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=safe_key_mask[:, None, None, :],
+            dropout_p=self.dropout if self.training else 0.0,
+        )
+        attended = attended.transpose(1, 2).reshape(batch_size, seq_len, self.dim)
+        x = x + self.attn_out(attended)
+
+        hidden = F.gelu(self.ffn_fc1(self.norm2(x)))
+        if self.training and self.dropout > 0.0:
+            hidden = F.dropout(hidden, p=self.dropout)
+        return x + self.ffn_fc2(hidden)
+
+
+class Visual3DTokenEncoder(nn.Module):
+    """Bias-free 3D-RoPE self-attention encoder for full visual token sequences."""
+
+    def __init__(
+        self,
+        *,
+        dim: int = 4096,
+        num_heads: int = 32,
+        depth: int = 1,
+        ffn_multiplier: float = 2.0,
+        dropout: float = 0.0,
+        residual_init_gain: float = 0.1,
+        positional_embedding_theta: float = 10000.0,
+        positional_embedding_max_pos: list[int] | None = None,
+        rope_type: LTXRopeType = LTXRopeType.SPLIT,
+        use_middle_positions: bool = True,
+    ) -> None:
+        super().__init__()
+        if dim <= 0:
+            raise ValueError("dim must be positive")
+        if num_heads <= 0:
+            raise ValueError("num_heads must be positive")
+        if dim % num_heads != 0:
+            raise ValueError(f"dim={dim} must be divisible by num_heads={num_heads}")
+        head_dim = dim // num_heads
+        if rope_type == LTXRopeType.SPLIT and head_dim % 2 != 0:
+            raise ValueError(
+                "Visual3DTokenEncoder requires even head_dim for split RoPE, got "
+                f"dim={dim}, num_heads={num_heads}, head_dim={head_dim}"
+            )
+        if depth <= 0:
+            raise ValueError("depth must be positive")
+        if ffn_multiplier <= 0.0:
+            raise ValueError("ffn_multiplier must be positive")
+        if not 0.0 <= dropout < 1.0:
+            raise ValueError("dropout must be in [0, 1)")
+        if residual_init_gain <= 0.0:
+            raise ValueError("residual_init_gain must be positive")
+
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.depth = depth
+        self.dropout = dropout
+        self.positional_embedding_theta = positional_embedding_theta
+        self.positional_embedding_max_pos = list(positional_embedding_max_pos or [20, 2048, 2048])
+        self.rope_type = rope_type
+        self.use_middle_positions = use_middle_positions
+
+        self.input_norm = nn.RMSNorm(dim, eps=1.0e-6, elementwise_affine=True)
+        self.blocks = nn.ModuleList(
+            _Visual3DSelfAttentionBlock(
+                dim=dim,
+                num_heads=num_heads,
+                ffn_multiplier=ffn_multiplier,
+                dropout=dropout,
+                residual_init_gain=residual_init_gain,
+            )
+            for _ in range(depth)
+        )
+        self.output_norm = nn.RMSNorm(dim, eps=1.0e-6, elementwise_affine=True)
+        nn.init.ones_(self.input_norm.weight)
+        nn.init.ones_(self.output_norm.weight)
+
+    def forward(
+        self,
+        *,
+        tokens: Tensor,
+        token_positions: Tensor,
+        token_mask: Tensor | None,
+    ) -> tuple[Tensor, Tensor]:
+        if tokens.ndim != 3:
+            raise ValueError(f"tokens must be [B,N,D], got {tuple(tokens.shape)}")
+        if tokens.shape[-1] != self.dim:
+            raise ValueError(f"tokens dim {tokens.shape[-1]} != encoder dim {self.dim}")
+        if token_positions.shape != (tokens.shape[0], 3, tokens.shape[1], 2):
+            raise ValueError(
+                "token_positions must be [B,3,N,2], got "
+                f"{tuple(token_positions.shape)} for tokens {tuple(tokens.shape)}"
+            )
+        if token_mask is None:
+            encoded_mask = torch.ones(tokens.shape[:2], dtype=torch.bool, device=tokens.device)
+        else:
+            if token_mask.shape != tokens.shape[:2]:
+                raise ValueError(f"token_mask must be [B,N], got {tuple(token_mask.shape)}")
+            encoded_mask = token_mask.to(device=tokens.device, dtype=torch.bool)
+
+        freqs_cis = precompute_freqs_cis(
+            indices_grid=token_positions.to(device=tokens.device),
+            dim=self.dim,
+            out_dtype=tokens.dtype,
+            theta=self.positional_embedding_theta,
+            max_pos=self.positional_embedding_max_pos,
+            use_middle_indices_grid=self.use_middle_positions,
+            num_attention_heads=self.num_heads,
+            rope_type=self.rope_type,
+            freq_grid_generator=generate_freq_grid_pytorch,
+        )
+        x = self.input_norm(tokens)
+        for block in self.blocks:
+            x = block(
+                x,
+                freqs_cis=freqs_cis,
+                token_mask=encoded_mask,
+                rope_type=self.rope_type,
+            )
+        x = self.output_norm(x)
+        x = x * encoded_mask.unsqueeze(-1).to(dtype=x.dtype)
+        return x, encoded_mask
+
+
 
 class Visual3DResampler(nn.Module):
     """Position-aware Perceiver/Q-former resampler for target-video SigLIP tokens.

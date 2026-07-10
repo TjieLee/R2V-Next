@@ -506,6 +506,266 @@ def test_visual_3d_resampler_shape_and_mask() -> None:
     assert torch.isfinite(out).all()
 
 
+def test_stage1_full_tokens_mode_registers_only_projection_and_full_encoder() -> None:
+    strategy = MultiReferenceVideoStrategy(
+        MultiReferenceVideoConfig(
+            visual_token_source_dim=6,
+            visual_token_target_dim=8,
+            visual_context_mode="full_tokens_3d_sa",
+            visual_context_expected_tokens=16,
+            visual_full_sa_num_heads=2,
+            visual_full_sa_depth=1,
+            visual_connector_enabled=False,
+        )
+    )
+    strategy.attach_models(
+        transformer=nn.Identity(),
+        embeddings_processor=_FakeEmbeddingsProcessor(8),
+        text_encoder=None,
+    )
+
+    modules = strategy.get_trainable_modules()
+    assert set(modules) == {"visual_token_projection", "visual_full_encoder"}
+    assert strategy._visual_resampler is None
+    assert strategy._visual_connector is None
+    assert strategy._visual_gate is None
+    assert strategy._visual_full_encoder is not None
+
+    conditions = _projection_conditions(batch_size=2, seq_len=3, dim=8)
+    batch = {
+        "gt_visual_tokens": _projection_gt_tokens(
+            batch_size=2,
+            token_count=16,
+            source_dim=6,
+            tokens_per_frame=4,
+        ),
+        "latents": {"height": torch.tensor([8, 8]), "width": torch.tensor([8, 8])},
+    }
+    output = strategy.postprocess_conditions_after_connector(batch, conditions)
+    visual_context = output["video_prompt_embeds"][:, -16:]
+
+    assert output["video_prompt_embeds"].shape == (2, 19, 8)
+    assert batch["_visual_context_shape"] == [2, 16, 8]
+    assert batch["_visual_context_token_count"] == 16
+    loss = (visual_context * torch.randn_like(visual_context)).mean()
+    loss.backward()
+    projection_grad = modules["visual_token_projection"].weight.grad
+    qkv_grad = modules["visual_full_encoder"].blocks[0].qkv.weight.grad
+    assert projection_grad is not None and torch.isfinite(projection_grad).all()
+    assert qkv_grad is not None and torch.isfinite(qkv_grad).all()
+    assert float(torch.linalg.vector_norm(projection_grad)) > 0.0
+    assert float(torch.linalg.vector_norm(qkv_grad)) > 0.0
+
+
+def test_stage1_full_tokens_mode_preserves_all_2048_tokens() -> None:
+    strategy = MultiReferenceVideoStrategy(
+        MultiReferenceVideoConfig(
+            visual_token_source_dim=8,
+            visual_token_target_dim=8,
+            visual_context_mode="full_tokens_3d_sa",
+            visual_context_expected_tokens=2048,
+            visual_full_sa_num_heads=2,
+            visual_full_sa_depth=1,
+            visual_full_sa_ffn_multiplier=1.0,
+            visual_connector_enabled=False,
+        )
+    )
+    strategy.attach_models(
+        transformer=nn.Identity(),
+        embeddings_processor=_FakeEmbeddingsProcessor(8),
+        text_encoder=None,
+    )
+    conditions = _projection_conditions(batch_size=1, seq_len=3, dim=8)
+    batch = {
+        "gt_visual_tokens": _projection_gt_tokens(
+            batch_size=1,
+            token_count=2048,
+            source_dim=8,
+            tokens_per_frame=256,
+        ),
+        "latents": {"height": torch.tensor([384]), "width": torch.tensor([640])},
+    }
+
+    with torch.no_grad():
+        output = strategy.postprocess_conditions_after_connector(batch, conditions)
+
+    assert output["video_prompt_embeds"].shape == (1, 2051, 8)
+    assert batch["_visual_context_shape"] == [1, 2048, 8]
+    assert batch["_visual_context_token_count"] == 2048
+
+
+def test_stage1_qformer_mode_still_compresses_2048_tokens_to_512() -> None:
+    strategy = MultiReferenceVideoStrategy(
+        MultiReferenceVideoConfig(
+            visual_token_source_dim=8,
+            visual_token_target_dim=8,
+            visual_context_mode="qformer_512",
+            visual_context_spatial_grid=8,
+            visual_context_max_tokens=512,
+            visual_resampler_num_heads=2,
+            visual_resampler_depth=1,
+            visual_resampler_ffn_multiplier=1.0,
+            visual_connector_enabled=False,
+        )
+    )
+    strategy.attach_models(
+        transformer=nn.Identity(),
+        embeddings_processor=_FakeEmbeddingsProcessor(8),
+        text_encoder=None,
+    )
+    conditions = _projection_conditions(batch_size=1, seq_len=3, dim=8)
+    batch = {
+        "gt_visual_tokens": _projection_gt_tokens(
+            batch_size=1,
+            token_count=2048,
+            source_dim=8,
+            tokens_per_frame=256,
+        ),
+        "latents": {"height": torch.tensor([384]), "width": torch.tensor([640])},
+    }
+
+    with torch.no_grad():
+        output = strategy.postprocess_conditions_after_connector(batch, conditions)
+
+    assert strategy._visual_resampler is not None
+    assert strategy._visual_full_encoder is None
+    assert output["video_prompt_embeds"].shape == (1, 515, 8)
+    assert batch["_visual_context_token_count"] == 512
+
+
+def test_stage1_full_tokens_config_rejects_connector_and_invalid_head_dim() -> None:
+    for kwargs, expected_message in (
+        (
+            {
+                "visual_token_source_dim": 8,
+                "visual_token_target_dim": 8,
+                "visual_context_mode": "full_tokens_3d_sa",
+                "visual_connector_enabled": True,
+            },
+            "visual_connector_enabled must be false",
+        ),
+        (
+            {
+                "visual_token_source_dim": 6,
+                "visual_token_target_dim": 6,
+                "visual_context_mode": "full_tokens_3d_sa",
+                "visual_full_sa_num_heads": 2,
+                "visual_connector_enabled": False,
+            },
+            "requires even head_dim",
+        ),
+    ):
+        raised = False
+        try:
+            MultiReferenceVideoConfig(**kwargs)
+        except ValueError as exc:
+            raised = True
+            assert expected_message in str(exc)
+        assert raised
+
+
+def test_stage1_full_tokens_mode_rejects_legacy_qformer_checkpoint_state() -> None:
+    strategy = MultiReferenceVideoStrategy(
+        MultiReferenceVideoConfig(
+            visual_token_source_dim=8,
+            visual_token_target_dim=8,
+            visual_context_mode="full_tokens_3d_sa",
+            visual_full_sa_num_heads=2,
+            visual_connector_enabled=False,
+        )
+    )
+    strategy.attach_models(
+        transformer=nn.Identity(),
+        embeddings_processor=_FakeEmbeddingsProcessor(8),
+        text_encoder=None,
+    )
+
+    raised = False
+    try:
+        strategy.load_extra_checkpoint_state_dict(
+            {"training_strategy.visual_resampler.query_tokens": torch.zeros(1)}
+        )
+    except ValueError as exc:
+        raised = True
+        assert "Cannot load legacy Q-former" in str(exc)
+    assert raised
+
+
+def _strategy_checkpoint_state(strategy: MultiReferenceVideoStrategy) -> dict[str, torch.Tensor]:
+    state: dict[str, torch.Tensor] = {}
+    for name, module in strategy.get_trainable_modules().items():
+        for key, value in module.state_dict().items():
+            state[f"training_strategy.{name}.{key}"] = value.detach().clone()
+    return state
+
+
+def test_stage1_qformer_checkpoint_keys_still_round_trip() -> None:
+    config = MultiReferenceVideoConfig(
+        visual_token_source_dim=8,
+        visual_token_target_dim=8,
+        visual_context_mode="qformer_512",
+        visual_context_spatial_grid=2,
+        visual_context_max_tokens=16,
+        visual_resampler_num_heads=2,
+        visual_connector_enabled=False,
+    )
+    original = MultiReferenceVideoStrategy(config)
+    original.attach_models(
+        transformer=nn.Identity(),
+        embeddings_processor=_FakeEmbeddingsProcessor(8),
+        text_encoder=None,
+    )
+    checkpoint_state = _strategy_checkpoint_state(original)
+
+    restored = MultiReferenceVideoStrategy(config)
+    restored.attach_models(
+        transformer=nn.Identity(),
+        embeddings_processor=_FakeEmbeddingsProcessor(8),
+        text_encoder=None,
+    )
+    restored.load_extra_checkpoint_state_dict(checkpoint_state)
+
+    assert any(key.startswith("training_strategy.visual_resampler.") for key in checkpoint_state)
+    assert any(key.startswith("training_strategy.visual_gate.") for key in checkpoint_state)
+    assert torch.equal(
+        restored._visual_resampler.query_tokens,
+        original._visual_resampler.query_tokens,
+    )
+
+
+def test_stage1_full_encoder_checkpoint_keys_round_trip() -> None:
+    config = MultiReferenceVideoConfig(
+        visual_token_source_dim=6,
+        visual_token_target_dim=8,
+        visual_context_mode="full_tokens_3d_sa",
+        visual_full_sa_num_heads=2,
+        visual_connector_enabled=False,
+    )
+    original = MultiReferenceVideoStrategy(config)
+    original.attach_models(
+        transformer=nn.Identity(),
+        embeddings_processor=_FakeEmbeddingsProcessor(8),
+        text_encoder=None,
+    )
+    checkpoint_state = _strategy_checkpoint_state(original)
+
+    restored = MultiReferenceVideoStrategy(config)
+    restored.attach_models(
+        transformer=nn.Identity(),
+        embeddings_processor=_FakeEmbeddingsProcessor(8),
+        text_encoder=None,
+    )
+    restored.load_extra_checkpoint_state_dict(checkpoint_state)
+
+    assert any(key.startswith("training_strategy.visual_token_projection.") for key in checkpoint_state)
+    assert any(key.startswith("training_strategy.visual_full_encoder.") for key in checkpoint_state)
+    assert not any("visual_gate" in key or "visual_resampler" in key for key in checkpoint_state)
+    assert torch.equal(
+        restored._visual_full_encoder.blocks[0].qkv.weight,
+        original._visual_full_encoder.blocks[0].qkv.weight,
+    )
+
+
 def test_video_positions_support_per_sample_fps_tensor() -> None:
     strategy = MultiReferenceVideoStrategy(MultiReferenceVideoConfig(visual_branch_enabled=False))
     fps = torch.tensor([24.0, 60.0])
