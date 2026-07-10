@@ -938,20 +938,25 @@ def test_stage1_infer_multidirectional_guidance_formula() -> None:
     pos = torch.tensor(10.0)
     neg = torch.tensor(2.0)
     no_ref = torch.tensor(7.0)
+    siglip_isolated = torch.tensor(6.0)
+    siglip_null = torch.tensor(4.0)
     stg = torch.tensor(8.0)
 
     actual = infer_multiref_stage1_overfit._combine_multidirectional_denoised(
         denoised_pos=pos,
         denoised_neg=neg,
         denoised_no_ref=no_ref,
+        denoised_siglip_isolated=siglip_isolated,
+        denoised_siglip_null=siglip_null,
         denoised_stg=stg,
-        guidance_scale=2.5,
-        ref_guidance_scale=1.0,
-        stg_scale=0.5,
+        guidance_scale=2.0,
+        ref_guidance_scale=2.0,
+        siglip_guidance_scale=1.5,
+        stg_scale=1.0,
         guidance_rescale=0.0,
     )
 
-    assert torch.equal(actual, torch.tensor(26.0))
+    assert torch.equal(actual, torch.tensor(29.0))
 
 
 def test_stage1_infer_multidirectional_guidance_handles_disabled_branches() -> None:
@@ -964,9 +969,12 @@ def test_stage1_infer_multidirectional_guidance_handles_disabled_branches() -> N
         denoised_pos=pos,
         denoised_neg=None,
         denoised_no_ref=None,
+        denoised_siglip_isolated=None,
+        denoised_siglip_null=None,
         denoised_stg=None,
         guidance_scale=1.0,
         ref_guidance_scale=0.0,
+        siglip_guidance_scale=0.0,
         stg_scale=0.0,
         guidance_rescale=0.0,
     )
@@ -974,9 +982,12 @@ def test_stage1_infer_multidirectional_guidance_handles_disabled_branches() -> N
         denoised_pos=pos,
         denoised_neg=None,
         denoised_no_ref=None,
+        denoised_siglip_isolated=None,
+        denoised_siglip_null=None,
         denoised_stg=stg,
         guidance_scale=1.0,
         ref_guidance_scale=0.0,
+        siglip_guidance_scale=0.0,
         stg_scale=0.5,
         guidance_rescale=0.0,
     )
@@ -984,9 +995,12 @@ def test_stage1_infer_multidirectional_guidance_handles_disabled_branches() -> N
         denoised_pos=pos,
         denoised_neg=neg,
         denoised_no_ref=None,
+        denoised_siglip_isolated=None,
+        denoised_siglip_null=None,
         denoised_stg=None,
         guidance_scale=1.5,
         ref_guidance_scale=0.0,
+        siglip_guidance_scale=0.0,
         stg_scale=0.0,
         guidance_rescale=0.0,
     )
@@ -994,9 +1008,12 @@ def test_stage1_infer_multidirectional_guidance_handles_disabled_branches() -> N
         denoised_pos=pos,
         denoised_neg=None,
         denoised_no_ref=no_ref,
+        denoised_siglip_isolated=None,
+        denoised_siglip_null=None,
         denoised_stg=None,
         guidance_scale=1.0,
         ref_guidance_scale=0.75,
+        siglip_guidance_scale=0.0,
         stg_scale=0.0,
         guidance_rescale=0.0,
     )
@@ -1014,9 +1031,12 @@ def test_stage1_infer_ref_guidance_requires_no_ref_prediction() -> None:
             denoised_pos=torch.tensor(10.0),
             denoised_neg=None,
             denoised_no_ref=None,
+            denoised_siglip_isolated=None,
+            denoised_siglip_null=None,
             denoised_stg=None,
             guidance_scale=1.0,
             ref_guidance_scale=1.0,
+            siglip_guidance_scale=0.0,
             stg_scale=0.0,
             guidance_rescale=0.0,
         )
@@ -1024,6 +1044,65 @@ def test_stage1_infer_ref_guidance_requires_no_ref_prediction() -> None:
         raised = True
         assert "requires denoised_no_ref" in str(exc)
     assert raised
+
+
+def test_stage1_infer_siglip_guidance_requires_both_predictions() -> None:
+    for isolated, null, expected_message in (
+        (None, torch.tensor(4.0), "requires denoised_siglip_isolated"),
+        (torch.tensor(6.0), None, "requires denoised_siglip_null"),
+    ):
+        raised = False
+        try:
+            infer_multiref_stage1_overfit._combine_multidirectional_denoised(
+                denoised_pos=torch.tensor(10.0),
+                denoised_neg=None,
+                denoised_no_ref=None,
+                denoised_siglip_isolated=isolated,
+                denoised_siglip_null=null,
+                denoised_stg=None,
+                guidance_scale=1.0,
+                ref_guidance_scale=0.0,
+                siglip_guidance_scale=1.0,
+                stg_scale=0.0,
+                guidance_rescale=0.0,
+            )
+        except ValueError as exc:
+            raised = True
+            assert expected_message in str(exc)
+        assert raised
+
+
+def test_stage1_infer_builds_isolated_siglip_contexts_and_reuses_mask() -> None:
+    pos_context = torch.arange(30, dtype=torch.float32).reshape(1, 5, 6)
+    pos_mask = torch.tensor([[1, 1, 1, 1, 0]], dtype=torch.long)
+
+    isolated, null, isolated_mask, null_mask = (
+        infer_multiref_stage1_overfit._build_isolated_siglip_contexts(
+            pos_context=pos_context,
+            pos_context_mask=pos_mask,
+            visual_token_count=2,
+        )
+    )
+
+    assert torch.count_nonzero(isolated[:, :3, :]) == 0
+    assert torch.equal(isolated[:, 3:, :], pos_context[:, 3:, :])
+    assert torch.count_nonzero(null) == 0
+    assert isolated_mask is pos_mask
+    assert null_mask is pos_mask
+
+
+def test_stage1_infer_siglip_guidance_rejects_text_only_mode_and_nonfinite_scale() -> None:
+    for scale, mode, expected_message in (
+        (1.0, "text_only_no_siglip", "only supported"),
+        (float("inf"), "full_siglip", "must be finite"),
+    ):
+        raised = False
+        try:
+            infer_multiref_stage1_overfit._validate_siglip_guidance(scale, mode)
+        except infer_multiref_stage1_overfit.typer.BadParameter as exc:
+            raised = True
+            assert expected_message in str(exc)
+        assert raised
 
 
 def test_stage1_infer_guidance_rescale_moves_target_std_toward_conditional() -> None:
@@ -1034,9 +1113,12 @@ def test_stage1_infer_guidance_rescale_moves_target_std_toward_conditional() -> 
         denoised_pos=pos,
         denoised_neg=neg,
         denoised_no_ref=None,
+        denoised_siglip_isolated=None,
+        denoised_siglip_null=None,
         denoised_stg=None,
         guidance_scale=2.5,
         ref_guidance_scale=0.0,
+        siglip_guidance_scale=0.0,
         stg_scale=0.0,
         guidance_rescale=0.0,
         target_seq_len=3,
@@ -1045,9 +1127,12 @@ def test_stage1_infer_guidance_rescale_moves_target_std_toward_conditional() -> 
         denoised_pos=pos,
         denoised_neg=neg,
         denoised_no_ref=None,
+        denoised_siglip_isolated=None,
+        denoised_siglip_null=None,
         denoised_stg=None,
         guidance_scale=2.5,
         ref_guidance_scale=0.0,
+        siglip_guidance_scale=0.0,
         stg_scale=0.0,
         guidance_rescale=0.7,
         target_seq_len=3,
@@ -1069,9 +1154,12 @@ def test_stage1_infer_guidance_rescale_ignores_reference_prefix_scale() -> None:
 
     kwargs = {
         "denoised_no_ref": None,
+        "denoised_siglip_isolated": None,
+        "denoised_siglip_null": None,
         "denoised_stg": None,
         "guidance_scale": 2.5,
         "ref_guidance_scale": 0.0,
+        "siglip_guidance_scale": 0.0,
         "stg_scale": 0.0,
         "guidance_rescale": 0.7,
         "target_seq_len": 3,

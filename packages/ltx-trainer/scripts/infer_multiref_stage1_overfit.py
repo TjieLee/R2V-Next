@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import shutil
 from pathlib import Path
 from typing import Any, Literal
@@ -127,9 +128,12 @@ def _combine_multidirectional_denoised(
     denoised_pos: Tensor,
     denoised_neg: Tensor | None,
     denoised_no_ref: Tensor | None,
+    denoised_siglip_isolated: Tensor | None,
+    denoised_siglip_null: Tensor | None,
     denoised_stg: Tensor | None,
     guidance_scale: float,
     ref_guidance_scale: float,
+    siglip_guidance_scale: float,
     stg_scale: float,
     guidance_rescale: float,
     target_seq_len: int | None = None,
@@ -145,6 +149,13 @@ def _combine_multidirectional_denoised(
         if denoised_no_ref is None:
             raise ValueError("ref_guidance_scale != 0.0 requires denoised_no_ref")
         guided = guided + ref_guidance_scale * (denoised_pos - denoised_no_ref)
+
+    if siglip_guidance_scale != 0.0:
+        if denoised_siglip_isolated is None:
+            raise ValueError("siglip_guidance_scale != 0 requires denoised_siglip_isolated")
+        if denoised_siglip_null is None:
+            raise ValueError("siglip_guidance_scale != 0 requires denoised_siglip_null")
+        guided = guided + siglip_guidance_scale * (denoised_siglip_isolated - denoised_siglip_null)
 
     if _stg_enabled(stg_scale):
         if denoised_stg is None:
@@ -181,6 +192,45 @@ def _cfg_enabled(guidance_scale: float) -> bool:
 def _validate_guidance_rescale(guidance_rescale: float) -> None:
     if not 0.0 <= guidance_rescale <= 1.0:
         raise typer.BadParameter("--guidance-rescale must be in [0, 1]")
+
+
+def _validate_siglip_guidance(siglip_guidance_scale: float, condition_mode: str) -> None:
+    if not math.isfinite(siglip_guidance_scale):
+        raise typer.BadParameter("--siglip-guidance-scale must be finite")
+    if siglip_guidance_scale != 0.0 and condition_mode != "full_siglip":
+        raise typer.BadParameter(
+            "--siglip-guidance-scale is only supported with --condition-mode full_siglip"
+        )
+
+
+def _build_isolated_siglip_contexts(
+    *,
+    pos_context: Tensor,
+    pos_context_mask: Tensor | None,
+    visual_token_count: int,
+) -> tuple[Tensor, Tensor, Tensor | None, Tensor | None]:
+    if visual_token_count <= 0:
+        raise ValueError("Isolated SigLIP guidance requires visual_context_token_count > 0")
+    if visual_token_count > pos_context.shape[1]:
+        raise ValueError(
+            "visual_context_token_count exceeds positive context length: "
+            f"{visual_token_count} > {pos_context.shape[1]}"
+        )
+
+    text_token_count = pos_context.shape[1] - visual_token_count
+    text_vlm_context = pos_context[:, :text_token_count, :]
+    visual_context = pos_context[:, text_token_count:, :]
+    null_text_siglip_context = torch.cat(
+        [torch.zeros_like(text_vlm_context), visual_context],
+        dim=1,
+    )
+    null_text_no_siglip_context = torch.zeros_like(pos_context)
+    return (
+        null_text_siglip_context,
+        null_text_no_siglip_context,
+        pos_context_mask,
+        pos_context_mask,
+    )
 
 
 def _negative_ref_valid_mask(ref_valid_mask: Tensor, *, drop_ref_latents: bool) -> Tensor:
@@ -647,6 +697,7 @@ def _denoise_stage1(
     guidance_scale: float,
     cfg_drop_ref_latents_in_negative: bool,
     ref_guidance_scale: float,
+    siglip_guidance_scale: float,
     guidance_rescale: float,
     stg_scale: float,
     stg_blocks: list[int] | None,
@@ -716,6 +767,23 @@ def _denoise_stage1(
     pos_context_key = _condition_feature_key(positive_conditions)
     pos_context = positive_conditions[pos_context_key]
     pos_context_mask = positive_conditions.get("prompt_attention_mask")
+    if siglip_guidance_scale != 0.0:
+        visual_token_count = int(batch.get("_visual_context_token_count", 0) or 0)
+        (
+            null_text_siglip_context,
+            null_text_no_siglip_context,
+            siglip_isolated_context_mask,
+            siglip_null_context_mask,
+        ) = _build_isolated_siglip_contexts(
+            pos_context=pos_context,
+            pos_context_mask=pos_context_mask,
+            visual_token_count=visual_token_count,
+        )
+    else:
+        null_text_siglip_context = None
+        null_text_no_siglip_context = None
+        siglip_isolated_context_mask = None
+        siglip_null_context_mask = None
     if _cfg_enabled(guidance_scale):
         if negative_conditions is None:
             raise ValueError("guidance_scale > 1.0 requires negative_conditions")
@@ -764,6 +832,8 @@ def _denoise_stage1(
             denoised_pos = _velocity_to_denoised(video_pos.latent, velocity_pos, packed.timesteps)
             denoised_neg = None
             denoised_no_ref = None
+            denoised_siglip_isolated = None
+            denoised_siglip_null = None
             denoised_stg = None
 
             if _cfg_enabled(guidance_scale):
@@ -829,6 +899,53 @@ def _denoise_stage1(
                     packed_no_ref.timesteps,
                 )
 
+            if siglip_guidance_scale != 0.0:
+                video_siglip_isolated = Modality(
+                    enabled=True,
+                    latent=packed.latents,
+                    sigma=sigma_batch,
+                    timesteps=packed.timesteps,
+                    positions=packed.positions,
+                    context=null_text_siglip_context,
+                    context_mask=siglip_isolated_context_mask,
+                    attention_mask=packed.attention_mask,
+                )
+                velocity_siglip_isolated, _ = transformer(
+                    video=video_siglip_isolated,
+                    audio=None,
+                    perturbations=None,
+                )
+                if velocity_siglip_isolated is None:
+                    raise RuntimeError("Transformer returned no isolated-SigLIP video velocity")
+                denoised_siglip_isolated = _velocity_to_denoised(
+                    video_siglip_isolated.latent,
+                    velocity_siglip_isolated,
+                    packed.timesteps,
+                )
+
+                video_siglip_null = Modality(
+                    enabled=True,
+                    latent=packed.latents,
+                    sigma=sigma_batch,
+                    timesteps=packed.timesteps,
+                    positions=packed.positions,
+                    context=null_text_no_siglip_context,
+                    context_mask=siglip_null_context_mask,
+                    attention_mask=packed.attention_mask,
+                )
+                velocity_siglip_null, _ = transformer(
+                    video=video_siglip_null,
+                    audio=None,
+                    perturbations=None,
+                )
+                if velocity_siglip_null is None:
+                    raise RuntimeError("Transformer returned no null-SigLIP video velocity")
+                denoised_siglip_null = _velocity_to_denoised(
+                    video_siglip_null.latent,
+                    velocity_siglip_null,
+                    packed.timesteps,
+                )
+
             if _stg_enabled(stg_scale):
                 velocity_stg, _ = transformer(video=video_pos, audio=None, perturbations=stg_perturbation_config)
                 if velocity_stg is None:
@@ -839,9 +956,12 @@ def _denoise_stage1(
                 denoised_pos=denoised_pos,
                 denoised_neg=denoised_neg,
                 denoised_no_ref=denoised_no_ref,
+                denoised_siglip_isolated=denoised_siglip_isolated,
+                denoised_siglip_null=denoised_siglip_null,
                 denoised_stg=denoised_stg,
                 guidance_scale=guidance_scale,
                 ref_guidance_scale=ref_guidance_scale,
+                siglip_guidance_scale=siglip_guidance_scale,
                 stg_scale=stg_scale,
                 guidance_rescale=guidance_rescale,
                 target_seq_len=target_seq_len,
@@ -952,6 +1072,15 @@ def main(  # noqa: PLR0913
             "0 disables this branch."
         ),
     ),
+    siglip_guidance_scale: float = typer.Option(
+        0.0,
+        "--siglip-guidance-scale",
+        help=(
+            "Isolated SigLIP visual guidance. Adds scale * "
+            "(null_text_with_siglip_and_refs - null_text_without_siglip_with_refs). "
+            "0 disables this branch. Negative values reverse the direction for diagnostics."
+        ),
+    ),
     guidance_rescale: float = typer.Option(
         0.0,
         "--guidance-rescale",
@@ -1015,6 +1144,7 @@ def main(  # noqa: PLR0913
     if ref_guidance_scale < 0.0:
         raise typer.BadParameter("--ref-guidance-scale must be >= 0.0")
     _validate_guidance_rescale(guidance_rescale)
+    _validate_siglip_guidance(siglip_guidance_scale, condition_mode)
     if ref_guidance_scale != 0.0 and cfg_drop_ref_latents_in_negative:
         raise typer.BadParameter(
             "--ref-guidance-scale requires --cfg-keep-ref-latents-in-negative so the CFG negative branch is N_R"
@@ -1148,6 +1278,7 @@ def main(  # noqa: PLR0913
         guidance_scale=guidance_scale,
         cfg_drop_ref_latents_in_negative=cfg_drop_ref_latents_in_negative,
         ref_guidance_scale=ref_guidance_scale,
+        siglip_guidance_scale=siglip_guidance_scale,
         guidance_rescale=guidance_rescale,
         stg_scale=stg_scale,
         stg_blocks=parsed_stg_blocks,
@@ -1188,6 +1319,11 @@ def main(  # noqa: PLR0913
         "negative_condition_shape": _condition_shape(negative_conditions),
         "ref_guidance_scale": ref_guidance_scale,
         "ref_guidance_enabled": ref_guidance_scale != 0.0,
+        "siglip_guidance_scale": siglip_guidance_scale,
+        "siglip_guidance_enabled": siglip_guidance_scale != 0.0,
+        "siglip_guidance_formula": (
+            "null_text_with_siglip_and_refs - null_text_without_siglip_with_refs"
+        ),
         "guidance_rescale": guidance_rescale,
         "guidance_rescale_enabled": guidance_rescale != 0.0,
         "stg_scale": stg_scale,
@@ -1196,7 +1332,9 @@ def main(  # noqa: PLR0913
         "stg_mode": stg_mode,
         "guidance_formula": (
             "x_negative_with_ref + cfg * (x_full - x_negative_with_ref) "
-            "+ ref * (x_full - x_full_without_ref_latents) + stg * (x_full - x_stg)"
+            "+ ref * (x_full - x_full_without_ref_latents) "
+            "+ siglip * (x_null_text_with_siglip - x_null_text_without_siglip) "
+            "+ stg * (x_full - x_stg)"
         ),
         "condition_mode": condition_mode,
         "condition_mode_detail": _condition_mode_detail(
