@@ -122,20 +122,27 @@ def _build_stg_perturbation_config(stg_blocks: list[int] | None) -> BatchedPertu
     )
 
 
-def _combine_cfg_stg_denoised(
+def _combine_multidirectional_denoised(
     *,
     denoised_pos: Tensor,
     denoised_neg: Tensor | None,
+    denoised_no_ref: Tensor | None,
     denoised_stg: Tensor | None,
     guidance_scale: float,
+    ref_guidance_scale: float,
     stg_scale: float,
 ) -> Tensor:
     if _cfg_enabled(guidance_scale):
         if denoised_neg is None:
-            raise ValueError("guidance_scale > 1.0 requires denoised_neg")
+            raise ValueError("guidance_scale != 1.0 requires denoised_neg")
         guided = denoised_neg + guidance_scale * (denoised_pos - denoised_neg)
     else:
         guided = denoised_pos
+
+    if ref_guidance_scale != 0.0:
+        if denoised_no_ref is None:
+            raise ValueError("ref_guidance_scale != 0.0 requires denoised_no_ref")
+        guided = guided + ref_guidance_scale * (denoised_pos - denoised_no_ref)
 
     if _stg_enabled(stg_scale):
         if denoised_stg is None:
@@ -619,6 +626,7 @@ def _denoise_stage1(
     negative_conditions: dict[str, Tensor | None] | None,
     guidance_scale: float,
     cfg_drop_ref_latents_in_negative: bool,
+    ref_guidance_scale: float,
     stg_scale: float,
     stg_blocks: list[int] | None,
     num_inference_steps: int,
@@ -628,6 +636,11 @@ def _denoise_stage1(
 ) -> Tensor:
     if num_inference_steps < 1:
         raise ValueError("--num-inference-steps must be >= 1")
+    if ref_guidance_scale != 0.0 and cfg_drop_ref_latents_in_negative:
+        raise ValueError(
+            "Reference-latent guidance requires the CFG negative branch to keep reference latents. "
+            "Use --cfg-keep-ref-latents-in-negative."
+        )
 
     latents_data = _move_nested_to_device(batch["latents"], device=device, dtype=dtype)
     ref_data = _move_nested_to_device(batch["multi_ref_latents"], device=device, dtype=dtype)
@@ -675,6 +688,7 @@ def _denoise_stage1(
     )
     ref_positions = ref_positions.reshape(1, num_refs, *ref_positions.shape[1:])
     ref_positions = strategy._scale_reference_positions(ref_positions, height, width, ref_height, ref_width)
+    no_ref_valid_mask = torch.zeros_like(ref_valid_mask)
 
     sigmas = LTX2Scheduler().execute(steps=num_inference_steps).to(device=device).float()
     stepper = EulerDiffusionStep()
@@ -728,6 +742,7 @@ def _denoise_stage1(
                 raise RuntimeError("Transformer returned no video velocity during Stage 1 inference")
             denoised_pos = _velocity_to_denoised(video_pos.latent, velocity_pos, packed.timesteps)
             denoised_neg = None
+            denoised_no_ref = None
             denoised_stg = None
 
             if _cfg_enabled(guidance_scale):
@@ -763,17 +778,49 @@ def _denoise_stage1(
                     raise RuntimeError("Transformer returned no negative-branch video velocity during Stage 1 CFG")
                 denoised_neg = _velocity_to_denoised(video_neg.latent, velocity_neg, packed_neg.timesteps)
 
+            if ref_guidance_scale != 0.0:
+                packed_no_ref = build_multiref_sequence(
+                    ref_tokens=ref_tokens,
+                    ref_positions=ref_positions,
+                    ref_valid_mask=no_ref_valid_mask,
+                    target_tokens=target_tokens,
+                    target_positions=target_positions,
+                    target_timesteps=target_timesteps,
+                    target_loss_mask=target_loss_mask,
+                    reference_time_stride=strategy.config.reference_time_stride,
+                )
+                video_no_ref = Modality(
+                    enabled=True,
+                    latent=packed_no_ref.latents,
+                    sigma=sigma_batch,
+                    timesteps=packed_no_ref.timesteps,
+                    positions=packed_no_ref.positions,
+                    context=pos_context,
+                    context_mask=pos_context_mask,
+                    attention_mask=packed_no_ref.attention_mask,
+                )
+                velocity_no_ref, _ = transformer(video=video_no_ref, audio=None, perturbations=None)
+                if velocity_no_ref is None:
+                    raise RuntimeError("Transformer returned no full-without-reference-latents velocity")
+                denoised_no_ref = _velocity_to_denoised(
+                    video_no_ref.latent,
+                    velocity_no_ref,
+                    packed_no_ref.timesteps,
+                )
+
             if _stg_enabled(stg_scale):
                 velocity_stg, _ = transformer(video=video_pos, audio=None, perturbations=stg_perturbation_config)
                 if velocity_stg is None:
                     raise RuntimeError("Transformer returned no STG-branch video velocity during Stage 1 STG")
                 denoised_stg = _velocity_to_denoised(video_pos.latent, velocity_stg, packed.timesteps)
 
-            denoised_video = _combine_cfg_stg_denoised(
+            denoised_video = _combine_multidirectional_denoised(
                 denoised_pos=denoised_pos,
                 denoised_neg=denoised_neg,
+                denoised_no_ref=denoised_no_ref,
                 denoised_stg=denoised_stg,
                 guidance_scale=guidance_scale,
+                ref_guidance_scale=ref_guidance_scale,
                 stg_scale=stg_scale,
             )
             next_packed = stepper.step(packed.latents, denoised_video, sigmas, step_idx)
@@ -873,6 +920,15 @@ def main(  # noqa: PLR0913
         "--guidance-scale",
         help="CFG guidance scale. 1.0 disables CFG. Recommended 1.2-2.0 for Stage1 checkpoints trained without CFG.",
     ),
+    ref_guidance_scale: float = typer.Option(
+        0.0,
+        "--ref-guidance-scale",
+        help=(
+            "Independent reference-latent guidance scale. "
+            "Adds scale * (full - full_without_reference_latents). "
+            "0 disables this branch."
+        ),
+    ),
     negative_prompt: str | None = typer.Option(
         None,
         "--negative-prompt",
@@ -924,6 +980,12 @@ def main(  # noqa: PLR0913
         raise typer.BadParameter("--num-inference-steps must be >= 1")
     if guidance_scale < 1.0:
         raise typer.BadParameter("--guidance-scale must be >= 1.0")
+    if ref_guidance_scale < 0.0:
+        raise typer.BadParameter("--ref-guidance-scale must be >= 0.0")
+    if ref_guidance_scale != 0.0 and cfg_drop_ref_latents_in_negative:
+        raise typer.BadParameter(
+            "--ref-guidance-scale requires --cfg-keep-ref-latents-in-negative so the CFG negative branch is N_R"
+        )
     if stg_scale < 0.0:
         raise typer.BadParameter("--stg-scale must be >= 0.0")
     if stg_mode != "stg_v":
@@ -1052,6 +1114,7 @@ def main(  # noqa: PLR0913
         negative_conditions=negative_conditions,
         guidance_scale=guidance_scale,
         cfg_drop_ref_latents_in_negative=cfg_drop_ref_latents_in_negative,
+        ref_guidance_scale=ref_guidance_scale,
         stg_scale=stg_scale,
         stg_blocks=parsed_stg_blocks,
         num_inference_steps=num_inference_steps,
@@ -1089,11 +1152,16 @@ def main(  # noqa: PLR0913
         "cfg_negative_mode": cfg_negative_mode,
         "cfg_drop_ref_latents_in_negative": cfg_drop_ref_latents_in_negative,
         "negative_condition_shape": _condition_shape(negative_conditions),
+        "ref_guidance_scale": ref_guidance_scale,
+        "ref_guidance_enabled": ref_guidance_scale != 0.0,
         "stg_scale": stg_scale,
         "stg_enabled": _stg_enabled(stg_scale),
         "stg_blocks": parsed_stg_blocks,
         "stg_mode": stg_mode,
-        "guidance_formula": "x_null + cfg * (x_prompt - x_null) + stg * (x_prompt - x_stg)",
+        "guidance_formula": (
+            "x_negative_with_ref + cfg * (x_full - x_negative_with_ref) "
+            "+ ref * (x_full - x_full_without_ref_latents) + stg * (x_full - x_stg)"
+        ),
         "condition_mode": condition_mode,
         "condition_mode_detail": _condition_mode_detail(
             condition_mode,

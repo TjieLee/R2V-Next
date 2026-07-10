@@ -933,53 +933,90 @@ def test_stage1_infer_cfg_combine_formula_matches_ltx_guidance() -> None:
     assert torch.equal(infer_multiref_stage1_overfit._combine_cfg_denoised(pos, neg, 2.0), 2 * pos - neg)
 
 
-def test_stage1_infer_cfg_stg_combine_formula_matches_expected_guidance() -> None:
-    pos = torch.tensor([[[2.0, 4.0]]])
-    neg = torch.tensor([[[1.0, 3.0]]])
-    stg = torch.tensor([[[0.5, 2.0]]])
+def test_stage1_infer_multidirectional_guidance_formula() -> None:
+    pos = torch.tensor(10.0)
+    neg = torch.tensor(2.0)
+    no_ref = torch.tensor(7.0)
+    stg = torch.tensor(8.0)
 
-    actual = infer_multiref_stage1_overfit._combine_cfg_stg_denoised(
+    actual = infer_multiref_stage1_overfit._combine_multidirectional_denoised(
         denoised_pos=pos,
         denoised_neg=neg,
+        denoised_no_ref=no_ref,
         denoised_stg=stg,
-        guidance_scale=1.5,
-        stg_scale=0.4,
-    )
-    expected = neg + 1.5 * (pos - neg) + 0.4 * (pos - stg)
-
-    assert torch.allclose(actual, expected)
-
-
-def test_stage1_infer_cfg_stg_combine_handles_disabled_branches() -> None:
-    pos = torch.tensor([[[2.0, 4.0]]])
-    neg = torch.tensor([[[1.0, 3.0]]])
-    stg = torch.tensor([[[0.5, 2.0]]])
-
-    no_guidance = infer_multiref_stage1_overfit._combine_cfg_stg_denoised(
-        denoised_pos=pos,
-        denoised_neg=None,
-        denoised_stg=None,
-        guidance_scale=1.0,
-        stg_scale=0.0,
-    )
-    stg_only = infer_multiref_stage1_overfit._combine_cfg_stg_denoised(
-        denoised_pos=pos,
-        denoised_neg=None,
-        denoised_stg=stg,
-        guidance_scale=1.0,
+        guidance_scale=2.5,
+        ref_guidance_scale=1.0,
         stg_scale=0.5,
     )
-    cfg_only = infer_multiref_stage1_overfit._combine_cfg_stg_denoised(
+
+    assert torch.equal(actual, torch.tensor(26.0))
+
+
+def test_stage1_infer_multidirectional_guidance_handles_disabled_branches() -> None:
+    pos = torch.tensor([[[2.0, 4.0]]])
+    neg = torch.tensor([[[1.0, 3.0]]])
+    no_ref = torch.tensor([[[1.5, 2.5]]])
+    stg = torch.tensor([[[0.5, 2.0]]])
+
+    no_guidance = infer_multiref_stage1_overfit._combine_multidirectional_denoised(
+        denoised_pos=pos,
+        denoised_neg=None,
+        denoised_no_ref=None,
+        denoised_stg=None,
+        guidance_scale=1.0,
+        ref_guidance_scale=0.0,
+        stg_scale=0.0,
+    )
+    stg_only = infer_multiref_stage1_overfit._combine_multidirectional_denoised(
+        denoised_pos=pos,
+        denoised_neg=None,
+        denoised_no_ref=None,
+        denoised_stg=stg,
+        guidance_scale=1.0,
+        ref_guidance_scale=0.0,
+        stg_scale=0.5,
+    )
+    cfg_only = infer_multiref_stage1_overfit._combine_multidirectional_denoised(
         denoised_pos=pos,
         denoised_neg=neg,
+        denoised_no_ref=None,
         denoised_stg=None,
         guidance_scale=1.5,
+        ref_guidance_scale=0.0,
+        stg_scale=0.0,
+    )
+    ref_only = infer_multiref_stage1_overfit._combine_multidirectional_denoised(
+        denoised_pos=pos,
+        denoised_neg=None,
+        denoised_no_ref=no_ref,
+        denoised_stg=None,
+        guidance_scale=1.0,
+        ref_guidance_scale=0.75,
         stg_scale=0.0,
     )
 
     assert torch.equal(no_guidance, pos)
     assert torch.allclose(stg_only, pos + 0.5 * (pos - stg))
     assert torch.allclose(cfg_only, neg + 1.5 * (pos - neg))
+    assert torch.allclose(ref_only, pos + 0.75 * (pos - no_ref))
+
+
+def test_stage1_infer_ref_guidance_requires_no_ref_prediction() -> None:
+    raised = False
+    try:
+        infer_multiref_stage1_overfit._combine_multidirectional_denoised(
+            denoised_pos=torch.tensor(10.0),
+            denoised_neg=None,
+            denoised_no_ref=None,
+            denoised_stg=None,
+            guidance_scale=1.0,
+            ref_guidance_scale=1.0,
+            stg_scale=0.0,
+        )
+    except ValueError as exc:
+        raised = True
+        assert "requires denoised_no_ref" in str(exc)
+    assert raised
 
 
 def test_stage1_infer_cfg_enabled_only_when_guidance_scale_not_one() -> None:
