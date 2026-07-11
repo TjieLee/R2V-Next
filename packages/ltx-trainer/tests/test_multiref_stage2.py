@@ -207,6 +207,54 @@ def test_ntp_selective_lm_head_only_receives_valid_text_rows() -> None:
     assert lm_head.seen_rows == [2, 1]
 
 
+def test_ntp_casts_hidden_to_lm_head_dtype_and_preserves_gradient() -> None:
+    strategy = _strategy()
+    lm_head = _CountingLmHead(dim=8, vocab_size=32).to(dtype=torch.float64)
+    lm_head.requires_grad_(False)
+    strategy.text_encoder = SimpleNamespace(model=SimpleNamespace(lm_head=lm_head))
+    final_hidden = torch.randn(2, 6, 8, dtype=torch.float32, requires_grad=True)
+    labels = torch.tensor(
+        [
+            [-100, 1, 2, -100, 3, -100],
+            [-100, 4, -100, 5, -100, 6],
+        ]
+    )
+
+    loss = strategy._compute_lm_loss(final_hidden, labels)
+
+    assert loss.dtype == torch.float32
+    assert loss.shape == (2,)
+    assert torch.isfinite(loss).all()
+    loss.sum().backward()
+    assert final_hidden.grad is not None
+    assert torch.any(final_hidden.grad != 0)
+    assert next(lm_head.parameters()).dtype == torch.float64
+    assert all(not parameter.requires_grad for parameter in lm_head.parameters())
+
+
+def test_ntp_empty_label_sample_returns_float32_zero() -> None:
+    strategy = _strategy()
+    lm_head = _CountingLmHead(dim=8, vocab_size=32).to(dtype=torch.float64)
+    lm_head.requires_grad_(False)
+    strategy.text_encoder = SimpleNamespace(model=SimpleNamespace(lm_head=lm_head))
+    final_hidden = torch.randn(2, 6, 8, dtype=torch.float32, requires_grad=True)
+    labels = torch.tensor(
+        [
+            [-100, 1, -100, 2, -100, -100],
+            [-100, -100, -100, -100, -100, -100],
+        ]
+    )
+
+    loss = strategy._compute_lm_loss(final_hidden, labels)
+
+    assert loss.dtype == torch.float32
+    assert torch.isfinite(loss[0])
+    assert loss[1] == 0
+    loss.sum().backward()
+    assert final_hidden.grad is not None
+    assert torch.any(final_hidden.grad != 0)
+
+
 def test_final_layer_mode_does_not_request_all_hidden_states() -> None:
     strategy = _strategy()
     strategy.config.vlm_hidden_layer = -1

@@ -174,6 +174,11 @@ def main(
             raise RuntimeError("Frozen DiT gradient checkpointing is not enabled")
         if trainer._transformer.training:
             raise RuntimeError("Frozen DiT must remain in eval mode")
+        lm_head = strategy._unwrap_text_encoder().model.lm_head
+        lm_head_param = next(lm_head.parameters())
+        typer.echo("NTP final hidden dtype will be adapted to lm_head dtype")
+        typer.echo(f"lm_head dtype: {lm_head_param.dtype}")
+        typer.echo(f"lm_head device: {lm_head_param.device}")
         _run_real_batch_smoke(trainer, strategy)
         return
 

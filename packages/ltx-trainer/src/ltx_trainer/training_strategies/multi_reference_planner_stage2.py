@@ -1250,6 +1250,16 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
         lm_head = getattr(self._unwrap_text_encoder().model, "lm_head", None)
         if lm_head is None:
             raise ValueError("NTP loss requires text_encoder.model.lm_head")
+        lm_head_parameter = next(
+            (parameter for parameter in lm_head.parameters() if parameter.is_floating_point()),
+            None,
+        )
+        if lm_head_parameter is None:
+            lm_head_device = final_hidden.device
+            lm_head_dtype = final_hidden.dtype
+        else:
+            lm_head_device = lm_head_parameter.device
+            lm_head_dtype = lm_head_parameter.dtype
         shift_hidden = final_hidden[:, :-1]
         shift_labels = labels[:, 1:].contiguous()
         losses = []
@@ -1258,15 +1268,28 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
             selected_hidden = sample_hidden[valid]
             selected_labels = sample_labels[valid]
             if selected_labels.numel() == 0:
-                losses.append(final_hidden.new_zeros(()))
+                losses.append(final_hidden.new_zeros((), dtype=torch.float32))
                 continue
             loss_sum = final_hidden.new_zeros((), dtype=torch.float32)
             count = 0
             for start in range(0, selected_labels.numel(), self.config.ntp_logits_chunk_size):
                 chunk_hidden = selected_hidden[start : start + self.config.ntp_logits_chunk_size]
                 chunk_labels = selected_labels[start : start + self.config.ntp_logits_chunk_size]
-                logits = lm_head(chunk_hidden)
-                loss_sum = loss_sum + F.cross_entropy(logits.float(), chunk_labels, reduction="sum")
+                chunk_hidden_for_head = chunk_hidden.to(
+                    device=lm_head_device,
+                    dtype=lm_head_dtype,
+                )
+                chunk_labels_for_loss = chunk_labels.to(
+                    device=lm_head_device,
+                    dtype=torch.long,
+                )
+                logits = lm_head(chunk_hidden_for_head)
+                chunk_loss = F.cross_entropy(
+                    logits.float(),
+                    chunk_labels_for_loss,
+                    reduction="sum",
+                )
+                loss_sum = loss_sum + chunk_loss.to(device=loss_sum.device)
                 count += int(chunk_labels.numel())
             losses.append(loss_sum / max(count, 1))
         return torch.stack(losses)
