@@ -1,7 +1,9 @@
 import importlib.util
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 
@@ -58,6 +60,31 @@ class _RecordingLanguageModel(nn.Module):
         )
 
 
+class _FakeCheckpointLanguageModel(nn.Module):
+    def __init__(self, *, reject_kwargs: bool = False) -> None:
+        super().__init__()
+        self.reject_kwargs = reject_kwargs
+        self.enable_calls = 0
+        self.received_kwargs = None
+        self.input_require_grads_enabled = False
+        self.is_gradient_checkpointing = False
+        self._gradient_checkpointing_func = None
+
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None) -> None:
+        self.enable_calls += 1
+        if self.reject_kwargs:
+            raise TypeError("gradient_checkpointing_kwargs is unsupported")
+        self.received_kwargs = gradient_checkpointing_kwargs
+        self.is_gradient_checkpointing = True
+        self._gradient_checkpointing_func = partial(
+            lambda: None,
+            **(gradient_checkpointing_kwargs or {}),
+        )
+
+    def enable_input_require_grads(self) -> None:
+        self.input_require_grads_enabled = True
+
+
 def _set_fake_language_model(strategy, language_model) -> None:
     strategy.text_encoder = SimpleNamespace(
         model=SimpleNamespace(model=SimpleNamespace(language_model=language_model))
@@ -87,6 +114,36 @@ def _strategy() -> MultiReferencePlannerStage2Strategy:
         text_encoder=None,
     )
     return strategy
+
+
+def test_gemma_gradient_checkpointing_is_non_reentrant() -> None:
+    strategy = _strategy()
+    language_model = _FakeCheckpointLanguageModel()
+    _set_fake_language_model(strategy, language_model)
+
+    strategy._enable_gemma_gradient_checkpointing(language_model)
+    strategy.assert_gemma_non_reentrant_checkpointing()
+
+    assert language_model.received_kwargs == {"use_reentrant": False}
+    assert language_model.input_require_grads_enabled is True
+
+
+def test_gemma_checkpoint_does_not_silently_fallback() -> None:
+    strategy = _strategy()
+    language_model = _FakeCheckpointLanguageModel(reject_kwargs=True)
+
+    with pytest.raises(RuntimeError, match="does not support non-reentrant"):
+        strategy._enable_gemma_gradient_checkpointing(language_model)
+
+    assert language_model.enable_calls == 1
+
+
+def test_stage2_rejects_reentrant_gemma_checkpoint() -> None:
+    with pytest.raises(ValueError, match="requires non-reentrant Gemma"):
+        MultiReferencePlannerStage2Config(
+            gemma_gradient_checkpointing=True,
+            gemma_gradient_checkpointing_use_reentrant=True,
+        )
 
 
 def _batch(predicted: torch.Tensor) -> dict:

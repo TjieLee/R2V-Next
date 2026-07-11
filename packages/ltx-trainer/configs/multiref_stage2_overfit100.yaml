@@ -93,6 +93,7 @@ training_strategy:
   freeze_transformer: true
   train_text_connector: true
   gemma_gradient_checkpointing: true
+  gemma_gradient_checkpointing_use_reentrant: false
 
 optimization:
   learning_rate: 1e-5

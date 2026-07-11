@@ -81,6 +81,7 @@ training_strategy:
   freeze_vlm_multi_modal_projector: true
   train_gemma_backbone: false
   gemma_gradient_checkpointing: true
+  gemma_gradient_checkpointing_use_reentrant: false
 
   ntp_loss_weight: 0.1
   siglip_loss_weight: 1.0

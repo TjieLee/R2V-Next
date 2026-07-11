@@ -154,6 +154,10 @@ def main(
     trainable_text_names = [name for name, parameter in text_encoder.named_parameters() if parameter.requires_grad]
     if not trainable_text_names or any("lora_" not in name for name in trainable_text_names):
         raise RuntimeError("Gemma trainable parameters must contain only language-model LoRA weights")
+    if cfg.training_strategy.gemma_gradient_checkpointing:
+        strategy.assert_gemma_non_reentrant_checkpointing()
+        typer.echo("Gemma gradient checkpointing: enabled")
+        typer.echo("Gemma checkpoint use_reentrant: false")
     gemma_model = strategy._unwrap_text_encoder().model.model
     for name in ("vision_tower", "multi_modal_projector"):
         module = getattr(gemma_model, name, None)

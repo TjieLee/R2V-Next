@@ -7,6 +7,8 @@ The placeholder count must match the GT SigLIP/projector token count exactly;
 an MSE loss aligns the VLM-predicted visual tokens to the GT visual tokens.
 """
 
+import logging
+from functools import partial
 from typing import Any, Literal
 
 import torch
@@ -26,6 +28,8 @@ from ltx_trainer.training_strategies.multi_reference_video import (
     MultiReferenceVideoConfig,
     MultiReferenceVideoStrategy,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class MultiReferencePlannerStage2Config(MultiReferenceVideoConfig):
@@ -251,6 +255,7 @@ class MultiReferencePlannerStage2Config(MultiReferenceVideoConfig):
     )
 
     gemma_gradient_checkpointing: bool = True
+    gemma_gradient_checkpointing_use_reentrant: bool = False
 
     @model_validator(mode="after")
     def _validate_stage2_architecture(self) -> "MultiReferencePlannerStage2Config":
@@ -268,6 +273,8 @@ class MultiReferencePlannerStage2Config(MultiReferenceVideoConfig):
             raise ValueError("Stage 2 requires the LTX base and Stage 1 DiT LoRA to remain frozen")
         if not self.train_text_connector:
             raise ValueError("Stage 2 requires train_text_connector=true")
+        if self.gemma_gradient_checkpointing and self.gemma_gradient_checkpointing_use_reentrant:
+            raise ValueError("Stage 2 DDP requires non-reentrant Gemma gradient checkpointing")
         if self.cfg_drop_ref_p != 0.0:
             raise ValueError("Stage 2 does not use cfg_drop_ref_p; set cfg_drop_ref_p=0")
         if self.cfg_dropout_enabled:
@@ -1170,10 +1177,10 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
             if hasattr(language_model, "config"):
                 language_model.config.use_cache = False
             if self.config.gemma_gradient_checkpointing:
-                if hasattr(language_model, "gradient_checkpointing_enable"):
-                    language_model.gradient_checkpointing_enable()
-                if hasattr(language_model, "enable_input_require_grads"):
-                    language_model.enable_input_require_grads()
+                self._enable_gemma_gradient_checkpointing(language_model)
+                self.assert_gemma_non_reentrant_checkpointing()
+                logger.info("Gemma gradient checkpointing: enabled")
+                logger.info("Gemma checkpoint use_reentrant: false")
 
         lm_head = getattr(self._unwrap_text_encoder().model, "lm_head", None)
         if lm_head is not None:
@@ -1188,6 +1195,44 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
             projector.requires_grad_(not self.config.freeze_vlm_multi_modal_projector)
 
         self._keep_frozen_vlm_modules_in_eval()
+
+    @staticmethod
+    def _enable_gemma_gradient_checkpointing(language_model: nn.Module) -> None:
+        language_model = getattr(language_model, "module", language_model)
+        checkpoint_model = language_model
+        if hasattr(language_model, "get_base_model"):
+            base_model = language_model.get_base_model()
+            if callable(getattr(base_model, "gradient_checkpointing_enable", None)):
+                checkpoint_model = base_model
+
+        enable = getattr(checkpoint_model, "gradient_checkpointing_enable", None)
+        if not callable(enable):
+            raise RuntimeError("Gemma model does not support gradient checkpointing")
+
+        try:
+            enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        except TypeError as exc:
+            raise RuntimeError(
+                "The installed Transformers version does not support non-reentrant gradient checkpointing. "
+                "Do not fall back to reentrant checkpointing under DDP."
+            ) from exc
+
+        enable_inputs = getattr(checkpoint_model, "enable_input_require_grads", None)
+        if callable(enable_inputs):
+            enable_inputs()
+
+    def assert_gemma_non_reentrant_checkpointing(self) -> None:
+        language_model = self._get_language_model()
+        language_model = getattr(language_model, "module", language_model)
+        checkpoint_model = (
+            language_model.get_base_model() if hasattr(language_model, "get_base_model") else language_model
+        )
+        if not getattr(checkpoint_model, "is_gradient_checkpointing", False):
+            raise RuntimeError("Gemma gradient checkpointing is not enabled")
+
+        checkpoint_func = getattr(checkpoint_model, "_gradient_checkpointing_func", None)
+        if isinstance(checkpoint_func, partial) and checkpoint_func.keywords.get("use_reentrant") is not False:
+            raise RuntimeError("Gemma gradient checkpointing must use use_reentrant=False")
 
     def _keep_frozen_vlm_modules_in_eval(self) -> None:
         if self.text_encoder is None:
