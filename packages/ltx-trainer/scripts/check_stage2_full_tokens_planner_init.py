@@ -162,6 +162,18 @@ def main(
         raise RuntimeError("Stage 2 must train embeddings_processor.video_connector")
 
     if real_batch:
+        base_transformer = (
+            trainer._transformer.get_base_model()
+            if hasattr(trainer._transformer, "get_base_model")
+            else trainer._transformer
+        )
+        if (
+            cfg.optimization.enable_gradient_checkpointing
+            and not base_transformer._enable_gradient_checkpointing
+        ):
+            raise RuntimeError("Frozen DiT gradient checkpointing is not enabled")
+        if trainer._transformer.training:
+            raise RuntimeError("Frozen DiT must remain in eval mode")
         _run_real_batch_smoke(trainer, strategy)
         return
 

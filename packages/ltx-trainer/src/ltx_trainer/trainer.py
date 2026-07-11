@@ -789,8 +789,7 @@ class LtxvTrainer:
             self._transformer.get_base_model() if hasattr(self._transformer, "get_base_model") else self._transformer
         )
 
-        if self._train_transformer:
-            transformer.set_gradient_checkpointing(self._config.optimization.enable_gradient_checkpointing)
+        transformer.set_gradient_checkpointing(self._config.optimization.enable_gradient_checkpointing)
 
         strategy_modules = self._training_strategy.get_trainable_modules()
         models_to_prepare = []

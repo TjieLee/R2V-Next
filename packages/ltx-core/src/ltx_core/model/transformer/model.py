@@ -2,6 +2,7 @@ import logging
 from enum import Enum
 
 import torch
+import torch.utils.checkpoint
 
 from ltx_core.guidance.perturbations import BatchedPerturbationConfig, PerturbationType
 from ltx_core.model.model_protocol import LTXModelProtocol
@@ -391,7 +392,7 @@ class LTXModel(torch.nn.Module):
                     cross_attn_type=PerturbationType.SKIP_V2A_CROSS_ATTN,
                 )
 
-            if self._enable_gradient_checkpointing and self.training:
+            if self._enable_gradient_checkpointing and torch.is_grad_enabled():
                 video, audio = torch.utils.checkpoint.checkpoint(
                     block,
                     video,

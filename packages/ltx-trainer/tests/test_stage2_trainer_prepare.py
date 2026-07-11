@@ -5,6 +5,7 @@ from accelerate.utils import DistributedType
 from peft import LoraConfig, get_peft_model
 from torch import nn
 
+from ltx_core.model.transformer.model import LTXModel
 from ltx_trainer.trainer import LtxvTrainer
 from ltx_trainer.training_strategies.multi_reference_planner_stage2 import (
     MultiReferencePlannerStage2Config,
@@ -16,6 +17,10 @@ class _TrackingLinear(nn.Linear):
     def __init__(self) -> None:
         super().__init__(4, 4)
         self.to_devices = []
+        self._enable_gradient_checkpointing = False
+
+    def set_gradient_checkpointing(self, enable: bool) -> None:
+        self._enable_gradient_checkpointing = enable
 
     def to(self, *args, **kwargs):
         device = kwargs.get("device", args[0] if args else None)
@@ -91,6 +96,18 @@ def test_frozen_transformer_is_not_prepared_by_ddp() -> None:
     assert trainer._accumulation_models == [trainer._training_strategy.module]
 
 
+def test_frozen_transformer_enables_gradient_checkpointing() -> None:
+    trainer = _trainer_for_prepare()
+    transformer = trainer._transformer
+
+    trainer._prepare_models_for_training()
+
+    assert transformer not in trainer._accelerator.prepared
+    assert transformer.training is False
+    assert all(not parameter.requires_grad for parameter in transformer.parameters())
+    assert transformer._enable_gradient_checkpointing is True
+
+
 def test_only_trainable_video_connector_is_prepared() -> None:
     trainer = _trainer_for_prepare()
     processor = trainer._embeddings_processor
@@ -124,6 +141,83 @@ def test_frozen_transformer_allows_input_gradient() -> None:
     output.square().mean().backward()
 
     assert all(parameter.grad is None for parameter in frozen_renderer.parameters())
+    assert all(parameter.grad is not None and torch.any(parameter.grad != 0) for parameter in upstream.parameters())
+
+
+class _IdentityBlockInputProcessor:
+    def __call__(self, modality, perturbations, block_idx, **kwargs):
+        del perturbations, block_idx, kwargs
+        return modality
+
+
+class _TinyTransformerBlock(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.projection = nn.Linear(4, 4)
+
+    def forward(self, video=None, audio=None):
+        return self.projection(video) if video is not None else None, audio
+
+
+def _tiny_ltx_model() -> LTXModel:
+    model = LTXModel.__new__(LTXModel)
+    nn.Module.__init__(model)
+    model._enable_gradient_checkpointing = True
+    model.transformer_blocks = nn.ModuleList([_TinyTransformerBlock()])
+    model.block_input_processor = _IdentityBlockInputProcessor()
+    model.eval()
+    return model
+
+
+def test_eval_model_uses_checkpoint_when_grad_enabled(monkeypatch) -> None:
+    model = _tiny_ltx_model()
+    calls = []
+
+    def fake_checkpoint(function, *args, **kwargs):
+        calls.append((function, kwargs))
+        return function(*args)
+
+    monkeypatch.setattr(torch.utils.checkpoint, "checkpoint", fake_checkpoint)
+    video, _ = model._process_transformer_blocks(
+        torch.randn(2, 4, requires_grad=True),
+        None,
+        object(),
+    )
+
+    assert video is not None
+    assert len(calls) == 1
+    assert calls[0][1] == {"use_reentrant": False}
+
+
+def test_eval_model_skips_checkpoint_under_no_grad(monkeypatch) -> None:
+    model = _tiny_ltx_model()
+    calls = []
+
+    def fake_checkpoint(function, *args, **kwargs):
+        calls.append((function, kwargs))
+        return function(*args)
+
+    monkeypatch.setattr(torch.utils.checkpoint, "checkpoint", fake_checkpoint)
+    with torch.no_grad():
+        video, _ = model._process_transformer_blocks(torch.randn(2, 4), None, object())
+
+    assert video is not None
+    assert calls == []
+
+
+def test_frozen_checkpointed_renderer_propagates_input_gradient() -> None:
+    upstream = nn.Linear(4, 4)
+    renderer = _tiny_ltx_model()
+    renderer.requires_grad_(False)
+
+    output, _ = renderer._process_transformer_blocks(
+        upstream(torch.randn(2, 4)),
+        None,
+        object(),
+    )
+    output.square().mean().backward()
+
+    assert all(parameter.grad is None for parameter in renderer.parameters())
     assert all(parameter.grad is not None and torch.any(parameter.grad != 0) for parameter in upstream.parameters())
 
 
