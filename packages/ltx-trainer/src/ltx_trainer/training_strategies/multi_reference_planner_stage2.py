@@ -11,9 +11,10 @@ from typing import Any, Literal
 
 import torch
 import torch.nn.functional as F
-from pydantic import Field
+from pydantic import Field, model_validator
 from torch import Tensor, nn
 
+from ltx_core.model.transformer.rope import LTXRopeType
 from ltx_core.multicond.visual_tokens import (
     VisualPlannerTokens,
     extract_projected_visual_tokens,
@@ -32,10 +33,20 @@ class MultiReferencePlannerStage2Config(MultiReferenceVideoConfig):
 
     name: Literal["multi_reference_planner_stage2"] = "multi_reference_planner_stage2"
 
-    visual_branch_enabled: bool = Field(
-        default=False,
-        description="Stage 2 keeps the legacy pre-connector planner-token path; disable Stage 1 post-connector visual branch.",
-    )
+    visual_branch_enabled: bool = True
+    visual_context_mode: Literal["qformer_512", "full_tokens_3d_sa"] = "full_tokens_3d_sa"
+    visual_context_expected_tokens: int | None = 2048
+    visual_context_max_tokens: int = 2048
+    visual_connector_enabled: bool = False
+    visual_token_source_dim: int | None = 3840
+    visual_token_target_dim: int | None = 4096
+    cfg_full_p: float = Field(default=0.65, ge=0.0)
+    cfg_drop_text_p: float = Field(default=0.10, ge=0.0)
+    cfg_drop_siglip_p: float = Field(default=0.10, ge=0.0)
+    cfg_drop_ref_latents_p: float = Field(default=0.10, ge=0.0)
+    cfg_drop_all_p: float | None = Field(default=0.05, ge=0.0)
+    cfg_drop_ref_p: float = Field(default=0.0, ge=0.0)
+    cfg_drop_planner_p: float = Field(default=0.0, ge=0.0)
 
     use_online_vlm: bool = Field(
         default=True,
@@ -63,13 +74,13 @@ class MultiReferencePlannerStage2Config(MultiReferenceVideoConfig):
     )
 
     vlm_lm_labels_key: str = Field(
-        default="labels",
-        description="Optional labels key for next-token/language-model loss. Use -100 for ignored tokens.",
+        default="ntp_labels",
+        description="NTP labels key. New caches use ntp_labels; labels remains a fallback.",
     )
 
     vlm_lm_loss_weight: float = Field(
         default=0.0,
-        description="Weight for optional Gemma language-model loss.",
+        description="Deprecated alias for ntp_loss_weight.",
         ge=0.0,
     )
 
@@ -100,7 +111,7 @@ class MultiReferencePlannerStage2Config(MultiReferenceVideoConfig):
     )
 
     planner_token_count: int = Field(
-        default=1024,
+        default=2048,
         description=(
             "Fixed target visual planner token count. Must equal the token count saved in "
             "gt_siglip_tokens/ for every sample."
@@ -122,7 +133,7 @@ class MultiReferencePlannerStage2Config(MultiReferenceVideoConfig):
     )
 
     planner_zero_init_cross_attention: bool = Field(
-        default=True,
+        default=False,
         description="Zero-initialize the planner cross-attention output projection.",
     )
 
@@ -140,7 +151,7 @@ class MultiReferencePlannerStage2Config(MultiReferenceVideoConfig):
     )
 
     planner_zero_init_ffn: bool = Field(
-        default=True,
+        default=False,
         description="Zero-initialize the planner FFN output projection.",
     )
 
@@ -167,13 +178,13 @@ class MultiReferencePlannerStage2Config(MultiReferenceVideoConfig):
     )
 
     planner_source_dim: int | None = Field(
-        default=None,
+        default=3840,
         description="Hidden size of the selected VLM layer. None defaults to visual_token_source_dim when set.",
         ge=1,
     )
 
     planner_output_dim: int | None = Field(
-        default=None,
+        default=3840,
         description=(
             "Output dimension of the planner/Q-former. Defaults to visual_token_source_dim. "
             "For SigLIP-space alignment this should be 3840."
@@ -186,6 +197,12 @@ class MultiReferencePlannerStage2Config(MultiReferenceVideoConfig):
         description="Normal init std for learned planner query tokens in planner_output_dim space.",
         ge=0.0,
     )
+
+    planner_use_content_residual: bool = True
+    planner_use_3d_rope: bool = True
+    planner_rope_use_middle_positions: bool = True
+    planner_residual_init_gain: float = Field(default=0.1, gt=0.0)
+    planner_query_chunk_size: int | None = Field(default=None, ge=1)
 
     use_connector_register_queries: bool = Field(
         default=False,
@@ -207,9 +224,15 @@ class MultiReferencePlannerStage2Config(MultiReferenceVideoConfig):
 
     planner_mse_weight: float = Field(
         default=1.0,
-        description="Weight for MSE(predicted visual tokens, GT SigLIP/projector visual tokens).",
+        description="Deprecated alias for siglip_loss_weight.",
         ge=0.0,
     )
+
+    siglip_loss_weight: float | None = Field(default=None, ge=0.0)
+
+    ntp_loss_weight: float = Field(default=0.1, ge=0.0)
+
+    ntp_logits_chunk_size: int = Field(default=128, ge=1)
 
     flow_loss_weight: float = Field(
         default=1.0,
@@ -227,8 +250,48 @@ class MultiReferencePlannerStage2Config(MultiReferenceVideoConfig):
         description="Also optimize the LTX video embedding connector during Stage 2.",
     )
 
+    gemma_gradient_checkpointing: bool = True
+
+    @model_validator(mode="after")
+    def _validate_stage2_architecture(self) -> "MultiReferencePlannerStage2Config":
+        if self.visual_context_mode != "full_tokens_3d_sa":
+            raise ValueError("Stage 2 planner requires visual_context_mode='full_tokens_3d_sa'")
+        if not self.visual_branch_enabled:
+            raise ValueError("Stage 2 planner requires visual_branch_enabled=true")
+        if self.visual_connector_enabled:
+            raise ValueError("Stage 2 full-token planner requires visual_connector_enabled=false")
+        if not self.freeze_vlm_vision_tower or not self.freeze_vlm_multi_modal_projector:
+            raise ValueError("Stage 2 requires the Gemma vision tower and multimodal projector to remain frozen")
+        if self.train_gemma_backbone or self.train_vlm_language_model is True:
+            raise ValueError("Stage 2 trains Gemma LoRA only; the Gemma base language model must remain frozen")
+        if not self.freeze_transformer:
+            raise ValueError("Stage 2 requires the LTX base and Stage 1 DiT LoRA to remain frozen")
+        if not self.train_text_connector:
+            raise ValueError("Stage 2 requires train_text_connector=true")
+        if self.cfg_drop_ref_p != 0.0:
+            raise ValueError("Stage 2 does not use cfg_drop_ref_p; set cfg_drop_ref_p=0")
+        if self.cfg_dropout_enabled:
+            drop_all = self.cfg_drop_all_p if self.cfg_drop_all_p is not None else self.cfg_drop_planner_p
+            total = (
+                self.cfg_full_p
+                + self.cfg_drop_text_p
+                + self.cfg_drop_siglip_p
+                + self.cfg_drop_ref_latents_p
+                + drop_all
+            )
+            if abs(total - 1.0) > 1.0e-6:
+                raise ValueError(f"Stage 2 CFG probabilities must sum to 1.0, got {total}")
+        return self
+
     def get_data_sources(self) -> dict[str, str]:
         data_sources = super().get_data_sources()
+        if (
+            self.cfg_dropout_enabled
+            and self.cfg_drop_ref_latents_p > 0
+            and self.cfg_text_conditions_dir is not None
+            and self.cfg_text_conditions_dir != self.conditions_dir
+        ):
+            data_sources[self.cfg_text_conditions_dir] = "cfg_text_conditions"
         if self.use_online_vlm:
             data_sources[self.planner_vlm_inputs_dir] = "planner_vlm_inputs"
         else:
@@ -248,6 +311,14 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
         self._planner_query_registers: Tensor | None = None
         self._last_planner_mse_loss: Tensor | None = None
         self._last_vlm_lm_loss: Tensor | None = None
+        self._last_flow_loss: Tensor | None = None
+        self._last_siglip_loss: Tensor | None = None
+        self._last_ntp_loss: Tensor | None = None
+        self._last_siglip_cosine: Tensor | None = None
+        self._last_predicted_token_std: Tensor | None = None
+        self._last_gt_token_std: Tensor | None = None
+        self._last_predicted_token_norm: Tensor | None = None
+        self._last_gt_token_norm: Tensor | None = None
 
     def attach_models(
         self,
@@ -274,7 +345,9 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
             connector_dim = getattr(video_connector, "inner_dim", None)
             if base_tokens is None:
                 if connector_dim is None:
-                    raise ValueError("Cannot initialize connector-register planner queries: video connector has no inner_dim")
+                    raise ValueError(
+                        "Cannot initialize connector-register planner queries: video connector has no inner_dim"
+                    )
                 base_tokens = torch.zeros(1, connector_dim, device=connector_device, dtype=connector_dtype)
             elif connector_dim is None:
                 connector_dim = base_tokens.shape[-1]
@@ -303,14 +376,31 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
             zero_init_ffn=self.config.planner_zero_init_ffn,
             use_learned_query_tokens=use_learned_query_tokens,
             query_init_std=self.config.planner_query_init_std,
+            positional_embedding_theta=getattr(transformer, "positional_embedding_theta", 10000.0),
+            positional_embedding_max_pos=getattr(
+                transformer,
+                "positional_embedding_max_pos",
+                [20, 2048, 2048],
+            ),
+            rope_type=getattr(transformer, "rope_type", LTXRopeType.SPLIT),
+            use_content_residual=self.config.planner_use_content_residual,
+            use_3d_rope=self.config.planner_use_3d_rope,
+            rope_use_middle_positions=self.config.planner_rope_use_middle_positions,
+            residual_init_gain=self.config.planner_residual_init_gain,
+            query_chunk_size=self.config.planner_query_chunk_size,
         ).to(device=connector_device, dtype=connector_dtype)
+
+        if self.config.visual_context_mode != "full_tokens_3d_sa":
+            raise ValueError("Stage 2 planner requires visual_context_mode='full_tokens_3d_sa'")
+        if self._visual_full_encoder is None:
+            raise RuntimeError("Stage 2 planner requires the Stage 1 Visual3DTokenEncoder")
+        if self._visual_resampler is not None or self._visual_connector is not None or self._visual_gate is not None:
+            raise RuntimeError("Stage 2 full-token planner must not create a visual resampler, connector, or gate")
 
         self.text_encoder = text_encoder
         if self.config.use_online_vlm:
             if self.text_encoder is None:
                 raise ValueError("Stage 2 online VLM training requires a loaded Gemma text_encoder.")
-            if self.config.vlm_lm_loss_weight > 0 and not self._train_gemma_backbone():
-                raise ValueError("vlm_lm_loss_weight > 0 requires train_gemma_backbone: true.")
             self._configure_vlm_trainable_parameters(self.text_encoder)
 
     def train_transformer(self) -> bool:
@@ -322,12 +412,13 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
     def requires_text_encoder(self) -> bool:
         return self.config.use_online_vlm
 
+    def requires_text_encoder_lora(self) -> bool:
+        return self.config.use_online_vlm
+
     def train_text_encoder(self) -> bool:
-        return self.config.use_online_vlm and (
-            self._train_gemma_backbone()
-            or not self.config.freeze_vlm_vision_tower
-            or not self.config.freeze_vlm_multi_modal_projector
-        )
+        if not self.config.use_online_vlm or self.text_encoder is None:
+            return False
+        return any(parameter.requires_grad for parameter in self.text_encoder.parameters())
 
     def get_trainable_modules(self) -> dict[str, nn.Module]:
         modules = super().get_trainable_modules()
@@ -340,12 +431,36 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
         if "planner_tokens" in modules:
             self.planner_tokens = modules["planner_tokens"]
 
+    def set_text_encoder(self, text_encoder: nn.Module) -> None:
+        self.text_encoder = text_encoder
+
+    def enforce_frozen_module_eval(self) -> None:
+        self._keep_frozen_vlm_modules_in_eval()
+
+    def get_text_encoder_trainable_module(self) -> nn.Module:
+        return self._get_language_model()
+
+    def set_text_encoder_trainable_module(self, language_model: nn.Module) -> None:
+        gemma_model = self._unwrap_text_encoder().model.model
+        gemma_model.language_model = language_model
+
+    def get_text_encoder_checkpoint_state_dict(self, accelerator: Any) -> dict[str, Tensor]:
+        language_model = self._get_language_model()
+        unwrapped = accelerator.unwrap_model(language_model, keep_torch_compile=False)
+        trainable_names = {name for name, parameter in unwrapped.named_parameters() if parameter.requires_grad}
+        full_state = accelerator.get_state_dict(language_model)
+        prefix = "model.model.language_model."
+        return {f"{prefix}{key}": value for key, value in full_state.items() if key in trainable_names}
+
     def prepare_conditions(self, batch: dict[str, Any], conditions: dict[str, Tensor]) -> dict[str, Tensor]:
         if self.planner_tokens is None:
             raise RuntimeError("Planner tokens were not initialized. Did attach_models() run?")
 
         self._last_planner_mse_loss = None
         self._last_vlm_lm_loss = None
+        self._last_flow_loss = None
+        self._last_siglip_loss = None
+        self._last_ntp_loss = None
 
         conditions = self._apply_cfg_preconnector_context_switch(batch, conditions)
         video_feature_key = "video_prompt_embeds" if "video_prompt_embeds" in conditions else "prompt_embeds"
@@ -358,11 +473,26 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
         self._assert_token_count("GT visual tokens", gt_tokens, gt_mask)
         planner_output_dim = self._resolved_planner_output_dim(planner_source_dim=self._resolved_planner_source_dim())
         self._assert_visual_token_dim("GT visual tokens", gt_tokens, planner_output_dim)
+        token_positions = self._build_visual_token_positions(
+            batch["gt_visual_tokens"],
+            batch["latents"],
+            token_count=gt_tokens.shape[1],
+            device=gt_tokens.device,
+            dtype=torch.float32,
+        )
 
         if self.config.use_online_vlm:
-            predicted_tokens, predicted_mask = self._run_online_vlm(batch, batch["planner_vlm_inputs"], gt_tokens.device)
+            predicted_tokens, predicted_mask = self._run_online_vlm(
+                batch,
+                batch["planner_vlm_inputs"],
+                gt_tokens.device,
+                token_positions=token_positions,
+            )
         else:
-            predicted_tokens, predicted_mask = self._load_offline_predicted_tokens(batch["planner_conditions"], gt_tokens)
+            predicted_tokens, predicted_mask = self._load_offline_predicted_tokens(
+                batch["planner_conditions"],
+                gt_tokens,
+            )
 
         self._assert_token_count("Predicted visual tokens", predicted_tokens, predicted_mask)
         predicted_tokens = predicted_tokens.to(device=gt_tokens.device, dtype=gt_tokens.dtype)
@@ -373,33 +503,71 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
                 f"Predicted raw visual dim {predicted_tokens.shape[-1]} must match raw GT dim {gt_tokens.shape[-1]} "
                 "for Stage 2 planner MSE."
             )
-        drop_visual_mask = self._cfg_drop_visual_mask(
+        exclude_siglip_loss = self._cfg_drop_ref_latents_mask(
             batch,
             batch_size=predicted_tokens.shape[0],
             device=predicted_tokens.device,
         )
 
-        if self.config.planner_mse_weight > 0:
+        if self._siglip_loss_weight() > 0:
             mse_mask = predicted_mask
-            if drop_visual_mask is not None and torch.any(drop_visual_mask):
-                mse_mask = mse_mask & ~drop_visual_mask[:, None]
+            if exclude_siglip_loss is not None and torch.any(exclude_siglip_loss):
+                mse_mask = mse_mask & ~exclude_siglip_loss[:, None]
             self._last_planner_mse_loss = self._compute_visual_alignment_loss(
                 predicted_tokens=predicted_tokens,
                 gt_tokens=gt_tokens,
                 mask=mse_mask,
             )
+            self._last_siglip_loss = self._last_planner_mse_loss
 
-        projected_tokens = self._project_visual_tokens(predicted_tokens, target_dim=video_features.shape[-1])
-        projected_tokens, predicted_mask = self._apply_cfg_planner_dropout(batch, projected_tokens, predicted_mask)
-        return self._append_visual_tokens_to_conditions(conditions, projected_tokens, predicted_mask)
+        diagnostic_mask = predicted_mask.unsqueeze(-1).to(dtype=predicted_tokens.dtype)
+        masked_predicted = predicted_tokens * diagnostic_mask
+        masked_gt = gt_tokens * diagnostic_mask
+        self._last_siglip_cosine = F.cosine_similarity(masked_predicted, masked_gt, dim=-1).mean(dim=1)
+        self._last_predicted_token_std = predicted_tokens.float().std(dim=(1, 2))
+        self._last_gt_token_std = gt_tokens.float().std(dim=(1, 2))
+        self._last_predicted_token_norm = predicted_tokens.float().norm(dim=-1).mean(dim=1)
+        self._last_gt_token_norm = gt_tokens.float().norm(dim=-1).mean(dim=1)
+
+        batch["_planner_predicted_raw_tokens"] = predicted_tokens
+        batch["_planner_predicted_mask"] = predicted_mask
+        batch["_planner_visual_positions"] = token_positions
+        return self._pad_conditions_to_connector_multiple(conditions)
 
     def postprocess_conditions_after_connector(
         self,
         batch: dict[str, Any],
         conditions: dict[str, Tensor],
     ) -> dict[str, Tensor]:
-        del batch
-        return conditions
+        conditions = self._apply_cfg_postconnector_text_dropout(batch, conditions)
+        predicted_tokens = batch.get("_planner_predicted_raw_tokens")
+        predicted_mask = batch.get("_planner_predicted_mask")
+        token_positions = batch.get("_planner_visual_positions")
+        if not isinstance(predicted_tokens, Tensor) or not isinstance(predicted_mask, Tensor):
+            raise RuntimeError("Stage 2 planner raw tokens were not prepared before the text connector")
+        if not isinstance(token_positions, Tensor):
+            raise RuntimeError("Stage 2 planner 3D positions were not prepared")
+        if self._visual_full_encoder is None:
+            raise RuntimeError("Stage 2 planner requires loaded Stage 1 visual_full_encoder weights")
+
+        context_key = "video_prompt_embeds" if "video_prompt_embeds" in conditions else "prompt_embeds"
+        target_dim = conditions[context_key].shape[-1]
+        projected_tokens = self._project_visual_tokens(predicted_tokens, target_dim=target_dim)
+        self._validate_full_visual_token_layout(
+            batch["gt_visual_tokens"],
+            token_count=projected_tokens.shape[1],
+        )
+        visual_context, visual_mask = self._visual_full_encoder(
+            tokens=projected_tokens,
+            token_positions=token_positions.to(device=projected_tokens.device),
+            token_mask=predicted_mask,
+        )
+        visual_context, visual_mask = self._apply_cfg_visual_dropout_after_connector(
+            batch,
+            visual_context,
+            visual_mask,
+        )
+        return self._append_postconnector_visual_context(conditions, visual_context, visual_mask)
 
     def compute_loss(
         self,
@@ -407,23 +575,116 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
         audio_pred: Tensor | None,
         inputs: ModelInputs,
     ) -> Tensor:
-        flow_loss = super().compute_loss(video_pred, audio_pred, inputs) * self.config.flow_loss_weight
-        loss = flow_loss
-        if self._last_planner_mse_loss is not None:
-            loss = loss + self._last_planner_mse_loss.to(device=flow_loss.device, dtype=flow_loss.dtype) * (
-                self.config.planner_mse_weight
+        flow_loss = super().compute_loss(video_pred, audio_pred, inputs)
+        self._last_flow_loss = flow_loss
+        siglip_loss = self._loss_or_zeros(self._last_siglip_loss, flow_loss)
+        ntp_loss = self._loss_or_zeros(self._last_ntp_loss, flow_loss)
+        return self._combine_losses(flow_loss, siglip_loss, ntp_loss)
+
+    def _combine_losses(self, flow_loss: Tensor, siglip_loss: Tensor, ntp_loss: Tensor) -> Tensor:
+        return (
+            flow_loss * self.config.flow_loss_weight
+            + siglip_loss * self._siglip_loss_weight()
+            + ntp_loss * self._ntp_loss_weight()
+        )
+
+    def _apply_cfg_preconnector_context_switch(
+        self,
+        batch: dict[str, Any],
+        conditions: dict[str, Tensor],
+    ) -> dict[str, Tensor]:
+        if not self.config.cfg_dropout_enabled:
+            return conditions
+        context_key = "video_prompt_embeds" if "video_prompt_embeds" in conditions else "prompt_embeds"
+        batch_size = conditions[context_key].shape[0]
+        drop_ref = self._cfg_drop_ref_latents_mask(
+            batch,
+            batch_size=batch_size,
+            device=conditions[context_key].device,
+        )
+        if drop_ref is None or not torch.any(drop_ref):
+            return conditions
+        text_only = batch.get("cfg_text_conditions")
+        if text_only is None:
+            raise ValueError(
+                "Stage 2 synchronized reference dropout requires cfg_text_conditions. "
+                "Set cfg_text_conditions_dir to precomputed text-only conditions."
             )
-        if self._last_vlm_lm_loss is not None and self.config.vlm_lm_loss_weight > 0:
-            loss = loss + self._last_vlm_lm_loss.to(device=flow_loss.device, dtype=flow_loss.dtype) * (
-                self.config.vlm_lm_loss_weight
-            )
-        return loss
+        return self._select_condition_rows(primary=conditions, alternate=text_only, use_alternate=drop_ref)
+
+    @staticmethod
+    def _loss_or_zeros(loss: Tensor | None, reference: Tensor) -> Tensor:
+        if loss is None:
+            return torch.zeros_like(reference)
+        return loss.to(device=reference.device, dtype=reference.dtype)
+
+    def _siglip_loss_weight(self) -> float:
+        if self.config.siglip_loss_weight is not None:
+            return self.config.siglip_loss_weight
+        return self.config.planner_mse_weight
+
+    def _ntp_loss_weight(self) -> float:
+        explicit_fields = getattr(self.config, "model_fields_set", set())
+        if "ntp_loss_weight" in explicit_fields:
+            return self.config.ntp_loss_weight
+        if "vlm_lm_loss_weight" in explicit_fields:
+            return self.config.vlm_lm_loss_weight
+        return self.config.ntp_loss_weight
+
+    def get_last_training_metrics(self) -> dict[str, Tensor]:
+        metrics: dict[str, Tensor | None] = {
+            "train/loss_flow": self._last_flow_loss,
+            "train/loss_siglip": self._last_siglip_loss,
+            "train/loss_ntp": self._last_ntp_loss,
+            "train/siglip_cosine": self._last_siglip_cosine,
+            "train/predicted_token_std": self._last_predicted_token_std,
+            "train/gt_token_std": self._last_gt_token_std,
+            "train/predicted_token_norm": self._last_predicted_token_norm,
+            "train/gt_token_norm": self._last_gt_token_norm,
+        }
+        return {name: value.detach().mean() for name, value in metrics.items() if value is not None}
+
+    def load_extra_checkpoint_state_dict(self, state_dict: dict[str, Tensor]) -> None:
+        legacy_prefixes = (
+            "training_strategy.visual_resampler.",
+            "training_strategy.visual_connector.",
+            "training_strategy.visual_gate.",
+        )
+        if any(key.startswith(legacy_prefixes) for key in state_dict):
+            raise ValueError("Stage 2 full-token planner cannot load legacy visual resampler/connector/gate weights")
+        stage1_modules = MultiReferenceVideoStrategy.get_trainable_modules(self)
+        required = {"visual_token_projection", "visual_full_encoder"}
+        for name, module in stage1_modules.items():
+            prefix = f"training_strategy.{name}."
+            module_state = {
+                key.removeprefix(prefix): value
+                for key, value in state_dict.items()
+                if key.startswith(prefix)
+            }
+            if module_state:
+                module.load_state_dict(module_state, strict=True)
+            elif name in required:
+                raise ValueError(f"Stage 2 requires checkpoint keys under {prefix}*")
+
+        if self.planner_tokens is not None:
+            prefix = "training_strategy.planner_tokens."
+            planner_state = {
+                key.removeprefix(prefix): value
+                for key, value in state_dict.items()
+                if key.startswith(prefix)
+            }
+            if planner_state:
+                self.planner_tokens.load_state_dict(planner_state, strict=True)
+            elif any(key.startswith("text_encoder.") for key in state_dict):
+                raise ValueError("Stage 2 checkpoint contains Gemma weights but no training_strategy.planner_tokens.*")
 
     def get_checkpoint_metadata(self) -> dict[str, Any]:
         metadata = super().get_checkpoint_metadata()
         metadata.update(
             {
                 "conditioning": "multi_reference_planner_stage2",
+                "stage": 2,
+                "planner_architecture": "content_residual_3d_rope_cross_attention",
                 "planner_token_count": self.config.planner_token_count,
                 "planner_cross_attention_heads": self.config.planner_cross_attention_heads,
                 "planner_zero_init_cross_attention": self.config.planner_zero_init_cross_attention,
@@ -432,10 +693,14 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
                 "planner_slot_encoding": self.config.planner_slot_encoding,
                 "planner_slot_init_std": self.config.planner_slot_init_std,
                 "planner_slot_init_seed": self.config.planner_slot_init_seed,
-                "planner_output_dim": self._resolved_planner_output_dim(planner_source_dim=self._resolved_planner_source_dim()),
+                "planner_output_dim": self._resolved_planner_output_dim(
+                    planner_source_dim=self._resolved_planner_source_dim()
+                ),
                 "planner_query_init_std": self.config.planner_query_init_std,
                 "use_connector_register_queries": self.config.use_connector_register_queries,
                 "planner_mse_weight": self.config.planner_mse_weight,
+                "siglip_loss_weight": self._siglip_loss_weight(),
+                "ntp_loss_weight": self._ntp_loss_weight(),
                 "flow_loss_weight": self.config.flow_loss_weight,
                 "freeze_transformer": self.config.freeze_transformer,
                 "train_text_connector": self.config.train_text_connector,
@@ -445,6 +710,8 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
                 "freeze_vlm_multi_modal_projector": self.config.freeze_vlm_multi_modal_projector,
                 "cfg_drop_all_p": self._cfg_drop_all_probability(),
                 "cfg_drop_planner_p_is_legacy_drop_all_alias": True,
+                "visual_context_mode": self.config.visual_context_mode,
+                "losses": ["ntp", "flow_matching", "siglip_mse"],
             }
         )
         return metadata
@@ -454,16 +721,21 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
         batch: dict[str, Any],
         planner_data: dict[str, Any],
         device: torch.device,
+        *,
+        token_positions: Tensor,
     ) -> tuple[Tensor, Tensor]:
         if self.text_encoder is None or self.planner_tokens is None:
             raise RuntimeError("Online VLM mode requires text_encoder and planner_tokens.")
 
+        self._keep_frozen_vlm_modules_in_eval()
         forward_inputs = self._build_vlm_forward_inputs(planner_data, device)
         placeholder_mask = planner_data[self.config.vlm_placeholder_mask_key].to(device=device, dtype=torch.bool)
         self._assert_placeholder_mask(placeholder_mask)
-        # Split CFG has no VLM-reference-image dropout mode. Reference-latent
-        # dropout is handled only in the DiT packed latent stream.
-        drop_ref_mask = None
+        drop_ref_mask = self._cfg_drop_ref_latents_mask(
+            batch,
+            batch_size=forward_inputs["input_ids"].shape[0],
+            device=device,
+        )
         drop_text_mask = self._cfg_drop_text_mask(
             batch,
             batch_size=forward_inputs["input_ids"].shape[0],
@@ -490,6 +762,8 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
             drop_ref_mask=drop_ref_mask,
         )
         language_model = self._get_language_model()
+        language_model.train(self.train_text_encoder())
+        self._keep_frozen_vlm_modules_in_eval()
         lm_inputs = {
             "inputs_embeds": inputs_embeds,
             "attention_mask": forward_inputs["attention_mask"],
@@ -511,11 +785,23 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
             planner_hidden=selected_hidden,
             query_registers=self._planner_query_registers,
             planner_mask=selected_mask,
+            token_positions=token_positions,
         )
 
         labels = planner_data.get(self.config.vlm_lm_labels_key)
-        if labels is not None and self.config.vlm_lm_loss_weight > 0:
-            self._last_vlm_lm_loss = self._compute_lm_loss(hidden_states[-1], labels.to(device=device, dtype=torch.long))
+        if labels is None:
+            labels = planner_data.get("ntp_labels", planner_data.get("labels"))
+        if labels is None and self._ntp_loss_weight() > 0:
+            raise ValueError(
+                "NTP loss is enabled but planner_vlm_inputs contain no ntp_labels/labels. "
+                "Regenerate them with precompute_planner_vlm_inputs.py."
+            )
+        if labels is not None and self._ntp_loss_weight() > 0:
+            labels = labels.to(device=device, dtype=torch.long).clone()
+            if drop_text_mask is not None and torch.any(drop_text_mask):
+                labels[drop_text_mask] = -100
+            self._last_vlm_lm_loss = self._compute_lm_loss(hidden_states[-1], labels)
+            self._last_ntp_loss = self._last_vlm_lm_loss
 
         return predicted_tokens, selected_mask
 
@@ -545,7 +831,7 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
             if dropped_image_token_mask is not None:
                 scatter_exclusion_mask = scatter_exclusion_mask | dropped_image_token_mask
             visual_batch = extract_projected_visual_tokens(
-                self.text_encoder.model,
+                self._unwrap_text_encoder().model,
                 pixel_values,
                 image_counts=image_counts,
             )
@@ -809,15 +1095,26 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
 
     def _configure_vlm_trainable_parameters(self, text_encoder: nn.Module) -> None:
         text_encoder.requires_grad_(False)
-        gemma_model = text_encoder.model.model
+        gemma_model = self._unwrap_text_encoder().model.model
 
         language_model = getattr(gemma_model, "language_model", None)
-        if language_model is not None and self._train_gemma_backbone():
-            language_model.requires_grad_(True)
+        if language_model is not None:
+            if self._train_gemma_backbone():
+                language_model.requires_grad_(True)
+            else:
+                for name, parameter in language_model.named_parameters():
+                    parameter.requires_grad_("lora_" in name)
+            if hasattr(language_model, "config"):
+                language_model.config.use_cache = False
+            if self.config.gemma_gradient_checkpointing:
+                if hasattr(language_model, "gradient_checkpointing_enable"):
+                    language_model.gradient_checkpointing_enable()
+                if hasattr(language_model, "enable_input_require_grads"):
+                    language_model.enable_input_require_grads()
 
-        lm_head = getattr(text_encoder.model, "lm_head", None)
-        if lm_head is not None and self._train_gemma_backbone() and self.config.vlm_lm_loss_weight > 0:
-            lm_head.requires_grad_(True)
+        lm_head = getattr(self._unwrap_text_encoder().model, "lm_head", None)
+        if lm_head is not None:
+            lm_head.requires_grad_(False)
 
         vision_tower = getattr(gemma_model, "vision_tower", None)
         if vision_tower is not None:
@@ -826,6 +1123,19 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
         projector = getattr(gemma_model, "multi_modal_projector", None)
         if projector is not None:
             projector.requires_grad_(not self.config.freeze_vlm_multi_modal_projector)
+
+        self._keep_frozen_vlm_modules_in_eval()
+
+    def _keep_frozen_vlm_modules_in_eval(self) -> None:
+        if self.text_encoder is None:
+            return
+        gemma_model = self._unwrap_text_encoder().model.model
+        vision_tower = getattr(gemma_model, "vision_tower", None)
+        projector = getattr(gemma_model, "multi_modal_projector", None)
+        if vision_tower is not None and self.config.freeze_vlm_vision_tower:
+            vision_tower.eval()
+        if projector is not None and self.config.freeze_vlm_multi_modal_projector:
+            projector.eval()
 
     def _train_gemma_backbone(self) -> bool:
         if self.config.train_vlm_language_model is not None:
@@ -874,27 +1184,45 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
         return token_loss.mul(loss_mask).sum(dim=1) / loss_mask.sum(dim=1).clamp(min=1.0)
 
     def _compute_lm_loss(self, final_hidden: Tensor, labels: Tensor) -> Tensor:
-        lm_head = getattr(self.text_encoder.model, "lm_head", None)
+        lm_head = getattr(self._unwrap_text_encoder().model, "lm_head", None)
         if lm_head is None:
-            raise ValueError("vlm_lm_loss_weight > 0 requires text_encoder.model.lm_head")
-        logits = lm_head(final_hidden)
-        shift_logits = logits[:, :-1, :].contiguous()
+            raise ValueError("NTP loss requires text_encoder.model.lm_head")
+        shift_hidden = final_hidden[:, :-1]
         shift_labels = labels[:, 1:].contiguous()
-        return F.cross_entropy(
-            shift_logits.view(-1, shift_logits.shape[-1]),
-            shift_labels.view(-1),
-            ignore_index=-100,
-        )
+        losses = []
+        for sample_hidden, sample_labels in zip(shift_hidden, shift_labels, strict=True):
+            valid = sample_labels != -100
+            selected_hidden = sample_hidden[valid]
+            selected_labels = sample_labels[valid]
+            if selected_labels.numel() == 0:
+                losses.append(final_hidden.new_zeros(()))
+                continue
+            loss_sum = final_hidden.new_zeros((), dtype=torch.float32)
+            count = 0
+            for start in range(0, selected_labels.numel(), self.config.ntp_logits_chunk_size):
+                chunk_hidden = selected_hidden[start : start + self.config.ntp_logits_chunk_size]
+                chunk_labels = selected_labels[start : start + self.config.ntp_logits_chunk_size]
+                logits = lm_head(chunk_hidden)
+                loss_sum = loss_sum + F.cross_entropy(logits.float(), chunk_labels, reduction="sum")
+                count += int(chunk_labels.numel())
+            losses.append(loss_sum / max(count, 1))
+        return torch.stack(losses)
 
     def _get_language_model(self) -> nn.Module:
-        gemma_model = self.text_encoder.model.model
+        gemma_model = self._unwrap_text_encoder().model.model
         language_model = getattr(gemma_model, "language_model", None)
         if language_model is None:
             raise ValueError("Gemma model does not expose language_model")
         return language_model
 
+    def _unwrap_text_encoder(self) -> nn.Module:
+        if self.text_encoder is None:
+            raise RuntimeError("Stage 2 online planner has no text encoder")
+        return getattr(self.text_encoder, "module", self.text_encoder)
+
     @staticmethod
     def _get_input_embeddings(language_model: nn.Module) -> nn.Module:
+        language_model = getattr(language_model, "module", language_model)
         if hasattr(language_model, "get_input_embeddings"):
             embeddings = language_model.get_input_embeddings()
             if embeddings is not None:

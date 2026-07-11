@@ -103,14 +103,14 @@ def test_cfg_split_masks_decouple_siglip_and_reference_latents() -> None:
 
 def test_stage2_visual_drop_mask_excludes_drop_ref_latents_from_mse() -> None:
     strategy = MultiReferencePlannerStage2Strategy(
-        MultiReferencePlannerStage2Config(cfg_dropout_enabled=True, cfg_drop_planner_p=0.25)
+        MultiReferencePlannerStage2Config(cfg_dropout_enabled=True)
     )
     batch = {"_cfg_modes": _fixed_modes()}
 
     drop_visual = strategy._cfg_drop_visual_mask(batch, batch_size=5, device=torch.device("cpu"))
 
     assert torch.equal(drop_visual, torch.tensor([False, False, True, False, True]))
-    assert strategy._cfg_drop_all_probability() == 0.25
+    assert strategy._cfg_drop_all_probability() == 0.05
 
 
 def test_inferred_text_token_mask_does_not_cover_planner_placeholders() -> None:
@@ -177,6 +177,9 @@ def test_planner_precompute_masks_separate_text_ref_and_planner_regions() -> Non
     assert not bool((text_mask & planner_boundary).any())
     assert not bool((text_mask & ref_region).any())
     assert torch.equal(text_mask, torch.tensor([True, False, False, False, True, False, False, False, False, False]))
+    assert torch.equal(out["ntp_label_mask"], text_mask)
+    assert torch.equal(out["ntp_labels"] != -100, text_mask)
+    assert torch.equal(out["labels"], out["ntp_labels"])
 
 
 def test_planner_precompute_source_length_budget_and_overflow() -> None:
@@ -866,14 +869,19 @@ def test_stage2_trainable_modules_include_visual_projection_and_planner_tokens()
         MultiReferencePlannerStage2Config(
             use_online_vlm=False,
             planner_token_count=4,
-            planner_source_dim=3840,
-            visual_token_source_dim=3840,
-            visual_token_target_dim=4096,
+            planner_source_dim=8,
+            planner_output_dim=8,
+            planner_cross_attention_heads=2,
+            visual_token_source_dim=8,
+            visual_token_target_dim=12,
+            visual_context_expected_tokens=4,
+            visual_full_sa_num_heads=2,
+            visual_full_sa_ffn_multiplier=1.0,
         )
     )
     strategy.attach_models(
         transformer=nn.Identity(),
-        embeddings_processor=_FakeEmbeddingsProcessor(4096),
+        embeddings_processor=_FakeEmbeddingsProcessor(12),
         text_encoder=None,
     )
 
@@ -883,50 +891,55 @@ def test_stage2_trainable_modules_include_visual_projection_and_planner_tokens()
     assert "planner_tokens" in modules
 
 
-def test_stage2_postconnector_hook_is_noop_for_legacy_planner_path() -> None:
-    strategy = MultiReferencePlannerStage2Strategy(MultiReferencePlannerStage2Config(use_online_vlm=False))
-    conditions = _projection_conditions(batch_size=1, seq_len=2, dim=8)
-
-    out = strategy.postprocess_conditions_after_connector({}, conditions)
-
-    assert out is conditions
-
-
-def test_stage2_mse_uses_raw_siglip_tokens_then_appends_projected_tokens() -> None:
+def test_stage2_mse_uses_raw_siglip_tokens_before_postconnector_append() -> None:
     strategy = MultiReferencePlannerStage2Strategy(
         MultiReferencePlannerStage2Config(
             use_online_vlm=False,
             planner_token_count=4,
-            planner_mse_weight=1.0,
-            planner_source_dim=3840,
-            planner_output_dim=3840,
-            visual_token_source_dim=3840,
-            visual_token_target_dim=4096,
+            siglip_loss_weight=1.0,
+            planner_source_dim=8,
+            planner_output_dim=8,
+            planner_cross_attention_heads=2,
+            visual_token_source_dim=8,
+            visual_token_target_dim=12,
+            visual_context_expected_tokens=4,
+            visual_full_sa_num_heads=2,
+            visual_full_sa_ffn_multiplier=1.0,
         )
     )
     strategy.attach_models(
         transformer=nn.Identity(),
-        embeddings_processor=_FakeEmbeddingsProcessor(4096),
+        embeddings_processor=_FakeEmbeddingsProcessor(12),
         text_encoder=None,
     )
-    conditions = _projection_conditions(batch_size=1, seq_len=2, dim=4096)
-    gt_tokens = _projection_gt_tokens(batch_size=1, token_count=4, source_dim=3840)
-    predicted_raw = torch.zeros(1, 4, 3840)
+    conditions = _projection_conditions(batch_size=1, seq_len=2, dim=12)
+    gt_tokens = _projection_gt_tokens(batch_size=1, token_count=4, source_dim=8)
+    gt_tokens.update(
+        {
+            "tokens_per_frame": torch.tensor([4]),
+            "sampled_frame_indices": torch.tensor([[0]]),
+            "source_fps": torch.tensor([24.0]),
+        }
+    )
+    predicted_raw = torch.zeros(1, 4, 8)
     batch = {
         "gt_visual_tokens": gt_tokens,
         "planner_conditions": {
             "predicted_visual_tokens": predicted_raw,
             "predicted_visual_token_mask": torch.ones(1, 4, dtype=torch.bool),
         },
+        "latents": {"height": torch.tensor([64]), "width": torch.tensor([96])},
     }
 
     out = strategy.prepare_conditions(batch, conditions)
 
-    assert out["video_prompt_embeds"].shape == (1, 6, 4096)
-    assert out["video_prompt_embeds"].shape[-1] == 4096
+    assert out["video_prompt_embeds"].shape == (1, 2, 12)
     assert strategy._last_planner_mse_loss is not None
     expected_loss = torch.mean((predicted_raw - gt_tokens["visual_tokens"]) ** 2, dim=[1, 2])
     assert torch.allclose(strategy._last_planner_mse_loss, expected_loss)
+
+    post = strategy.postprocess_conditions_after_connector(batch, out)
+    assert post["video_prompt_embeds"].shape == (1, 6, 12)
 
 
 def test_visual_token_dim_mismatch_without_projection_raises_clear_error() -> None:
@@ -1112,26 +1125,30 @@ def test_stage1_train_text_connector_flag_requests_embeddings_processor_training
     assert strategy.train_embeddings_processor() is True
 
 
-def test_stage2_default_uses_learned_3840_query_tokens_not_connector_registers() -> None:
+def test_stage2_default_uses_learned_query_tokens_not_connector_registers() -> None:
     strategy = MultiReferencePlannerStage2Strategy(
         MultiReferencePlannerStage2Config(
             use_online_vlm=False,
             planner_token_count=4,
-            planner_source_dim=3840,
-            planner_output_dim=3840,
-            visual_token_source_dim=3840,
-            visual_token_target_dim=4096,
+            planner_source_dim=8,
+            planner_output_dim=8,
+            planner_cross_attention_heads=2,
+            visual_token_source_dim=8,
+            visual_token_target_dim=12,
+            visual_context_expected_tokens=4,
+            visual_full_sa_num_heads=2,
+            visual_full_sa_ffn_multiplier=1.0,
         )
     )
     strategy.attach_models(
         transformer=nn.Identity(),
-        embeddings_processor=_FakeEmbeddingsProcessor(4096),
+        embeddings_processor=_FakeEmbeddingsProcessor(12),
         text_encoder=None,
     )
 
     assert strategy._planner_query_registers is None
     assert strategy.planner_tokens is not None
-    assert strategy.planner_tokens.dim == 3840
+    assert strategy.planner_tokens.dim == 8
     assert strategy.planner_tokens.query_tokens is not None
 
 
@@ -1140,11 +1157,15 @@ def test_stage2_connector_register_query_dim_mismatch_raises() -> None:
         MultiReferencePlannerStage2Config(
             use_online_vlm=False,
             planner_token_count=4,
-            planner_source_dim=3840,
-            planner_output_dim=3840,
+            planner_source_dim=8,
+            planner_output_dim=8,
+            planner_cross_attention_heads=2,
             use_connector_register_queries=True,
-            visual_token_source_dim=3840,
-            visual_token_target_dim=4096,
+            visual_token_source_dim=8,
+            visual_token_target_dim=12,
+            visual_context_expected_tokens=4,
+            visual_full_sa_num_heads=2,
+            visual_full_sa_ffn_multiplier=1.0,
         )
     )
 
@@ -1152,12 +1173,12 @@ def test_stage2_connector_register_query_dim_mismatch_raises() -> None:
     try:
         strategy.attach_models(
             transformer=nn.Identity(),
-            embeddings_processor=_FakeEmbeddingsProcessor(4096),
+            embeddings_processor=_FakeEmbeddingsProcessor(12),
             text_encoder=None,
         )
     except ValueError as exc:
         raised = True
-        assert "connector dim 4096 != planner_output_dim 3840" in str(exc)
+        assert "connector dim 12 != planner_output_dim 8" in str(exc)
     assert raised
 
 

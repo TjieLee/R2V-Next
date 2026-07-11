@@ -230,6 +230,12 @@ def _append_planner_placeholders(
     # It now represents the full reference image region, not only pure image-pad positions.
     tensor_data["gt_image_token_mask"] = ref_image_region_mask.to(dtype=torch.bool)
     tensor_data["text_token_mask"] = text_token_mask.to(dtype=torch.bool)
+    ntp_labels = input_ids.clone()
+    ntp_label_mask = active_mask & text_token_mask
+    ntp_labels[~ntp_label_mask] = -100
+    tensor_data["ntp_labels"] = ntp_labels
+    tensor_data["ntp_label_mask"] = ntp_label_mask.to(dtype=torch.bool)
+    tensor_data["labels"] = ntp_labels.clone()
     tensor_data["source_max_length"] = torch.tensor(source_max_length, dtype=torch.long)
     tensor_data["ref_visual_token_count"] = ref_visual_token_mask.sum().to(dtype=torch.long)
     tensor_data["planner_token_count"] = torch.tensor(planner_token_count, dtype=torch.long)

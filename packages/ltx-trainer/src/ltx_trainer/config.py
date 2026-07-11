@@ -303,6 +303,19 @@ class LoraConfig(ConfigBaseModel):
     )
 
 
+class TextEncoderLoraConfig(ConfigBaseModel):
+    """Independent Gemma language-model LoRA configuration."""
+
+    enabled: bool = False
+    rank: int = Field(default=16, ge=1)
+    alpha: int = Field(default=16, ge=1)
+    dropout: float = Field(default=0.0, ge=0.0, le=1.0)
+    target_modules: list[str] = Field(
+        default=["q_proj", "k_proj", "v_proj", "o_proj"],
+        description="Gemma language-model modules targeted by the Stage 2 LoRA adapter.",
+    )
+
+
 def _get_strategy_discriminator(v: dict | TrainingStrategyConfigBase) -> str:
     """Discriminator function for strategy config union."""
     if isinstance(v, dict):
@@ -769,6 +782,7 @@ class LtxTrainerConfig(ConfigBaseModel):
     # Sub-configurations
     model: ModelConfig = Field(default_factory=ModelConfig)
     lora: LoraConfig | None = Field(default=None)
+    text_encoder_lora: TextEncoderLoraConfig = Field(default_factory=TextEncoderLoraConfig)
     training_strategy: TrainingStrategyConfig = Field(
         default_factory=TextToVideoConfig,
         description="Training strategy configuration. Determines the training mode and its parameters.",
@@ -833,5 +847,38 @@ class LtxTrainerConfig(ConfigBaseModel):
         # Check that LoRA config is provided when using video_to_video strategy
         if self.training_strategy.name == "video_to_video" and self.model.training_mode != "lora":
             raise ValueError("Training mode must be 'lora' when using video_to_video strategy")
+
+        if self.training_strategy.name == "multi_reference_planner_stage2":
+            if self.model.training_mode != "lora" or self.lora is None:
+                raise ValueError("Stage 2 requires the Stage 1 DiT LoRA configuration")
+            if self.lora.rank != 128 or self.lora.alpha != 128:
+                raise ValueError("Stage 2 DiT LoRA must match Stage 1 rank=128, alpha=128")
+            required_dit_targets = {
+                "attn1.to_k",
+                "attn1.to_q",
+                "attn1.to_v",
+                "attn1.to_out.0",
+                "attn2.to_k",
+                "attn2.to_q",
+                "attn2.to_v",
+                "attn2.to_out.0",
+                "ff.net.0.proj",
+                "ff.net.2",
+            }
+            if set(self.lora.target_modules) != required_dit_targets:
+                raise ValueError("Stage 2 DiT LoRA target_modules must exactly match the Stage 1 full-token config")
+            if not self.text_encoder_lora.enabled or self.text_encoder_lora.rank != 16:
+                raise ValueError("Stage 2 requires text_encoder_lora.enabled=true with rank=16")
+            if self.text_encoder_lora.alpha != 16 or set(self.text_encoder_lora.target_modules) != {
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+            }:
+                raise ValueError("Stage 2 Gemma LoRA must use alpha=16 and q/k/v/o projections")
+            if self.model.load_checkpoint is None:
+                raise ValueError("Stage 2 requires model.load_checkpoint pointing to the Stage 1 checkpoint")
+            if not self.checkpoints.no_resume:
+                raise ValueError("Stage 2 requires checkpoints.no_resume=true so training starts at step 0")
 
         return self

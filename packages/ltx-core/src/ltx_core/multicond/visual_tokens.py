@@ -23,15 +23,7 @@ class VisualTokenBatch:
 
 
 class VisualPlannerTokens(nn.Module):
-    """Baton-style visual planner/Q-former for fixed visual placeholder tokens.
-
-    The default Stage 2 path uses internal learned query tokens in raw
-    SigLIP/Gemma-projector space, while the legacy path can still repeat external
-    connector register tokens as queries. Hidden states at the target
-    ``<img_pad>`` positions provide keys/values. The output projection and FFN
-    can be zero-initialized so the bridge starts as a small residual adapter over
-    the query tokens.
-    """
+    """Content-residual 3D-RoPE bridge from VLM placeholders to visual tokens."""
 
     def __init__(
         self,
@@ -53,6 +45,11 @@ class VisualPlannerTokens(nn.Module):
         positional_embedding_theta: float = 10000.0,
         positional_embedding_max_pos: list[int] | None = None,
         rope_type: LTXRopeType = LTXRopeType.SPLIT,
+        use_content_residual: bool = True,
+        use_3d_rope: bool = False,
+        rope_use_middle_positions: bool = True,
+        residual_init_gain: float = 0.1,
+        query_chunk_size: int | None = None,
     ) -> None:
         super().__init__()
         if token_count <= 0:
@@ -67,6 +64,10 @@ class VisualPlannerTokens(nn.Module):
             raise ValueError("slot_init_std must be non-negative")
         if query_init_std < 0:
             raise ValueError("query_init_std must be non-negative")
+        if residual_init_gain <= 0:
+            raise ValueError("residual_init_gain must be positive")
+        if query_chunk_size is not None and query_chunk_size <= 0:
+            raise ValueError("query_chunk_size must be positive when set")
 
         self.token_count = token_count
         self.dim = dim
@@ -80,6 +81,18 @@ class VisualPlannerTokens(nn.Module):
         self.slot_init_seed = slot_init_seed
         self.use_learned_query_tokens = use_learned_query_tokens
         self.query_init_std = query_init_std
+        self.use_content_residual = use_content_residual
+        self.use_3d_rope = use_3d_rope
+        self.rope_use_middle_positions = rope_use_middle_positions
+        self.positional_embedding_theta = positional_embedding_theta
+        self.positional_embedding_max_pos = list(positional_embedding_max_pos or [20, 2048, 2048])
+        self.rope_type = rope_type
+        self.query_chunk_size = query_chunk_size
+        if use_3d_rope and rope_type == LTXRopeType.SPLIT and self.head_dim % 2 != 0:
+            raise ValueError(
+                "VisualPlannerTokens requires even head_dim for split RoPE, got "
+                f"dim={dim}, num_heads={num_heads}, head_dim={self.head_dim}"
+            )
 
         if use_learned_query_tokens:
             self.query_tokens = nn.Parameter(torch.empty(token_count, dim))
@@ -93,18 +106,29 @@ class VisualPlannerTokens(nn.Module):
         self.key_projection = nn.Linear(self.source_dim, dim)
         self.value_projection = nn.Linear(self.source_dim, dim)
         self.output_projection = nn.Linear(dim, dim)
+        self.content_projection = nn.Linear(self.source_dim, dim, bias=False)
 
-        if zero_init_output:
-            nn.init.zeros_(self.output_projection.weight)
-            nn.init.zeros_(self.output_projection.bias)
+        nn.init.xavier_uniform_(self.query_projection.weight, gain=1.0)
+        nn.init.xavier_uniform_(self.key_projection.weight, gain=1.0)
+        nn.init.xavier_uniform_(self.value_projection.weight, gain=1.0)
+        nn.init.xavier_uniform_(self.output_projection.weight, gain=0.0 if zero_init_output else residual_init_gain)
+        nn.init.zeros_(self.query_projection.bias)
+        nn.init.zeros_(self.key_projection.bias)
+        nn.init.zeros_(self.value_projection.bias)
+        nn.init.zeros_(self.output_projection.bias)
+        if self.source_dim == dim:
+            nn.init.eye_(self.content_projection.weight)
+        else:
+            nn.init.xavier_uniform_(self.content_projection.weight, gain=1.0)
 
         ffn_hidden_dim = max(1, int(dim * ffn_multiplier))
         self.ffn_norm = nn.LayerNorm(dim)
         self.ffn_fc1 = nn.Linear(dim, ffn_hidden_dim)
         self.ffn_fc2 = nn.Linear(ffn_hidden_dim, dim)
-        if zero_init_ffn:
-            nn.init.zeros_(self.ffn_fc2.weight)
-            nn.init.zeros_(self.ffn_fc2.bias)
+        nn.init.xavier_uniform_(self.ffn_fc1.weight, gain=1.0)
+        nn.init.xavier_uniform_(self.ffn_fc2.weight, gain=0.0 if zero_init_ffn else residual_init_gain)
+        nn.init.zeros_(self.ffn_fc1.bias)
+        nn.init.zeros_(self.ffn_fc2.bias)
 
         if use_slot_encoding:
             self.query_slot_encoding = nn.Parameter(torch.zeros(token_count, dim))
@@ -156,6 +180,7 @@ class VisualPlannerTokens(nn.Module):
         planner_hidden: Tensor,
         query_registers: Tensor | None = None,
         planner_mask: Tensor | None = None,
+        token_positions: Tensor | None = None,
     ) -> Tensor:
         if planner_hidden.ndim != 3:
             raise ValueError(f"planner_hidden must be [B,K,D], got {tuple(planner_hidden.shape)}")
@@ -194,16 +219,44 @@ class VisualPlannerTokens(nn.Module):
         k = self._split_heads(k)
         v = self._split_heads(v)
 
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        if self.use_3d_rope:
+            if token_positions is None:
+                raise ValueError("token_positions is required when use_3d_rope=True")
+            if token_positions.shape != (batch_size, 3, self.token_count, 2):
+                raise ValueError(
+                    "token_positions must be [B,3,K,2], got "
+                    f"{tuple(token_positions.shape)} for planner_hidden {tuple(planner_hidden.shape)}"
+                )
+            freqs_cis = precompute_freqs_cis(
+                indices_grid=token_positions.to(device=planner_hidden.device),
+                dim=self.dim,
+                out_dtype=q.dtype,
+                theta=self.positional_embedding_theta,
+                max_pos=self.positional_embedding_max_pos,
+                use_middle_indices_grid=self.rope_use_middle_positions,
+                num_attention_heads=self.num_heads,
+                rope_type=self.rope_type,
+                freq_grid_generator=generate_freq_grid_pytorch,
+            )
+            q = apply_rotary_emb(q, freqs_cis, self.rope_type)
+            k = apply_rotary_emb(k, freqs_cis, self.rope_type)
+
+        attn_mask = None
         if planner_mask is not None:
-            key_mask = planner_mask.to(device=scores.device, dtype=torch.bool)
-            scores = scores.masked_fill(~key_mask[:, None, None, :], torch.finfo(scores.dtype).min)
-        attn = torch.softmax(scores, dim=-1)
-        if self.training and self.dropout > 0:
-            attn = F.dropout(attn, p=self.dropout)
-        attended = torch.matmul(attn, v)
+            key_mask = planner_mask.to(device=q.device, dtype=torch.bool)
+            if key_mask.shape != planner_hidden.shape[:2]:
+                raise ValueError(f"planner_mask must be [B,K], got {tuple(key_mask.shape)}")
+            no_valid_keys = ~key_mask.any(dim=1)
+            if torch.any(no_valid_keys):
+                key_mask = key_mask.clone()
+                key_mask[no_valid_keys, 0] = True
+            attn_mask = key_mask[:, None, None, :]
+
+        attended = self._scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         attended = self._merge_heads(attended)
-        x = query + self.output_projection(attended)
+        content = self.content_projection(planner_hidden)
+        residual = content if self.use_content_residual else query
+        x = residual + self.output_projection(attended)
 
         ffn_hidden = self.ffn_fc1(self.ffn_norm(x))
         ffn_hidden = F.gelu(ffn_hidden)
@@ -213,6 +266,30 @@ class VisualPlannerTokens(nn.Module):
         if self.training and self.ffn_dropout > 0:
             ffn_out = F.dropout(ffn_out, p=self.ffn_dropout)
         return x + ffn_out
+
+    def _scaled_dot_product_attention(
+        self,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        *,
+        attn_mask: Tensor | None,
+    ) -> Tensor:
+        dropout_p = self.dropout if self.training else 0.0
+        if self.query_chunk_size is None or q.shape[-2] <= self.query_chunk_size:
+            return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p)
+        chunks = []
+        for start in range(0, q.shape[-2], self.query_chunk_size):
+            chunks.append(
+                F.scaled_dot_product_attention(
+                    q[..., start : start + self.query_chunk_size, :],
+                    k,
+                    v,
+                    attn_mask=attn_mask,
+                    dropout_p=dropout_p,
+                )
+            )
+        return torch.cat(chunks, dim=-2)
 
     def _repeat_query_registers(
         self,

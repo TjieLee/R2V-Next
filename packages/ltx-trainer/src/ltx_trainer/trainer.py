@@ -185,7 +185,19 @@ class LtxvTrainer:
         if IS_MAIN_PROCESS and disable_progress_bars:
             logger.warning("Progress bars disabled. Intermediate status messages will be logged instead.")
 
-        self._transformer.train()
+        if self._train_transformer:
+            self._transformer.train()
+        else:
+            self._transformer.eval()
+        if self._train_embeddings_processor:
+            self._embeddings_processor.train()
+        else:
+            self._embeddings_processor.eval()
+        if self._text_encoder is not None:
+            self._text_encoder.train(self._train_text_encoder)
+        enforce_frozen_eval = getattr(self._training_strategy, "enforce_frozen_module_eval", None)
+        if callable(enforce_frozen_eval):
+            enforce_frozen_eval()
         self._global_step = initial_step
 
         peak_mem_during_training = start_mem
@@ -273,10 +285,19 @@ class LtxvTrainer:
                         self._sigma_tracker.update(output.sigma.cpu().tolist(), output.loss.detach().cpu().tolist())
                         metrics = {
                             "train/loss": step_loss,
+                            "train/loss_total": step_loss,
                             "train/learning_rate": current_lr,
                             "train/step_time": step_time,
                             "train/global_step": self._global_step,
                         }
+                        get_strategy_metrics = getattr(self._training_strategy, "get_last_training_metrics", None)
+                        if callable(get_strategy_metrics):
+                            metrics.update(
+                                {
+                                    name: float(value.detach().float().mean().item())
+                                    for name, value in get_strategy_metrics().items()
+                                }
+                            )
                         metrics.update(self._sigma_tracker.get_metrics())
                         self._log_metrics(metrics)
 
@@ -430,6 +451,7 @@ class LtxvTrainer:
                 load_in_8bit=self._config.acceleration.load_text_encoder_in_8bit,
             )
             self._text_encoder.requires_grad_(False)
+            self._setup_text_encoder_lora()
 
         transformer_dtype = torch.bfloat16 if self._config.model.training_mode == "lora" else torch.float32
         self._transformer = self._transformer.to(dtype=transformer_dtype)
@@ -455,7 +477,10 @@ class LtxvTrainer:
         """Collect trainable parameters based on training mode."""
         self._train_transformer = self._training_strategy.train_transformer()
         self._train_embeddings_processor = self._training_strategy.train_embeddings_processor()
-        self._train_text_encoder = self._training_strategy.train_text_encoder()
+        self._train_text_encoder = self._training_strategy.train_text_encoder() or (
+            self._text_encoder is not None
+            and any(parameter.requires_grad for parameter in self._text_encoder.parameters())
+        )
 
         if self._config.model.training_mode == "lora":
             # For LoRA training, first set up LoRA layers
@@ -511,6 +536,33 @@ class LtxvTrainer:
         # Wrap the transformer with PEFT to add LoRA layers
         # noinspection PyTypeChecker
         self._transformer = get_peft_model(self._transformer, lora_config)
+
+    def _setup_text_encoder_lora(self) -> None:
+        config = self._config.text_encoder_lora
+        if not config.enabled:
+            requires_lora = getattr(self._training_strategy, "requires_text_encoder_lora", None)
+            if callable(requires_lora) and requires_lora():
+                raise ValueError("This training strategy requires text_encoder_lora.enabled=true")
+            return
+        if self._text_encoder is None:
+            raise ValueError("text_encoder_lora.enabled=true requires a loaded text encoder")
+        gemma_model = self._text_encoder.model.model
+        language_model = getattr(gemma_model, "language_model", None)
+        if language_model is None:
+            raise ValueError("Gemma model does not expose model.language_model for text_encoder_lora")
+        language_model.requires_grad_(False)
+        language_model = get_peft_model(
+            language_model,
+            LoraConfig(
+                r=config.rank,
+                lora_alpha=config.alpha,
+                lora_dropout=config.dropout,
+                target_modules=config.target_modules,
+                init_lora_weights=True,
+            ),
+        )
+        gemma_model.language_model = language_model
+        logger.info(f"Added Gemma language-model LoRA with rank {config.rank}")
 
     def _load_checkpoint(self) -> None:
         """Load checkpoint if specified in config, then resolve resume state."""
@@ -733,7 +785,11 @@ class LtxvTrainer:
         if self._train_embeddings_processor:
             models_to_prepare.append(("embeddings_processor", self._embeddings_processor))
         if self._train_text_encoder:
-            models_to_prepare.append(("text_encoder", self._text_encoder))
+            get_text_module = getattr(self._training_strategy, "get_text_encoder_trainable_module", None)
+            if callable(get_text_module):
+                models_to_prepare.append(("text_encoder_trainable", get_text_module()))
+            else:
+                models_to_prepare.append(("text_encoder", self._text_encoder))
         models_to_prepare.extend((f"strategy.{name}", module) for name, module in strategy_modules.items())
 
         prepared_models = self._accelerator.prepare(*(module for _, module in models_to_prepare))
@@ -748,17 +804,27 @@ class LtxvTrainer:
                 self._embeddings_processor = prepared_module
             elif name == "text_encoder":
                 self._text_encoder = prepared_module
+            elif name == "text_encoder_trainable":
+                set_text_module = getattr(self._training_strategy, "set_text_encoder_trainable_module", None)
+                if not callable(set_text_module):
+                    raise RuntimeError("Training strategy cannot receive its prepared text encoder module")
+                set_text_module(prepared_module)
             elif name.startswith("strategy."):
                 prepared_strategy_modules[name.removeprefix("strategy.")] = prepared_module
 
         if prepared_strategy_modules:
             self._training_strategy.set_trainable_modules(prepared_strategy_modules)
+        if self._train_text_encoder and self._text_encoder is not None:
+            set_text_encoder = getattr(self._training_strategy, "set_text_encoder", None)
+            if callable(set_text_encoder):
+                set_text_encoder(self._text_encoder)
 
         self._accumulation_models = [self._transformer]
         if self._train_embeddings_processor:
             self._accumulation_models.append(self._embeddings_processor)
         if self._train_text_encoder:
-            self._accumulation_models.append(self._text_encoder)
+            get_text_module = getattr(self._training_strategy, "get_text_encoder_trainable_module", None)
+            self._accumulation_models.append(get_text_module() if callable(get_text_module) else self._text_encoder)
         self._accumulation_models.extend(self._training_strategy.get_trainable_modules().values())
 
         # Log GPU memory usage after model preparation
@@ -1140,6 +1206,9 @@ class LtxvTrainer:
         return {key: value for key, value in full_state.items() if key in trainable_names}
 
     def _collect_trainable_text_encoder_state(self) -> dict[str, Tensor]:
+        get_strategy_state = getattr(self._training_strategy, "get_text_encoder_checkpoint_state_dict", None)
+        if callable(get_strategy_state):
+            return get_strategy_state(self._accelerator)
         unwrapped = self._accelerator.unwrap_model(self._text_encoder, keep_torch_compile=False)
         trainable_names = {name for name, param in unwrapped.named_parameters() if param.requires_grad}
         full_state = self._accelerator.get_state_dict(self._text_encoder)
@@ -1244,6 +1313,13 @@ class LtxvTrainer:
             Values are converted to strings for safetensors compatibility.
         """
         raw_metadata = self._training_strategy.get_checkpoint_metadata()
+        if self._config.text_encoder_lora.enabled:
+            raw_metadata.update(
+                {
+                    "gemma_lora_rank": self._config.text_encoder_lora.rank,
+                    "gemma_lora_alpha": self._config.text_encoder_lora.alpha,
+                }
+            )
         # Convert all values to strings for safetensors compatibility
         metadata = {k: str(v) for k, v in raw_metadata.items()}
         if metadata:

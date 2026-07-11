@@ -56,8 +56,8 @@ model:
   load_checkpoint: "path/to/stage1/lora_weights_step_XXXXX.safetensors"
 
 lora:
-  rank: 32
-  alpha: 32
+  rank: 128
+  alpha: 128
   dropout: 0.0
   target_modules:
     - "attn1.to_k"
@@ -68,6 +68,15 @@ lora:
     - "attn2.to_q"
     - "attn2.to_v"
     - "attn2.to_out.0"
+    - "ff.net.0.proj"
+    - "ff.net.2"
+
+text_encoder_lora:
+  enabled: true
+  rank: 16
+  alpha: 16
+  dropout: 0.0
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
 
 training_strategy:
   name: "multi_reference_planner_stage2"
@@ -81,12 +90,13 @@ training_strategy:
   visual_token_source_dim: 3840
   visual_token_target_dim: 4096
   cfg_dropout_enabled: true
-  cfg_full_p: 0.7
+  cfg_full_p: 0.65
   cfg_drop_text_p: 0.1
-  cfg_drop_ref_p: 0.1
-  cfg_drop_all_p: null
-  # Deprecated alias for cfg_drop_all_p/null. Kept for older configs; this is not planner-only dropout.
-  cfg_drop_planner_p: 0.1
+  cfg_drop_siglip_p: 0.1
+  cfg_drop_ref_latents_p: 0.1
+  cfg_drop_ref_p: 0.0
+  cfg_drop_all_p: 0.05
+  cfg_drop_planner_p: 0.0
   cfg_text_conditions_dir: "conditions"
   cfg_ref_only_conditions_dir: null
   planner_conditions_dir: "planner_conditions"
@@ -98,8 +108,7 @@ training_strategy:
 
   vlm_placeholder_mask_key: "planner_placeholder_mask"
   vlm_hidden_layer: -1
-  vlm_lm_labels_key: "labels"
-  vlm_lm_loss_weight: 0.0
+  vlm_lm_labels_key: "ntp_labels"
   train_gemma_backbone: false
   freeze_vlm_vision_tower: true
   freeze_vlm_multi_modal_projector: true
@@ -110,10 +119,10 @@ training_strategy:
   planner_token_count: 2048
   planner_cross_attention_heads: 16
   planner_cross_attention_dropout: 0.0
-  planner_zero_init_cross_attention: true
+  planner_zero_init_cross_attention: false
   planner_ffn_multiplier: 4.0
   planner_ffn_dropout: 0.0
-  planner_zero_init_ffn: true
+  planner_zero_init_ffn: false
   planner_slot_encoding: true
   # Tiny random per-slot offset that breaks repeated LTX register-query symmetry.
   # Set to 0.0 to recover the exact previous all-zero slot encoding behavior.
@@ -121,12 +130,20 @@ training_strategy:
   planner_slot_init_seed: 0
   # Set this if the selected VLM hidden layer dim differs from the LTX connector input dim (default 3840).
   planner_source_dim: 3840
+  planner_output_dim: 3840
+  planner_use_content_residual: true
+  planner_use_3d_rope: true
+  planner_rope_use_middle_positions: true
+  planner_residual_init_gain: 0.1
   predicted_visual_token_key: "predicted_visual_tokens"
   predicted_visual_token_mask_key: "predicted_visual_token_mask"
-  planner_mse_weight: 1.0
+  siglip_loss_weight: 1.0
+  ntp_loss_weight: 0.1
+  ntp_logits_chunk_size: 128
   flow_loss_weight: 1.0
   freeze_transformer: true
   train_text_connector: true
+  gemma_gradient_checkpointing: true
 
 optimization:
   learning_rate: 5e-5
@@ -159,7 +176,7 @@ checkpoints:
   interval: 500
   keep_last_n: 2
   precision: "bfloat16"
-  no_resume: false
+  no_resume: true
   save_training_state: "minimal"
 
 hub:
