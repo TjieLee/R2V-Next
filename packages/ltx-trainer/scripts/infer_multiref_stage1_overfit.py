@@ -1064,13 +1064,13 @@ def _decode_video_latents(
     return rearrange(video, "1 c f h w -> f c h w").float().cpu()
 
 
-def _load_models_and_strategy(
+def _load_transformer_processor_and_strategy(
     *,
     cfg: LtxTrainerConfig,
     checkpoint_path: Path,
     device: torch.device,
     dtype: torch.dtype,
-) -> tuple[torch.nn.Module, torch.nn.Module, torch.nn.Module, MultiReferenceVideoStrategy, dict[str, bool]]:
+) -> tuple[torch.nn.Module, torch.nn.Module, MultiReferenceVideoStrategy, dict[str, bool]]:
     transformer = load_transformer(cfg.model.model_path, device=device, dtype=dtype)
     embeddings_processor = load_embeddings_processor(cfg.model.model_path, device=device, dtype=dtype)
     embeddings_processor.requires_grad_(False)
@@ -1101,13 +1101,30 @@ def _load_models_and_strategy(
         embeddings_processor=embeddings_processor,
         strategy=strategy,
     )
-    transformer.eval()
-    embeddings_processor.eval()
+    transformer.requires_grad_(False).eval()
+    embeddings_processor.requires_grad_(False).eval()
     for module in strategy.get_trainable_modules().values():
-        module.eval()
+        module.requires_grad_(False).eval()
+
+    return transformer, embeddings_processor, strategy, checkpoint_flags
+
+
+def _load_models_and_strategy(
+    *,
+    cfg: LtxTrainerConfig,
+    checkpoint_path: Path,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[torch.nn.Module, torch.nn.Module, torch.nn.Module, MultiReferenceVideoStrategy, dict[str, bool]]:
+    transformer, embeddings_processor, strategy, checkpoint_flags = _load_transformer_processor_and_strategy(
+        cfg=cfg,
+        checkpoint_path=checkpoint_path,
+        device=device,
+        dtype=dtype,
+    )
 
     vae_decoder = load_video_vae_decoder(cfg.model.model_path, device=device, dtype=dtype)
-    vae_decoder.eval()
+    vae_decoder.requires_grad_(False).eval()
     return transformer, embeddings_processor, vae_decoder, strategy, checkpoint_flags
 
 
@@ -1138,7 +1155,7 @@ def _load_inference_runtime(
     keep_feature_extractor: bool = False,
 ) -> Stage1InferenceRuntime:
     cfg = _load_config(config_path)
-    transformer, embeddings_processor, vae_decoder, strategy, checkpoint_flags = _load_models_and_strategy(
+    transformer, embeddings_processor, strategy, checkpoint_flags = _load_transformer_processor_and_strategy(
         cfg=cfg,
         checkpoint_path=checkpoint_path,
         device=device,
@@ -1160,11 +1177,12 @@ def _load_inference_runtime(
 
     if not keep_feature_extractor and hasattr(embeddings_processor, "feature_extractor"):
         embeddings_processor.feature_extractor = None
-    transformer.requires_grad_(False).eval()
-    embeddings_processor.requires_grad_(False).eval()
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    vae_decoder = load_video_vae_decoder(cfg.model.model_path, device=device, dtype=dtype)
     vae_decoder.requires_grad_(False).eval()
-    for module in strategy.get_trainable_modules().values():
-        module.requires_grad_(False).eval()
 
     return Stage1InferenceRuntime(
         cfg=cfg,
@@ -1184,6 +1202,77 @@ def _load_inference_runtime(
 
 def _expected_generated_path(output_dir: Path, sample_index: int, condition_mode: str) -> Path:
     return output_dir / f"sample_{sample_index}" / f"generated_{condition_mode}.mp4"
+
+
+def _temporary_output_path(final_path: Path) -> Path:
+    return final_path.with_name(f".{final_path.stem}.tmp{final_path.suffix}")
+
+
+def _metadata_path_for_video(video_path: Path) -> Path:
+    return video_path.parent / "metadata.json"
+
+
+def _temporary_metadata_path(video_path: Path) -> Path:
+    return video_path.parent / ".metadata.tmp.json"
+
+
+def _sample_is_complete(
+    *,
+    output_dir: Path,
+    sample_index: int,
+    condition_mode: str,
+) -> bool:
+    video_path = _expected_generated_path(output_dir, sample_index, condition_mode)
+    metadata_path = _metadata_path_for_video(video_path)
+    if not video_path.is_file() or video_path.stat().st_size <= 0 or not metadata_path.is_file():
+        return False
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(metadata, dict):
+        return False
+    return (
+        metadata.get("sample_index") == sample_index
+        and metadata.get("condition_mode") == condition_mode
+        and metadata.get("generated") == str(video_path)
+    )
+
+
+def _cleanup_stale_sample_outputs(
+    *,
+    output_dir: Path,
+    sample_index: int,
+    condition_mode: str,
+) -> None:
+    final_video = _expected_generated_path(output_dir, sample_index, condition_mode)
+    _temporary_output_path(final_video).unlink(missing_ok=True)
+    _temporary_metadata_path(final_video).unlink(missing_ok=True)
+
+
+def _save_sample_outputs_atomically(
+    *,
+    video_tensor: Tensor,
+    final_video: Path,
+    metadata: dict[str, Any],
+    fps: float,
+) -> None:
+    final_video.parent.mkdir(parents=True, exist_ok=True)
+    temp_video = _temporary_output_path(final_video)
+    final_metadata = _metadata_path_for_video(final_video)
+    temp_metadata = _temporary_metadata_path(final_video)
+    temp_video.unlink(missing_ok=True)
+    temp_metadata.unlink(missing_ok=True)
+
+    save_video(video_tensor=video_tensor, output_path=temp_video, fps=fps, video_format="FCHW")
+    if not temp_video.is_file() or temp_video.stat().st_size <= 0:
+        raise RuntimeError(f"Temporary generated video is missing or empty: {temp_video}")
+    temp_metadata.write_text(
+        json.dumps(metadata, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    temp_video.replace(final_video)
+    temp_metadata.replace(final_metadata)
 
 
 def _select_sample_indices(
@@ -1340,7 +1429,6 @@ def _run_one_sample(  # noqa: PLR0913, PLR0915
     latent_fps = runtime.strategy._first_scalar(batch["latents"].get("fps"), default=24.0)
     output_fps = float(fps) if fps is not None else float(latent_fps)
     generated_path = _expected_generated_path(output_dir, sample_index, condition_mode)
-    save_video(video_tensor=decoded, output_path=generated_path, fps=output_fps, video_format="FCHW")
 
     reference_paths = [
         str(_resolve_path(value, manifest_root))
@@ -1425,9 +1513,11 @@ def _run_one_sample(  # noqa: PLR0913, PLR0915
         "decode_tile": decode_tile,
         "generated": str(generated_path),
     }
-    (sample_dir / "metadata.json").write_text(
-        json.dumps(metadata, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
+    _save_sample_outputs_atomically(
+        video_tensor=decoded,
+        final_video=generated_path,
+        metadata=metadata,
+        fps=output_fps,
     )
     console.print(f"[green]Saved generated video:[/green] {generated_path}")
 
@@ -1452,6 +1542,7 @@ def _run_selected_samples(
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     failures_path = output_dir / f"failures_shard_{shard_index}.jsonl"
+    failures_path.unlink(missing_ok=True)
     start_time = time.perf_counter()
     num_success = 0
     num_skipped = 0
@@ -1459,7 +1550,16 @@ def _run_selected_samples(
 
     for position, sample_index in enumerate(selected_indices, start=1):
         expected_video = _expected_generated_path(output_dir, sample_index, condition_mode)
-        if skip_existing and expected_video.is_file() and expected_video.stat().st_size > 0:
+        _cleanup_stale_sample_outputs(
+            output_dir=output_dir,
+            sample_index=sample_index,
+            condition_mode=condition_mode,
+        )
+        if skip_existing and _sample_is_complete(
+            output_dir=output_dir,
+            sample_index=sample_index,
+            condition_mode=condition_mode,
+        ):
             num_skipped += 1
             console.print(f"[cyan]Skipping existing sample {sample_index}:[/cyan] {expected_video}")
             if gc_interval > 0 and position % gc_interval == 0:
@@ -1790,5 +1890,12 @@ def main(  # noqa: PLR0913, PLR0915
     )
     if batch_mode:
         console.print(f"[green]Persistent shard complete:[/green] {json.dumps(summary, ensure_ascii=False)}")
+        if summary["num_failed"] > 0:
+            console.print(
+                f"[red]Shard completed with {summary['num_failed']} failed samples[/red]"
+            )
+            raise typer.Exit(code=2)
+
+
 if __name__ == "__main__":
     app()

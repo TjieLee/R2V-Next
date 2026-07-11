@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import pytest
 import torch
 from torch import nn
 from typer.testing import CliRunner
@@ -55,6 +56,23 @@ def _checkpoint_flags() -> dict[str, bool]:
         "visual_token_projection_checkpoint_loaded": True,
         "visual_full_encoder_checkpoint_loaded": False,
     }
+
+
+def _write_complete_sample(output_dir: Path, sample_index: int, condition_mode: str) -> Path:
+    video_path = infer._expected_generated_path(output_dir, sample_index, condition_mode)
+    video_path.parent.mkdir(parents=True, exist_ok=True)
+    video_path.write_bytes(b"video")
+    infer._metadata_path_for_video(video_path).write_text(
+        json.dumps(
+            {
+                "sample_index": sample_index,
+                "condition_mode": condition_mode,
+                "generated": str(video_path),
+            }
+        ),
+        encoding="utf-8",
+    )
+    return video_path
 
 
 def test_batch_runtime_loads_models_only_once(monkeypatch, tmp_path) -> None:
@@ -120,9 +138,10 @@ def test_negative_prompt_is_encoded_once(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(infer, "_load_config", Mock(return_value=cfg))
     monkeypatch.setattr(
         infer,
-        "_load_models_and_strategy",
-        Mock(return_value=(nn.Identity(), _Processor(8), nn.Identity(), strategy, _checkpoint_flags())),
+        "_load_transformer_processor_and_strategy",
+        Mock(return_value=(nn.Identity(), _Processor(8), strategy, _checkpoint_flags())),
     )
+    monkeypatch.setattr(infer, "load_video_vae_decoder", Mock(return_value=nn.Identity()))
     monkeypatch.setattr(infer, "_encode_negative_prompt_condition", encode_negative)
 
     runtime = infer._load_inference_runtime(
@@ -189,10 +208,14 @@ def test_shard_selection_uses_global_manifest_indices() -> None:
 
 
 def test_skip_existing_does_not_run_sample(tmp_path) -> None:
-    existing = infer._expected_generated_path(tmp_path, 4, "full_siglip")
-    existing.parent.mkdir(parents=True)
-    existing.write_bytes(b"video")
+    _write_complete_sample(tmp_path, 4, "full_siglip")
     run_sample = Mock()
+
+    assert infer._sample_is_complete(
+        output_dir=tmp_path,
+        sample_index=4,
+        condition_mode="full_siglip",
+    )
 
     summary = infer._run_selected_samples(
         selected_indices=[4],
@@ -211,6 +234,136 @@ def test_skip_existing_does_not_run_sample(tmp_path) -> None:
 
     assert run_sample.call_count == 0
     assert summary["num_skipped"] == 1
+
+
+def test_sample_with_only_nonempty_mp4_is_not_complete_and_is_rerun(tmp_path) -> None:
+    video_path = infer._expected_generated_path(tmp_path, 4, "full_siglip")
+    video_path.parent.mkdir(parents=True)
+    video_path.write_bytes(b"video")
+    run_sample = Mock(return_value=video_path)
+
+    assert not infer._sample_is_complete(
+        output_dir=tmp_path,
+        sample_index=4,
+        condition_mode="full_siglip",
+    )
+    summary = infer._run_selected_samples(
+        selected_indices=[4],
+        output_dir=tmp_path,
+        condition_mode="full_siglip",
+        checkpoint_path=tmp_path / "checkpoint.safetensors",
+        shard_index=0,
+        num_shards=1,
+        skip_existing=True,
+        continue_on_error=True,
+        gc_interval=20,
+        device=torch.device("cpu"),
+        run_sample=run_sample,
+        write_summary=True,
+    )
+
+    assert run_sample.call_count == 1
+    assert summary["num_success"] == 1
+
+
+def test_corrupt_or_mismatched_metadata_is_not_complete(tmp_path) -> None:
+    video_path = infer._expected_generated_path(tmp_path, 7, "full_siglip")
+    video_path.parent.mkdir(parents=True)
+    video_path.write_bytes(b"video")
+    metadata_path = infer._metadata_path_for_video(video_path)
+    metadata_path.write_text("not-json", encoding="utf-8")
+    assert not infer._sample_is_complete(
+        output_dir=tmp_path, sample_index=7, condition_mode="full_siglip"
+    )
+
+    valid = {
+        "sample_index": 7,
+        "condition_mode": "full_siglip",
+        "generated": str(video_path),
+    }
+    for key, wrong_value in (
+        ("sample_index", 8),
+        ("condition_mode", "text_only_no_siglip"),
+        ("generated", str(video_path.with_name("wrong.mp4"))),
+    ):
+        metadata = dict(valid)
+        metadata[key] = wrong_value
+        metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+        assert not infer._sample_is_complete(
+            output_dir=tmp_path, sample_index=7, condition_mode="full_siglip"
+        )
+
+
+def test_temporary_outputs_are_not_complete(tmp_path) -> None:
+    final_video = infer._expected_generated_path(tmp_path, 2, "full_siglip")
+    final_video.parent.mkdir(parents=True)
+    infer._temporary_output_path(final_video).write_bytes(b"partial")
+    infer._temporary_metadata_path(final_video).write_text("{}", encoding="utf-8")
+
+    assert not infer._sample_is_complete(
+        output_dir=tmp_path, sample_index=2, condition_mode="full_siglip"
+    )
+
+
+def test_atomic_sample_output_commit(monkeypatch, tmp_path) -> None:
+    final_video = infer._expected_generated_path(tmp_path, 3, "full_siglip")
+    metadata = {
+        "sample_index": 3,
+        "condition_mode": "full_siglip",
+        "generated": str(final_video),
+    }
+
+    def save_video(*, output_path, **kwargs) -> None:
+        del kwargs
+        output_path.write_bytes(b"video")
+
+    monkeypatch.setattr(infer, "save_video", save_video)
+    infer._save_sample_outputs_atomically(
+        video_tensor=torch.zeros(1),
+        final_video=final_video,
+        metadata=metadata,
+        fps=24.0,
+    )
+
+    assert final_video.is_file()
+    assert infer._metadata_path_for_video(final_video).is_file()
+    assert not infer._temporary_output_path(final_video).exists()
+    assert not infer._temporary_metadata_path(final_video).exists()
+    saved_metadata = json.loads(infer._metadata_path_for_video(final_video).read_text())
+    assert saved_metadata["generated"] == str(final_video)
+
+
+def test_interrupted_atomic_commit_is_not_complete(monkeypatch, tmp_path) -> None:
+    final_video = infer._expected_generated_path(tmp_path, 3, "full_siglip")
+    metadata = {
+        "sample_index": 3,
+        "condition_mode": "full_siglip",
+        "generated": str(final_video),
+    }
+    original_replace = Path.replace
+
+    def save_video(*, output_path, **kwargs) -> None:
+        del kwargs
+        output_path.write_bytes(b"video")
+
+    def fail_metadata_replace(path: Path, target: Path):
+        if path.name == ".metadata.tmp.json":
+            raise OSError("metadata replace interrupted")
+        return original_replace(path, target)
+
+    monkeypatch.setattr(infer, "save_video", save_video)
+    monkeypatch.setattr(Path, "replace", fail_metadata_replace)
+    with pytest.raises(OSError, match="metadata replace interrupted"):
+        infer._save_sample_outputs_atomically(
+            video_tensor=torch.zeros(1),
+            final_video=final_video,
+            metadata=metadata,
+            fps=24.0,
+        )
+
+    assert not infer._sample_is_complete(
+        output_dir=tmp_path, sample_index=3, condition_mode="full_siglip"
+    )
 
 
 def test_continue_on_error_processes_later_samples_and_writes_failure(tmp_path) -> None:
@@ -243,6 +396,147 @@ def test_continue_on_error_processes_later_samples_and_writes_failure(tmp_path) 
     assert summary["num_failed"] == 1
     assert failure["sample_index"] == 1
     assert failure["error_type"] == "RuntimeError"
+
+
+def test_failure_file_is_reset_for_each_worker_run(tmp_path) -> None:
+    failures_path = tmp_path / "failures_shard_0.jsonl"
+    failures_path.write_text('{"error":"old failure"}\n', encoding="utf-8")
+    infer._run_selected_samples(
+        selected_indices=[0],
+        output_dir=tmp_path,
+        condition_mode="full_siglip",
+        checkpoint_path=tmp_path / "checkpoint.safetensors",
+        shard_index=0,
+        num_shards=1,
+        skip_existing=False,
+        continue_on_error=True,
+        gc_interval=20,
+        device=torch.device("cpu"),
+        run_sample=lambda index: tmp_path / f"{index}.mp4",
+        write_summary=True,
+    )
+    assert not failures_path.exists()
+
+    failures_path.write_text('{"error":"old failure"}\n', encoding="utf-8")
+
+    def fail_current_sample(index: int) -> Path:
+        raise RuntimeError(f"current failure {index}")
+
+    infer._run_selected_samples(
+        selected_indices=[5],
+        output_dir=tmp_path,
+        condition_mode="full_siglip",
+        checkpoint_path=tmp_path / "checkpoint.safetensors",
+        shard_index=0,
+        num_shards=1,
+        skip_existing=False,
+        continue_on_error=True,
+        gc_interval=20,
+        device=torch.device("cpu"),
+        run_sample=fail_current_sample,
+        write_summary=True,
+    )
+    current_failures = failures_path.read_text(encoding="utf-8")
+    assert "old failure" not in current_failures
+    assert "current failure 5" in current_failures
+
+
+def test_negative_prompt_is_encoded_before_vae_load(monkeypatch, tmp_path) -> None:
+    strategy = MultiReferenceVideoStrategy(MultiReferenceVideoConfig(visual_branch_enabled=False))
+    cfg = _fake_config(strategy.config)
+    events: list[str] = []
+    monkeypatch.setattr(infer, "_load_config", Mock(return_value=cfg))
+    monkeypatch.setattr(
+        infer,
+        "_load_transformer_processor_and_strategy",
+        Mock(return_value=(nn.Identity(), _Processor(8), strategy, _checkpoint_flags())),
+    )
+
+    def encode_negative(**kwargs):
+        del kwargs
+        events.append("encode_negative")
+        return {
+            "video_prompt_embeds": torch.zeros(1, 2, 8),
+            "audio_prompt_embeds": None,
+            "prompt_attention_mask": None,
+        }
+
+    def load_vae(*args, **kwargs):
+        del args, kwargs
+        events.append("load_vae")
+        return nn.Identity()
+
+    monkeypatch.setattr(infer, "_encode_negative_prompt_condition", encode_negative)
+    monkeypatch.setattr(infer, "load_video_vae_decoder", load_vae)
+    infer._load_inference_runtime(
+        config_path=tmp_path / "config.yaml",
+        checkpoint_path=tmp_path / "checkpoint.safetensors",
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        guidance_scale=2.0,
+        negative_prompt="negative",
+    )
+
+    assert events == ["encode_negative", "load_vae"]
+
+
+def _batch_cli_args(tmp_path: Path) -> list[str]:
+    return [
+        "--config",
+        "config.yaml",
+        "--checkpoint",
+        "checkpoint.safetensors",
+        "--manifest",
+        "manifest.json",
+        "--precomputed-root",
+        "precomputed",
+        "--output-dir",
+        str(tmp_path),
+        "--all-samples",
+        "--no-skip-existing",
+        "--continue-on-error",
+    ]
+
+
+def test_batch_cli_returns_two_after_processing_all_samples_with_failures(monkeypatch, tmp_path) -> None:
+    rows = [{"video": "a.mp4"}, {"video": "b.mp4"}, {"video": "c.mp4"}]
+    processed: list[int] = []
+    monkeypatch.setattr(infer, "_read_manifest", Mock(return_value=rows))
+    monkeypatch.setattr(infer, "_load_inference_runtime", Mock(return_value=SimpleNamespace()))
+
+    def run_one_sample(**kwargs) -> Path:
+        index = kwargs["sample_index"]
+        processed.append(index)
+        if index == 1:
+            raise RuntimeError("broken sample")
+        return infer._expected_generated_path(kwargs["output_dir"], index, kwargs["condition_mode"])
+
+    monkeypatch.setattr(infer, "_run_one_sample", run_one_sample)
+    result = CliRunner().invoke(infer.app, _batch_cli_args(tmp_path))
+    summary = json.loads((tmp_path / "batch_summary_shard_0.json").read_text(encoding="utf-8"))
+
+    assert processed == [0, 1, 2]
+    assert summary["num_failed"] == 1
+    assert summary["num_success"] == 2
+    assert result.exit_code == 2
+
+
+def test_batch_cli_returns_zero_when_all_samples_succeed(monkeypatch, tmp_path) -> None:
+    rows = [{"video": "a.mp4"}, {"video": "b.mp4"}]
+    processed: list[int] = []
+    monkeypatch.setattr(infer, "_read_manifest", Mock(return_value=rows))
+    monkeypatch.setattr(infer, "_load_inference_runtime", Mock(return_value=SimpleNamespace()))
+
+    def run_one_sample(**kwargs) -> Path:
+        index = kwargs["sample_index"]
+        processed.append(index)
+        return infer._expected_generated_path(kwargs["output_dir"], index, kwargs["condition_mode"])
+
+    monkeypatch.setattr(infer, "_run_one_sample", run_one_sample)
+    result = CliRunner().invoke(infer.app, _batch_cli_args(tmp_path))
+
+    assert processed == [0, 1]
+    assert result.exit_code == 0, result.output
 
 
 def test_legacy_single_sample_cli_still_processes_one_sample(monkeypatch, tmp_path) -> None:

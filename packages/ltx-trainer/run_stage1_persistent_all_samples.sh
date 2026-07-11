@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(
+    cd "$(dirname "${BASH_SOURCE[0]}")"
+    pwd
+)"
+cd "$SCRIPT_DIR"
+
 CONFIG="${CONFIG:-configs/multiref_stage1_full_tokens_2048_2000.yaml}"
 : "${CHECKPOINT:?Set CHECKPOINT to the Stage 1 safetensors checkpoint}"
 : "${MANIFEST:?Set MANIFEST to the inference manifest}"
@@ -9,6 +15,7 @@ CONFIG="${CONFIG:-configs/multiref_stage1_full_tokens_2048_2000.yaml}"
 
 NUM_GPUS="${NUM_GPUS:-8}"
 mkdir -p "${OUTPUT}/logs"
+PIDS=()
 
 for ((GPU_ID = 0; GPU_ID < NUM_GPUS; GPU_ID++)); do
     CUDA_VISIBLE_DEVICES="${GPU_ID}" \
@@ -40,6 +47,19 @@ for ((GPU_ID = 0; GPU_ID < NUM_GPUS; GPU_ID++)); do
         --no-copy-media \
         --decode-tile \
         > "${OUTPUT}/logs/shard_${GPU_ID}.log" 2>&1 &
+    PIDS+=("$!")
 done
 
-wait
+FAILED=0
+for PID in "${PIDS[@]}"; do
+    if ! wait "$PID"; then
+        FAILED=1
+    fi
+done
+
+if [[ "$FAILED" -ne 0 ]]; then
+    echo "One or more inference shards completed with failures."
+    exit 1
+fi
+
+echo "All inference shards completed successfully."
