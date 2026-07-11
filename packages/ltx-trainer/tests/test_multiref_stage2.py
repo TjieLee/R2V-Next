@@ -1,3 +1,5 @@
+import importlib.util
+from pathlib import Path
 from types import SimpleNamespace
 
 import torch
@@ -7,6 +9,13 @@ from ltx_trainer.training_strategies.multi_reference_planner_stage2 import (
     MultiReferencePlannerStage2Config,
     MultiReferencePlannerStage2Strategy,
 )
+
+
+_DATA_CHECK_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "check_stage2_precomputed_data.py"
+_DATA_CHECK_SPEC = importlib.util.spec_from_file_location("check_stage2_precomputed_data", _DATA_CHECK_SCRIPT)
+assert _DATA_CHECK_SPEC is not None and _DATA_CHECK_SPEC.loader is not None
+check_stage2_precomputed_data = importlib.util.module_from_spec(_DATA_CHECK_SPEC)
+_DATA_CHECK_SPEC.loader.exec_module(check_stage2_precomputed_data)
 
 
 class _VideoConnector(nn.Module):
@@ -32,6 +41,28 @@ class _CountingLmHead(nn.Module):
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
         self.seen_rows.append(hidden.shape[0])
         return self.projection(hidden)
+
+
+class _RecordingLanguageModel(nn.Module):
+    def __init__(self, final_hidden: torch.Tensor, hidden_states: tuple[torch.Tensor, ...]) -> None:
+        super().__init__()
+        self.final_hidden = final_hidden
+        self.hidden_states = hidden_states
+        self.forward_kwargs = None
+
+    def forward(self, **kwargs):
+        self.forward_kwargs = kwargs
+        return SimpleNamespace(
+            last_hidden_state=self.final_hidden,
+            hidden_states=self.hidden_states if kwargs["output_hidden_states"] else None,
+        )
+
+
+def _set_fake_language_model(strategy, language_model) -> None:
+    strategy.text_encoder = SimpleNamespace(
+        model=SimpleNamespace(model=SimpleNamespace(language_model=language_model))
+    )
+    strategy.train_text_encoder = lambda: False
 
 
 def _strategy() -> MultiReferencePlannerStage2Strategy:
@@ -176,6 +207,41 @@ def test_ntp_selective_lm_head_only_receives_valid_text_rows() -> None:
     assert lm_head.seen_rows == [2, 1]
 
 
+def test_final_layer_mode_does_not_request_all_hidden_states() -> None:
+    strategy = _strategy()
+    strategy.config.vlm_hidden_layer = -1
+    final_hidden = torch.randn(1, 5, 8)
+    language_model = _RecordingLanguageModel(final_hidden, (torch.zeros_like(final_hidden), final_hidden))
+    _set_fake_language_model(strategy, language_model)
+
+    planner_hidden, ntp_hidden = strategy._forward_language_model_for_planner(
+        inputs_embeds=torch.randn(1, 5, 8),
+        attention_mask=torch.ones(1, 5, dtype=torch.long),
+    )
+
+    assert language_model.forward_kwargs["output_hidden_states"] is False
+    assert planner_hidden is final_hidden
+    assert ntp_hidden is final_hidden
+
+
+def test_intermediate_layer_mode_requests_hidden_states() -> None:
+    strategy = _strategy()
+    strategy.config.vlm_hidden_layer = -2
+    intermediate = torch.randn(1, 5, 8)
+    final_hidden = torch.randn(1, 5, 8)
+    language_model = _RecordingLanguageModel(final_hidden, (torch.zeros_like(final_hidden), intermediate, final_hidden))
+    _set_fake_language_model(strategy, language_model)
+
+    planner_hidden, ntp_hidden = strategy._forward_language_model_for_planner(
+        inputs_embeds=torch.randn(1, 5, 8),
+        attention_mask=torch.ones(1, 5, dtype=torch.long),
+    )
+
+    assert language_model.forward_kwargs["output_hidden_states"] is True
+    assert planner_hidden is intermediate
+    assert ntp_hidden is final_hidden
+
+
 def test_stage1_checkpoint_loads_projection_and_full_encoder_without_planner_keys() -> None:
     strategy = _strategy()
     state_dict = {}
@@ -215,3 +281,69 @@ def test_stage2_strategy_checkpoint_roundtrip() -> None:
         second_module = second.get_trainable_modules()[name]
         for key, first_value in first_module.state_dict().items():
             assert torch.equal(first_value, second_module.state_dict()[key]), f"{name}.{key}"
+
+
+def test_stage2_precomputed_gt_and_ntp_validation() -> None:
+    token_count = 8
+    gt_data = {
+        "visual_tokens": torch.randn(token_count, 3840),
+        "visual_token_mask": torch.ones(token_count, dtype=torch.bool),
+        "num_visual_tokens": torch.tensor(token_count),
+        "tokens_per_frame": torch.tensor(4),
+        "sampled_frame_indices": torch.tensor([0, 6]),
+        "source_fps": torch.tensor(24.0),
+    }
+    input_ids = torch.arange(16)
+    attention_mask = torch.tensor([1] * 14 + [0, 0])
+    planner_placeholder_mask = torch.zeros(16, dtype=torch.bool)
+    planner_placeholder_mask[6:14] = True
+    ref_image_region_mask = torch.zeros(16, dtype=torch.bool)
+    ref_image_region_mask[2:5] = True
+    ntp_label_mask = torch.zeros(16, dtype=torch.bool)
+    ntp_label_mask[[0, 1, 5]] = True
+    ntp_labels = torch.full((16,), -100)
+    ntp_labels[ntp_label_mask] = input_ids[ntp_label_mask]
+    planner_data = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "planner_placeholder_mask": planner_placeholder_mask,
+        "planner_region_mask": planner_placeholder_mask.clone(),
+        "ref_image_region_mask": ref_image_region_mask,
+        "text_token_mask": ntp_label_mask.clone(),
+        "ntp_labels": ntp_labels,
+        "ntp_label_mask": ntp_label_mask,
+    }
+
+    gt_count = check_stage2_precomputed_data._validate_gt(
+        gt_data,
+        planner_token_count=token_count,
+        expected_tokens_per_frame=4,
+    )
+    planner_count = check_stage2_precomputed_data._validate_planner(
+        planner_data,
+        planner_token_count=token_count,
+    )
+
+    assert gt_count == planner_count == token_count
+
+
+def test_stage2_checkpoint_contains_required_components() -> None:
+    state_dict = {
+        "diffusion_model.block.attn.lora_A.weight": torch.ones(1),
+        "training_strategy.planner_tokens.query_tokens": torch.ones(1),
+        "training_strategy.visual_token_projection.weight": torch.ones(1),
+        "training_strategy.visual_full_encoder.input_norm.weight": torch.ones(1),
+        "embeddings_processor.video_connector.weight": torch.ones(1),
+        "text_encoder.model.model.language_model.block.lora_A.default.weight": torch.ones(1),
+    }
+
+    MultiReferencePlannerStage2Strategy.validate_checkpoint_state_dict(state_dict)
+
+    bad_state = dict(state_dict)
+    bad_state["text_encoder.model.model.language_model.embed_tokens.weight"] = torch.ones(1)
+    try:
+        MultiReferencePlannerStage2Strategy.validate_checkpoint_state_dict(bad_state)
+    except RuntimeError as exc:
+        assert "frozen base weights" in str(exc)
+    else:
+        raise AssertionError("Expected full Gemma base weight to be rejected")

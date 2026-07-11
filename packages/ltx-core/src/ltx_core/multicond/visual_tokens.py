@@ -246,11 +246,12 @@ class VisualPlannerTokens(nn.Module):
             key_mask = planner_mask.to(device=q.device, dtype=torch.bool)
             if key_mask.shape != planner_hidden.shape[:2]:
                 raise ValueError(f"planner_mask must be [B,K], got {tuple(key_mask.shape)}")
-            no_valid_keys = ~key_mask.any(dim=1)
-            if torch.any(no_valid_keys):
-                key_mask = key_mask.clone()
-                key_mask[no_valid_keys, 0] = True
-            attn_mask = key_mask[:, None, None, :]
+            if not bool(key_mask.all()):
+                no_valid_keys = ~key_mask.any(dim=1)
+                if torch.any(no_valid_keys):
+                    key_mask = key_mask.clone()
+                    key_mask[no_valid_keys, 0] = True
+                attn_mask = key_mask[:, None, None, :]
 
         attended = self._scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         attended = self._merge_heads(attended)

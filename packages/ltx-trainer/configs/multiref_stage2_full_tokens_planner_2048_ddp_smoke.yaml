@@ -1,3 +1,4 @@
+# Two-GPU, one-step smoke for the Stage 2 full-token planner.
 # Stage 2 freezes LTX base + Stage 1 DiT LoRA, while training the Gemma LoRA,
 # planner, visual projection, Visual3DTokenEncoder, and LTX text connector.
 model:
@@ -101,9 +102,9 @@ training_strategy:
 
 optimization:
   learning_rate: 2.0e-5
-  steps: 2000
+  steps: 1
   batch_size: 1
-  gradient_accumulation_steps: 4
+  gradient_accumulation_steps: 1
   max_grad_norm: 1.0
   optimizer_type: "adamw"
   scheduler_type: "linear"
@@ -118,7 +119,7 @@ acceleration:
 
 data:
   preprocessed_data_root: "/mnt/workspace/litengjie/my_dataset/overfit_2000/.precomputed"
-  num_dataloader_workers: 2
+  num_dataloader_workers: 0
 
 validation:
   interval: null
@@ -127,11 +128,11 @@ validation:
   generate_video: true
 
 checkpoints:
-  interval: 500
-  keep_last_n: 2
+  interval: null
+  keep_last_n: 1
   precision: "bfloat16"
   no_resume: true
-  save_training_state: "minimal"
+  save_training_state: "off"
 
 hub:
   push_to_hub: false
@@ -149,4 +150,4 @@ wandb:
   log_validation_videos: false
 
 seed: 42
-output_dir: "/mnt/workspace/litengjie/ltx2_multiref_stage2_full_tokens_planner_2048"
+output_dir: "/mnt/workspace/litengjie/ltx2_stage2_ddp_smoke"

@@ -202,7 +202,7 @@ class MultiReferencePlannerStage2Config(MultiReferenceVideoConfig):
     planner_use_3d_rope: bool = True
     planner_rope_use_middle_positions: bool = True
     planner_residual_init_gain: float = Field(default=0.1, gt=0.0)
-    planner_query_chunk_size: int | None = Field(default=None, ge=1)
+    planner_query_chunk_size: int | None = Field(default=256, ge=1)
 
     use_connector_register_queries: bool = Field(
         default=False,
@@ -716,6 +716,41 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
         )
         return metadata
 
+    @staticmethod
+    def validate_checkpoint_state_dict(state_dict: dict[str, Tensor]) -> None:
+        required_prefixes = (
+            "diffusion_model.",
+            "training_strategy.planner_tokens.",
+            "training_strategy.visual_token_projection.",
+            "training_strategy.visual_full_encoder.",
+            "embeddings_processor.video_connector.",
+            "text_encoder.model.model.language_model.",
+        )
+        missing = [prefix for prefix in required_prefixes if not any(key.startswith(prefix) for key in state_dict)]
+        if missing:
+            raise RuntimeError(f"Stage 2 checkpoint is missing required components: {missing}")
+
+        forbidden_prefixes = (
+            "text_encoder.model.model.vision_tower.",
+            "text_encoder.model.model.multi_modal_projector.",
+        )
+        forbidden = [key for key in state_dict if key.startswith(forbidden_prefixes)]
+        if forbidden:
+            raise RuntimeError(f"Stage 2 checkpoint contains frozen Gemma vision/projector weights: {forbidden[:5]}")
+        non_lora_text = [
+            key
+            for key in state_dict
+            if key.startswith("text_encoder.model.model.language_model.") and "lora_" not in key
+        ]
+        non_lora_dit = [
+            key for key in state_dict if key.startswith("diffusion_model.") and "lora_" not in key
+        ]
+        if non_lora_text or non_lora_dit:
+            raise RuntimeError(
+                "Stage 2 checkpoint contains frozen base weights: "
+                f"text={non_lora_text[:5]}, dit={non_lora_dit[:5]}"
+            )
+
     def _run_online_vlm(
         self,
         batch: dict[str, Any],
@@ -761,24 +796,14 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
             dropped_text_token_mask=dropped_text_token_mask,
             drop_ref_mask=drop_ref_mask,
         )
-        language_model = self._get_language_model()
-        language_model.train(self.train_text_encoder())
-        self._keep_frozen_vlm_modules_in_eval()
-        lm_inputs = {
-            "inputs_embeds": inputs_embeds,
-            "attention_mask": forward_inputs["attention_mask"],
-            "output_hidden_states": True,
-            "return_dict": True,
-        }
-        for key in ("position_ids", "cache_position"):
-            if key in forward_inputs:
-                lm_inputs[key] = forward_inputs[key]
-
-        with torch.set_grad_enabled(self.train_text_encoder()):
-            outputs = language_model(**lm_inputs)
-        hidden_states = self._extract_hidden_states(outputs)
+        planner_hidden_source, final_hidden = self._forward_language_model_for_planner(
+            inputs_embeds=inputs_embeds,
+            attention_mask=forward_inputs["attention_mask"],
+            position_ids=forward_inputs.get("position_ids"),
+            cache_position=forward_inputs.get("cache_position"),
+        )
         selected_hidden, selected_mask = self._select_masked_hidden(
-            hidden_states[self.config.vlm_hidden_layer],
+            planner_hidden_source,
             placeholder_mask,
         )
         predicted_tokens = self.planner_tokens(
@@ -800,10 +825,48 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
             labels = labels.to(device=device, dtype=torch.long).clone()
             if drop_text_mask is not None and torch.any(drop_text_mask):
                 labels[drop_text_mask] = -100
-            self._last_vlm_lm_loss = self._compute_lm_loss(hidden_states[-1], labels)
+            self._last_vlm_lm_loss = self._compute_lm_loss(final_hidden, labels)
             self._last_ntp_loss = self._last_vlm_lm_loss
 
         return predicted_tokens, selected_mask
+
+    def _forward_language_model_for_planner(
+        self,
+        *,
+        inputs_embeds: Tensor,
+        attention_mask: Tensor,
+        position_ids: Tensor | None = None,
+        cache_position: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        language_model = self._get_language_model()
+        language_model.train(self.train_text_encoder())
+        self._keep_frozen_vlm_modules_in_eval()
+        need_intermediate_hidden = self.config.vlm_hidden_layer != -1
+        lm_inputs = {
+            "inputs_embeds": inputs_embeds,
+            "attention_mask": attention_mask,
+            "output_hidden_states": need_intermediate_hidden,
+            "return_dict": True,
+        }
+        if position_ids is not None:
+            lm_inputs["position_ids"] = position_ids
+        if cache_position is not None:
+            lm_inputs["cache_position"] = cache_position
+
+        with torch.set_grad_enabled(self.train_text_encoder()):
+            outputs = language_model(**lm_inputs)
+        if need_intermediate_hidden:
+            hidden_states = self._extract_hidden_states(outputs)
+            planner_hidden_source = hidden_states[self.config.vlm_hidden_layer]
+            final_hidden = hidden_states[-1]
+        else:
+            final_hidden = getattr(outputs, "last_hidden_state", None)
+            if final_hidden is None:
+                raise ValueError(
+                    "Gemma language_model output has no last_hidden_state while vlm_hidden_layer=-1"
+                )
+            planner_hidden_source = final_hidden
+        return planner_hidden_source, final_hidden
 
     def _build_vlm_inputs_embeds(
         self,

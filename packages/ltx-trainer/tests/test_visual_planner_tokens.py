@@ -87,3 +87,26 @@ def test_planner_query_chunking_matches_unchunked_eval() -> None:
         atol=1.0e-6,
         rtol=1.0e-5,
     )
+
+
+def test_all_valid_planner_mask_matches_none_and_sdpa_receives_no_mask(monkeypatch) -> None:
+    planner = _planner().eval()
+    hidden = torch.randn(1, 4, 8)
+    positions = _positions(1, 4)
+    observed_masks = []
+    original_sdpa = torch.nn.functional.scaled_dot_product_attention
+
+    def record_sdpa(query, key, value, *, attn_mask=None, dropout_p=0.0):
+        observed_masks.append(attn_mask)
+        return original_sdpa(query, key, value, attn_mask=attn_mask, dropout_p=dropout_p)
+
+    monkeypatch.setattr(torch.nn.functional, "scaled_dot_product_attention", record_sdpa)
+    without_mask = planner(planner_hidden=hidden, planner_mask=None, token_positions=positions)
+    all_valid = planner(
+        planner_hidden=hidden,
+        planner_mask=torch.ones(1, 4, dtype=torch.bool),
+        token_positions=positions,
+    )
+
+    assert torch.allclose(without_mask, all_valid, atol=1.0e-6, rtol=1.0e-5)
+    assert observed_masks == [None, None]

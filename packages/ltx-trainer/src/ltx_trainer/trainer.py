@@ -271,6 +271,14 @@ class LtxvTrainer:
                     current_lr = self._optimizer.param_groups[0]["lr"]
                     step_time = (time.time() - step_start_time) * cfg.optimization.gradient_accumulation_steps
                     step_loss = output.loss.detach().mean().item()
+                    strategy_metrics: dict[str, float] = {}
+                    if IS_MAIN_PROCESS and is_optimization_step:
+                        get_strategy_metrics = getattr(self._training_strategy, "get_last_training_metrics", None)
+                        if callable(get_strategy_metrics):
+                            strategy_metrics = {
+                                name: float(value.detach().float().mean().item())
+                                for name, value in get_strategy_metrics().items()
+                            }
 
                     progress.update_training(
                         loss=step_loss,
@@ -290,19 +298,12 @@ class LtxvTrainer:
                             "train/step_time": step_time,
                             "train/global_step": self._global_step,
                         }
-                        get_strategy_metrics = getattr(self._training_strategy, "get_last_training_metrics", None)
-                        if callable(get_strategy_metrics):
-                            metrics.update(
-                                {
-                                    name: float(value.detach().float().mean().item())
-                                    for name, value in get_strategy_metrics().items()
-                                }
-                            )
+                        metrics.update(strategy_metrics)
                         metrics.update(self._sigma_tracker.get_metrics())
                         self._log_metrics(metrics)
 
                     # Fallback logging when progress bars are disabled
-                    if disable_progress_bars and IS_MAIN_PROCESS and self._global_step % 20 == 0:
+                    if disable_progress_bars and IS_MAIN_PROCESS and is_optimization_step:
                         elapsed = time.time() - train_start_time
                         steps_done = self._global_step - initial_step
                         if steps_done > 0:
@@ -310,9 +311,14 @@ class LtxvTrainer:
                             total_time = f"{total_estimated // 3600:.0f}h {(total_estimated % 3600) // 60:.0f}m"
                         else:
                             total_time = "calculating..."
+                        flow_text = self._format_optional_metric(strategy_metrics, "train/loss_flow")
+                        siglip_text = self._format_optional_metric(strategy_metrics, "train/loss_siglip")
+                        ntp_text = self._format_optional_metric(strategy_metrics, "train/loss_ntp")
+                        cosine_text = self._format_optional_metric(strategy_metrics, "train/siglip_cosine")
                         logger.info(
                             f"Step {self._global_step}/{cfg.optimization.steps} - "
-                            f"Loss: {step_loss:.4f}, LR: {current_lr:.2e}, "
+                            f"Total: {step_loss:.4f}, Flow: {flow_text}, SigLIP: {siglip_text}, "
+                            f"NTP: {ntp_text}, SigLIP cosine: {cosine_text}, LR: {current_lr:.2e}, "
                             f"Time/Step: {step_time:.2f}s, Total Time: {total_time}",
                         )
 
@@ -764,6 +770,11 @@ class LtxvTrainer:
     def _prepare_models_for_training(self) -> None:
         """Prepare models for training with Accelerate."""
 
+        if self._accelerator.distributed_type == DistributedType.FSDP and not self._train_transformer:
+            raise RuntimeError(
+                "Stage 2 frozen-Transformer FSDP is not implemented. Use DDP or single GPU."
+            )
+
         # For FSDP + LoRA: Cast entire model to FP32.
         # FSDP requires uniform dtype across all parameters in wrapped modules.
         # In LoRA mode, PEFT creates LoRA params in FP32 while base model is BF16.
@@ -778,12 +789,21 @@ class LtxvTrainer:
             self._transformer.get_base_model() if hasattr(self._transformer, "get_base_model") else self._transformer
         )
 
-        transformer.set_gradient_checkpointing(self._config.optimization.enable_gradient_checkpointing)
+        if self._train_transformer:
+            transformer.set_gradient_checkpointing(self._config.optimization.enable_gradient_checkpointing)
 
         strategy_modules = self._training_strategy.get_trainable_modules()
-        models_to_prepare = [("transformer", self._transformer)]
+        models_to_prepare = []
+        if self._train_transformer:
+            models_to_prepare.append(("transformer", self._transformer))
+        else:
+            self._transformer = self._transformer.to(self._accelerator.device)
+            self._transformer.requires_grad_(False)
+            self._transformer.eval()
         if self._train_embeddings_processor:
-            models_to_prepare.append(("embeddings_processor", self._embeddings_processor))
+            models_to_prepare.append(
+                ("embeddings_processor_video_connector", self._embeddings_processor.video_connector)
+            )
         if self._train_text_encoder:
             get_text_module = getattr(self._training_strategy, "get_text_encoder_trainable_module", None)
             if callable(get_text_module):
@@ -791,6 +811,9 @@ class LtxvTrainer:
             else:
                 models_to_prepare.append(("text_encoder", self._text_encoder))
         models_to_prepare.extend((f"strategy.{name}", module) for name, module in strategy_modules.items())
+
+        if not models_to_prepare:
+            raise RuntimeError("No trainable modules were provided to accelerator.prepare()")
 
         prepared_models = self._accelerator.prepare(*(module for _, module in models_to_prepare))
         if len(models_to_prepare) == 1:
@@ -802,6 +825,8 @@ class LtxvTrainer:
                 self._transformer = prepared_module
             elif name == "embeddings_processor":
                 self._embeddings_processor = prepared_module
+            elif name == "embeddings_processor_video_connector":
+                self._embeddings_processor.video_connector = prepared_module
             elif name == "text_encoder":
                 self._text_encoder = prepared_module
             elif name == "text_encoder_trainable":
@@ -819,13 +844,17 @@ class LtxvTrainer:
             if callable(set_text_encoder):
                 set_text_encoder(self._text_encoder)
 
-        self._accumulation_models = [self._transformer]
+        self._accumulation_models = []
+        if self._train_transformer:
+            self._accumulation_models.append(self._transformer)
         if self._train_embeddings_processor:
-            self._accumulation_models.append(self._embeddings_processor)
+            self._accumulation_models.append(self._embeddings_processor.video_connector)
         if self._train_text_encoder:
             get_text_module = getattr(self._training_strategy, "get_text_encoder_trainable_module", None)
             self._accumulation_models.append(get_text_module() if callable(get_text_module) else self._text_encoder)
         self._accumulation_models.extend(self._training_strategy.get_trainable_modules().values())
+        if not self._accumulation_models:
+            raise RuntimeError("At least one trainable module is required for gradient accumulation")
 
         # Log GPU memory usage after model preparation
         vram_usage_gb = torch.cuda.memory_allocated() / 1024**3
@@ -1164,6 +1193,10 @@ class LtxvTrainer:
             state_dict = {k: v.to(save_dtype) if isinstance(v, Tensor) else v for k, v in state_dict.items()}
             state_dict.update(auxiliary_state_dict)
 
+            validate_checkpoint = getattr(self._training_strategy, "validate_checkpoint_state_dict", None)
+            if callable(validate_checkpoint):
+                validate_checkpoint(state_dict)
+
             # Build metadata for safetensors file
             metadata = self._build_checkpoint_metadata()
 
@@ -1200,10 +1233,11 @@ class LtxvTrainer:
         return {key: value.to(save_dtype) if isinstance(value, Tensor) else value for key, value in state_dict.items()}
 
     def _collect_trainable_embeddings_processor_state(self) -> dict[str, Tensor]:
-        unwrapped = self._accelerator.unwrap_model(self._embeddings_processor, keep_torch_compile=False)
+        connector = self._embeddings_processor.video_connector
+        unwrapped = self._accelerator.unwrap_model(connector, keep_torch_compile=False)
         trainable_names = {name for name, param in unwrapped.named_parameters() if param.requires_grad}
-        full_state = self._accelerator.get_state_dict(self._embeddings_processor)
-        return {key: value for key, value in full_state.items() if key in trainable_names}
+        full_state = self._accelerator.get_state_dict(connector)
+        return {f"video_connector.{key}": value for key, value in full_state.items() if key in trainable_names}
 
     def _collect_trainable_text_encoder_state(self) -> dict[str, Tensor]:
         get_strategy_state = getattr(self._training_strategy, "get_text_encoder_checkpoint_state_dict", None)
@@ -1361,3 +1395,8 @@ class LtxvTrainer:
         """Log metrics to Weights & Biases."""
         if self._wandb_run is not None:
             self._wandb_run.log(metrics)
+
+    @staticmethod
+    def _format_optional_metric(metrics: dict[str, float], name: str) -> str:
+        value = metrics.get(name)
+        return "n/a" if value is None else f"{value:.4f}"

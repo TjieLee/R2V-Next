@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Initialize the real Stage 2 stack and smoke-test its full-token bridge."""
 
+import time
 from pathlib import Path
 
 import torch
@@ -32,12 +33,91 @@ def _mean_nonzero_grad(module: torch.nn.Module) -> bool:
     )
 
 
+def _assert_frozen_gradients(trainer: LtxvTrainer, strategy: MultiReferencePlannerStage2Strategy) -> None:
+    if any(parameter.grad is not None for parameter in trainer._transformer.parameters()):
+        raise RuntimeError("Frozen LTX base/Stage 1 DiT LoRA received gradients")
+    text_encoder = strategy._unwrap_text_encoder()
+    for name, parameter in text_encoder.named_parameters():
+        if "lora_" not in name and parameter.grad is not None:
+            raise RuntimeError(f"Frozen Gemma parameter received a gradient: {name}")
+
+
+def _run_real_batch_smoke(
+    trainer: LtxvTrainer,
+    strategy: MultiReferencePlannerStage2Strategy,
+) -> None:
+    trainer._init_dataloader()
+    trainer._init_timestep_sampler()
+    batch = next(iter(trainer._dataloader))
+    for parameter in trainer._trainable_params:
+        parameter.grad = None
+
+    device = trainer._accelerator.device
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+        torch.cuda.synchronize(device)
+    forward_start = time.perf_counter()
+    cfg_dropout_enabled = strategy.config.cfg_dropout_enabled
+    strategy.config.cfg_dropout_enabled = False
+    try:
+        output = trainer._training_step(batch)
+    finally:
+        strategy.config.cfg_dropout_enabled = cfg_dropout_enabled
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    forward_seconds = time.perf_counter() - forward_start
+
+    if not torch.isfinite(output.loss).all():
+        raise RuntimeError("Real-batch total loss is not finite")
+    strategy_metrics = strategy.get_last_training_metrics()
+    for name in ("train/loss_flow", "train/loss_siglip", "train/loss_ntp"):
+        value = strategy_metrics.get(name)
+        if value is None or not torch.isfinite(value).all():
+            raise RuntimeError(f"Real-batch metric is missing or non-finite: {name}")
+
+    backward_start = time.perf_counter()
+    trainer._accelerator.backward(output.loss.mean())
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    backward_seconds = time.perf_counter() - backward_start
+
+    embeddings_processor = trainer._accelerator.unwrap_model(
+        trainer._embeddings_processor,
+        keep_torch_compile=False,
+    )
+    required_modules = {
+        "Gemma LoRA": strategy.get_text_encoder_trainable_module(),
+        "planner_tokens": strategy.get_trainable_modules()["planner_tokens"],
+        "visual_token_projection": strategy.get_trainable_modules()["visual_token_projection"],
+        "visual_full_encoder": strategy.get_trainable_modules()["visual_full_encoder"],
+        "embeddings_processor.video_connector": embeddings_processor.video_connector,
+    }
+    for name, module in required_modules.items():
+        if not _mean_nonzero_grad(module):
+            raise RuntimeError(f"No nonzero real-batch gradient for {name}")
+    _assert_frozen_gradients(trainer, strategy)
+
+    allocated = torch.cuda.memory_allocated(device) / 1024**3 if device.type == "cuda" else 0.0
+    peak = torch.cuda.max_memory_allocated(device) / 1024**3 if device.type == "cuda" else 0.0
+    typer.echo(f"total loss: {output.loss.detach().float().mean().item():.6f}")
+    typer.echo(f"flow loss: {strategy_metrics['train/loss_flow'].item():.6f}")
+    typer.echo(f"siglip loss: {strategy_metrics['train/loss_siglip'].item():.6f}")
+    typer.echo(f"ntp loss: {strategy_metrics['train/loss_ntp'].item():.6f}")
+    cosine = strategy_metrics.get("train/siglip_cosine")
+    typer.echo(f"siglip cosine: {cosine.item():.6f}" if cosine is not None else "siglip cosine: n/a")
+    typer.echo(f"allocated VRAM: {allocated:.3f} GiB")
+    typer.echo(f"peak VRAM: {peak:.3f} GiB")
+    typer.echo(f"forward seconds: {forward_seconds:.3f}")
+    typer.echo(f"backward seconds: {backward_seconds:.3f}")
+
+
 @app.command()
 def main(
     config: str = typer.Option(..., help="Stage 2 full-token planner YAML."),
     stage1_checkpoint: str = typer.Option(..., help="Stage 1 rank-128 LoRA/full visual checkpoint."),
     device: str = typer.Option("cuda", help="Smoke-test device."),
     dtype: str = typer.Option("bf16", help="bf16 or float32."),
+    real_batch: bool = typer.Option(False, "--real-batch/--no-real-batch"),
 ) -> None:
     config_path = Path(config)
     config_data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
@@ -81,6 +161,10 @@ def main(
     if not trainer._train_embeddings_processor:
         raise RuntimeError("Stage 2 must train embeddings_processor.video_connector")
 
+    if real_batch:
+        _run_real_batch_smoke(trainer, strategy)
+        return
+
     planner = modules["planner_tokens"]
     projection = modules["visual_token_projection"]
     full_encoder = modules["visual_full_encoder"]
@@ -95,14 +179,10 @@ def main(
         requires_grad=True,
     )
     language_model = strategy.get_text_encoder_trainable_module()
-    language_model.train()
-    lm_outputs = language_model(
+    planner_hidden, final_hidden = strategy._forward_language_model_for_planner(
         inputs_embeds=fake_inputs_embeds.to(dtype=parameter.dtype),
         attention_mask=torch.ones(fake_inputs_embeds.shape[:2], dtype=torch.long, device=smoke_device),
-        output_hidden_states=True,
-        return_dict=True,
     )
-    planner_hidden = lm_outputs.hidden_states[-1]
     times = torch.arange(8, device=smoke_device, dtype=torch.float32).unsqueeze(0) / 6.0
     positions = strategy._make_visual_positions(
         times,
@@ -134,7 +214,7 @@ def main(
         device=smoke_device,
     )
     ntp_labels[:, 1] = 0
-    ntp_loss = strategy._compute_lm_loss(planner_hidden, ntp_labels)
+    ntp_loss = strategy._compute_lm_loss(final_hidden, ntp_labels)
     total = strategy._combine_losses(flow_loss, siglip_loss, ntp_loss)
     if not torch.isfinite(total).all():
         raise RuntimeError("Stage 2 smoke loss is not finite")
