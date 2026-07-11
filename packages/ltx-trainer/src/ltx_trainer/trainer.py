@@ -376,6 +376,11 @@ class LtxvTrainer:
 
     def _training_step(self, batch: dict[str, dict[str, Tensor]]) -> TrainingStepOutput:
         """Perform a single training step using the configured strategy."""
+        with self._accelerator.autocast():
+            return self._training_step_autocast(batch)
+
+    def _training_step_autocast(self, batch: dict[str, dict[str, Tensor]]) -> TrainingStepOutput:
+        """Perform the full training step inside the caller's autocast context."""
         # Apply embedding connectors to transform pre-computed text embeddings
         conditions = batch["conditions"]
         conditions = self._training_strategy.prepare_conditions(batch, conditions)

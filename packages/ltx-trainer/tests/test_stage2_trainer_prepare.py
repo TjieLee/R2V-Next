@@ -1,12 +1,14 @@
+from contextlib import contextmanager
 from types import SimpleNamespace
 
+import pytest
 import torch
 from accelerate.utils import DistributedType
 from peft import LoraConfig, get_peft_model
 from torch import nn
 
 from ltx_core.model.transformer.model import LTXModel
-from ltx_trainer.trainer import LtxvTrainer
+from ltx_trainer.trainer import LtxvTrainer, TrainingStepOutput
 from ltx_trainer.training_strategies.multi_reference_planner_stage2 import (
     MultiReferencePlannerStage2Config,
     MultiReferencePlannerStage2Strategy,
@@ -33,6 +35,19 @@ class _FakeAccelerator:
         self.distributed_type = distributed_type
         self.device = torch.device("cpu")
         self.prepared = []
+        self.autocast_active = False
+        self.autocast_entered = False
+        self.autocast_exited = False
+
+    @contextmanager
+    def autocast(self):
+        self.autocast_entered = True
+        self.autocast_active = True
+        try:
+            yield
+        finally:
+            self.autocast_active = False
+            self.autocast_exited = True
 
     def prepare(self, *modules):
         self.prepared.extend(modules)
@@ -219,6 +234,110 @@ def test_frozen_checkpointed_renderer_propagates_input_gradient() -> None:
 
     assert all(parameter.grad is None for parameter in renderer.parameters())
     assert all(parameter.grad is not None and torch.any(parameter.grad != 0) for parameter in upstream.parameters())
+
+
+def test_training_step_enters_accelerator_autocast(monkeypatch) -> None:
+    trainer = LtxvTrainer.__new__(LtxvTrainer)
+    trainer._accelerator = _FakeAccelerator()
+    expected = TrainingStepOutput(loss=torch.tensor([1.0]), sigma=torch.tensor([0.5]))
+
+    def fake_training_step_autocast(batch):
+        assert batch == {}
+        assert trainer._accelerator.autocast_active is True
+        return expected
+
+    monkeypatch.setattr(trainer, "_training_step_autocast", fake_training_step_autocast)
+
+    actual = trainer._training_step({})
+
+    assert actual is expected
+    assert trainer._accelerator.autocast_entered is True
+    assert trainer._accelerator.autocast_exited is True
+    assert trainer._accelerator.autocast_active is False
+
+
+def test_frozen_bf16_renderer_accepts_float32_input_under_autocast() -> None:
+    upstream = nn.Linear(4, 4)
+    renderer = nn.Linear(4, 4).to(dtype=torch.bfloat16)
+    renderer.requires_grad_(False)
+    renderer.eval()
+    renderer_input = upstream(torch.randn(2, 4))
+
+    assert renderer_input.dtype == torch.float32
+    try:
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            output = renderer(renderer_input)
+            loss = output.float().square().mean()
+    except RuntimeError as exc:
+        pytest.skip(f"CPU BF16 autocast is unavailable: {exc}")
+    loss.backward()
+
+    assert torch.isfinite(output).all()
+    assert all(parameter.grad is None for parameter in renderer.parameters())
+    assert all(parameter.grad is not None and torch.any(parameter.grad != 0) for parameter in upstream.parameters())
+
+
+class _TrainingStepEmbeddingsProcessor:
+    @staticmethod
+    def create_embeddings(video_features, audio_features, additive_mask):
+        return video_features, audio_features, additive_mask
+
+
+class _TrainingStepStrategy:
+    @staticmethod
+    def prepare_conditions(batch, conditions):
+        del batch
+        return conditions
+
+    @staticmethod
+    def postprocess_conditions_after_connector(batch, conditions):
+        del batch
+        return conditions
+
+    @staticmethod
+    def prepare_training_inputs(batch, timestep_sampler):
+        del batch, timestep_sampler
+        video = SimpleNamespace(enabled=True, sigma=torch.tensor([0.5]))
+        return SimpleNamespace(video=video, audio=None)
+
+    @staticmethod
+    def compute_loss(video_pred, audio_pred, model_inputs):
+        del audio_pred, model_inputs
+        return video_pred
+
+
+class _AutocastRecordingTransformer(nn.Module):
+    def __init__(self, accelerator: _FakeAccelerator) -> None:
+        super().__init__()
+        self.accelerator = accelerator
+        self.forward_saw_autocast = False
+
+    def forward(self, *, video, audio, perturbations):
+        del video, audio, perturbations
+        self.forward_saw_autocast = self.accelerator.autocast_active
+        return torch.ones(1), None
+
+
+def test_training_step_autocast_covers_transformer_forward() -> None:
+    trainer = LtxvTrainer.__new__(LtxvTrainer)
+    trainer._accelerator = _FakeAccelerator()
+    trainer._training_strategy = _TrainingStepStrategy()
+    trainer._embeddings_processor = _TrainingStepEmbeddingsProcessor()
+    trainer._transformer = _AutocastRecordingTransformer(trainer._accelerator)
+    trainer._timestep_sampler = object()
+    batch = {
+        "conditions": {
+            "video_prompt_embeds": torch.randn(1, 2, 4),
+            "audio_prompt_embeds": None,
+            "prompt_attention_mask": torch.ones(1, 2, dtype=torch.long),
+        }
+    }
+
+    output = trainer._training_step(batch)
+
+    assert trainer._transformer.forward_saw_autocast is True
+    assert output.loss.shape == (1,)
+    assert output.sigma.shape == (1,)
 
 
 class _TinyLanguageModel(nn.Module):

@@ -53,6 +53,14 @@ def _run_real_batch_smoke(
         parameter.grad = None
 
     device = trainer._accelerator.device
+    base_transformer = (
+        trainer._transformer.get_base_model()
+        if hasattr(trainer._transformer, "get_base_model")
+        else trainer._transformer
+    )
+    typer.echo(f"latent storage dtype: {batch['latents']['latents'].dtype}")
+    typer.echo(f"DiT patchify weight dtype: {base_transformer.patchify_proj.weight.dtype}")
+    typer.echo(f"Accelerator mixed precision: {trainer._accelerator.mixed_precision}")
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
         torch.cuda.synchronize(device)
