@@ -1,4 +1,5 @@
 import importlib.util
+import sys
 from pathlib import Path
 
 import torch
@@ -28,6 +29,7 @@ _STAGE1_INFER_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "infer_
 _STAGE1_SPEC = importlib.util.spec_from_file_location("infer_multiref_stage1_overfit", _STAGE1_INFER_SCRIPT)
 assert _STAGE1_SPEC is not None and _STAGE1_SPEC.loader is not None
 infer_multiref_stage1_overfit = importlib.util.module_from_spec(_STAGE1_SPEC)
+sys.modules[_STAGE1_SPEC.name] = infer_multiref_stage1_overfit
 _STAGE1_SPEC.loader.exec_module(infer_multiref_stage1_overfit)
 
 

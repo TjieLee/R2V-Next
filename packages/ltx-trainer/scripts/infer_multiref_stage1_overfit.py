@@ -11,11 +11,15 @@ plain LTX text conditioning. Optional inference-time CFG/STG is supported.
 from __future__ import annotations
 
 import csv
+import gc
 import json
 import math
 import shutil
+import time
+import traceback
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 import torch
 import typer
@@ -559,6 +563,8 @@ def _load_sample_precomputed(
     precomputed_root: Path,
     video_column: str,
     condition_mode: str,
+    text_condition_source: Literal["precomputed", "online"] = "online",
+    text_conditions_dir: str = "conditions",
 ) -> tuple[Path, dict[str, dict[str, Any]]]:
     video_path = _resolve_path(str(row[video_column]), manifest_root)
     rel_path = _output_relative(video_path, manifest_root).with_suffix(".pt")
@@ -573,6 +579,15 @@ def _load_sample_precomputed(
                 "gt_visual_tokens": precomputed_root / "gt_siglip_tokens" / rel_path,
             }
         )
+    elif text_condition_source == "precomputed":
+        text_condition_path = precomputed_root / text_conditions_dir / rel_path
+        if not text_condition_path.is_file():
+            raise FileNotFoundError(
+                "Precomputed text-only condition is missing. Run preprocessing or use "
+                "--text-condition-source online. "
+                f"Expected: {text_condition_path}"
+            )
+        files["conditions"] = text_condition_path
     return rel_path, {key: _load_pt_file(path) for key, path in files.items()}
 
 
@@ -659,6 +674,36 @@ def _prepare_condition_context(
     return conditions, shapes
 
 
+def _prepare_precomputed_text_condition(
+    *,
+    strategy: MultiReferenceVideoStrategy,
+    embeddings_processor: torch.nn.Module,
+    batch: dict[str, Any],
+    device: torch.device,
+    dtype: torch.dtype,
+) -> dict[str, Tensor | None]:
+    if "conditions" not in batch:
+        raise ValueError("Precomputed text-only condition is missing from the sample batch")
+    batch["conditions"] = _move_nested_to_device(batch["conditions"], device=device, dtype=dtype)
+    conditions = strategy.prepare_conditions(batch, batch["conditions"])
+    feature_key = _condition_feature_key(conditions)
+    video_features = conditions[feature_key]
+    audio_features = conditions.get("audio_prompt_embeds")
+    additive_mask = convert_to_additive_mask(conditions["prompt_attention_mask"], video_features.dtype)
+    video_embeds, audio_embeds, attention_mask = embeddings_processor.create_embeddings(
+        video_features,
+        audio_features,
+        additive_mask,
+    )
+    prepared: dict[str, Tensor | None] = {
+        "video_prompt_embeds": video_embeds,
+        "audio_prompt_embeds": audio_embeds,
+        "prompt_attention_mask": attention_mask,
+    }
+    batch["conditions"] = prepared
+    return prepared
+
+
 def _encode_text_prompt_condition(
     *,
     cfg: LtxTrainerConfig,
@@ -687,6 +732,7 @@ def _encode_text_prompt_condition(
         "prompt_attention_mask": None,
     }
     del text_encoder
+    gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     return conditions
@@ -1065,14 +1111,460 @@ def _load_models_and_strategy(
     return transformer, embeddings_processor, vae_decoder, strategy, checkpoint_flags
 
 
+@dataclass
+class Stage1InferenceRuntime:
+    cfg: LtxTrainerConfig
+    transformer: torch.nn.Module
+    embeddings_processor: torch.nn.Module
+    vae_decoder: torch.nn.Module
+    strategy: MultiReferenceVideoStrategy
+    checkpoint_flags: dict[str, bool]
+    negative_conditions: dict[str, Tensor | None] | None
+    device: torch.device
+    dtype: torch.dtype
+    config_path: Path
+    checkpoint_path: Path
+    negative_prompt: str | None
+
+
+def _load_inference_runtime(
+    *,
+    config_path: Path,
+    checkpoint_path: Path,
+    device: torch.device,
+    dtype: torch.dtype,
+    guidance_scale: float,
+    negative_prompt: str | None,
+    keep_feature_extractor: bool = False,
+) -> Stage1InferenceRuntime:
+    cfg = _load_config(config_path)
+    transformer, embeddings_processor, vae_decoder, strategy, checkpoint_flags = _load_models_and_strategy(
+        cfg=cfg,
+        checkpoint_path=checkpoint_path,
+        device=device,
+        dtype=dtype,
+    )
+    effective_negative_prompt = negative_prompt or cfg.validation.negative_prompt
+    if _cfg_enabled(guidance_scale):
+        negative_conditions = _encode_negative_prompt_condition(
+            cfg=cfg,
+            embeddings_processor=embeddings_processor,
+            negative_prompt=effective_negative_prompt,
+            device=device,
+            dtype=dtype,
+        )
+        console.print(f"negative condition shape: {_condition_shape(negative_conditions)}")
+    else:
+        negative_conditions = None
+        effective_negative_prompt = None
+
+    if not keep_feature_extractor and hasattr(embeddings_processor, "feature_extractor"):
+        embeddings_processor.feature_extractor = None
+    transformer.requires_grad_(False).eval()
+    embeddings_processor.requires_grad_(False).eval()
+    vae_decoder.requires_grad_(False).eval()
+    for module in strategy.get_trainable_modules().values():
+        module.requires_grad_(False).eval()
+
+    return Stage1InferenceRuntime(
+        cfg=cfg,
+        transformer=transformer,
+        embeddings_processor=embeddings_processor,
+        vae_decoder=vae_decoder,
+        strategy=strategy,
+        checkpoint_flags=checkpoint_flags,
+        negative_conditions=negative_conditions,
+        device=device,
+        dtype=dtype,
+        config_path=config_path,
+        checkpoint_path=checkpoint_path,
+        negative_prompt=effective_negative_prompt,
+    )
+
+
+def _expected_generated_path(output_dir: Path, sample_index: int, condition_mode: str) -> Path:
+    return output_dir / f"sample_{sample_index}" / f"generated_{condition_mode}.mp4"
+
+
+def _select_sample_indices(
+    *,
+    row_count: int,
+    start_index: int,
+    end_index: int | None,
+    shard_index: int,
+    num_shards: int,
+) -> list[int]:
+    upper_bound = row_count if end_index is None else min(end_index, row_count)
+    return [index for index in range(start_index, upper_bound) if index % num_shards == shard_index]
+
+
+def _text_only_condition_shapes(conditions: dict[str, Tensor | None]) -> dict[str, Any]:
+    text_condition_shape = _condition_shape(conditions)
+    return {
+        "original_condition_shape": None,
+        "original_feature_shape": None,
+        "raw_gt_visual_shape": None,
+        "projected_visual_shape": None,
+        "pre_connector_condition_shape": None,
+        "post_connector_condition_shape": text_condition_shape,
+        "transformer_condition_shape": text_condition_shape,
+        "text_only_prompt_condition_shape": text_condition_shape,
+        "post_connector_text_condition_shape": text_condition_shape,
+        "visual_context_shape": None,
+        "visual_context_token_count": 0,
+    }
+
+
+def _run_one_sample(  # noqa: PLR0913, PLR0915
+    *,
+    runtime: Stage1InferenceRuntime,
+    rows: list[dict[str, Any]],
+    sample_index: int,
+    manifest_root: Path,
+    precomputed_root: Path,
+    output_dir: Path,
+    video_column: str,
+    caption_column: str,
+    reference_column: str,
+    condition_mode: str,
+    text_condition_source: Literal["precomputed", "online"],
+    text_conditions_dir: str,
+    copy_media: bool,
+    fps: float | None,
+    decode_tile: bool,
+    guidance_scale: float,
+    cfg_negative_mode: str,
+    cfg_drop_ref_latents_in_negative: bool,
+    ref_guidance_scale: float,
+    siglip_guidance_scale: float,
+    guidance_rescale: float,
+    stg_scale: float,
+    stg_blocks: list[int] | None,
+    stg_mode: str,
+    num_inference_steps: int,
+    seed: int,
+) -> Path:
+    sample = rows[sample_index]
+    if video_column not in sample:
+        raise ValueError(f"Selected sample has no video column {video_column!r}")
+    sample_dir = output_dir / f"sample_{sample_index}"
+    sample_dir.mkdir(parents=True, exist_ok=True)
+
+    if copy_media:
+        gt_copy, ref_copies = _copy_sample_media(
+            sample=sample,
+            sample_dir=sample_dir,
+            manifest_root=manifest_root,
+            video_column=video_column,
+            reference_column=reference_column,
+        )
+    else:
+        gt_copy = None
+        ref_copies = []
+
+    rel_path, precomputed = _load_sample_precomputed(
+        row=sample,
+        manifest_root=manifest_root,
+        precomputed_root=precomputed_root,
+        video_column=video_column,
+        condition_mode=condition_mode,
+        text_condition_source=text_condition_source,
+        text_conditions_dir=text_conditions_dir,
+    )
+    batch = _build_single_sample_batch(
+        latents=precomputed["latents"],
+        multi_reference_latents=precomputed["multi_reference_latents"],
+        conditions=precomputed.get("conditions"),
+        gt_visual_tokens=precomputed.get("gt_visual_tokens"),
+    )
+
+    positive_prompt = str(sample.get(caption_column, ""))
+    if condition_mode == "full_siglip":
+        conditions, condition_shapes = _prepare_condition_context(
+            strategy=runtime.strategy,
+            embeddings_processor=runtime.embeddings_processor,
+            batch=batch,
+            device=runtime.device,
+            dtype=runtime.dtype,
+        )
+    elif text_condition_source == "precomputed":
+        conditions = _prepare_precomputed_text_condition(
+            strategy=runtime.strategy,
+            embeddings_processor=runtime.embeddings_processor,
+            batch=batch,
+            device=runtime.device,
+            dtype=runtime.dtype,
+        )
+        condition_shapes = _text_only_condition_shapes(conditions)
+    else:
+        if not positive_prompt.strip():
+            raise ValueError(f"Sample has empty prompt in caption column {caption_column!r}")
+        conditions = _encode_text_prompt_condition(
+            cfg=runtime.cfg,
+            embeddings_processor=runtime.embeddings_processor,
+            prompt=positive_prompt,
+            device=runtime.device,
+            dtype=runtime.dtype,
+        )
+        condition_shapes = _text_only_condition_shapes(conditions)
+
+    console.print(
+        f"sample={sample_index} mode={condition_mode} "
+        f"condition_shape={condition_shapes.get('post_connector_condition_shape')}"
+    )
+    generated_latents = _denoise_stage1(
+        transformer=runtime.transformer,
+        strategy=runtime.strategy,
+        batch=batch,
+        positive_conditions=conditions,
+        negative_conditions=runtime.negative_conditions,
+        guidance_scale=guidance_scale,
+        cfg_drop_ref_latents_in_negative=cfg_drop_ref_latents_in_negative,
+        ref_guidance_scale=ref_guidance_scale,
+        siglip_guidance_scale=siglip_guidance_scale,
+        guidance_rescale=guidance_rescale,
+        stg_scale=stg_scale,
+        stg_blocks=stg_blocks,
+        num_inference_steps=num_inference_steps,
+        seed=seed,
+        device=runtime.device,
+        dtype=runtime.dtype,
+    )
+    decoded = _decode_video_latents(
+        vae_decoder=runtime.vae_decoder,
+        latents=generated_latents,
+        device=runtime.device,
+        decode_tile=decode_tile,
+    )
+
+    latent_fps = runtime.strategy._first_scalar(batch["latents"].get("fps"), default=24.0)
+    output_fps = float(fps) if fps is not None else float(latent_fps)
+    generated_path = _expected_generated_path(output_dir, sample_index, condition_mode)
+    save_video(video_tensor=decoded, output_path=generated_path, fps=output_fps, video_format="FCHW")
+
+    reference_paths = [
+        str(_resolve_path(value, manifest_root))
+        for value in _parse_reference_images(sample.get(reference_column))
+    ]
+    metadata = {
+        "sample_index": sample_index,
+        "checkpoint": str(runtime.checkpoint_path),
+        "config": str(runtime.config_path),
+        "prompt": positive_prompt,
+        "gt_path": str(_resolve_path(str(sample[video_column]), manifest_root)),
+        "gt_copy": str(gt_copy) if gt_copy is not None else None,
+        "reference_paths": reference_paths,
+        "reference_copies": [str(path) for path in ref_copies],
+        "precomputed_relative_path": str(rel_path),
+        "seed": seed,
+        "num_inference_steps": num_inference_steps,
+        "guidance_scale": guidance_scale,
+        "cfg_enabled": _cfg_enabled(guidance_scale),
+        "negative_prompt": runtime.negative_prompt if _cfg_enabled(guidance_scale) else None,
+        "cfg_negative_mode": cfg_negative_mode,
+        "cfg_drop_ref_latents_in_negative": cfg_drop_ref_latents_in_negative,
+        "negative_condition_shape": _condition_shape(runtime.negative_conditions),
+        "ref_guidance_scale": ref_guidance_scale,
+        "ref_guidance_enabled": ref_guidance_scale != 0.0,
+        "siglip_guidance_scale": siglip_guidance_scale,
+        "siglip_guidance_enabled": siglip_guidance_scale != 0.0,
+        "siglip_guidance_formula": "null_text_with_siglip_and_refs - null_text_without_siglip_with_refs",
+        "guidance_rescale": guidance_rescale,
+        "guidance_rescale_enabled": guidance_rescale != 0.0,
+        "stg_scale": stg_scale,
+        "stg_enabled": _stg_enabled(stg_scale),
+        "stg_blocks": stg_blocks,
+        "stg_mode": stg_mode,
+        "guidance_formula": (
+            "x_negative_with_ref + cfg * (x_full - x_negative_with_ref) "
+            "+ ref * (x_full - x_full_without_ref_latents) "
+            "+ siglip * (x_null_text_with_siglip - x_null_text_without_siglip) "
+            "+ stg * (x_full - x_stg)"
+        ),
+        "condition_mode": condition_mode,
+        "condition_mode_detail": _condition_mode_detail(
+            condition_mode,
+            guidance_scale=guidance_scale,
+            stg_scale=stg_scale,
+        ),
+        "uses_gt_siglip_visual_tokens": condition_mode == "full_siglip",
+        "uses_vlm_reference_image_context": condition_mode == "full_siglip",
+        "uses_text_only_prompt_condition": condition_mode == "text_only_no_siglip",
+        "keeps_reference_latent_condition": True,
+        "text_only_prompt_condition_shape": condition_shapes.get("text_only_prompt_condition_shape"),
+        "visual_branch_enabled": (
+            bool(getattr(runtime.strategy.config, "visual_branch_enabled", False))
+            and condition_mode == "full_siglip"
+        ),
+        "visual_context_mode": runtime.strategy.config.visual_context_mode,
+        "visual_context_shape": condition_shapes.get("visual_context_shape"),
+        "visual_context_token_count": condition_shapes.get("visual_context_token_count"),
+        "visual_full_sa_num_heads": runtime.strategy.config.visual_full_sa_num_heads,
+        "visual_full_sa_depth": runtime.strategy.config.visual_full_sa_depth,
+        "visual_gate": (
+            float(runtime.strategy._visual_gate.value.detach().float().cpu().item())
+            if getattr(runtime.strategy, "_visual_gate", None) is not None
+            else None
+        ),
+        "connector_checkpoint_loaded": runtime.checkpoint_flags["connector_checkpoint_loaded"],
+        "visual_token_projection_checkpoint_loaded": runtime.checkpoint_flags[
+            "visual_token_projection_checkpoint_loaded"
+        ],
+        "visual_full_encoder_checkpoint_loaded": runtime.checkpoint_flags[
+            "visual_full_encoder_checkpoint_loaded"
+        ],
+        "original_feature_shape": condition_shapes["original_feature_shape"],
+        "raw_gt_visual_shape": condition_shapes["raw_gt_visual_shape"],
+        "projected_visual_shape": condition_shapes["projected_visual_shape"],
+        "pre_connector_condition_shape": condition_shapes["pre_connector_condition_shape"],
+        "post_connector_condition_shape": condition_shapes["post_connector_condition_shape"],
+        "final_condition_shape": condition_shapes["post_connector_condition_shape"],
+        "reference_latent_shape": _shape(batch["multi_ref_latents"]["latents"]),
+        "target_latent_shape": _shape(batch["latents"]["latents"]),
+        "fps": output_fps,
+        "decode_tile": decode_tile,
+        "generated": str(generated_path),
+    }
+    (sample_dir / "metadata.json").write_text(
+        json.dumps(metadata, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    console.print(f"[green]Saved generated video:[/green] {generated_path}")
+
+    del batch, conditions, generated_latents, decoded, precomputed
+    return generated_path
+
+
+def _run_selected_samples(
+    *,
+    selected_indices: list[int],
+    output_dir: Path,
+    condition_mode: str,
+    checkpoint_path: Path,
+    shard_index: int,
+    num_shards: int,
+    skip_existing: bool,
+    continue_on_error: bool,
+    gc_interval: int,
+    device: torch.device,
+    run_sample: Callable[[int], Path],
+    write_summary: bool,
+) -> dict[str, Any]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    failures_path = output_dir / f"failures_shard_{shard_index}.jsonl"
+    start_time = time.perf_counter()
+    num_success = 0
+    num_skipped = 0
+    num_failed = 0
+
+    for position, sample_index in enumerate(selected_indices, start=1):
+        expected_video = _expected_generated_path(output_dir, sample_index, condition_mode)
+        if skip_existing and expected_video.is_file() and expected_video.stat().st_size > 0:
+            num_skipped += 1
+            console.print(f"[cyan]Skipping existing sample {sample_index}:[/cyan] {expected_video}")
+            if gc_interval > 0 and position % gc_interval == 0:
+                gc.collect()
+            continue
+
+        sample_start = time.perf_counter()
+        recover_cuda_oom = False
+        try:
+            generated_path = run_sample(sample_index)
+            num_success += 1
+            elapsed = time.perf_counter() - sample_start
+            allocated = torch.cuda.memory_allocated(device) if device.type == "cuda" else 0
+            peak = torch.cuda.max_memory_allocated(device) if device.type == "cuda" else 0
+            console.print(
+                f"sample={sample_index} elapsed={elapsed:.2f}s output={generated_path} "
+                f"cuda_allocated={allocated} cuda_peak={peak}"
+            )
+        except Exception as exc:
+            num_failed += 1
+            failure = {
+                "sample_index": sample_index,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "traceback": traceback.format_exc(),
+            }
+            with failures_path.open("a", encoding="utf-8") as file:
+                file.write(json.dumps(failure, ensure_ascii=False) + "\n")
+            console.print(f"[red]Sample {sample_index} failed:[/red] {type(exc).__name__}: {exc}")
+            recover_cuda_oom = device.type == "cuda" and (
+                isinstance(exc, torch.cuda.OutOfMemoryError) or "out of memory" in str(exc).lower()
+            )
+            if not continue_on_error:
+                raise
+        finally:
+            if recover_cuda_oom:
+                gc.collect()
+                torch.cuda.empty_cache()
+            elif gc_interval > 0 and position % gc_interval == 0:
+                gc.collect()
+
+    summary = {
+        "condition_mode": condition_mode,
+        "checkpoint": str(checkpoint_path),
+        "num_selected": len(selected_indices),
+        "num_success": num_success,
+        "num_skipped": num_skipped,
+        "num_failed": num_failed,
+        "shard_index": shard_index,
+        "num_shards": num_shards,
+        "elapsed_seconds": time.perf_counter() - start_time,
+    }
+    if write_summary:
+        summary_path = output_dir / f"batch_summary_shard_{shard_index}.json"
+        summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return summary
+
+
 @app.command()
-def main(  # noqa: PLR0913
+def main(  # noqa: PLR0913, PLR0915
     config: str = typer.Option(..., help="Stage 1 overfit/training YAML config."),
     checkpoint: str = typer.Option(..., help="Stage 1 checkpoint safetensors file."),
     manifest: str = typer.Option(..., help="Overfit manifest JSON/JSONL/CSV."),
     precomputed_root: str = typer.Option(..., help="Root containing latents/, vlm_conditions/, etc."),
-    sample_index: int = typer.Option(0, help="Sample index inside manifest."),
     output_dir: str = typer.Option(..., help="Directory for sample_<index>/ outputs."),
+    sample_index: int | None = typer.Option(
+        None,
+        "--sample-index",
+        help="Single sample index. Defaults to 0 when no batch range is requested.",
+    ),
+    all_samples: bool = typer.Option(
+        False,
+        "--all-samples/--no-all-samples",
+        help="Process all samples in the selected global-index range.",
+    ),
+    start_index: int = typer.Option(0, "--start-index", help="Inclusive batch range start."),
+    end_index: int | None = typer.Option(None, "--end-index", help="Exclusive batch range end."),
+    shard_index: int = typer.Option(0, "--shard-index", help="Global modulo shard index."),
+    num_shards: int = typer.Option(1, "--num-shards", help="Number of independent persistent workers."),
+    skip_existing: bool = typer.Option(
+        True,
+        "--skip-existing/--no-skip-existing",
+        help="Skip non-empty generated videos that already exist.",
+    ),
+    continue_on_error: bool = typer.Option(
+        True,
+        "--continue-on-error/--fail-fast",
+        help="Continue processing the shard after a sample failure.",
+    ),
+    copy_media: bool | None = typer.Option(
+        None,
+        "--copy-media/--no-copy-media",
+        help="Copy GT/reference media. Defaults to true for single sample and false for batch mode.",
+    ),
+    text_condition_source: Literal["precomputed", "online"] | None = typer.Option(
+        None,
+        "--text-condition-source",
+        help="Text-only source. Defaults to online for single sample and precomputed for batch mode.",
+    ),
+    text_conditions_dir: str = typer.Option(
+        "conditions",
+        "--text-conditions-dir",
+        help="Precomputed text-only condition directory.",
+    ),
+    gc_interval: int = typer.Option(20, "--gc-interval", help="Run Python GC after every N attempted samples."),
     device: str = typer.Option("cuda", help="Torch device, e.g. cuda or cuda:0."),
     seed: int = typer.Option(42, help="Random seed for target latent initialization."),
     num_inference_steps: int = typer.Option(50, help="Number of denoising steps."),
@@ -1159,8 +1651,20 @@ def main(  # noqa: PLR0913
         ),
     ),
 ) -> None:
-    if sample_index < 0:
+    if sample_index is not None and sample_index < 0:
         raise typer.BadParameter("--sample-index must be >= 0")
+    if all_samples and sample_index is not None:
+        raise typer.BadParameter("--sample-index and --all-samples cannot be used together")
+    if start_index < 0:
+        raise typer.BadParameter("--start-index must be >= 0")
+    if end_index is not None and end_index <= start_index:
+        raise typer.BadParameter("--end-index must be greater than --start-index")
+    if num_shards <= 0:
+        raise typer.BadParameter("--num-shards must be >= 1")
+    if not 0 <= shard_index < num_shards:
+        raise typer.BadParameter("--shard-index must satisfy 0 <= shard_index < num_shards")
+    if gc_interval < 0:
+        raise typer.BadParameter("--gc-interval must be >= 0")
     if num_inference_steps < 1:
         raise typer.BadParameter("--num-inference-steps must be >= 1")
     if guidance_scale < 1.0:
@@ -1183,223 +1687,108 @@ def main(  # noqa: PLR0913
         raise typer.BadParameter(
             "--condition-mode must be one of: " + ", ".join(sorted(_POSITIVE_CONDITION_MODES))
         )
-    parsed_stg_blocks = _parse_stg_blocks(stg_blocks)
 
-    cfg = _load_config(Path(config))
-    checkpoint_path = Path(checkpoint)
-    if not checkpoint_path.is_file():
-        raise FileNotFoundError(f"Checkpoint does not exist: {checkpoint_path}")
-
-    torch_device = torch.device(device)
-    dtype = torch.bfloat16
+    range_requested = (
+        all_samples
+        or start_index != 0
+        or end_index is not None
+        or shard_index != 0
+        or num_shards != 1
+    )
+    batch_mode = sample_index is None and range_requested
     manifest_path = Path(manifest)
     manifest_root = Path(root_dir) if root_dir is not None else manifest_path.parent
     rows = _read_manifest(manifest_path)
-    if sample_index >= len(rows):
-        raise typer.BadParameter(f"--sample-index must be in [0, {len(rows) - 1}]")
-    sample = rows[sample_index]
-    if video_column not in sample:
-        raise ValueError(f"Selected sample has no video column '{video_column}'")
+    if sample_index is not None:
+        if sample_index >= len(rows):
+            raise typer.BadParameter(f"--sample-index must be in [0, {len(rows) - 1}]")
+        selected_indices = [sample_index]
+    elif batch_mode:
+        selected_indices = _select_sample_indices(
+            row_count=len(rows),
+            start_index=start_index,
+            end_index=end_index,
+            shard_index=shard_index,
+            num_shards=num_shards,
+        )
+    else:
+        if not rows:
+            raise ValueError("Manifest contains no samples")
+        selected_indices = [0]
 
-    sample_dir = Path(output_dir) / f"sample_{sample_index}"
-    sample_dir.mkdir(parents=True, exist_ok=True)
-    gt_copy, ref_copies = _copy_sample_media(
-        sample=sample,
-        sample_dir=sample_dir,
-        manifest_root=manifest_root,
-        video_column=video_column,
-        reference_column=reference_column,
+    resolved_text_condition_source = text_condition_source or (
+        "precomputed" if batch_mode and condition_mode == "text_only_no_siglip" else "online"
     )
+    if batch_mode and condition_mode == "text_only_no_siglip" and resolved_text_condition_source == "online":
+        raise typer.BadParameter(
+            "Batch text_only_no_siglip inference requires --text-condition-source precomputed"
+        )
+    resolved_copy_media = copy_media if copy_media is not None else not batch_mode
 
-    rel_path, precomputed = _load_sample_precomputed(
-        row=sample,
-        manifest_root=manifest_root,
-        precomputed_root=_normalize_precomputed_root(Path(precomputed_root)),
-        video_column=video_column,
-        condition_mode=condition_mode,
-    )
-    batch = _build_single_sample_batch(
-        latents=precomputed["latents"],
-        multi_reference_latents=precomputed["multi_reference_latents"],
-        conditions=precomputed.get("conditions"),
-        gt_visual_tokens=precomputed.get("gt_visual_tokens"),
-    )
-
-    transformer, embeddings_processor, vae_decoder, strategy, checkpoint_flags = _load_models_and_strategy(
-        cfg=cfg,
+    torch_device = torch.device(device)
+    dtype = torch.bfloat16
+    config_path = Path(config)
+    checkpoint_path = Path(checkpoint)
+    runtime = _load_inference_runtime(
+        config_path=config_path,
         checkpoint_path=checkpoint_path,
         device=torch_device,
         dtype=dtype,
-    )
-
-    positive_prompt = str(sample.get(caption_column, ""))
-    if condition_mode == "full_siglip":
-        conditions, condition_shapes = _prepare_condition_context(
-            strategy=strategy,
-            embeddings_processor=embeddings_processor,
-            batch=batch,
-            device=torch_device,
-            dtype=dtype,
-        )
-    else:
-        if not positive_prompt.strip():
-            raise ValueError(f"Sample has empty prompt in caption column {caption_column!r}")
-        conditions = _encode_text_prompt_condition(
-            cfg=cfg,
-            embeddings_processor=embeddings_processor,
-            prompt=positive_prompt,
-            device=torch_device,
-            dtype=dtype,
-        )
-        text_condition_shape = _condition_shape(conditions)
-        condition_shapes = {
-            "original_condition_shape": None,
-            "original_feature_shape": None,
-            "raw_gt_visual_shape": None,
-            "projected_visual_shape": None,
-            "pre_connector_condition_shape": None,
-            "post_connector_condition_shape": text_condition_shape,
-            "transformer_condition_shape": text_condition_shape,
-            "text_only_prompt_condition_shape": text_condition_shape,
-            "post_connector_text_condition_shape": text_condition_shape,
-            "visual_context_shape": None,
-            "visual_context_token_count": 0,
-        }
-
-    console.print(f"positive condition mode: {condition_mode}")
-    console.print(f"original feature shape: {condition_shapes.get('original_feature_shape')}")
-    console.print(f"raw GT visual token shape: {condition_shapes.get('raw_gt_visual_shape')}")
-    console.print(f"projected visual token shape: {condition_shapes.get('projected_visual_shape')}")
-    console.print(f"pre-connector final condition shape: {condition_shapes.get('pre_connector_condition_shape')}")
-    console.print(f"post-connector text condition shape: {condition_shapes.get('post_connector_text_condition_shape')}")
-    console.print(f"visual context shape: {condition_shapes.get('visual_context_shape')}")
-    console.print(f"post-connector transformer condition shape: {condition_shapes.get('post_connector_condition_shape')}")
-
-    effective_negative_prompt = negative_prompt or cfg.validation.negative_prompt
-    if _cfg_enabled(guidance_scale):
-        negative_conditions = _encode_negative_prompt_condition(
-            cfg=cfg,
-            embeddings_processor=embeddings_processor,
-            negative_prompt=effective_negative_prompt,
-            device=torch_device,
-            dtype=dtype,
-        )
-        console.print(f"negative condition shape: {_condition_shape(negative_conditions)}")
-    else:
-        negative_conditions = None
-        effective_negative_prompt = None
-
-    embeddings_processor.feature_extractor = None
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    generated_latents = _denoise_stage1(
-        transformer=transformer,
-        strategy=strategy,
-        batch=batch,
-        positive_conditions=conditions,
-        negative_conditions=negative_conditions,
         guidance_scale=guidance_scale,
-        cfg_drop_ref_latents_in_negative=cfg_drop_ref_latents_in_negative,
-        ref_guidance_scale=ref_guidance_scale,
-        siglip_guidance_scale=siglip_guidance_scale,
-        guidance_rescale=guidance_rescale,
-        stg_scale=stg_scale,
-        stg_blocks=parsed_stg_blocks,
-        num_inference_steps=num_inference_steps,
-        seed=seed,
-        device=torch_device,
-        dtype=dtype,
-    )
-    decoded = _decode_video_latents(
-        vae_decoder=vae_decoder,
-        latents=generated_latents,
-        device=torch_device,
-        decode_tile=decode_tile,
-    )
-
-    latent_fps = strategy._first_scalar(batch["latents"].get("fps"), default=24.0)
-    output_fps = float(fps) if fps is not None else float(latent_fps)
-    generated_path = sample_dir / f"generated_{condition_mode}.mp4"
-    save_video(video_tensor=decoded, output_path=generated_path, fps=output_fps, video_format="FCHW")
-
-    metadata = {
-        "sample_index": sample_index,
-        "checkpoint": str(checkpoint_path),
-        "config": str(Path(config)),
-        "prompt": str(sample.get(caption_column, "")),
-        "gt_path": str(_resolve_path(str(sample[video_column]), manifest_root)),
-        "gt_copy": str(gt_copy),
-        "reference_paths": [str(_resolve_path(value, manifest_root)) for value in _parse_reference_images(sample.get(reference_column))],
-        "reference_copies": [str(path) for path in ref_copies],
-        "precomputed_relative_path": str(rel_path),
-        "seed": seed,
-        "num_inference_steps": num_inference_steps,
-        "guidance_scale": guidance_scale,
-        "cfg_enabled": _cfg_enabled(guidance_scale),
-        "negative_prompt": effective_negative_prompt if _cfg_enabled(guidance_scale) else None,
-        "cfg_negative_mode": cfg_negative_mode,
-        "cfg_drop_ref_latents_in_negative": cfg_drop_ref_latents_in_negative,
-        "negative_condition_shape": _condition_shape(negative_conditions),
-        "ref_guidance_scale": ref_guidance_scale,
-        "ref_guidance_enabled": ref_guidance_scale != 0.0,
-        "siglip_guidance_scale": siglip_guidance_scale,
-        "siglip_guidance_enabled": siglip_guidance_scale != 0.0,
-        "siglip_guidance_formula": (
-            "null_text_with_siglip_and_refs - null_text_without_siglip_with_refs"
+        negative_prompt=negative_prompt,
+        keep_feature_extractor=(
+            condition_mode == "text_only_no_siglip" and resolved_text_condition_source == "online"
         ),
-        "guidance_rescale": guidance_rescale,
-        "guidance_rescale_enabled": guidance_rescale != 0.0,
-        "stg_scale": stg_scale,
-        "stg_enabled": _stg_enabled(stg_scale),
-        "stg_blocks": parsed_stg_blocks,
-        "stg_mode": stg_mode,
-        "guidance_formula": (
-            "x_negative_with_ref + cfg * (x_full - x_negative_with_ref) "
-            "+ ref * (x_full - x_full_without_ref_latents) "
-            "+ siglip * (x_null_text_with_siglip - x_null_text_without_siglip) "
-            "+ stg * (x_full - x_stg)"
-        ),
-        "condition_mode": condition_mode,
-        "condition_mode_detail": _condition_mode_detail(
-            condition_mode,
+    )
+    parsed_stg_blocks = _parse_stg_blocks(stg_blocks)
+    normalized_precomputed_root = _normalize_precomputed_root(Path(precomputed_root))
+    output_dir_path = Path(output_dir)
+
+    def run_sample(index: int) -> Path:
+        return _run_one_sample(
+            runtime=runtime,
+            rows=rows,
+            sample_index=index,
+            manifest_root=manifest_root,
+            precomputed_root=normalized_precomputed_root,
+            output_dir=output_dir_path,
+            video_column=video_column,
+            caption_column=caption_column,
+            reference_column=reference_column,
+            condition_mode=condition_mode,
+            text_condition_source=resolved_text_condition_source,
+            text_conditions_dir=text_conditions_dir,
+            copy_media=resolved_copy_media,
+            fps=fps,
+            decode_tile=decode_tile,
             guidance_scale=guidance_scale,
+            cfg_negative_mode=cfg_negative_mode,
+            cfg_drop_ref_latents_in_negative=cfg_drop_ref_latents_in_negative,
+            ref_guidance_scale=ref_guidance_scale,
+            siglip_guidance_scale=siglip_guidance_scale,
+            guidance_rescale=guidance_rescale,
             stg_scale=stg_scale,
-        ),
-        "uses_gt_siglip_visual_tokens": condition_mode == "full_siglip",
-        "uses_vlm_reference_image_context": condition_mode == "full_siglip",
-        "uses_text_only_prompt_condition": condition_mode == "text_only_no_siglip",
-        "keeps_reference_latent_condition": True,
-        "text_only_prompt_condition_shape": condition_shapes.get("text_only_prompt_condition_shape"),
-        "visual_branch_enabled": bool(getattr(strategy.config, "visual_branch_enabled", False)) and condition_mode == "full_siglip",
-        "visual_context_mode": strategy.config.visual_context_mode,
-        "visual_context_shape": condition_shapes.get("visual_context_shape"),
-        "visual_context_token_count": condition_shapes.get("visual_context_token_count"),
-        "visual_full_sa_num_heads": strategy.config.visual_full_sa_num_heads,
-        "visual_full_sa_depth": strategy.config.visual_full_sa_depth,
-        "visual_gate": (
-            float(strategy._visual_gate.value.detach().float().cpu().item())
-            if getattr(strategy, "_visual_gate", None) is not None
-            else None
-        ),
-        "connector_checkpoint_loaded": checkpoint_flags["connector_checkpoint_loaded"],
-        "visual_token_projection_checkpoint_loaded": checkpoint_flags["visual_token_projection_checkpoint_loaded"],
-        "visual_full_encoder_checkpoint_loaded": checkpoint_flags["visual_full_encoder_checkpoint_loaded"],
-        "original_feature_shape": condition_shapes["original_feature_shape"],
-        "raw_gt_visual_shape": condition_shapes["raw_gt_visual_shape"],
-        "projected_visual_shape": condition_shapes["projected_visual_shape"],
-        "pre_connector_condition_shape": condition_shapes["pre_connector_condition_shape"],
-        "post_connector_condition_shape": condition_shapes["post_connector_condition_shape"],
-        "final_condition_shape": condition_shapes["post_connector_condition_shape"],
-        "reference_latent_shape": _shape(batch["multi_ref_latents"]["latents"]),
-        "target_latent_shape": _shape(batch["latents"]["latents"]),
-        "fps": output_fps,
-        "decode_tile": decode_tile,
-        "generated": str(generated_path),
-    }
-    (sample_dir / "metadata.json").write_text(json.dumps(metadata, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    console.print(f"[green]Saved generated video:[/green] {generated_path}")
+            stg_blocks=parsed_stg_blocks,
+            stg_mode=stg_mode,
+            num_inference_steps=num_inference_steps,
+            seed=seed,
+        )
 
-
+    summary = _run_selected_samples(
+        selected_indices=selected_indices,
+        output_dir=output_dir_path,
+        condition_mode=condition_mode,
+        checkpoint_path=checkpoint_path,
+        shard_index=shard_index,
+        num_shards=num_shards,
+        skip_existing=skip_existing,
+        continue_on_error=continue_on_error if batch_mode else False,
+        gc_interval=gc_interval,
+        device=torch_device,
+        run_sample=run_sample,
+        write_summary=batch_mode,
+    )
+    if batch_mode:
+        console.print(f"[green]Persistent shard complete:[/green] {json.dumps(summary, ensure_ascii=False)}")
 if __name__ == "__main__":
     app()
