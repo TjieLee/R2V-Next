@@ -539,6 +539,113 @@ def test_negative_condition_uses_prompt_once_and_has_no_planner_visual_context(m
     assert conditions["prompt_attention_mask"] is None
 
 
+class _RuntimeFakeProcessor(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.feature_extractor = object()
+        self.process_calls = 0
+
+    def process_hidden_states(self, hidden_states, attention_mask):
+        del attention_mask
+        assert self.feature_extractor is not None
+        self.process_calls += 1
+        return SimpleNamespace(video_encoding=hidden_states, audio_encoding=None)
+
+
+class _RuntimeFakeTextEncoder(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.encode_calls = 0
+
+    def encode(self, prompts):
+        self.encode_calls += 1
+        assert prompts == ["negative"]
+        return [(torch.ones(1, 3, 4), torch.ones(1, 3, dtype=torch.long))]
+
+
+class _RuntimeFakeLanguageModel:
+    @staticmethod
+    def disable_adapter():
+        return nullcontext()
+
+
+class _RuntimeFakeStrategy:
+    def attach_models(self, **kwargs) -> None:
+        del kwargs
+
+    @staticmethod
+    def get_trainable_modules() -> dict:
+        return {}
+
+    @staticmethod
+    def _get_language_model():
+        return _RuntimeFakeLanguageModel()
+
+
+def _install_runtime_fakes(monkeypatch, processor: _RuntimeFakeProcessor) -> _RuntimeFakeTextEncoder:
+    text_encoder = _RuntimeFakeTextEncoder()
+    strategy = _RuntimeFakeStrategy()
+    cfg = SimpleNamespace(
+        model=SimpleNamespace(model_path="model", text_encoder_path="gemma"),
+        acceleration=SimpleNamespace(load_text_encoder_in_8bit=False),
+        training_strategy=object(),
+        validation=SimpleNamespace(negative_prompt="negative"),
+    )
+    monkeypatch.setattr(infer, "MultiReferencePlannerStage2Strategy", _RuntimeFakeStrategy)
+    monkeypatch.setattr(infer, "_load_config", Mock(return_value=cfg))
+    monkeypatch.setattr(infer, "load_transformer", Mock(return_value=torch.nn.Identity()))
+    monkeypatch.setattr(infer, "_setup_dit_lora", lambda transformer, config: transformer)
+    monkeypatch.setattr(infer, "load_embeddings_processor", Mock(return_value=processor))
+    monkeypatch.setattr(infer, "load_text_encoder", Mock(return_value=text_encoder))
+    monkeypatch.setattr(infer, "_setup_gemma_lora", lambda encoder, config: None)
+    monkeypatch.setattr(infer, "get_training_strategy", Mock(return_value=strategy))
+    monkeypatch.setattr(infer, "_load_checkpoint_weights", Mock(return_value={}))
+    monkeypatch.setattr(infer, "_disable_gradient_checkpointing", lambda transformer, value: None)
+    monkeypatch.setattr(infer, "load_video_vae_decoder", Mock(return_value=torch.nn.Identity()))
+    monkeypatch.setattr(infer, "_autocast_context", lambda device, dtype: nullcontext())
+    return text_encoder
+
+
+def test_negative_prompt_is_encoded_before_feature_extractor_release(monkeypatch, tmp_path: Path) -> None:
+    processor = _RuntimeFakeProcessor()
+    text_encoder = _install_runtime_fakes(monkeypatch, processor)
+
+    runtime = infer._load_inference_runtime(
+        config_path=tmp_path / "config.yaml",
+        checkpoint_path=tmp_path / "checkpoint.safetensors",
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        guidance_scale=2.0,
+        negative_prompt=None,
+    )
+
+    assert processor.process_calls == 1
+    assert text_encoder.encode_calls == 1
+    assert runtime.negative_conditions is not None
+    assert processor.feature_extractor is None
+
+
+def test_cfg_disabled_releases_feature_extractor_without_encoding_negative(monkeypatch, tmp_path: Path) -> None:
+    processor = _RuntimeFakeProcessor()
+    text_encoder = _install_runtime_fakes(monkeypatch, processor)
+    encode_negative = Mock(side_effect=AssertionError("negative prompt must not be encoded"))
+    monkeypatch.setattr(infer, "_encode_negative_prompt_condition", encode_negative)
+
+    runtime = infer._load_inference_runtime(
+        config_path=tmp_path / "config.yaml",
+        checkpoint_path=tmp_path / "checkpoint.safetensors",
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        guidance_scale=1.0,
+        negative_prompt=None,
+    )
+
+    assert encode_negative.call_count == 0
+    assert text_encoder.encode_calls == 0
+    assert runtime.negative_conditions is None
+    assert processor.feature_extractor is None
+
+
 def test_held_out_guidance_formula_is_numerically_correct() -> None:
     full = torch.tensor([[[10.0]]])
     negative = torch.tensor([[[2.0]]])
