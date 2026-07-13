@@ -33,10 +33,33 @@ from ltx_trainer.training_strategies.multi_reference_video import (
 logger = logging.getLogger(__name__)
 
 
+def configure_stage3_transformer_trainability(transformer: nn.Module) -> list[str]:
+    """Freeze the base DiT and enable only the existing Stage 1 LoRA weights."""
+    transformer.requires_grad_(False)
+    trainable_names: list[str] = []
+    for name, parameter in transformer.named_parameters():
+        if "lora_" in name:
+            parameter.requires_grad_(True)
+            trainable_names.append(name)
+
+    if not trainable_names:
+        raise RuntimeError("Stage 3 requires trainable Stage 1 DiT LoRA parameters")
+    non_lora_trainable = [
+        name
+        for name, parameter in transformer.named_parameters()
+        if parameter.requires_grad and "lora_" not in name
+    ]
+    if non_lora_trainable:
+        raise RuntimeError(f"Stage 3 must not train base DiT parameters: {non_lora_trainable[:20]}")
+    return trainable_names
+
+
 class MultiReferencePlannerStage2Config(MultiReferenceVideoConfig):
     """Stage 2 VLM planner token training."""
 
     name: Literal["multi_reference_planner_stage2"] = "multi_reference_planner_stage2"
+    training_phase: Literal["stage2", "stage3"] = "stage2"
+    train_stage1_dit_lora: bool = False
 
     visual_branch_enabled: bool = True
     visual_context_mode: Literal["qformer_512", "full_tokens_3d_sa"] = "full_tokens_3d_sa"
@@ -247,7 +270,9 @@ class MultiReferencePlannerStage2Config(MultiReferenceVideoConfig):
 
     freeze_transformer: bool = Field(
         default=True,
-        description="Freeze the Stage 1 transformer/LoRA weights while training the VLM planner.",
+        description=(
+            "Freeze the LTX base DiT. Stage 2 also freezes the Stage 1 LoRA; Stage 3 can train only that LoRA."
+        ),
     )
 
     train_text_connector: bool = Field(
@@ -270,8 +295,12 @@ class MultiReferencePlannerStage2Config(MultiReferenceVideoConfig):
             raise ValueError("Stage 2 requires the Gemma vision tower and multimodal projector to remain frozen")
         if self.train_gemma_backbone or self.train_vlm_language_model is True:
             raise ValueError("Stage 2 trains Gemma LoRA only; the Gemma base language model must remain frozen")
+        if self.training_phase == "stage2" and self.train_stage1_dit_lora:
+            raise ValueError("Stage 2 requires train_stage1_dit_lora=false")
+        if self.training_phase == "stage3" and not self.train_stage1_dit_lora:
+            raise ValueError("Stage 3 requires train_stage1_dit_lora=true")
         if not self.freeze_transformer:
-            raise ValueError("Stage 2 requires the LTX base and Stage 1 DiT LoRA to remain frozen")
+            raise ValueError("Stage 2/3 requires freeze_transformer=true so the LTX base DiT stays frozen")
         if not self.train_text_connector:
             raise ValueError("Stage 2 requires train_text_connector=true")
         if self.gemma_gradient_checkpointing and self.gemma_gradient_checkpointing_use_reentrant:
@@ -414,7 +443,13 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
             self._configure_vlm_trainable_parameters(self.text_encoder)
 
     def train_transformer(self) -> bool:
-        return not self.config.freeze_transformer
+        return self.config.training_phase == "stage3" and self.config.train_stage1_dit_lora
+
+    def configure_transformer_trainability(self, transformer: nn.Module) -> list[str]:
+        if self.config.training_phase == "stage3":
+            return configure_stage3_transformer_trainability(transformer)
+        transformer.requires_grad_(False)
+        return []
 
     def train_embeddings_processor(self) -> bool:
         return self.config.train_text_connector
@@ -881,7 +916,9 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
         metadata.update(
             {
                 "conditioning": "multi_reference_planner_stage2",
-                "stage": 2,
+                "stage": 3 if self.config.training_phase == "stage3" else 2,
+                "training_phase": self.config.training_phase,
+                "train_stage1_dit_lora": self.config.train_stage1_dit_lora,
                 "planner_architecture": "content_residual_3d_rope_cross_attention",
                 "planner_token_count": self.config.planner_token_count,
                 "planner_cross_attention_heads": self.config.planner_cross_attention_heads,
@@ -913,6 +950,10 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
             }
         )
         return metadata
+
+    def validate_initial_checkpoint_state_dict(self, state_dict: dict[str, Tensor]) -> None:
+        if self.config.training_phase == "stage3":
+            self.validate_checkpoint_state_dict(state_dict)
 
     @staticmethod
     def validate_checkpoint_state_dict(state_dict: dict[str, Tensor]) -> None:
@@ -948,6 +989,13 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
                 "Stage 2 checkpoint contains frozen base weights: "
                 f"text={non_lora_text[:5]}, dit={non_lora_dit[:5]}"
             )
+        non_finite = [
+            key
+            for key, value in state_dict.items()
+            if isinstance(value, Tensor) and value.is_floating_point() and not torch.isfinite(value).all()
+        ]
+        if non_finite:
+            raise RuntimeError(f"Planner checkpoint contains non-finite tensors: {non_finite[:20]}")
 
     def _run_online_vlm(
         self,

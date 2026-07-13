@@ -849,10 +849,11 @@ class LtxTrainerConfig(ConfigBaseModel):
             raise ValueError("Training mode must be 'lora' when using video_to_video strategy")
 
         if self.training_strategy.name == "multi_reference_planner_stage2":
+            training_phase = self.training_strategy.training_phase
             if self.model.training_mode != "lora" or self.lora is None:
-                raise ValueError("Stage 2 requires the Stage 1 DiT LoRA configuration")
+                raise ValueError(f"{training_phase} requires the Stage 1 DiT LoRA configuration")
             if self.lora.rank != 128 or self.lora.alpha != 128:
-                raise ValueError("Stage 2 DiT LoRA must match Stage 1 rank=128, alpha=128")
+                raise ValueError(f"{training_phase} DiT LoRA must match Stage 1 rank=128, alpha=128")
             required_dit_targets = {
                 "attn1.to_k",
                 "attn1.to_q",
@@ -866,19 +867,22 @@ class LtxTrainerConfig(ConfigBaseModel):
                 "ff.net.2",
             }
             if set(self.lora.target_modules) != required_dit_targets:
-                raise ValueError("Stage 2 DiT LoRA target_modules must exactly match the Stage 1 full-token config")
+                raise ValueError(
+                    f"{training_phase} DiT LoRA target_modules must exactly match the Stage 1 full-token config"
+                )
             if not self.text_encoder_lora.enabled or self.text_encoder_lora.rank != 16:
-                raise ValueError("Stage 2 requires text_encoder_lora.enabled=true with rank=16")
+                raise ValueError(f"{training_phase} requires text_encoder_lora.enabled=true with rank=16")
             if self.text_encoder_lora.alpha != 16 or set(self.text_encoder_lora.target_modules) != {
                 "q_proj",
                 "k_proj",
                 "v_proj",
                 "o_proj",
             }:
-                raise ValueError("Stage 2 Gemma LoRA must use alpha=16 and q/k/v/o projections")
+                raise ValueError(f"{training_phase} Gemma LoRA must use alpha=16 and q/k/v/o projections")
             if self.model.load_checkpoint is None:
-                raise ValueError("Stage 2 requires model.load_checkpoint pointing to the Stage 1 checkpoint")
+                source = "merged Stage 2 checkpoint" if training_phase == "stage3" else "Stage 1 checkpoint"
+                raise ValueError(f"{training_phase} requires model.load_checkpoint pointing to the {source}")
             if not self.checkpoints.no_resume:
-                raise ValueError("Stage 2 requires checkpoints.no_resume=true so training starts at step 0")
+                raise ValueError(f"{training_phase} requires checkpoints.no_resume=true so training starts at step 0")
 
         return self

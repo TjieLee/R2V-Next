@@ -104,9 +104,10 @@ class LtxvTrainer:
 
         self._load_models()
         self._setup_accelerator()
-        self._collect_trainable_params()
+        self._setup_trainable_model_wrappers()
         self._loaded_checkpoint_path: Path | None = None
         self._load_checkpoint()
+        self._collect_trainable_params()
         self._prepare_models_for_training()
         self._dataset = None
         self._global_step = -1
@@ -484,8 +485,8 @@ class LtxvTrainer:
             text_encoder=self._text_encoder,
         )
 
-    def _collect_trainable_params(self) -> None:
-        """Collect trainable parameters based on training mode."""
+    def _setup_trainable_model_wrappers(self) -> None:
+        """Create LoRA wrappers before loading an initialization checkpoint."""
         self._train_transformer = self._training_strategy.train_transformer()
         self._train_embeddings_processor = self._training_strategy.train_embeddings_processor()
         self._train_text_encoder = self._training_strategy.train_text_encoder() or (
@@ -494,15 +495,26 @@ class LtxvTrainer:
         )
 
         if self._config.model.training_mode == "lora":
-            # For LoRA training, first set up LoRA layers
             self._setup_lora()
-            if not self._train_transformer:
-                self._transformer.requires_grad_(False)
         elif self._config.model.training_mode == "full":
-            # For full training, unfreeze all transformer parameters
-            self._transformer.requires_grad_(self._train_transformer)
+            pass
         else:
             raise ValueError(f"Unknown training mode: {self._config.model.training_mode}")
+
+    def _collect_trainable_params(self) -> None:
+        """Configure and collect trainable parameters after checkpoint initialization."""
+        if self._config.model.training_mode == "lora":
+            configure_transformer = getattr(
+                self._training_strategy,
+                "configure_transformer_trainability",
+                None,
+            )
+            if callable(configure_transformer):
+                configure_transformer(self._transformer)
+            elif not self._train_transformer:
+                self._transformer.requires_grad_(False)
+        else:
+            self._transformer.requires_grad_(self._train_transformer)
 
         self._embeddings_processor.requires_grad_(False)
         if self._train_embeddings_processor:
@@ -514,20 +526,96 @@ class LtxvTrainer:
         for module in strategy_modules.values():
             module.requires_grad_(True)
 
-        self._trainable_params = [p for p in self._transformer.parameters() if p.requires_grad]
+        candidate_params = [p for p in self._transformer.parameters() if p.requires_grad]
         if self._train_embeddings_processor:
-            self._trainable_params.extend(p for p in self._embeddings_processor.parameters() if p.requires_grad)
+            candidate_params.extend(p for p in self._embeddings_processor.parameters() if p.requires_grad)
         if self._train_text_encoder:
             if self._text_encoder is None:
                 raise ValueError("Training strategy requested text encoder training, but no text encoder was loaded.")
-            self._trainable_params.extend(p for p in self._text_encoder.parameters() if p.requires_grad)
+            candidate_params.extend(p for p in self._text_encoder.parameters() if p.requires_grad)
         for module in strategy_modules.values():
-            self._trainable_params.extend(p for p in module.parameters() if p.requires_grad)
+            candidate_params.extend(p for p in module.parameters() if p.requires_grad)
+
+        self._trainable_params = self._deduplicate_parameters(candidate_params)
 
         if not self._trainable_params:
             raise ValueError("No trainable parameters were found for the selected training strategy.")
 
         logger.debug(f"Trainable params count: {sum(p.numel() for p in self._trainable_params):,}")
+        self._log_stage3_parameter_summary(strategy_modules)
+
+    @staticmethod
+    def _deduplicate_parameters(parameters: list[Tensor]) -> list[Tensor]:
+        unique: list[Tensor] = []
+        seen: set[int] = set()
+        for parameter in parameters:
+            if not parameter.requires_grad:
+                continue
+            parameter_id = id(parameter)
+            if parameter_id not in seen:
+                seen.add(parameter_id)
+                unique.append(parameter)
+        return unique
+
+    def _log_stage3_parameter_summary(self, strategy_modules: dict[str, torch.nn.Module]) -> None:
+        if getattr(self._training_strategy.config, "training_phase", "stage2") != "stage3":
+            return
+
+        count = lambda parameters: sum(parameter.numel() for parameter in parameters)  # noqa: E731
+        dit_lora = [
+            parameter
+            for name, parameter in self._transformer.named_parameters()
+            if parameter.requires_grad and "lora_" in name
+        ]
+        frozen_dit = [
+            parameter
+            for name, parameter in self._transformer.named_parameters()
+            if not parameter.requires_grad and "lora_" not in name
+        ]
+        gemma_lora = []
+        frozen_gemma_base = []
+        frozen_vision_projector = []
+        if self._text_encoder is not None:
+            gemma_lora = [
+                parameter
+                for name, parameter in self._text_encoder.named_parameters()
+                if parameter.requires_grad and "lora_" in name
+            ]
+            frozen_gemma_base = [
+                parameter
+                for name, parameter in self._text_encoder.named_parameters()
+                if not parameter.requires_grad
+                and "lora_" not in name
+                and "vision_tower" not in name
+                and "multi_modal_projector" not in name
+            ]
+            frozen_vision_projector = [
+                parameter
+                for name, parameter in self._text_encoder.named_parameters()
+                if not parameter.requires_grad
+                and ("vision_tower" in name or "multi_modal_projector" in name)
+            ]
+        connector_params = [
+            parameter
+            for parameter in self._embeddings_processor.video_connector.parameters()
+            if parameter.requires_grad
+        ]
+        logger.info(f"Stage 3 trainable DiT LoRA params: {count(dit_lora):,}")
+        logger.info(f"Stage 3 trainable Gemma LoRA params: {count(gemma_lora):,}")
+        logger.info(f"Stage 3 trainable planner params: {count(strategy_modules['planner_tokens'].parameters()):,}")
+        logger.info(
+            "Stage 3 trainable visual projection params: "
+            f"{count(strategy_modules['visual_token_projection'].parameters()):,}"
+        )
+        logger.info(
+            "Stage 3 trainable visual encoder params: "
+            f"{count(strategy_modules['visual_full_encoder'].parameters()):,}"
+        )
+        logger.info(f"Stage 3 trainable text connector params: {count(connector_params):,}")
+        logger.info(f"Stage 3 total trainable params: {count(self._trainable_params):,}")
+        logger.info(f"Frozen base DiT params: {count(frozen_dit):,}")
+        logger.info(f"Frozen Gemma base params: {count(frozen_gemma_base):,}")
+        logger.info(f"Frozen vision/projector params: {count(frozen_vision_projector):,}")
 
     def _init_timestep_sampler(self) -> None:
         """Initialize the timestep sampler based on the config."""
@@ -613,6 +701,9 @@ class LtxvTrainer:
     def _load_lora_checkpoint(self, checkpoint_path: Path) -> None:
         """Load LoRA checkpoint with DDP/FSDP compatibility."""
         state_dict = load_file(checkpoint_path)
+        validate_initial = getattr(self._training_strategy, "validate_initial_checkpoint_state_dict", None)
+        if callable(validate_initial):
+            validate_initial(state_dict)
         self._load_auxiliary_checkpoint_state(state_dict)
 
         # Adjust layer names to match internal format.
