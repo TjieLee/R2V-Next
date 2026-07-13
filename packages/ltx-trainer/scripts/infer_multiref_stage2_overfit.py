@@ -292,9 +292,6 @@ def _load_inference_runtime(
     if hasattr(embeddings_processor, "feature_extractor"):
         embeddings_processor.feature_extractor = None
 
-    gc.collect()
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
     negative_conditions = None
     if guidance_scale > 1.0:
         negative_conditions = _encode_negative_prompt_condition(
@@ -305,7 +302,20 @@ def _load_inference_runtime(
             device=device,
             dtype=dtype,
         )
-        console.print(f"Cached negative prompt condition: {stage1._condition_shape(negative_conditions)}")
+        console.print(
+            f"Cached negative prompt condition: "
+            f"{stage1._condition_shape(negative_conditions)}"
+        )
+
+    # Negative prompt has now been encoded and cached. The online Stage 2
+    # planner path does not need the LTX text feature extractor afterward.
+    if hasattr(embeddings_processor, "feature_extractor"):
+        embeddings_processor.feature_extractor = None
+
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+        # console.print(f"Cached negative prompt condition: {stage1._condition_shape(negative_conditions)}")
     vae_decoder = load_video_vae_decoder(cfg.model.model_path, device=device, dtype=dtype)
     vae_decoder.requires_grad_(False).eval()
     return Stage2InferenceRuntime(
