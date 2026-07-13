@@ -81,8 +81,8 @@ training_strategy:
   cfg_dropout_enabled: true
   cfg_full_p: 0.65
   cfg_drop_text_p: 0.10
-  cfg_drop_siglip_p: 0.10
-  cfg_drop_ref_latents_p: 0.10
+  cfg_drop_siglip_p: 0.05
+  cfg_drop_ref_latents_p: 0.15
   cfg_drop_all_p: 0.05
   cfg_drop_ref_p: 0.0
   cfg_drop_planner_p: 0.0
