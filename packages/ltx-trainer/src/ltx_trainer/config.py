@@ -882,7 +882,5 @@ class LtxTrainerConfig(ConfigBaseModel):
             if self.model.load_checkpoint is None:
                 source = "merged Stage 2 checkpoint" if training_phase == "stage3" else "Stage 1 checkpoint"
                 raise ValueError(f"{training_phase} requires model.load_checkpoint pointing to the {source}")
-            if not self.checkpoints.no_resume:
-                raise ValueError(f"{training_phase} requires checkpoints.no_resume=true so training starts at step 0")
 
         return self

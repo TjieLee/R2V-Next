@@ -18,6 +18,7 @@ from peft import LoraConfig, get_peft_model, get_peft_model_state_dict, set_peft
 from peft.tuners.tuners_utils import BaseTunerLayer
 from peft.utils import ModulesToSaveWrapper
 from pydantic import BaseModel
+from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 from torch import Tensor
 from torch.optim import AdamW
@@ -67,6 +68,16 @@ StepCallback = Callable[[int, int, list[Path]], None]  # (step, total, list[samp
 MEMORY_CHECK_INTERVAL = 200
 
 
+def normalize_peft_adapter_key(key: str) -> str:
+    """Normalize PEFT adapter keys across saved and in-memory naming variants."""
+    normalized = key
+    while normalized.startswith("base_model.model."):
+        normalized = normalized.removeprefix("base_model.model.")
+    for adapter_key in ("lora_A", "lora_B", "lora_embedding_A", "lora_embedding_B"):
+        normalized = normalized.replace(f".{adapter_key}.default.", f".{adapter_key}.")
+    return normalized
+
+
 class TrainingStats(BaseModel):
     """Statistics collected during training"""
 
@@ -113,6 +124,8 @@ class LtxvTrainer:
         self._global_step = -1
         self._checkpoint_paths: list[Path] = []
         self._training_state_paths: list[Path] = []
+        self._last_saved_step: int | None = None
+        self._last_saved_weights_path: Path | None = None
         self._training_state_size_warned = False
         self._sigma_tracker = SigmaBucketTracker()
         self._wandb_run = None
@@ -145,6 +158,8 @@ class LtxvTrainer:
         self._init_optimizer()
 
         if training_state is not None and not self._restore_training_state(training_state):
+            if self._is_strict_stage3_resume():
+                raise RuntimeError("Failed to restore the Stage 3 training state")
             initial_step = 0
             resuming = False
 
@@ -698,6 +713,161 @@ class LtxvTrainer:
 
         logger.info("✅ Full model checkpoint loaded successfully")
 
+    @staticmethod
+    def _index_peft_adapter_state(
+        state_dict: dict[str, Tensor],
+        *,
+        label: str,
+    ) -> dict[str, tuple[str, Tensor]]:
+        indexed: dict[str, tuple[str, Tensor]] = {}
+        for key, value in state_dict.items():
+            normalized = normalize_peft_adapter_key(key)
+            if normalized in indexed:
+                first_key = indexed[normalized][0]
+                raise RuntimeError(
+                    f"{label} contains duplicate normalized adapter key {normalized!r}: "
+                    f"{first_key!r} and {key!r}"
+                )
+            indexed[normalized] = (key, value)
+        return indexed
+
+    @classmethod
+    def _validate_peft_adapter_state(
+        cls,
+        model: torch.nn.Module,
+        checkpoint_state: dict[str, Tensor],
+        *,
+        label: str,
+    ) -> tuple[dict[str, tuple[str, Tensor]], dict[str, tuple[str, Tensor]]]:
+        model = getattr(model, "module", model)
+        expected_state = get_peft_model_state_dict(model)
+        expected = cls._index_peft_adapter_state(expected_state, label=f"expected {label}")
+        checkpoint = cls._index_peft_adapter_state(checkpoint_state, label=f"checkpoint {label}")
+        expected_keys = set(expected)
+        checkpoint_keys = set(checkpoint)
+        missing = sorted(expected_keys - checkpoint_keys)
+        unexpected = sorted(checkpoint_keys - expected_keys)
+        if missing or unexpected:
+            raise RuntimeError(
+                f"Incomplete {label} checkpoint: missing={missing[:20]}, "
+                f"unexpected={unexpected[:20]}"
+            )
+
+        shape_mismatches = [
+            (
+                normalized,
+                tuple(checkpoint[normalized][1].shape),
+                tuple(expected[normalized][1].shape),
+            )
+            for normalized in sorted(expected_keys)
+            if checkpoint[normalized][1].shape != expected[normalized][1].shape
+        ]
+        if shape_mismatches:
+            raise RuntimeError(f"{label} checkpoint shape mismatch: {shape_mismatches[:20]}")
+        return expected, checkpoint
+
+    @classmethod
+    def _strict_load_peft_adapter_state(
+        cls,
+        model: torch.nn.Module,
+        checkpoint_state: dict[str, Tensor],
+        *,
+        label: str,
+    ) -> int:
+        """Load one PEFT adapter only after exact key and shape validation."""
+        model = getattr(model, "module", model)
+        expected, checkpoint = cls._validate_peft_adapter_state(
+            model,
+            checkpoint_state,
+            label=label,
+        )
+        expected_keys = set(expected)
+
+        load_state = {
+            expected[normalized][0]: checkpoint[normalized][1]
+            for normalized in sorted(expected_keys)
+        }
+        try:
+            load_result = set_peft_model_state_dict(model, load_state)
+        except (RuntimeError, ValueError) as exc:
+            raise RuntimeError(f"Failed to load the complete {label} checkpoint") from exc
+
+        adapter_missing = [key for key in load_result.missing_keys if "lora_" in key]
+        adapter_unexpected = [key for key in load_result.unexpected_keys if "lora_" in key]
+        if adapter_missing or adapter_unexpected:
+            raise RuntimeError(
+                f"PEFT rejected part of {label}: missing={adapter_missing[:20]}, "
+                f"unexpected={adapter_unexpected[:20]}"
+            )
+
+        loaded = cls._index_peft_adapter_state(
+            get_peft_model_state_dict(model),
+            label=f"loaded {label}",
+        )
+        different = [
+            normalized
+            for normalized in sorted(expected_keys)
+            if not torch.equal(
+                loaded[normalized][1].detach().cpu().to(checkpoint[normalized][1].dtype),
+                checkpoint[normalized][1].detach().cpu(),
+            )
+        ]
+        if different:
+            raise RuntimeError(f"{label} tensors differ after loading: {different[:20]}")
+        return len(expected_keys)
+
+    @staticmethod
+    def _validate_module_state(
+        module: torch.nn.Module,
+        checkpoint_state: dict[str, Tensor],
+        *,
+        label: str,
+    ) -> None:
+        if not checkpoint_state:
+            raise RuntimeError(f"Stage 3 checkpoint is missing {label}")
+        expected_state = module.state_dict()
+        missing = sorted(set(expected_state) - set(checkpoint_state))
+        unexpected = sorted(set(checkpoint_state) - set(expected_state))
+        if missing or unexpected:
+            raise RuntimeError(
+                f"Incomplete {label} checkpoint: missing={missing[:20]}, "
+                f"unexpected={unexpected[:20]}"
+            )
+        shape_mismatches = [
+            (key, tuple(checkpoint_state[key].shape), tuple(expected_state[key].shape))
+            for key in sorted(expected_state)
+            if checkpoint_state[key].shape != expected_state[key].shape
+        ]
+        if shape_mismatches:
+            raise RuntimeError(f"{label} checkpoint shape mismatch: {shape_mismatches[:20]}")
+
+    @classmethod
+    def _strict_load_module_state(
+        cls,
+        module: torch.nn.Module,
+        checkpoint_state: dict[str, Tensor],
+        *,
+        label: str,
+    ) -> int:
+        """Strictly load a regular module and verify the loaded tensor values."""
+        cls._validate_module_state(module, checkpoint_state, label=label)
+        try:
+            module.load_state_dict(checkpoint_state, strict=True)
+        except RuntimeError as exc:
+            raise RuntimeError(f"Failed to load the complete {label} checkpoint") from exc
+        loaded_state = module.state_dict()
+        different = [
+            key
+            for key in sorted(checkpoint_state)
+            if not torch.equal(
+                loaded_state[key].detach().cpu().to(checkpoint_state[key].dtype),
+                checkpoint_state[key].detach().cpu(),
+            )
+        ]
+        if different:
+            raise RuntimeError(f"{label} tensors differ after loading: {different[:20]}")
+        return len(checkpoint_state)
+
     def _load_lora_checkpoint(self, checkpoint_path: Path) -> None:
         """Load LoRA checkpoint with DDP/FSDP compatibility."""
         state_dict = load_file(checkpoint_path)
@@ -708,22 +878,32 @@ class LtxvTrainer:
 
         # Adjust layer names to match internal format.
         # (Weights are saved in ComfyUI-compatible format, with "diffusion_model." prefix)
-        state_dict = {k.replace("diffusion_model.", "", 1): v for k, v in state_dict.items() if k.startswith("diffusion_model.")}
+        state_dict = {
+            key.replace("diffusion_model.", "", 1): value
+            for key, value in state_dict.items()
+            if key.startswith("diffusion_model.")
+        }
 
         if not state_dict:
             logger.info("No LoRA weights found in checkpoint; loaded auxiliary weights only")
             return
 
-        # Load LoRA weights and verify all weights were loaded. Shape mismatches usually mean
-        # rank/target_modules differ from the checkpoint and must not be silently ignored.
-        base_model = self._transformer.get_base_model()
-        try:
-            set_peft_model_state_dict(base_model, state_dict)
-        except RuntimeError as exc:
-            raise RuntimeError(
-                "LoRA config does not match checkpoint. Use the original training config or matching "
-                "rank/target_modules."
-            ) from exc
+        if self._is_stage3_phase():
+            self._strict_load_peft_adapter_state(
+                self._transformer,
+                state_dict,
+                label="Stage 1 DiT LoRA",
+            )
+        else:
+            # Older strategies retain their permissive PEFT loading behavior.
+            base_model = self._transformer.get_base_model()
+            try:
+                set_peft_model_state_dict(base_model, state_dict)
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    "LoRA config does not match checkpoint. Use the original training config or matching "
+                    "rank/target_modules."
+                ) from exc
 
         logger.info("✅ LoRA checkpoint loaded successfully")
 
@@ -739,6 +919,10 @@ class LtxvTrainer:
 
     def _load_auxiliary_checkpoint_state(self, state_dict: dict[str, Tensor]) -> None:
         self._training_strategy.load_extra_checkpoint_state_dict(state_dict)
+
+        if self._is_stage3_phase():
+            self._load_stage3_auxiliary_checkpoint_state(state_dict)
+            return
 
         processor_state = {
             key.removeprefix("embeddings_processor."): value
@@ -771,6 +955,45 @@ class LtxvTrainer:
                     logger.debug(f"Unexpected text encoder keys while loading auxiliary checkpoint: {unexpected}")
                 logger.info("✅ Text encoder checkpoint loaded successfully")
 
+    def _load_stage3_auxiliary_checkpoint_state(self, state_dict: dict[str, Tensor]) -> None:
+        connector_prefix = "embeddings_processor.video_connector."
+        connector_state = {
+            key.removeprefix(connector_prefix): value
+            for key, value in state_dict.items()
+            if key.startswith(connector_prefix)
+        }
+        self._strict_load_module_state(
+            self._embeddings_processor.video_connector,
+            connector_state,
+            label="video connector",
+        )
+        logger.info("✅ Complete video connector checkpoint loaded successfully")
+
+        gemma_prefix = "text_encoder.model.model.language_model."
+        gemma_adapter_state = {
+            key.removeprefix(gemma_prefix): value
+            for key, value in state_dict.items()
+            if key.startswith(gemma_prefix)
+        }
+        if self._text_encoder is None:
+            raise RuntimeError("Stage 3 checkpoint contains Gemma LoRA weights but no text encoder is loaded")
+        get_language_model = getattr(self._training_strategy, "_get_language_model", None)
+        if not callable(get_language_model):
+            raise RuntimeError("Stage 3 strategy does not expose its Gemma PEFT language model")
+        self._strict_load_peft_adapter_state(
+            get_language_model(),
+            gemma_adapter_state,
+            label="Stage 2 Gemma LoRA",
+        )
+        logger.info("✅ Complete Gemma LoRA checkpoint loaded successfully")
+
+    def _is_stage3_phase(self) -> bool:
+        strategy_config = getattr(self._training_strategy, "config", None)
+        return getattr(strategy_config, "training_phase", None) == "stage3"
+
+    def _is_strict_stage3_resume(self) -> bool:
+        return self._is_stage3_phase() and not self._config.checkpoints.no_resume
+
     def _resolve_resume_state(self) -> tuple[int, TrainingState | None]:
         """Determine resume state by looking for a training state file next to the loaded checkpoint.
         Returns (initial_step, TrainingState or None).
@@ -779,8 +1002,16 @@ class LtxvTrainer:
         if self._config.checkpoints.no_resume or self._loaded_checkpoint_path is None:
             return 0, None
 
+        strict_stage3_resume = self._is_strict_stage3_resume()
+        if strict_stage3_resume:
+            metadata = self._read_safetensors_metadata(self._loaded_checkpoint_path)
+            if metadata.get("training_phase") != "stage3":
+                raise RuntimeError(self._stage3_resume_error_message())
+
         state = self._load_training_state(self._loaded_checkpoint_path)
         if state is None:
+            if strict_stage3_resume:
+                raise RuntimeError(self._stage3_resume_error_message())
             return 0, None
 
         fp = state.config_fingerprint
@@ -800,6 +1031,10 @@ class LtxvTrainer:
         ):
             mismatches.append(f"lora_rank: {fp.lora_rank} → {cfg.lora.rank}")
         if mismatches:
+            if strict_stage3_resume:
+                raise RuntimeError(
+                    f"Stage 3 training state config mismatch: {', '.join(mismatches)}"
+                )
             logger.warning(
                 f"⚠️ Training state config mismatch ({', '.join(mismatches)}). "
                 "Starting from step 0. Set checkpoints.no_resume=true to silence this warning."
@@ -807,10 +1042,29 @@ class LtxvTrainer:
             return 0, None
 
         if state.global_step < 0:
-            logger.warning(f"⚠️ Training state has invalid global_step={state.global_step!r}. Starting from step 0.")
+            if strict_stage3_resume:
+                raise RuntimeError(f"Stage 3 training state has invalid global_step={state.global_step!r}")
+            logger.warning(
+                f"⚠️ Training state has invalid global_step={state.global_step!r}. Starting from step 0."
+            )
             return 0, None
         logger.info(f"📌 Resuming from step {state.global_step}")
         return state.global_step, state
+
+    @staticmethod
+    def _read_safetensors_metadata(checkpoint_path: Path) -> dict[str, str]:
+        try:
+            with safe_open(str(checkpoint_path), framework="pt", device="cpu") as checkpoint:
+                return checkpoint.metadata() or {}
+        except Exception as exc:
+            raise RuntimeError(f"Could not read checkpoint metadata from {checkpoint_path}") from exc
+
+    @staticmethod
+    def _stage3_resume_error_message() -> str:
+        return (
+            "Stage 3 resume requires a Stage 3 checkpoint and matching training state. "
+            "Use no_resume=true when initializing from a Stage 2 checkpoint."
+        )
 
     @staticmethod
     def _load_training_state(checkpoint_path: Path) -> TrainingState | None:
@@ -1259,11 +1513,23 @@ class LtxvTrainer:
         filename = f"{prefix}_weights_step_{self._global_step:05d}.safetensors"
         saved_weights_path = save_dir / filename
 
+        if (
+            self._last_saved_step == self._global_step
+            and self._last_saved_weights_path is not None
+            and self._last_saved_weights_path.is_file()
+        ):
+            logger.debug(
+                f"Checkpoint for step {self._global_step} already exists; skipping duplicate save"
+            )
+            return self._last_saved_weights_path
+
         # Get state dict (collective operation - all processes must participate)
         self._accelerator.wait_for_everyone()
         full_state_dict = self._accelerator.get_state_dict(self._transformer)
 
         if not IS_MAIN_PROCESS:
+            self._last_saved_step = self._global_step
+            self._last_saved_weights_path = saved_weights_path
             return None
 
         save_dir.mkdir(exist_ok=True, parents=True)
@@ -1288,6 +1554,9 @@ class LtxvTrainer:
             state_dict = {k: v.to(save_dtype) if isinstance(v, Tensor) else v for k, v in state_dict.items()}
             state_dict.update(auxiliary_state_dict)
 
+            if self._is_stage3_phase():
+                self._validate_stage3_checkpoint_components(state_dict)
+
             validate_checkpoint = getattr(self._training_strategy, "validate_checkpoint_state_dict", None)
             if callable(validate_checkpoint):
                 validate_checkpoint(state_dict)
@@ -1308,10 +1577,13 @@ class LtxvTrainer:
         rel_path = saved_weights_path.relative_to(self._config.output_dir)
         logger.info(f"💾 {prefix.capitalize()} weights for step {self._global_step} saved in {rel_path}")
 
-        self._checkpoint_paths.append(saved_weights_path)
-        self._cleanup_checkpoints()
-
         self._save_training_state(save_dir)
+
+        self._last_saved_step = self._global_step
+        self._last_saved_weights_path = saved_weights_path
+        if saved_weights_path not in self._checkpoint_paths:
+            self._checkpoint_paths.append(saved_weights_path)
+        self._cleanup_checkpoints()
 
         return saved_weights_path
 
@@ -1343,8 +1615,83 @@ class LtxvTrainer:
         full_state = self._accelerator.get_state_dict(self._text_encoder)
         return {key: value for key, value in full_state.items() if key in trainable_names}
 
+    @staticmethod
+    def _checkpoint_substate(state_dict: dict[str, Tensor], prefix: str) -> dict[str, Tensor]:
+        return {
+            key.removeprefix(prefix): value
+            for key, value in state_dict.items()
+            if key.startswith(prefix)
+        }
+
+    def _validate_stage3_checkpoint_components(self, state_dict: dict[str, Tensor]) -> None:
+        """Reject incomplete Stage 3 checkpoints before they are written."""
+        transformer = self._accelerator.unwrap_model(self._transformer, keep_torch_compile=False)
+        self._validate_peft_adapter_state(
+            transformer,
+            self._checkpoint_substate(state_dict, "diffusion_model."),
+            label="Stage 1 DiT LoRA",
+        )
+
+        get_language_model = getattr(self._training_strategy, "_get_language_model", None)
+        if not callable(get_language_model):
+            raise RuntimeError("Stage 3 strategy does not expose its Gemma PEFT language model")
+        language_model = self._accelerator.unwrap_model(
+            get_language_model(),
+            keep_torch_compile=False,
+        )
+        self._validate_peft_adapter_state(
+            language_model,
+            self._checkpoint_substate(
+                state_dict,
+                "text_encoder.model.model.language_model.",
+            ),
+            label="Stage 2 Gemma LoRA",
+        )
+
+        strategy_modules = self._training_strategy.get_trainable_modules()
+        required_strategy_modules = {
+            "planner_tokens": "planner",
+            "visual_token_projection": "visual projection",
+            "visual_full_encoder": "Visual3DTokenEncoder",
+        }
+        for module_name, label in required_strategy_modules.items():
+            module = strategy_modules.get(module_name)
+            if module is None:
+                raise RuntimeError(f"Stage 3 strategy is missing required module {module_name}")
+            module = self._accelerator.unwrap_model(module, keep_torch_compile=False)
+            self._validate_module_state(
+                module,
+                self._checkpoint_substate(
+                    state_dict,
+                    f"training_strategy.{module_name}.",
+                ),
+                label=label,
+            )
+
+        connector = self._accelerator.unwrap_model(
+            self._embeddings_processor.video_connector,
+            keep_torch_compile=False,
+        )
+        self._validate_module_state(
+            connector,
+            self._checkpoint_substate(
+                state_dict,
+                "embeddings_processor.video_connector.",
+            ),
+            label="video connector",
+        )
+
     def _cleanup_checkpoints(self) -> None:
         """Clean up old checkpoints."""
+        unique_paths: list[Path] = []
+        resolved_paths: set[Path] = set()
+        for checkpoint_path in self._checkpoint_paths:
+            resolved = checkpoint_path.resolve()
+            if resolved not in resolved_paths:
+                resolved_paths.add(resolved)
+                unique_paths.append(checkpoint_path)
+        self._checkpoint_paths = unique_paths
+
         if 0 < self._config.checkpoints.keep_last_n < len(self._checkpoint_paths):
             checkpoints_to_remove = self._checkpoint_paths[: -self._config.checkpoints.keep_last_n]
             for old_checkpoint in checkpoints_to_remove:

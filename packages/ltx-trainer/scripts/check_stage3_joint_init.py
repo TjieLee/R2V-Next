@@ -6,15 +6,76 @@ from pathlib import Path
 import torch
 import typer
 import yaml
+from peft import get_peft_model_state_dict
+from safetensors.torch import load_file
 
 from ltx_trainer.config import LtxTrainerConfig
-from ltx_trainer.trainer import LtxvTrainer
+from ltx_trainer.trainer import LtxvTrainer, normalize_peft_adapter_key
 from ltx_trainer.training_strategies.multi_reference_planner_stage2 import (
     MultiReferencePlannerStage2Strategy,
 )
 
 
 app = typer.Typer(pretty_exceptions_enable=False, no_args_is_help=True)
+
+
+def _index_state(
+    state: dict[str, torch.Tensor],
+    *,
+    normalize_peft: bool,
+) -> dict[str, torch.Tensor]:
+    indexed: dict[str, torch.Tensor] = {}
+    for key, value in state.items():
+        normalized = normalize_peft_adapter_key(key) if normalize_peft else key
+        if normalized in indexed:
+            raise RuntimeError(f"Duplicate normalized checkpoint key: {normalized}")
+        indexed[normalized] = value
+    return indexed
+
+
+def _assert_exact_tensor_group(
+    *,
+    label: str,
+    checkpoint_state: dict[str, torch.Tensor],
+    loaded_state: dict[str, torch.Tensor],
+    normalize_peft: bool = False,
+) -> int:
+    checkpoint = _index_state(checkpoint_state, normalize_peft=normalize_peft)
+    loaded = _index_state(loaded_state, normalize_peft=normalize_peft)
+    missing = sorted(set(checkpoint) - set(loaded))
+    unexpected = sorted(set(loaded) - set(checkpoint))
+    if missing or unexpected:
+        raise RuntimeError(
+            f"{label} key mismatch: missing={missing[:20]}, unexpected={unexpected[:20]}"
+        )
+    shape_mismatches = [
+        (key, tuple(checkpoint[key].shape), tuple(loaded[key].shape))
+        for key in sorted(checkpoint)
+        if checkpoint[key].shape != loaded[key].shape
+    ]
+    if shape_mismatches:
+        raise RuntimeError(f"{label} shape mismatch: {shape_mismatches[:20]}")
+    different = [
+        key
+        for key in sorted(checkpoint)
+        if not torch.equal(
+            loaded[key].detach().cpu().to(checkpoint[key].dtype),
+            checkpoint[key].detach().cpu(),
+        )
+    ]
+    if different:
+        raise RuntimeError(f"{label} differs from the source checkpoint: {different[:20]}")
+    if not checkpoint:
+        raise RuntimeError(f"{label} checkpoint group is empty")
+    return len(checkpoint)
+
+
+def _checkpoint_group(state: dict[str, torch.Tensor], prefix: str) -> dict[str, torch.Tensor]:
+    return {
+        key.removeprefix(prefix): value
+        for key, value in state.items()
+        if key.startswith(prefix)
+    }
 
 
 def _has_finite_nonzero_gradient(module: torch.nn.Module) -> bool:
@@ -73,16 +134,7 @@ def main(
     if not trainer._train_transformer:
         raise RuntimeError("Stage 3 must train the Stage 1 DiT LoRA")
 
-    _assert_only_lora_trainable(trainer._transformer, "Stage 1 DiT")
     text_encoder = strategy._unwrap_text_encoder()
-    _assert_only_lora_trainable(text_encoder, "Gemma language model")
-    gemma_model = text_encoder.model.model
-    _assert_frozen_module(getattr(gemma_model, "vision_tower", None), "Gemma vision tower")
-    _assert_frozen_module(
-        getattr(gemma_model, "multi_modal_projector", None),
-        "Gemma multimodal projector",
-    )
-
     modules = strategy.get_trainable_modules()
     required_modules = {
         "planner_tokens",
@@ -93,6 +145,82 @@ def main(
     if missing_modules:
         raise RuntimeError(f"Missing Stage 3 strategy modules: {sorted(missing_modules)}")
     connector = trainer._embeddings_processor.video_connector
+    checkpoint_state = load_file(trainer._loaded_checkpoint_path)
+    dit = trainer._accelerator.unwrap_model(trainer._transformer, keep_torch_compile=False)
+    language_model = trainer._accelerator.unwrap_model(
+        strategy._get_language_model(),
+        keep_torch_compile=False,
+    )
+    verified_counts = {
+        "DiT LoRA": _assert_exact_tensor_group(
+            label="DiT LoRA",
+            checkpoint_state=_checkpoint_group(checkpoint_state, "diffusion_model."),
+            loaded_state=get_peft_model_state_dict(dit),
+            normalize_peft=True,
+        ),
+        "Gemma LoRA": _assert_exact_tensor_group(
+            label="Gemma LoRA",
+            checkpoint_state=_checkpoint_group(
+                checkpoint_state,
+                "text_encoder.model.model.language_model.",
+            ),
+            loaded_state=get_peft_model_state_dict(language_model),
+            normalize_peft=True,
+        ),
+        "Planner": _assert_exact_tensor_group(
+            label="Planner",
+            checkpoint_state=_checkpoint_group(
+                checkpoint_state,
+                "training_strategy.planner_tokens.",
+            ),
+            loaded_state=trainer._accelerator.unwrap_model(
+                modules["planner_tokens"], keep_torch_compile=False
+            ).state_dict(),
+        ),
+        "Visual projection": _assert_exact_tensor_group(
+            label="Visual projection",
+            checkpoint_state=_checkpoint_group(
+                checkpoint_state,
+                "training_strategy.visual_token_projection.",
+            ),
+            loaded_state=trainer._accelerator.unwrap_model(
+                modules["visual_token_projection"], keep_torch_compile=False
+            ).state_dict(),
+        ),
+        "Visual3DTokenEncoder": _assert_exact_tensor_group(
+            label="Visual3DTokenEncoder",
+            checkpoint_state=_checkpoint_group(
+                checkpoint_state,
+                "training_strategy.visual_full_encoder.",
+            ),
+            loaded_state=trainer._accelerator.unwrap_model(
+                modules["visual_full_encoder"], keep_torch_compile=False
+            ).state_dict(),
+        ),
+        "Text connector": _assert_exact_tensor_group(
+            label="Text connector",
+            checkpoint_state=_checkpoint_group(
+                checkpoint_state,
+                "embeddings_processor.video_connector.",
+            ),
+            loaded_state=trainer._accelerator.unwrap_model(
+                connector, keep_torch_compile=False
+            ).state_dict(),
+        ),
+    }
+    for label, count in verified_counts.items():
+        typer.echo(f"{label} tensors loaded: {count}/{count}")
+    del checkpoint_state
+
+    _assert_only_lora_trainable(trainer._transformer, "Stage 1 DiT")
+    _assert_only_lora_trainable(text_encoder, "Gemma language model")
+    gemma_model = text_encoder.model.model
+    _assert_frozen_module(getattr(gemma_model, "vision_tower", None), "Gemma vision tower")
+    _assert_frozen_module(
+        getattr(gemma_model, "multi_modal_projector", None),
+        "Gemma multimodal projector",
+    )
+
     if not all(parameter.requires_grad for parameter in connector.parameters()):
         raise RuntimeError("Stage 3 text connector must be trainable")
 

@@ -505,6 +505,7 @@ def _run_one_sample(  # noqa: PLR0913, PLR0915
     save_predicted_tokens: bool,
     guidance_scale: float,
     ref_guidance_scale: float,
+    guidance_rescale: float,
     stg_scale: float,
     stg_blocks: list[int] | None,
     num_inference_steps: int,
@@ -627,7 +628,7 @@ def _run_one_sample(  # noqa: PLR0913, PLR0915
         cfg_drop_ref_latents_in_negative=False,
         ref_guidance_scale=ref_guidance_scale,
         siglip_guidance_scale=0.0,
-        guidance_rescale=0.0,
+        guidance_rescale=guidance_rescale,
         stg_scale=stg_scale,
         stg_blocks=stg_blocks,
         num_inference_steps=num_inference_steps,
@@ -672,6 +673,7 @@ def _run_one_sample(  # noqa: PLR0913, PLR0915
         "cfg_negative_mode": "negative_prompt_no_visual_keep_refs",
         "guidance_scale": guidance_scale,
         "ref_guidance_scale": ref_guidance_scale,
+        "guidance_rescale": guidance_rescale,
         "stg_scale": stg_scale,
         "stg_blocks": stg_blocks,
         "no_ref_branch_is_synchronized": ref_guidance_scale != 0.0,
@@ -827,6 +829,7 @@ def main(  # noqa: PLR0913, PLR0915
     negative_prompt: str | None = typer.Option(None, "--negative-prompt"),
     guidance_scale: float = typer.Option(2.0, "--guidance-scale"),
     ref_guidance_scale: float = typer.Option(2.0, "--ref-guidance-scale"),
+    guidance_rescale: float = typer.Option(0.0, "--guidance-rescale"),
     siglip_guidance_scale: float = typer.Option(0.0, "--siglip-guidance-scale"),
     stg_scale: float = typer.Option(1.0, "--stg-scale"),
     stg_blocks: str | None = typer.Option(None, "--stg-blocks"),
@@ -837,6 +840,7 @@ def main(  # noqa: PLR0913, PLR0915
         siglip_guidance_scale=siglip_guidance_scale,
         stg_scale=stg_scale,
     )
+    stage1._validate_guidance_rescale(guidance_rescale)
     _validate_strict_no_gt(
         strict_no_gt=strict_no_gt,
         position_source=position_source,
@@ -919,6 +923,7 @@ def main(  # noqa: PLR0913, PLR0915
             save_predicted_tokens=save_predicted_tokens,
             guidance_scale=guidance_scale,
             ref_guidance_scale=ref_guidance_scale,
+            guidance_rescale=guidance_rescale,
             stg_scale=stg_scale,
             stg_blocks=resolved_stg_blocks,
             num_inference_steps=num_inference_steps,
