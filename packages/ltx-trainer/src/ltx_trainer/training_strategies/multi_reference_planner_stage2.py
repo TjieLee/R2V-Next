@@ -551,6 +551,7 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
         planner_vlm_inputs: dict[str, Any],
         latents_metadata: dict[str, Any],
         visual_position_metadata: dict[str, Any],
+        drop_reference_images: bool = False,
     ) -> tuple[dict[str, Tensor], dict[str, Any]]:
         """Build Stage 2 planner conditions without GT visual tokens or training-only losses/dropout."""
         if not self.config.use_online_vlm:
@@ -584,6 +585,7 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
             planner_vlm_inputs,
             device=conditions[feature_key].device,
             token_positions=token_positions,
+            drop_reference_images=drop_reference_images,
         )
         self._assert_token_count("Predicted visual tokens", predicted_tokens, predicted_mask)
         planner_output_dim = self._resolved_planner_output_dim(
@@ -634,8 +636,34 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
             "pre_connector_condition_shape": pre_connector_shape,
             "post_connector_text_condition_shape": post_connector_text_shape,
             "final_condition_shape": list(final_conditions["video_prompt_embeds"].shape),
+            "drop_reference_images": drop_reference_images,
         }
         return final_conditions, diagnostics
+
+    @staticmethod
+    def _prepare_inference_planner_data(
+        planner_data: dict[str, Any],
+        *,
+        drop_reference_images: bool,
+        device: torch.device,
+    ) -> dict[str, Any]:
+        if not drop_reference_images:
+            return planner_data
+
+        planner_forward_data = dict(planner_data)
+        planner_forward_data.pop("pixel_values", None)
+        image_counts = planner_data.get("num_ref_images")
+        if isinstance(image_counts, Tensor):
+            planner_forward_data["num_ref_images"] = torch.zeros_like(image_counts)
+        else:
+            input_ids = planner_data.get("input_ids")
+            batch_size = input_ids.shape[0] if isinstance(input_ids, Tensor) and input_ids.ndim > 1 else 1
+            planner_forward_data["num_ref_images"] = torch.zeros(
+                batch_size,
+                dtype=torch.long,
+                device=device,
+            )
+        return planner_forward_data
 
     def _run_online_vlm_inference(
         self,
@@ -643,22 +671,54 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
         *,
         device: torch.device,
         token_positions: Tensor,
+        drop_reference_images: bool = False,
     ) -> tuple[Tensor, Tensor]:
         if self.text_encoder is None or self.planner_tokens is None:
             raise RuntimeError("Online VLM inference requires text_encoder and planner_tokens")
-        forward_inputs = self._build_vlm_forward_inputs(planner_data, device)
-        placeholder_mask = planner_data[self.config.vlm_placeholder_mask_key].to(device=device, dtype=torch.bool)
+        planner_forward_data = self._prepare_inference_planner_data(
+            planner_data,
+            drop_reference_images=drop_reference_images,
+            device=device,
+        )
+
+        forward_inputs = self._build_vlm_forward_inputs(planner_forward_data, device)
+        placeholder_mask = planner_forward_data[self.config.vlm_placeholder_mask_key].to(
+            device=device,
+            dtype=torch.bool,
+        )
         self._assert_placeholder_mask(placeholder_mask)
+        dropped_image_token_mask = None
+        drop_ref_mask = None
+        if drop_reference_images:
+            drop_ref_mask = torch.ones(
+                forward_inputs["input_ids"].shape[0],
+                dtype=torch.bool,
+                device=device,
+            )
+            dropped_image_token_mask, _ = self._build_vlm_dropout_masks(
+                planner_data=planner_forward_data,
+                forward_inputs=forward_inputs,
+                drop_ref_mask=drop_ref_mask,
+                drop_text_mask=None,
+            )
+            forward_inputs = self._apply_vlm_condition_dropout(
+                forward_inputs=forward_inputs,
+                dropped_image_token_mask=dropped_image_token_mask,
+                dropped_text_token_mask=None,
+            )
         inputs_embeds = self._build_vlm_inputs_embeds(
             forward_inputs,
-            planner_data,
+            planner_forward_data,
             placeholder_mask,
+            dropped_image_token_mask=dropped_image_token_mask,
+            drop_ref_mask=drop_ref_mask,
         )
         planner_hidden_source, _ = self._forward_language_model_for_planner(
             inputs_embeds=inputs_embeds,
             attention_mask=forward_inputs["attention_mask"],
             position_ids=forward_inputs.get("position_ids"),
             cache_position=forward_inputs.get("cache_position"),
+            force_eval=True,
         )
         selected_hidden, selected_mask = self._select_masked_hidden(
             planner_hidden_source,
@@ -975,9 +1035,11 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
         attention_mask: Tensor,
         position_ids: Tensor | None = None,
         cache_position: Tensor | None = None,
+        force_eval: bool = False,
     ) -> tuple[Tensor, Tensor]:
         language_model = self._get_language_model()
-        language_model.train(self.train_text_encoder())
+        enable_grad = self.train_text_encoder() and not force_eval
+        language_model.train(enable_grad)
         self._keep_frozen_vlm_modules_in_eval()
         need_intermediate_hidden = self.config.vlm_hidden_layer != -1
         lm_inputs = {
@@ -991,7 +1053,7 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
         if cache_position is not None:
             lm_inputs["cache_position"] = cache_position
 
-        with torch.set_grad_enabled(self.train_text_encoder()):
+        with torch.set_grad_enabled(enable_grad):
             outputs = language_model(**lm_inputs)
         if need_intermediate_hidden:
             hidden_states = self._extract_hidden_states(outputs)

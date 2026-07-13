@@ -22,7 +22,6 @@ from rich.console import Console
 from safetensors.torch import load_file
 from torch import Tensor, nn
 
-from ltx_core.types import VIDEO_SCALE_FACTORS
 from ltx_trainer.config import LtxTrainerConfig
 from ltx_trainer.model_loader import (
     load_embeddings_processor,
@@ -72,6 +71,8 @@ class Stage2InferenceRuntime:
     dtype: torch.dtype
     config_path: Path
     checkpoint_path: Path
+    negative_prompt: str | None
+    negative_conditions: dict[str, Tensor | None] | None
 
 
 def _load_config(config_path: Path) -> LtxTrainerConfig:
@@ -225,14 +226,35 @@ def _disable_gradient_checkpointing(transformer: nn.Module, strategy: MultiRefer
         disable()
 
 
+def _resolve_negative_prompt(
+    *,
+    cli_negative_prompt: str | None,
+    config_negative_prompt: str | None,
+    guidance_scale: float,
+) -> str | None:
+    cli_prompt = cli_negative_prompt.strip() if cli_negative_prompt else None
+    config_prompt = config_negative_prompt.strip() if config_negative_prompt else None
+    effective_prompt = cli_prompt or config_prompt
+    if guidance_scale > 1.0 and not effective_prompt:
+        raise ValueError("--guidance-scale > 1 requires a non-empty negative prompt")
+    return effective_prompt
+
+
 def _load_inference_runtime(
     *,
     config_path: Path,
     checkpoint_path: Path,
     device: torch.device,
     dtype: torch.dtype,
+    guidance_scale: float,
+    negative_prompt: str | None,
 ) -> Stage2InferenceRuntime:
     cfg = _load_config(config_path)
+    effective_negative_prompt = _resolve_negative_prompt(
+        cli_negative_prompt=negative_prompt,
+        config_negative_prompt=cfg.validation.negative_prompt,
+        guidance_scale=guidance_scale,
+    )
     transformer = load_transformer(cfg.model.model_path, device=device, dtype=dtype)
     transformer = _setup_dit_lora(transformer, cfg)
     embeddings_processor = load_embeddings_processor(cfg.model.model_path, device=device, dtype=dtype)
@@ -273,6 +295,17 @@ def _load_inference_runtime(
     gc.collect()
     if device.type == "cuda":
         torch.cuda.empty_cache()
+    negative_conditions = None
+    if guidance_scale > 1.0:
+        negative_conditions = _encode_negative_prompt_condition(
+            text_encoder=text_encoder,
+            embeddings_processor=embeddings_processor,
+            strategy=strategy,
+            negative_prompt=effective_negative_prompt,
+            device=device,
+            dtype=dtype,
+        )
+        console.print(f"Cached negative prompt condition: {stage1._condition_shape(negative_conditions)}")
     vae_decoder = load_video_vae_decoder(cfg.model.model_path, device=device, dtype=dtype)
     vae_decoder.requires_grad_(False).eval()
     return Stage2InferenceRuntime(
@@ -287,6 +320,8 @@ def _load_inference_runtime(
         dtype=dtype,
         config_path=config_path,
         checkpoint_path=checkpoint_path,
+        negative_prompt=effective_negative_prompt,
+        negative_conditions=negative_conditions,
     )
 
 
@@ -297,13 +332,17 @@ def _load_sample_precomputed(
     precomputed_root: Path,
     video_column: str,
     need_gt: bool,
+    strict_no_gt: bool,
 ) -> tuple[Path, dict[str, dict[str, Any]]]:
+    if strict_no_gt and need_gt:
+        raise ValueError("strict-no-GT mode cannot request GT SigLIP data")
     video_path = stage1._resolve_path(str(row[video_column]), manifest_root)
     rel_path = stage1._output_relative(video_path, manifest_root).with_suffix(".pt")
     files = {
         "latents": precomputed_root / "latents" / rel_path,
         "multi_reference_latents": precomputed_root / "multi_reference_latents" / rel_path,
         "conditions": precomputed_root / "vlm_conditions" / rel_path,
+        "text_conditions": precomputed_root / "conditions" / rel_path,
         "planner_vlm_inputs": precomputed_root / "planner_vlm_inputs" / rel_path,
     }
     if need_gt:
@@ -318,6 +357,7 @@ def _build_batch(precomputed: dict[str, dict[str, Any]]) -> dict[str, Any]:
         conditions=precomputed["conditions"],
     )
     batch["planner_vlm_inputs"] = stage1._unsqueeze_sample_dim(precomputed["planner_vlm_inputs"])
+    batch["text_conditions"] = stage1._unsqueeze_sample_dim(precomputed["text_conditions"])
     return batch
 
 
@@ -329,9 +369,10 @@ def _extract_gt_position_metadata(gt_data: dict[str, Any]) -> dict[str, Any]:
 
 
 def _uniform_position_metadata(latents_metadata: dict[str, Any]) -> dict[str, Tensor]:
-    latent_frames = int(latents_metadata["num_frames"].flatten()[0].item())
-    target_frames = max((latent_frames - 1) * VIDEO_SCALE_FACTORS.time + 1, 1)
-    sampled = torch.linspace(0, target_frames - 1, steps=8).round().to(dtype=torch.long).unsqueeze(0)
+    num_video_frames = int(latents_metadata["num_frames"].flatten()[0].item())
+    if num_video_frames < 1:
+        raise ValueError(f"num_frames must be positive, got {num_video_frames}")
+    sampled = torch.linspace(0, num_video_frames - 1, steps=8).round().to(dtype=torch.long).unsqueeze(0)
     fps = latents_metadata.get("fps")
     if isinstance(fps, Tensor):
         source_fps = fps.flatten()[:1].to(dtype=torch.float32)
@@ -415,6 +456,35 @@ def _autocast_context(device: torch.device, dtype: torch.dtype) -> Any:
     return nullcontext()
 
 
+def _encode_negative_prompt_condition(
+    *,
+    text_encoder: nn.Module,
+    embeddings_processor: nn.Module,
+    strategy: MultiReferencePlannerStage2Strategy,
+    negative_prompt: str | None,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> dict[str, Tensor | None]:
+    if not negative_prompt:
+        raise ValueError("Negative prompt must be non-empty")
+    language_model = strategy._get_language_model()
+    language_model = getattr(language_model, "module", language_model)
+    disable_adapter = getattr(language_model, "disable_adapter", None)
+    adapter_context = disable_adapter() if callable(disable_adapter) else nullcontext()
+    with adapter_context, torch.inference_mode(), _autocast_context(device, dtype):
+        hidden_states, attention_mask = text_encoder.encode([negative_prompt])[0]
+        encoded = embeddings_processor.process_hidden_states(hidden_states, attention_mask)
+    return {
+        "video_prompt_embeds": encoded.video_encoding.to(device=device, dtype=dtype),
+        "audio_prompt_embeds": (
+            encoded.audio_encoding.to(device=device, dtype=dtype)
+            if encoded.audio_encoding is not None
+            else None
+        ),
+        "prompt_attention_mask": None,
+    }
+
+
 def _run_one_sample(  # noqa: PLR0913, PLR0915
     *,
     runtime: Stage2InferenceRuntime,
@@ -431,7 +501,12 @@ def _run_one_sample(  # noqa: PLR0913, PLR0915
     decode_tile: bool,
     position_source: Literal["gt_metadata", "uniform_target"],
     compute_gt_siglip_metrics: bool,
+    strict_no_gt: bool,
     save_predicted_tokens: bool,
+    guidance_scale: float,
+    ref_guidance_scale: float,
+    stg_scale: float,
+    stg_blocks: list[int] | None,
     num_inference_steps: int,
     seed: int,
 ) -> Path:
@@ -457,13 +532,14 @@ def _run_one_sample(  # noqa: PLR0913, PLR0915
         gt_copy = None
         ref_copies = []
 
-    need_gt = position_source == "gt_metadata" or compute_gt_siglip_metrics
+    need_gt = not strict_no_gt and (position_source == "gt_metadata" or compute_gt_siglip_metrics)
     rel_path, precomputed = _load_sample_precomputed(
         row=sample,
         manifest_root=manifest_root,
         precomputed_root=precomputed_root,
         video_column=video_column,
         need_gt=need_gt,
+        strict_no_gt=strict_no_gt,
     )
     batch = _build_batch(precomputed)
     gt_data = precomputed.get("gt_siglip_tokens")
@@ -484,6 +560,11 @@ def _run_one_sample(  # noqa: PLR0913, PLR0915
         device=runtime.device,
         dtype=runtime.dtype,
     )
+    batch["text_conditions"] = stage1._move_nested_to_device(
+        batch["text_conditions"],
+        device=runtime.device,
+        dtype=runtime.dtype,
+    )
     visual_position_metadata = stage1._move_nested_to_device(
         visual_position_metadata,
         device=runtime.device,
@@ -496,6 +577,17 @@ def _run_one_sample(  # noqa: PLR0913, PLR0915
             latents_metadata=batch["latents"],
             visual_position_metadata=visual_position_metadata,
         )
+        if ref_guidance_scale != 0.0:
+            no_ref_conditions, no_ref_diagnostics = runtime.strategy.prepare_inference_conditions(
+                conditions=batch["text_conditions"],
+                planner_vlm_inputs=batch["planner_vlm_inputs"],
+                latents_metadata=batch["latents"],
+                visual_position_metadata=visual_position_metadata,
+                drop_reference_images=True,
+            )
+        else:
+            no_ref_conditions = None
+            no_ref_diagnostics = None
 
     planner_metrics: dict[str, float] = {}
     if compute_gt_siglip_metrics:
@@ -519,20 +611,25 @@ def _run_one_sample(  # noqa: PLR0913, PLR0915
     inference_diagnostics.pop("predicted_visual_tokens")
     inference_diagnostics.pop("predicted_visual_token_mask")
     inference_diagnostics.pop("token_positions")
+    if no_ref_diagnostics is not None:
+        no_ref_diagnostics.pop("predicted_visual_tokens")
+        no_ref_diagnostics.pop("predicted_visual_token_mask")
+        no_ref_diagnostics.pop("token_positions")
 
     generated_latents = stage1._denoise_stage1(
         transformer=runtime.transformer,
         strategy=runtime.strategy,
         batch=batch,
         positive_conditions=conditions,
-        negative_conditions=None,
-        guidance_scale=1.0,
+        negative_conditions=runtime.negative_conditions,
+        no_ref_conditions=no_ref_conditions,
+        guidance_scale=guidance_scale,
         cfg_drop_ref_latents_in_negative=False,
-        ref_guidance_scale=0.0,
+        ref_guidance_scale=ref_guidance_scale,
         siglip_guidance_scale=0.0,
         guidance_rescale=0.0,
-        stg_scale=0.0,
-        stg_blocks=None,
+        stg_scale=stg_scale,
+        stg_blocks=stg_blocks,
         num_inference_steps=num_inference_steps,
         seed=seed,
         device=runtime.device,
@@ -547,6 +644,8 @@ def _run_one_sample(  # noqa: PLR0913, PLR0915
 
     latent_fps = runtime.strategy._first_scalar(batch["latents"].get("fps"), default=24.0)
     output_fps = float(fps) if fps is not None else float(latent_fps)
+    sampled_frame_indices = visual_position_metadata["sampled_frame_indices"].detach().cpu().flatten().tolist()
+    num_video_frames = int(batch["latents"]["num_frames"].flatten()[0].item())
     generated_path = stage1._expected_generated_path(output_dir, sample_index, _CONDITION_MODE)
     reference_paths = [
         str(stage1._resolve_path(value, manifest_root))
@@ -567,6 +666,21 @@ def _run_one_sample(  # noqa: PLR0913, PLR0915
         "position_source": position_source,
         "uses_gt_visual_tokens": False,
         "uses_gt_visual_metadata": position_source == "gt_metadata",
+        "strict_no_gt": strict_no_gt,
+        "compute_gt_siglip_metrics": compute_gt_siglip_metrics,
+        "negative_prompt": runtime.negative_prompt if guidance_scale > 1.0 else None,
+        "cfg_negative_mode": "negative_prompt_no_visual_keep_refs",
+        "guidance_scale": guidance_scale,
+        "ref_guidance_scale": ref_guidance_scale,
+        "stg_scale": stg_scale,
+        "stg_blocks": stg_blocks,
+        "no_ref_branch_is_synchronized": ref_guidance_scale != 0.0,
+        "guidance_formula": (
+            "negative_with_refs + cfg*(full-negative_with_refs) + "
+            "ref*(full-no_ref_sync) + stg*(full-stg)"
+        ),
+        "uniform_sampled_frame_indices": sampled_frame_indices if position_source == "uniform_target" else None,
+        "num_video_frames": num_video_frames,
         "planner_raw_shape": inference_diagnostics["planner_raw_shape"],
         "planner_projected_shape": inference_diagnostics["planner_projected_shape"],
         "visual_context_shape": inference_diagnostics["visual_context_shape"],
@@ -599,7 +713,8 @@ def _run_one_sample(  # noqa: PLR0913, PLR0915
         fps=output_fps,
     )
     console.print(f"[green]Saved Stage 2 planner video:[/green] {generated_path}")
-    del batch, conditions, inference_diagnostics, generated_latents, decoded, precomputed
+    del batch, conditions, no_ref_conditions, inference_diagnostics, no_ref_diagnostics
+    del generated_latents, decoded, precomputed
     return generated_path
 
 
@@ -645,14 +760,26 @@ def _validate_guidance(
     siglip_guidance_scale: float,
     stg_scale: float,
 ) -> None:
-    if guidance_scale != 1.0:
-        raise typer.BadParameter("Stage 2 first-pass inference requires --guidance-scale 1.0")
-    if ref_guidance_scale != 0.0:
-        raise typer.BadParameter("Stage 2 first-pass inference requires --ref-guidance-scale 0.0")
+    if guidance_scale < 1.0:
+        raise typer.BadParameter("--guidance-scale must be >= 1.0")
+    if ref_guidance_scale < 0.0:
+        raise typer.BadParameter("--ref-guidance-scale must be >= 0.0")
     if siglip_guidance_scale != 0.0:
-        raise typer.BadParameter("Stage 2 first-pass inference requires --siglip-guidance-scale 0.0")
-    if stg_scale != 0.0:
-        raise typer.BadParameter("Stage 2 first-pass inference requires --stg-scale 0.0")
+        raise typer.BadParameter("Stage 2 held-out inference requires --siglip-guidance-scale 0.0")
+    if stg_scale < 0.0:
+        raise typer.BadParameter("--stg-scale must be >= 0.0")
+
+
+def _validate_strict_no_gt(
+    *,
+    strict_no_gt: bool,
+    position_source: str,
+    compute_gt_siglip_metrics: bool,
+) -> None:
+    if strict_no_gt and position_source != "uniform_target":
+        raise typer.BadParameter("--strict-no-gt requires --position-source uniform_target")
+    if strict_no_gt and compute_gt_siglip_metrics:
+        raise typer.BadParameter("--strict-no-gt requires --no-compute-gt-siglip-metrics")
 
 
 @app.command()
@@ -681,25 +808,39 @@ def main(  # noqa: PLR0913, PLR0915
     root_dir: str | None = typer.Option(None),
     fps: float | None = typer.Option(None),
     decode_tile: bool = typer.Option(True, "--decode-tile/--no-decode-tile"),
-    position_source: Literal["gt_metadata", "uniform_target"] = typer.Option("gt_metadata", "--position-source"),
+    position_source: Literal["gt_metadata", "uniform_target"] = typer.Option(
+        "uniform_target",
+        "--position-source",
+    ),
     compute_gt_siglip_metrics: bool = typer.Option(
-        True,
+        False,
         "--compute-gt-siglip-metrics/--no-compute-gt-siglip-metrics",
+    ),
+    strict_no_gt: bool = typer.Option(
+        True,
+        "--strict-no-gt/--allow-gt-diagnostics",
     ),
     save_predicted_tokens: bool = typer.Option(
         False,
         "--save-predicted-tokens/--no-save-predicted-tokens",
     ),
-    guidance_scale: float = typer.Option(1.0, "--guidance-scale"),
-    ref_guidance_scale: float = typer.Option(0.0, "--ref-guidance-scale"),
+    negative_prompt: str | None = typer.Option(None, "--negative-prompt"),
+    guidance_scale: float = typer.Option(2.0, "--guidance-scale"),
+    ref_guidance_scale: float = typer.Option(2.0, "--ref-guidance-scale"),
     siglip_guidance_scale: float = typer.Option(0.0, "--siglip-guidance-scale"),
-    stg_scale: float = typer.Option(0.0, "--stg-scale"),
+    stg_scale: float = typer.Option(1.0, "--stg-scale"),
+    stg_blocks: str | None = typer.Option(None, "--stg-blocks"),
 ) -> None:
     _validate_guidance(
         guidance_scale=guidance_scale,
         ref_guidance_scale=ref_guidance_scale,
         siglip_guidance_scale=siglip_guidance_scale,
         stg_scale=stg_scale,
+    )
+    _validate_strict_no_gt(
+        strict_no_gt=strict_no_gt,
+        position_source=position_source,
+        compute_gt_siglip_metrics=compute_gt_siglip_metrics,
     )
     if sample_index is not None and sample_index < 0:
         raise typer.BadParameter("--sample-index must be >= 0")
@@ -746,7 +887,15 @@ def main(  # noqa: PLR0913, PLR0915
         checkpoint_path=checkpoint_path,
         device=torch_device,
         dtype=dtype,
+        guidance_scale=guidance_scale,
+        negative_prompt=negative_prompt,
     )
+    if stg_blocks is None:
+        resolved_stg_blocks = runtime.cfg.validation.stg_blocks
+        if resolved_stg_blocks is None:
+            resolved_stg_blocks = [29]
+    else:
+        resolved_stg_blocks = stage1._parse_stg_blocks(stg_blocks)
     normalized_precomputed_root = stage1._normalize_precomputed_root(Path(precomputed_root))
     output_dir_path = Path(output_dir)
 
@@ -766,7 +915,12 @@ def main(  # noqa: PLR0913, PLR0915
             decode_tile=decode_tile,
             position_source=position_source,
             compute_gt_siglip_metrics=compute_gt_siglip_metrics,
+            strict_no_gt=strict_no_gt,
             save_predicted_tokens=save_predicted_tokens,
+            guidance_scale=guidance_scale,
+            ref_guidance_scale=ref_guidance_scale,
+            stg_scale=stg_scale,
+            stg_blocks=resolved_stg_blocks,
             num_inference_steps=num_inference_steps,
             seed=seed,
         )

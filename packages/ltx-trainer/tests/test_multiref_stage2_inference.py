@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -106,12 +107,19 @@ class _InferenceHarness:
         sampled = visual_data["sampled_frame_indices"].float().sum()
         return torch.full((1, 3, self.token_count, 2), sampled.item(), dtype=torch.float32)
 
-    def _run_online_vlm_inference(self, planner_data, *, device, token_positions):
+    def _run_online_vlm_inference(
+        self,
+        planner_data,
+        *,
+        device,
+        token_positions,
+        drop_reference_images=False,
+    ):
         del token_positions
-        self.events.append("vlm_planner")
+        self.events.append("vlm_planner_no_ref" if drop_reference_images else "vlm_planner")
         value = planner_data["input_ids"].float().sum()
         pixel_values = planner_data.get("pixel_values")
-        if isinstance(pixel_values, torch.Tensor):
+        if isinstance(pixel_values, torch.Tensor) and not drop_reference_images:
             value = value + pixel_values.float().sum()
         tokens = torch.full(
             (1, self.token_count, self.raw_dim),
@@ -167,9 +175,15 @@ def _prepare_with_harness(
     input_ids: torch.Tensor | None = None,
     pixel_values: torch.Tensor | None = None,
     visual_metadata: dict | None = None,
+    condition_value: float = 0.0,
+    drop_reference_images: bool = False,
 ):
     conditions = {
-        "video_prompt_embeds": torch.zeros(1, 2, harness.raw_dim, dtype=torch.float16),
+        "video_prompt_embeds": torch.full(
+            (1, 2, harness.raw_dim),
+            condition_value,
+            dtype=torch.float16,
+        ),
         "audio_prompt_embeds": None,
         "prompt_attention_mask": torch.ones(1, 2, dtype=torch.long),
     }
@@ -188,6 +202,7 @@ def _prepare_with_harness(
         planner_vlm_inputs=planner_inputs,
         latents_metadata={"height": torch.tensor([64]), "width": torch.tensor([96])},
         visual_position_metadata=visual_metadata,
+        drop_reference_images=drop_reference_images,
     )
 
 
@@ -279,6 +294,53 @@ def test_caption_and_reference_inputs_change_planner_prediction() -> None:
     assert not torch.equal(ref_a["predicted_visual_tokens"], ref_b["predicted_visual_tokens"])
 
 
+def test_no_ref_planner_reruns_without_pixels_and_uses_text_only_context() -> None:
+    harness = _InferenceHarness()
+    pixel_values = torch.ones(1, 2, 3)
+
+    _full_conditions, full_diagnostics = _prepare_with_harness(
+        harness,
+        pixel_values=pixel_values,
+        condition_value=1.0,
+    )
+    no_ref_conditions, no_ref_diagnostics = _prepare_with_harness(
+        harness,
+        pixel_values=pixel_values,
+        condition_value=5.0,
+        drop_reference_images=True,
+    )
+
+    assert harness.events.count("vlm_planner") == 1
+    assert harness.events.count("vlm_planner_no_ref") == 1
+    assert no_ref_diagnostics["drop_reference_images"] is True
+    assert not torch.equal(
+        full_diagnostics["predicted_visual_tokens"],
+        no_ref_diagnostics["predicted_visual_tokens"],
+    )
+    text_prefix = no_ref_conditions["video_prompt_embeds"][:, :2]
+    assert torch.all(text_prefix[..., : harness.raw_dim] == 5.0)
+    assert torch.all(text_prefix[..., harness.raw_dim :] == 0.0)
+
+
+def test_no_ref_planner_data_removes_pixels_and_zeros_reference_count() -> None:
+    planner_data = {
+        "input_ids": torch.ones(2, 5, dtype=torch.long),
+        "pixel_values": torch.randn(3, 3, 8, 8),
+        "num_ref_images": torch.tensor([1, 2]),
+    }
+
+    no_ref_data = MultiReferencePlannerStage2Strategy._prepare_inference_planner_data(
+        planner_data,
+        drop_reference_images=True,
+        device=torch.device("cpu"),
+    )
+
+    assert "pixel_values" not in no_ref_data
+    assert no_ref_data["num_ref_images"].tolist() == [0, 0]
+    assert "pixel_values" in planner_data
+    assert planner_data["num_ref_images"].tolist() == [1, 2]
+
+
 def test_gt_metrics_are_diagnostic_only() -> None:
     conditions, diagnostics = _prepare_with_harness(_InferenceHarness())
     condition_before = conditions["video_prompt_embeds"].clone()
@@ -352,24 +414,150 @@ def test_stage2_shard_selection_and_skip_existing(tmp_path: Path) -> None:
     assert run_sample.call_count == 0
 
 
+def test_strict_no_gt_loader_never_builds_or_loads_gt_path(monkeypatch, tmp_path: Path) -> None:
+    loaded_paths: list[Path] = []
+
+    def load_pt(path: Path) -> dict:
+        loaded_paths.append(path)
+        return {}
+
+    monkeypatch.setattr(infer.stage1, "_load_pt_file", load_pt)
+    _rel_path, precomputed = infer._load_sample_precomputed(
+        row={"video": "part_000/sample.mp4"},
+        manifest_root=tmp_path / "manifest",
+        precomputed_root=tmp_path / ".precomputed",
+        video_column="video",
+        need_gt=False,
+        strict_no_gt=True,
+    )
+
+    assert set(precomputed) == {
+        "latents",
+        "multi_reference_latents",
+        "conditions",
+        "text_conditions",
+        "planner_vlm_inputs",
+    }
+    assert len(loaded_paths) == 5
+    assert all("gt_siglip_tokens" not in path.parts for path in loaded_paths)
+
+
+def test_strict_no_gt_rejects_gt_metadata_and_metrics() -> None:
+    with pytest.raises(infer.typer.BadParameter, match="position-source uniform_target"):
+        infer._validate_strict_no_gt(
+            strict_no_gt=True,
+            position_source="gt_metadata",
+            compute_gt_siglip_metrics=False,
+        )
+    with pytest.raises(infer.typer.BadParameter, match="no-compute-gt-siglip-metrics"):
+        infer._validate_strict_no_gt(
+            strict_no_gt=True,
+            position_source="uniform_target",
+            compute_gt_siglip_metrics=True,
+        )
+
+
 def test_uniform_positions_and_guidance_validation_are_deterministic() -> None:
-    latents = {"num_frames": torch.tensor([11]), "fps": torch.tensor([24.0])}
+    latents = {"num_frames": torch.tensor([97]), "fps": torch.tensor([24.0])}
 
     first = infer._uniform_position_metadata(latents)
     second = infer._uniform_position_metadata(latents)
 
     assert torch.equal(first["sampled_frame_indices"], second["sampled_frame_indices"])
-    assert first["sampled_frame_indices"].tolist() == [[0, 11, 23, 34, 46, 57, 69, 80]]
+    assert first["sampled_frame_indices"].tolist() == [[0, 14, 27, 41, 55, 69, 82, 96]]
     infer._validate_guidance(
-        guidance_scale=1.0,
-        ref_guidance_scale=0.0,
+        guidance_scale=2.0,
+        ref_guidance_scale=2.0,
         siglip_guidance_scale=0.0,
-        stg_scale=0.0,
+        stg_scale=1.0,
     )
-    with pytest.raises(infer.typer.BadParameter, match="guidance-scale 1.0"):
+    with pytest.raises(infer.typer.BadParameter, match="siglip-guidance-scale 0.0"):
         infer._validate_guidance(
             guidance_scale=2.0,
-            ref_guidance_scale=0.0,
-            siglip_guidance_scale=0.0,
-            stg_scale=0.0,
+            ref_guidance_scale=2.0,
+            siglip_guidance_scale=1.0,
+            stg_scale=1.0,
         )
+
+
+def test_negative_prompt_resolution_prefers_cli_and_rejects_empty_cfg_prompt() -> None:
+    assert infer._resolve_negative_prompt(
+        cli_negative_prompt="cli negative",
+        config_negative_prompt="config negative",
+        guidance_scale=2.0,
+    ) == "cli negative"
+    assert infer._resolve_negative_prompt(
+        cli_negative_prompt=None,
+        config_negative_prompt="config negative",
+        guidance_scale=2.0,
+    ) == "config negative"
+    assert infer._resolve_negative_prompt(
+        cli_negative_prompt="  ",
+        config_negative_prompt="config negative",
+        guidance_scale=2.0,
+    ) == "config negative"
+    with pytest.raises(ValueError, match="non-empty negative prompt"):
+        infer._resolve_negative_prompt(
+            cli_negative_prompt="  ",
+            config_negative_prompt="",
+            guidance_scale=2.0,
+        )
+
+
+def test_negative_condition_uses_prompt_once_and_has_no_planner_visual_context(monkeypatch) -> None:
+    events: list[str] = []
+
+    class LanguageModel:
+        def disable_adapter(self):
+            events.append("disable_adapter")
+            return nullcontext()
+
+    class TextEncoder:
+        def encode(self, prompts):
+            events.append(f"encode:{prompts[0]}")
+            return [(torch.ones(1, 3, 4), torch.ones(1, 3, dtype=torch.long))]
+
+    class Processor:
+        def process_hidden_states(self, hidden_states, attention_mask):
+            del attention_mask
+            events.append("text_connector")
+            return SimpleNamespace(video_encoding=hidden_states, audio_encoding=None)
+
+    strategy = SimpleNamespace(_get_language_model=lambda: LanguageModel())
+    monkeypatch.setattr(infer, "_autocast_context", lambda device, dtype: nullcontext())
+    conditions = infer._encode_negative_prompt_condition(
+        text_encoder=TextEncoder(),
+        embeddings_processor=Processor(),
+        strategy=strategy,
+        negative_prompt="held-out negative",
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    assert events == ["disable_adapter", "encode:held-out negative", "text_connector"]
+    assert conditions["video_prompt_embeds"].shape == (1, 3, 4)
+    assert conditions["prompt_attention_mask"] is None
+
+
+def test_held_out_guidance_formula_is_numerically_correct() -> None:
+    full = torch.tensor([[[10.0]]])
+    negative = torch.tensor([[[2.0]]])
+    no_ref = torch.tensor([[[4.0]]])
+    stg = torch.tensor([[[7.0]]])
+
+    guided = infer.stage1._combine_multidirectional_denoised(
+        denoised_pos=full,
+        denoised_neg=negative,
+        denoised_no_ref=no_ref,
+        denoised_siglip_isolated=None,
+        denoised_siglip_null=None,
+        denoised_stg=stg,
+        guidance_scale=2.0,
+        ref_guidance_scale=2.0,
+        siglip_guidance_scale=0.0,
+        stg_scale=1.0,
+        guidance_rescale=0.0,
+        target_seq_len=1,
+    )
+
+    assert guided.item() == 33.0

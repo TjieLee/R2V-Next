@@ -764,6 +764,7 @@ def _denoise_stage1(
     batch: dict[str, Any],
     positive_conditions: dict[str, Tensor],
     negative_conditions: dict[str, Tensor | None] | None,
+    no_ref_conditions: dict[str, Tensor | None] | None = None,
     guidance_scale: float,
     cfg_drop_ref_latents_in_negative: bool,
     ref_guidance_scale: float,
@@ -837,6 +838,13 @@ def _denoise_stage1(
     pos_context_key = _condition_feature_key(positive_conditions)
     pos_context = positive_conditions[pos_context_key]
     pos_context_mask = positive_conditions.get("prompt_attention_mask")
+    if no_ref_conditions is None:
+        no_ref_context = pos_context
+        no_ref_context_mask = pos_context_mask
+    else:
+        no_ref_context_key = _condition_feature_key(no_ref_conditions)
+        no_ref_context = no_ref_conditions[no_ref_context_key]
+        no_ref_context_mask = no_ref_conditions.get("prompt_attention_mask")
     if siglip_guidance_scale != 0.0:
         visual_token_count = int(batch.get("_visual_context_token_count", 0) or 0)
         (
@@ -956,8 +964,8 @@ def _denoise_stage1(
                     sigma=sigma_batch,
                     timesteps=packed_no_ref.timesteps,
                     positions=packed_no_ref.positions,
-                    context=pos_context,
-                    context_mask=pos_context_mask,
+                    context=no_ref_context,
+                    context_mask=no_ref_context_mask,
                     attention_mask=packed_no_ref.attention_mask,
                 )
                 velocity_no_ref, _ = transformer(video=video_no_ref, audio=None, perturbations=None)
