@@ -3,12 +3,17 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import yaml
 from accelerate.utils import DistributedType
 from peft import LoraConfig, get_peft_model, get_peft_model_state_dict
 from safetensors.torch import load_file, save_file
 from torch import nn
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import LinearLR
 
+from ltx_trainer.config import LtxTrainerConfig
 from ltx_trainer.trainer import LtxvTrainer, normalize_peft_adapter_key
+from ltx_trainer.training_state import ConfigFingerprint, RngStates, TrainingState
 from ltx_trainer.training_strategies.multi_reference_planner_stage2 import (
     MultiReferencePlannerStage2Config,
     MultiReferencePlannerStage2Strategy,
@@ -544,33 +549,368 @@ def test_final_save_is_idempotent_when_interval_matches_last_step(
     assert trainer._accelerator.state_dict_calls == 1
 
 
-def test_checkpoint_cleanup_keeps_four_unique_interval_steps(tmp_path: Path) -> None:
+def _training_state(
+    step: int,
+    *,
+    optimizer_state: dict | None,
+    scheduler_state: dict | None = None,
+) -> TrainingState:
+    return TrainingState(
+        global_step=step,
+        config_fingerprint=ConfigFingerprint(
+            optimizer_type="adamw",
+            scheduler_type="linear",
+            training_mode="lora",
+            lora_rank=128,
+        ),
+        rng_states=RngStates(torch_state=torch.random.get_rng_state()),
+        lr_scheduler_state_dict=scheduler_state
+        or {"last_epoch": step, "_last_lr": [1.0e-5]},
+        optimizer_state_dict=optimizer_state,
+    )
+
+
+def _resume_test_trainer(
+    checkpoint_path: Path,
+    *,
+    warm: bool = False,
+) -> LtxvTrainer:
     trainer = LtxvTrainer.__new__(LtxvTrainer)
-    trainer._config = SimpleNamespace(checkpoints=SimpleNamespace(keep_last_n=4))
-    checkpoints = []
-    for step in (500, 1000, 1500, 2000):
-        path = tmp_path / f"lora_weights_step_{step:05d}.safetensors"
-        path.write_bytes(b"checkpoint")
-        checkpoints.append(path)
-    trainer._checkpoint_paths = [*checkpoints, checkpoints[-1]]
+    trainer._loaded_checkpoint_path = checkpoint_path
+    trainer._training_strategy = SimpleNamespace(config=SimpleNamespace(training_phase="stage3"))
+    trainer._config = SimpleNamespace(
+        checkpoints=SimpleNamespace(
+            no_resume=False,
+            save_training_state="minimal" if warm else "full",
+            allow_warm_resume_without_optimizer=warm,
+        ),
+        optimization=SimpleNamespace(
+            optimizer_type="adamw",
+            scheduler_type="linear",
+            steps=2000,
+        ),
+        model=SimpleNamespace(training_mode="lora"),
+        lora=SimpleNamespace(rank=128),
+    )
+    return trainer
 
-    trainer._cleanup_checkpoints()
 
-    assert trainer._checkpoint_paths == checkpoints
-    assert all(path.is_file() for path in checkpoints)
+def _write_resume_pair(
+    directory: Path,
+    *,
+    filename_step: int,
+    metadata_step: int | None,
+    state: TrainingState,
+) -> Path:
+    checkpoint = directory / f"lora_weights_step_{filename_step:05d}.safetensors"
+    metadata = {"training_phase": "stage3"}
+    if metadata_step is not None:
+        metadata["global_step"] = str(metadata_step)
+    save_file({"weight": torch.ones(1)}, checkpoint, metadata=metadata)
+    torch.save(
+        state.to_save_dict(),
+        directory / f"training_state_step_{filename_step:05d}.pt",
+    )
+    return checkpoint
+
+
+def test_stage3_exact_resume_rejects_minimal_state_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = (
+        Path(__file__).resolve().parents[1]
+        / "configs"
+        / "multiref_stage3_joint_full_tokens_planner_2048_resume.yaml"
+    )
+    config_data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    monkeypatch.setattr(LtxTrainerConfig, "_validate_data_dirs_exist", lambda _self: None)
+    exact_config = LtxTrainerConfig.model_validate(config_data)
+    assert exact_config.checkpoints.save_training_state == "full"
+    assert exact_config.checkpoints.allow_warm_resume_without_optimizer is False
+
+    config_data["checkpoints"]["save_training_state"] = "minimal"
+    config_data["checkpoints"]["allow_warm_resume_without_optimizer"] = False
+
+    with pytest.raises(ValueError, match="Exact Stage 3 resume requires save_training_state='full'"):
+        LtxTrainerConfig.model_validate(config_data)
+
+    config_data["checkpoints"]["allow_warm_resume_without_optimizer"] = True
+    config = LtxTrainerConfig.model_validate(config_data)
+    assert config.checkpoints.save_training_state == "minimal"
+    assert config.checkpoints.allow_warm_resume_without_optimizer is True
+
+
+def test_stage3_warm_resume_logs_optimizer_reset_warning(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    checkpoint = _write_resume_pair(
+        tmp_path,
+        filename_step=500,
+        metadata_step=500,
+        state=_training_state(500, optimizer_state=None),
+    )
+    trainer = _resume_test_trainer(checkpoint, warm=True)
+
+    step, state = trainer._resolve_resume_state()
+
+    assert step == 500
+    assert state is not None
+    assert "Warm Stage 3 resume: optimizer moments are reset." in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("metadata_step", "state_step", "expected"),
+    [
+        (500, 1000, "filename=500, metadata=500, training_state=1000"),
+        (1000, 500, "filename=500, metadata=1000, training_state=500"),
+    ],
+)
+def test_stage3_resume_rejects_step_mismatch(
+    tmp_path: Path,
+    metadata_step: int,
+    state_step: int,
+    expected: str,
+) -> None:
+    checkpoint = _write_resume_pair(
+        tmp_path,
+        filename_step=500,
+        metadata_step=metadata_step,
+        state=_training_state(state_step, optimizer_state={}),
+    )
+    trainer = _resume_test_trainer(checkpoint)
+
+    with pytest.raises(RuntimeError, match=expected):
+        trainer._resolve_resume_state()
+
+
+def test_stage3_resume_accepts_matching_filename_metadata_and_state(tmp_path: Path) -> None:
+    checkpoint = _write_resume_pair(
+        tmp_path,
+        filename_step=500,
+        metadata_step=500,
+        state=_training_state(500, optimizer_state={}),
+    )
+    trainer = _resume_test_trainer(checkpoint)
+
+    step, state = trainer._resolve_resume_state()
+
+    assert step == 500
+    assert state is not None and state.global_step == 500
+
+
+def test_stage3_resume_rejects_scheduler_epoch_mismatch(tmp_path: Path) -> None:
+    checkpoint = _write_resume_pair(
+        tmp_path,
+        filename_step=500,
+        metadata_step=500,
+        state=_training_state(
+            500,
+            optimizer_state={},
+            scheduler_state={"last_epoch": 499, "_last_lr": [1.0e-5]},
+        ),
+    )
+    trainer = _resume_test_trainer(checkpoint)
+
+    with pytest.raises(RuntimeError, match="scheduler/global_step mismatch"):
+        trainer._resolve_resume_state()
+
+
+def test_stage3_resume_accepts_accelerated_scheduler_epoch(tmp_path: Path) -> None:
+    checkpoint = _write_resume_pair(
+        tmp_path,
+        filename_step=500,
+        metadata_step=500,
+        state=_training_state(
+            500,
+            optimizer_state={},
+            scheduler_state={"last_epoch": 4000, "_last_lr": [1.0e-5]},
+        ),
+    )
+    trainer = _resume_test_trainer(checkpoint)
+    trainer._accelerator = SimpleNamespace(num_processes=8, split_batches=False)
+
+    step, state = trainer._resolve_resume_state()
+
+    assert step == 500
+    assert state is not None and state.global_step == 500
+
+
+def test_stage3_resume_rejects_legacy_metadata_without_global_step(tmp_path: Path) -> None:
+    checkpoint = _write_resume_pair(
+        tmp_path,
+        filename_step=500,
+        metadata_step=None,
+        state=_training_state(500, optimizer_state={}),
+    )
+    trainer = _resume_test_trainer(checkpoint)
+
+    with pytest.raises(RuntimeError, match="metadata is missing global_step"):
+        trainer._resolve_resume_state()
 
 
 def test_stage3_resume_rejects_stage2_metadata_and_missing_state(tmp_path: Path) -> None:
     checkpoint = tmp_path / "lora_weights_step_00500.safetensors"
-    save_file({"weight": torch.ones(1)}, checkpoint, metadata={"training_phase": "stage2"})
-    trainer = LtxvTrainer.__new__(LtxvTrainer)
-    trainer._loaded_checkpoint_path = checkpoint
-    trainer._training_strategy = SimpleNamespace(config=SimpleNamespace(training_phase="stage3"))
-    trainer._config = SimpleNamespace(checkpoints=SimpleNamespace(no_resume=False))
+    save_file(
+        {"weight": torch.ones(1)},
+        checkpoint,
+        metadata={"training_phase": "stage2", "global_step": "500"},
+    )
+    trainer = _resume_test_trainer(checkpoint)
 
     with pytest.raises(RuntimeError, match="Stage 3 resume requires a Stage 3 checkpoint"):
         trainer._resolve_resume_state()
 
-    save_file({"weight": torch.ones(1)}, checkpoint, metadata={"training_phase": "stage3"})
+    save_file(
+        {"weight": torch.ones(1)},
+        checkpoint,
+        metadata={"training_phase": "stage3", "global_step": "500"},
+    )
     with pytest.raises(RuntimeError, match="matching training state"):
         trainer._resolve_resume_state()
+
+
+def test_exact_resume_restores_adam_state_and_lr_continuity() -> None:
+    source_parameter = nn.Parameter(torch.tensor([1.0]))
+    source_optimizer = AdamW([source_parameter], lr=1.0e-3)
+    source_scheduler = LinearLR(
+        source_optimizer,
+        start_factor=1.0,
+        end_factor=0.1,
+        total_iters=1000,
+    )
+    for _ in range(500):
+        source_parameter.grad = torch.ones_like(source_parameter)
+        source_optimizer.step()
+        source_optimizer.zero_grad(set_to_none=True)
+        source_scheduler.step()
+
+    resumed_parameter = nn.Parameter(source_parameter.detach().clone())
+    resumed_optimizer = AdamW([resumed_parameter], lr=1.0e-3)
+    resumed_scheduler = LinearLR(
+        resumed_optimizer,
+        start_factor=1.0,
+        end_factor=0.1,
+        total_iters=1000,
+    )
+    state = _training_state(
+        500,
+        optimizer_state=source_optimizer.state_dict(),
+        scheduler_state=source_scheduler.state_dict(),
+    )
+    trainer = _resume_test_trainer(Path("lora_weights_step_00500.safetensors"))
+    trainer._optimizer = resumed_optimizer
+    trainer._lr_scheduler = resumed_scheduler
+    trainer._accelerator = SimpleNamespace(num_processes=1)
+
+    saved_rng_state = state.rng_states.torch_state.clone()
+    torch.random.set_rng_state(saved_rng_state)
+    expected_random_values = torch.rand(4)
+    torch.manual_seed(12345)
+
+    assert trainer._restore_training_state(state)
+    source_adam_state = source_optimizer.state[source_parameter]
+    resumed_adam_state = resumed_optimizer.state[resumed_parameter]
+    assert torch.equal(resumed_adam_state["exp_avg"], source_adam_state["exp_avg"])
+    assert torch.equal(resumed_adam_state["exp_avg_sq"], source_adam_state["exp_avg_sq"])
+    assert resumed_optimizer.param_groups[0]["lr"] == source_optimizer.param_groups[0]["lr"]
+    assert resumed_optimizer.param_groups[0]["lr"] == resumed_scheduler.get_last_lr()[0]
+    assert torch.equal(torch.rand(4), expected_random_values)
+
+    source_parameter.grad = torch.ones_like(source_parameter)
+    resumed_parameter.grad = torch.ones_like(resumed_parameter)
+    source_optimizer.step()
+    source_scheduler.step()
+    resumed_optimizer.step()
+    resumed_scheduler.step()
+
+    assert torch.allclose(resumed_parameter, source_parameter)
+    assert resumed_optimizer.param_groups[0]["lr"] == source_optimizer.param_groups[0]["lr"]
+
+
+def test_warm_resume_restores_scheduler_lr_without_adam_state() -> None:
+    source_parameter = nn.Parameter(torch.tensor([1.0]))
+    source_optimizer = AdamW([source_parameter], lr=1.0e-3)
+    source_scheduler = LinearLR(source_optimizer, start_factor=1.0, end_factor=0.1, total_iters=100)
+    for _ in range(20):
+        source_parameter.grad = torch.ones_like(source_parameter)
+        source_optimizer.step()
+        source_optimizer.zero_grad(set_to_none=True)
+        source_scheduler.step()
+
+    resumed_parameter = nn.Parameter(torch.tensor([1.0]))
+    resumed_optimizer = AdamW([resumed_parameter], lr=1.0e-3)
+    resumed_scheduler = LinearLR(resumed_optimizer, start_factor=1.0, end_factor=0.1, total_iters=100)
+    trainer = _resume_test_trainer(Path("lora_weights_step_00020.safetensors"), warm=True)
+    trainer._optimizer = resumed_optimizer
+    trainer._lr_scheduler = resumed_scheduler
+    trainer._accelerator = SimpleNamespace(num_processes=1)
+    state = _training_state(
+        20,
+        optimizer_state=None,
+        scheduler_state=source_scheduler.state_dict(),
+    )
+
+    assert trainer._restore_training_state(state)
+    assert resumed_optimizer.state == {}
+    assert resumed_optimizer.param_groups[0]["lr"] == source_optimizer.param_groups[0]["lr"]
+    assert resumed_optimizer.param_groups[0]["lr"] == resumed_scheduler.get_last_lr()[0]
+
+
+def _write_checkpoint_pair(checkpoints_dir: Path, step: int) -> tuple[Path, Path]:
+    checkpoint = checkpoints_dir / f"lora_weights_step_{step:05d}.safetensors"
+    state = checkpoints_dir / f"training_state_step_{step:05d}.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    state.write_bytes(b"state")
+    return checkpoint, state
+
+
+def test_resume_cleanup_scans_disk_and_removes_checkpoint_state_pairs(tmp_path: Path) -> None:
+    checkpoints_dir = tmp_path / "checkpoints"
+    checkpoints_dir.mkdir()
+    checkpoint_500, state_500 = _write_checkpoint_pair(checkpoints_dir, 500)
+    checkpoint_1000, _ = _write_checkpoint_pair(checkpoints_dir, 1000)
+    trainer = LtxvTrainer.__new__(LtxvTrainer)
+    trainer._config = SimpleNamespace(
+        output_dir=str(tmp_path),
+        checkpoints=SimpleNamespace(keep_last_n=4),
+    )
+    trainer._loaded_checkpoint_path = checkpoint_1000
+    trainer._checkpoint_paths = []
+    trainer._training_state_paths = []
+
+    for step in (1500, 2000, 2500):
+        _write_checkpoint_pair(checkpoints_dir, step)
+        trainer._cleanup_checkpoints()
+
+    expected_steps = [1000, 1500, 2000, 2500]
+    assert [trainer._checkpoint_step(path) for path in trainer._checkpoint_paths] == expected_steps
+    assert [trainer._checkpoint_step(path) for path in trainer._training_state_paths] == expected_steps
+    assert checkpoint_1000.is_file()
+    assert not checkpoint_500.exists()
+    assert not state_500.exists()
+    assert len(list(checkpoints_dir.glob("lora_weights_step_*.safetensors"))) == 4
+    assert len(list(checkpoints_dir.glob("training_state_step_*.pt"))) == 4
+
+
+def test_stage3_checkpoint_metadata_contains_global_step() -> None:
+    trainer = LtxvTrainer.__new__(LtxvTrainer)
+    trainer._global_step = 500
+    trainer._training_strategy = SimpleNamespace(get_checkpoint_metadata=lambda: {"training_phase": "stage3"})
+    trainer._config = SimpleNamespace(text_encoder_lora=SimpleNamespace(enabled=False))
+
+    metadata = trainer._build_checkpoint_metadata()
+
+    assert metadata["training_phase"] == "stage3"
+    assert metadata["global_step"] == "500"
+
+
+def test_effective_global_batch_and_throughput_include_gradient_accumulation() -> None:
+    global_batch = LtxvTrainer._effective_global_batch_size(
+        batch_size=1,
+        num_processes=8,
+        gradient_accumulation_steps=4,
+    )
+
+    assert global_batch == 32
+    assert 2.5 * global_batch == 80.0

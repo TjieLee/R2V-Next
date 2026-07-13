@@ -123,7 +123,8 @@ checkpoints:
   keep_last_n: 4
   precision: "bfloat16"
   no_resume: false
-  save_training_state: "minimal"
+  save_training_state: "full"
+  allow_warm_resume_without_optimizer: false
 
 hub:
   push_to_hub: false

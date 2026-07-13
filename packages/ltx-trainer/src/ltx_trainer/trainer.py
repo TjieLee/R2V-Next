@@ -85,6 +85,8 @@ class TrainingStats(BaseModel):
     steps_per_second: float
     samples_per_second: float
     peak_gpu_memory_gb: float
+    local_batch_size: int
+    gradient_accumulation_steps: int
     global_batch_size: int
     num_processes: int
 
@@ -352,15 +354,22 @@ class LtxvTrainer:
         total_time_seconds = train_end_time - train_start_time
         steps_per_second = remaining_steps / total_time_seconds
 
-        samples_per_second = steps_per_second * self._accelerator.num_processes * cfg.optimization.batch_size
+        effective_global_batch_size = self._effective_global_batch_size(
+            batch_size=cfg.optimization.batch_size,
+            num_processes=self._accelerator.num_processes,
+            gradient_accumulation_steps=cfg.optimization.gradient_accumulation_steps,
+        )
+        samples_per_second = steps_per_second * effective_global_batch_size
 
         stats = TrainingStats(
             total_time_seconds=total_time_seconds,
             steps_per_second=steps_per_second,
             samples_per_second=samples_per_second,
             peak_gpu_memory_gb=peak_mem,
+            local_batch_size=cfg.optimization.batch_size,
+            gradient_accumulation_steps=cfg.optimization.gradient_accumulation_steps,
             num_processes=self._accelerator.num_processes,
-            global_batch_size=cfg.optimization.batch_size * self._accelerator.num_processes,
+            global_batch_size=effective_global_batch_size,
         )
 
         saved_path = self._save_checkpoint()
@@ -994,6 +1003,14 @@ class LtxvTrainer:
     def _is_strict_stage3_resume(self) -> bool:
         return self._is_stage3_phase() and not self._config.checkpoints.no_resume
 
+    def _is_warm_stage3_resume(self) -> bool:
+        checkpoints = self._config.checkpoints
+        return (
+            self._is_strict_stage3_resume()
+            and checkpoints.save_training_state == "minimal"
+            and checkpoints.allow_warm_resume_without_optimizer
+        )
+
     def _resolve_resume_state(self) -> tuple[int, TrainingState | None]:
         """Determine resume state by looking for a training state file next to the loaded checkpoint.
         Returns (initial_step, TrainingState or None).
@@ -1003,9 +1020,10 @@ class LtxvTrainer:
             return 0, None
 
         strict_stage3_resume = self._is_strict_stage3_resume()
+        checkpoint_metadata: dict[str, str] | None = None
         if strict_stage3_resume:
-            metadata = self._read_safetensors_metadata(self._loaded_checkpoint_path)
-            if metadata.get("training_phase") != "stage3":
+            checkpoint_metadata = self._read_safetensors_metadata(self._loaded_checkpoint_path)
+            if checkpoint_metadata.get("training_phase") != "stage3":
                 raise RuntimeError(self._stage3_resume_error_message())
 
         state = self._load_training_state(self._loaded_checkpoint_path)
@@ -1013,6 +1031,14 @@ class LtxvTrainer:
             if strict_stage3_resume:
                 raise RuntimeError(self._stage3_resume_error_message())
             return 0, None
+
+        if strict_stage3_resume:
+            assert checkpoint_metadata is not None
+            self._validate_stage3_resume_state(
+                checkpoint_path=self._loaded_checkpoint_path,
+                metadata=checkpoint_metadata,
+                state=state,
+            )
 
         fp = state.config_fingerprint
         cfg = self._config
@@ -1048,8 +1074,76 @@ class LtxvTrainer:
                 f"⚠️ Training state has invalid global_step={state.global_step!r}. Starting from step 0."
             )
             return 0, None
+        if self._is_warm_stage3_resume():
+            logger.warning("Warm Stage 3 resume: optimizer moments are reset.")
         logger.info(f"📌 Resuming from step {state.global_step}")
         return state.global_step, state
+
+    def _validate_stage3_resume_state(
+        self,
+        *,
+        checkpoint_path: Path,
+        metadata: dict[str, str],
+        state: TrainingState,
+    ) -> None:
+        filename_step = self._checkpoint_step(checkpoint_path)
+        if filename_step is None:
+            raise RuntimeError(f"Cannot parse Stage 3 resume step from checkpoint filename: {checkpoint_path.name}")
+        metadata_step_raw = metadata.get("global_step")
+        if metadata_step_raw is None:
+            raise RuntimeError(
+                "Stage 3 checkpoint metadata is missing global_step. "
+                "This checkpoint predates strict resume metadata; migrate it by re-saving it with the updated trainer."
+            )
+        try:
+            metadata_step = int(metadata_step_raw)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"Invalid Stage 3 checkpoint metadata global_step={metadata_step_raw!r}") from exc
+
+        state_step = state.global_step
+        if filename_step != metadata_step or filename_step != state_step:
+            raise RuntimeError(
+                "Stage 3 resume step mismatch:\n"
+                f"filename={filename_step}, metadata={metadata_step}, training_state={state_step}"
+            )
+        if state_step < 0:
+            raise RuntimeError(f"Stage 3 resume global_step must be non-negative, got {state_step}")
+        if state_step >= self._config.optimization.steps:
+            raise RuntimeError(
+                f"Stage 3 resume global_step={state_step} must be less than "
+                f"optimization.steps={self._config.optimization.steps}"
+            )
+
+        scheduler_state = state.lr_scheduler_state_dict
+        if self._config.optimization.scheduler_type != "constant":
+            if scheduler_state is None:
+                raise RuntimeError("Stage 3 resume is missing LR scheduler state")
+            scheduler_last_epoch = scheduler_state.get("last_epoch")
+            if scheduler_last_epoch is None:
+                raise RuntimeError("Stage 3 LR scheduler state is missing last_epoch")
+            scheduler_steps_per_optimizer_step = self._scheduler_steps_per_optimizer_step()
+            expected_scheduler_last_epoch = state_step * scheduler_steps_per_optimizer_step
+            if int(scheduler_last_epoch) != expected_scheduler_last_epoch:
+                raise RuntimeError(
+                    "Stage 3 scheduler/global_step mismatch: "
+                    f"last_epoch={scheduler_last_epoch}, global_step={state_step}, "
+                    f"expected_last_epoch={expected_scheduler_last_epoch}"
+                )
+
+        if not self._is_warm_stage3_resume() and state.optimizer_state_dict is None:
+            raise RuntimeError("Exact Stage 3 resume requires optimizer state in the matching training state file")
+
+    @staticmethod
+    def _checkpoint_step(path: Path) -> int | None:
+        match = re.search(r"step_(\d+)", path.name)
+        return int(match.group(1)) if match else None
+
+    def _scheduler_steps_per_optimizer_step(self) -> int:
+        """Return the scheduler step multiplier used by AcceleratedScheduler."""
+        accelerator = getattr(self, "_accelerator", None)
+        if accelerator is None or getattr(accelerator, "split_batches", False):
+            return 1
+        return max(int(getattr(accelerator, "num_processes", 1)), 1)
 
     @staticmethod
     def _read_safetensors_metadata(checkpoint_path: Path) -> dict[str, str]:
@@ -1094,12 +1188,15 @@ class LtxvTrainer:
         Returns True if restore succeeded, False if it failed (caller should fall back to step 0).
         """
         try:
-            if training_state.optimizer_state_dict is not None:
+            if training_state.optimizer_state_dict is not None and not self._is_warm_stage3_resume():
                 self._optimizer.load_state_dict(training_state.optimizer_state_dict)
                 logger.debug("Restored optimizer state (full mode)")
 
-            if training_state.lr_scheduler_state_dict is not None and self._lr_scheduler is not None:
+            if training_state.lr_scheduler_state_dict is not None:
+                if self._lr_scheduler is None:
+                    raise RuntimeError("Training state contains an LR scheduler but no scheduler is configured")
                 self._lr_scheduler.load_state_dict(training_state.lr_scheduler_state_dict)
+                self._restore_optimizer_learning_rates(training_state.lr_scheduler_state_dict)
                 logger.debug("Restored LR scheduler state")
         except Exception as e:
             logger.warning(f"⚠️ Failed to restore training state: {e}. Starting from step 0.")
@@ -1116,6 +1213,30 @@ class LtxvTrainer:
             logger.debug("Restored RNG states")
 
         return True
+
+    def _restore_optimizer_learning_rates(self, scheduler_state: dict[str, Any]) -> None:
+        saved_lrs = scheduler_state.get("_last_lr")
+        if saved_lrs is None:
+            return
+        optimizer_groups = self._optimizer.param_groups
+        if len(saved_lrs) != len(optimizer_groups):
+            raise RuntimeError(
+                "LR scheduler state has a different number of learning rates and optimizer parameter groups: "
+                f"saved_lrs={len(saved_lrs)}, param_groups={len(optimizer_groups)}"
+            )
+        restored_lrs = [float(saved_lr) for saved_lr in saved_lrs]
+        for parameter_group, saved_lr in zip(optimizer_groups, restored_lrs, strict=True):
+            parameter_group["lr"] = saved_lr
+
+        scheduler_lrs = [float(lr) for lr in self._lr_scheduler.get_last_lr()]
+        optimizer_lrs = [float(group["lr"]) for group in optimizer_groups]
+        if optimizer_lrs != scheduler_lrs:
+            raise RuntimeError(
+                "Restored optimizer learning rates do not match scheduler learning rates: "
+                f"optimizer={optimizer_lrs}, scheduler={scheduler_lrs}"
+            )
+        if self._is_stage3_phase():
+            logger.info(f"Stage 3 resumed learning rates: {optimizer_lrs}")
 
     def _prepare_models_for_training(self) -> None:
         """Prepare models for training with Accelerate."""
@@ -1365,9 +1486,20 @@ class LtxvTrainer:
                 f"with {self._accelerator.num_processes} processes"
             )
 
-            local_batch = self._config.optimization.batch_size
-            global_batch = self._config.optimization.batch_size * self._accelerator.num_processes
-            logger.info(f"Local batch size: {local_batch}, global batch size: {global_batch}")
+        local_batch = self._config.optimization.batch_size
+        accumulation_steps = self._config.optimization.gradient_accumulation_steps
+        global_batch = self._effective_global_batch_size(
+            batch_size=local_batch,
+            num_processes=self._accelerator.num_processes,
+            gradient_accumulation_steps=accumulation_steps,
+        )
+        logger.info(
+            "Training batch configuration:\n"
+            f"Local micro batch size: {local_batch}\n"
+            f"Gradient accumulation steps: {accumulation_steps}\n"
+            f"Number of processes: {self._accelerator.num_processes}\n"
+            f"Effective global batch size: {global_batch}"
+        )
 
         # Log torch.compile status from Accelerate's dynamo plugin
         is_compile_enabled = (
@@ -1488,6 +1620,15 @@ class LtxvTrainer:
         return paths
 
     @staticmethod
+    def _effective_global_batch_size(
+        *,
+        batch_size: int,
+        num_processes: int,
+        gradient_accumulation_steps: int,
+    ) -> int:
+        return batch_size * num_processes * gradient_accumulation_steps
+
+    @staticmethod
     def _log_training_stats(stats: TrainingStats) -> None:
         """Log training statistics."""
         stats_str = (
@@ -1495,11 +1636,12 @@ class LtxvTrainer:
             f" - Total time: {stats.total_time_seconds / 60:.1f} minutes\n"
             f" - Training speed: {stats.steps_per_second:.2f} steps/second\n"
             f" - Samples/second: {stats.samples_per_second:.2f}\n"
-            f" - Peak GPU memory: {stats.peak_gpu_memory_gb:.2f} GB"
+            f" - Peak GPU memory: {stats.peak_gpu_memory_gb:.2f} GB\n"
+            f" - Local micro batch size: {stats.local_batch_size}\n"
+            f" - Gradient accumulation steps: {stats.gradient_accumulation_steps}\n"
+            f" - Number of processes: {stats.num_processes}\n"
+            f" - Effective global batch size: {stats.global_batch_size}"
         )
-        if stats.num_processes > 1:
-            stats_str += f"\n - Number of processes: {stats.num_processes}\n"
-            stats_str += f" - Global batch size: {stats.global_batch_size}"
         logger.info(stats_str)
 
     def _save_checkpoint(self) -> Path | None:
@@ -1682,23 +1824,86 @@ class LtxvTrainer:
         )
 
     def _cleanup_checkpoints(self) -> None:
-        """Clean up old checkpoints."""
-        unique_paths: list[Path] = []
-        resolved_paths: set[Path] = set()
-        for checkpoint_path in self._checkpoint_paths:
-            resolved = checkpoint_path.resolve()
-            if resolved not in resolved_paths:
-                resolved_paths.add(resolved)
-                unique_paths.append(checkpoint_path)
-        self._checkpoint_paths = unique_paths
+        """Scan disk and clean checkpoint/training-state pairs by step."""
+        save_dir = Path(self._config.output_dir) / "checkpoints"
+        if not save_dir.is_dir():
+            self._checkpoint_paths = []
+            self._training_state_paths = []
+            return
 
-        if 0 < self._config.checkpoints.keep_last_n < len(self._checkpoint_paths):
-            checkpoints_to_remove = self._checkpoint_paths[: -self._config.checkpoints.keep_last_n]
-            for old_checkpoint in checkpoints_to_remove:
-                if old_checkpoint.exists():
-                    old_checkpoint.unlink()
-                    logger.info(f"Removed old checkpoint: {old_checkpoint}")
-            self._checkpoint_paths = self._checkpoint_paths[-self._config.checkpoints.keep_last_n :]
+        loaded_path = getattr(self, "_loaded_checkpoint_path", None)
+        loaded_resolved = loaded_path.resolve() if loaded_path is not None else None
+        weights_by_step: dict[int, list[Path]] = {}
+        for path in save_dir.glob("*_weights_step_*.safetensors"):
+            step = self._checkpoint_step(path)
+            if step is not None:
+                weights_by_step.setdefault(step, []).append(path)
+        states_by_step: dict[int, Path] = {}
+        for path in save_dir.glob("training_state_step_*.pt"):
+            step = self._checkpoint_step(path)
+            if step is not None:
+                states_by_step[step] = path
+
+        # Keep exactly one weight path per step, preferring the currently loaded path.
+        selected_weights: dict[int, Path] = {}
+        for step, paths in weights_by_step.items():
+            unique = {path.resolve(): path for path in paths}
+            selected = next(
+                (path for resolved, path in unique.items() if resolved == loaded_resolved),
+                sorted(unique.values())[0],
+            )
+            selected_weights[step] = selected
+            for path in unique.values():
+                if path != selected:
+                    path.unlink(missing_ok=True)
+                    logger.info(f"Removed duplicate checkpoint for step {step}: {path}")
+
+        ordered_steps = sorted(selected_weights)
+        keep_n = self._config.checkpoints.keep_last_n
+        retained_steps = set(ordered_steps if keep_n <= 0 else ordered_steps[-keep_n:])
+        loaded_step = next(
+            (
+                step
+                for step, path in selected_weights.items()
+                if loaded_resolved is not None and path.resolve() == loaded_resolved
+            ),
+            None,
+        )
+        if keep_n > 0 and loaded_step is not None and loaded_step not in retained_steps:
+            if retained_steps:
+                retained_steps.remove(min(retained_steps))
+            retained_steps.add(loaded_step)
+
+        for step in ordered_steps:
+            if step in retained_steps:
+                continue
+            checkpoint_path = selected_weights[step]
+            if loaded_resolved is not None and checkpoint_path.resolve() == loaded_resolved:
+                continue
+            checkpoint_path.unlink(missing_ok=True)
+            logger.info(f"Removed old checkpoint: {checkpoint_path}")
+            state_path = states_by_step.pop(step, None)
+            if state_path is not None:
+                state_path.unlink(missing_ok=True)
+                logger.debug(f"Removed matching training state: {state_path}")
+
+        remaining_weights = {
+            step: path
+            for step, path in selected_weights.items()
+            if path.is_file()
+        }
+        for step, state_path in list(states_by_step.items()):
+            if step not in remaining_weights:
+                state_path.unlink(missing_ok=True)
+                states_by_step.pop(step)
+                logger.debug(f"Removed orphan training state: {state_path}")
+
+        self._checkpoint_paths = [remaining_weights[step] for step in sorted(remaining_weights)]
+        self._training_state_paths = [
+            states_by_step[step]
+            for step in sorted(states_by_step)
+            if states_by_step[step].is_file()
+        ]
 
     def _save_training_state(self, save_dir: Path) -> None:
         """Save training state alongside checkpoint for resume.
@@ -1719,6 +1924,11 @@ class LtxvTrainer:
         optimizer_state = None
         if mode == "full":
             if is_fsdp:
+                if self._is_stage3_phase():
+                    raise RuntimeError(
+                        "Exact Stage 3 resume requires optimizer state, but full optimizer-state saving "
+                        "is not supported with FSDP. Use DDP for exact Stage 3 resume."
+                    )
                 logger.warning(
                     "⚠️ save_training_state='full' is not supported with FSDP. "
                     "Saving 'minimal' state (scheduler + RNG only)."
@@ -1756,29 +1966,28 @@ class LtxvTrainer:
         file_size_gb = state_path.stat().st_size / (1024**3)
         if file_size_gb > 1.0 and not self._training_state_size_warned:
             self._training_state_size_warned = True
-            logger.warning(
-                f"⚠️ Training state file is {file_size_gb:.1f} GB (full mode includes optimizer state). "
-                f'Set checkpoints.save_training_state="minimal" to save only scheduler/RNG/step (~few KB), '
-                f'or "off" to disable entirely.'
-            )
+            if self._is_stage3_phase() and mode == "full":
+                logger.warning(
+                    f"⚠️ Training state file is {file_size_gb:.1f} GB. Full optimizer state is required "
+                    "for exact Stage 3 resume; use explicitly allowed warm resume only if resetting Adam moments "
+                    "is intentional."
+                )
+            else:
+                logger.warning(
+                    f"⚠️ Training state file is {file_size_gb:.1f} GB (full mode includes optimizer state). "
+                    f'Set checkpoints.save_training_state="minimal" to save only scheduler/RNG/step (~few KB), '
+                    f'or "off" to disable entirely.'
+                )
 
         if not self._training_state_paths or self._training_state_paths[-1] != state_path:
             self._training_state_paths.append(state_path)
-        self._cleanup_training_states()
 
         rel_path = state_path.relative_to(self._config.output_dir)
         logger.debug(f"Training state saved to {rel_path}")
 
     def _cleanup_training_states(self) -> None:
-        """Clean up old training state files, using the same keep_last_n as checkpoints."""
-        keep_n = self._config.checkpoints.keep_last_n
-        if 0 < keep_n < len(self._training_state_paths):
-            to_remove = self._training_state_paths[:-keep_n]
-            for old_state in to_remove:
-                if old_state.exists():
-                    old_state.unlink()
-                    logger.debug(f"Removed old training state: {old_state}")
-            self._training_state_paths = self._training_state_paths[-keep_n:]
+        """Compatibility wrapper; checkpoint cleanup now manages paired state files."""
+        self._cleanup_checkpoints()
 
     def _build_checkpoint_metadata(self) -> dict[str, str]:
         """Build metadata dictionary for safetensors checkpoint.
@@ -1789,6 +1998,7 @@ class LtxvTrainer:
             Values are converted to strings for safetensors compatibility.
         """
         raw_metadata = self._training_strategy.get_checkpoint_metadata()
+        raw_metadata["global_step"] = self._global_step
         if self._config.text_encoder_lora.enabled:
             raw_metadata.update(
                 {

@@ -712,9 +712,29 @@ class CheckpointsConfig(ConfigBaseModel):
         default="minimal",
         description="Save training state alongside checkpoints for resume. "
         "'full': optimizer + scheduler + RNG + step (~800MB for LoRA, much larger for full fine-tuning). "
-        "'minimal': scheduler + RNG + step only (~few KB, sufficient for LoRA). "
+        "'minimal': scheduler + RNG + step only (~few KB; optimizer moments are reset). "
         "'off': nothing saved, resume not possible.",
     )
+
+    allow_warm_resume_without_optimizer: bool = Field(
+        default=False,
+        description="Allow an explicit warm resume from minimal Stage 3 state. "
+        "Optimizer moments are reset while scheduler/RNG/step are restored.",
+    )
+
+    def validate_stage3_resume_mode(self) -> None:
+        """Require exact optimizer state unless warm resume is explicitly requested."""
+        if self.no_resume or self.save_training_state == "full":
+            return
+        if self.save_training_state == "minimal" and self.allow_warm_resume_without_optimizer:
+            return
+        if self.save_training_state == "minimal":
+            raise ValueError(
+                "Exact Stage 3 resume requires save_training_state='full'. "
+                "Set allow_warm_resume_without_optimizer=true only when intentionally "
+                "restarting Adam moments from the loaded model weights."
+            )
+        raise ValueError("Stage 3 resume requires save_training_state='full' or an explicitly allowed warm resume")
 
 
 class HubConfig(ConfigBaseModel):
@@ -882,5 +902,7 @@ class LtxTrainerConfig(ConfigBaseModel):
             if self.model.load_checkpoint is None:
                 source = "merged Stage 2 checkpoint" if training_phase == "stage3" else "Stage 1 checkpoint"
                 raise ValueError(f"{training_phase} requires model.load_checkpoint pointing to the {source}")
+            if training_phase == "stage3":
+                self.checkpoints.validate_stage3_resume_mode()
 
         return self
