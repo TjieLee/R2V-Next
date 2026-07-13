@@ -22,6 +22,7 @@ from ltx_core.multicond.visual_tokens import (
     extract_projected_visual_tokens,
     scatter_visual_tokens_into_embeddings,
 )
+from ltx_core.text_encoders.gemma import convert_to_additive_mask
 from ltx_core.text_encoders.gemma.config import GEMMA3_CONFIG_FOR_LTX
 from ltx_trainer.training_strategies.base_strategy import ModelInputs
 from ltx_trainer.training_strategies.multi_reference_video import (
@@ -315,6 +316,7 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
         super().__init__(config)
         self.planner_tokens: VisualPlannerTokens | None = None
         self.text_encoder: nn.Module | None = None
+        self._inference_embeddings_processor: nn.Module | None = None
         self._planner_query_registers: Tensor | None = None
         self._last_planner_mse_loss: Tensor | None = None
         self._last_vlm_lm_loss: Tensor | None = None
@@ -339,6 +341,7 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
             embeddings_processor=embeddings_processor,
             text_encoder=text_encoder,
         )
+        self._inference_embeddings_processor = embeddings_processor
         video_connector = embeddings_processor.video_connector
         connector_param = next(video_connector.parameters(), None)
         connector_device = connector_param.device if connector_param is not None else torch.device("cpu")
@@ -540,6 +543,134 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
         batch["_planner_predicted_mask"] = predicted_mask
         batch["_planner_visual_positions"] = token_positions
         return self._pad_conditions_to_connector_multiple(conditions)
+
+    def prepare_inference_conditions(
+        self,
+        *,
+        conditions: dict[str, Tensor],
+        planner_vlm_inputs: dict[str, Any],
+        latents_metadata: dict[str, Any],
+        visual_position_metadata: dict[str, Any],
+    ) -> tuple[dict[str, Tensor], dict[str, Any]]:
+        """Build Stage 2 planner conditions without GT visual tokens or training-only losses/dropout."""
+        if not self.config.use_online_vlm:
+            raise RuntimeError("Stage 2 planner inference requires use_online_vlm=true")
+        if self.planner_tokens is None or self.text_encoder is None:
+            raise RuntimeError("Stage 2 planner inference models are not attached")
+        if self._inference_embeddings_processor is None:
+            raise RuntimeError("Stage 2 planner inference requires an attached embeddings processor")
+        if self._visual_full_encoder is None:
+            raise RuntimeError("Stage 2 planner inference requires visual_full_encoder")
+        visual_token_key = getattr(self.config, "visual_token_key", "visual_tokens")
+        if visual_token_key in visual_position_metadata:
+            raise ValueError(
+                "Stage 2 planner inference accepts visual position metadata only; "
+                f"remove raw {visual_token_key!r} before building conditions"
+            )
+
+        conditions = dict(conditions)
+        feature_key = "video_prompt_embeds" if "video_prompt_embeds" in conditions else "prompt_embeds"
+        if feature_key not in conditions:
+            raise ValueError("Stage 2 inference conditions contain no video/prompt embeddings")
+        original_shape = list(conditions[feature_key].shape)
+        token_positions = self._build_visual_token_positions(
+            visual_position_metadata,
+            latents_metadata,
+            token_count=self.config.planner_token_count,
+            device=conditions[feature_key].device,
+            dtype=torch.float32,
+        )
+        predicted_tokens, predicted_mask = self._run_online_vlm_inference(
+            planner_vlm_inputs,
+            device=conditions[feature_key].device,
+            token_positions=token_positions,
+        )
+        self._assert_token_count("Predicted visual tokens", predicted_tokens, predicted_mask)
+        planner_output_dim = self._resolved_planner_output_dim(
+            planner_source_dim=self._resolved_planner_source_dim()
+        )
+        self._assert_visual_token_dim("Predicted visual tokens", predicted_tokens, planner_output_dim)
+
+        conditions = self._pad_conditions_to_connector_multiple(conditions)
+        pre_connector_shape = list(conditions[feature_key].shape)
+        video_features = conditions[feature_key]
+        audio_features = conditions.get("audio_prompt_embeds")
+        additive_mask = convert_to_additive_mask(conditions["prompt_attention_mask"], video_features.dtype)
+        video_embeds, audio_embeds, attention_mask = self._inference_embeddings_processor.create_embeddings(
+            video_features,
+            audio_features,
+            additive_mask,
+        )
+        connected_conditions = dict(conditions)
+        connected_conditions["video_prompt_embeds"] = video_embeds
+        if audio_embeds is not None:
+            connected_conditions["audio_prompt_embeds"] = audio_embeds
+        connected_conditions["prompt_attention_mask"] = attention_mask
+        post_connector_text_shape = list(video_embeds.shape)
+
+        projected_tokens = self._project_visual_tokens(predicted_tokens, target_dim=video_embeds.shape[-1])
+        self._validate_full_visual_token_layout(
+            visual_position_metadata,
+            token_count=projected_tokens.shape[1],
+        )
+        visual_context, visual_mask = self._visual_full_encoder(
+            tokens=projected_tokens,
+            token_positions=token_positions,
+            token_mask=predicted_mask,
+        )
+        final_conditions = self._append_postconnector_visual_context(
+            connected_conditions,
+            visual_context,
+            visual_mask,
+        )
+        diagnostics = {
+            "predicted_visual_tokens": predicted_tokens,
+            "predicted_visual_token_mask": predicted_mask,
+            "token_positions": token_positions,
+            "planner_raw_shape": list(predicted_tokens.shape),
+            "planner_projected_shape": list(projected_tokens.shape),
+            "visual_context_shape": list(visual_context.shape),
+            "original_condition_shape": original_shape,
+            "pre_connector_condition_shape": pre_connector_shape,
+            "post_connector_text_condition_shape": post_connector_text_shape,
+            "final_condition_shape": list(final_conditions["video_prompt_embeds"].shape),
+        }
+        return final_conditions, diagnostics
+
+    def _run_online_vlm_inference(
+        self,
+        planner_data: dict[str, Any],
+        *,
+        device: torch.device,
+        token_positions: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        if self.text_encoder is None or self.planner_tokens is None:
+            raise RuntimeError("Online VLM inference requires text_encoder and planner_tokens")
+        forward_inputs = self._build_vlm_forward_inputs(planner_data, device)
+        placeholder_mask = planner_data[self.config.vlm_placeholder_mask_key].to(device=device, dtype=torch.bool)
+        self._assert_placeholder_mask(placeholder_mask)
+        inputs_embeds = self._build_vlm_inputs_embeds(
+            forward_inputs,
+            planner_data,
+            placeholder_mask,
+        )
+        planner_hidden_source, _ = self._forward_language_model_for_planner(
+            inputs_embeds=inputs_embeds,
+            attention_mask=forward_inputs["attention_mask"],
+            position_ids=forward_inputs.get("position_ids"),
+            cache_position=forward_inputs.get("cache_position"),
+        )
+        selected_hidden, selected_mask = self._select_masked_hidden(
+            planner_hidden_source,
+            placeholder_mask,
+        )
+        predicted_tokens = self.planner_tokens(
+            planner_hidden=selected_hidden,
+            query_registers=self._planner_query_registers,
+            planner_mask=selected_mask,
+            token_positions=token_positions,
+        )
+        return predicted_tokens, selected_mask
 
     def postprocess_conditions_after_connector(
         self,
