@@ -229,7 +229,8 @@ class LtxvTrainer:
 
             self._accelerator.wait_for_everyone()
 
-            for step in range(remaining_steps * cfg.optimization.gradient_accumulation_steps):
+            micro_step = 0
+            while self._global_step < cfg.optimization.steps:
                 # Get next batch, reset the dataloader if needed
                 try:
                     batch = next(data_iter)
@@ -239,7 +240,7 @@ class LtxvTrainer:
 
                 step_start_time = time.time()
                 with self._accelerator.accumulate(*self._accumulation_models):
-                    is_optimization_step = (step + 1) % cfg.optimization.gradient_accumulation_steps == 0
+                    is_optimization_step = self._accelerator.sync_gradients
                     if is_optimization_step:
                         self._global_step += 1
 
@@ -255,8 +256,10 @@ class LtxvTrainer:
                     self._optimizer.step()
                     self._optimizer.zero_grad()
 
-                    if self._lr_scheduler is not None:
-                        self._lr_scheduler.step()
+                    self._step_lr_scheduler(
+                        self._lr_scheduler,
+                        sync_gradients=self._accelerator.sync_gradients,
+                    )
 
                     # Run validation if needed (handles DDP/FSDP work distribution internally)
                     if (
@@ -341,9 +344,10 @@ class LtxvTrainer:
                         )
 
                     # Sample GPU memory periodically
-                    if step % MEMORY_CHECK_INTERVAL == 0:
+                    if micro_step % MEMORY_CHECK_INTERVAL == 0:
                         current_mem = get_gpu_memory_gb(device)
                         peak_mem_during_training = max(peak_mem_during_training, current_mem)
+                micro_step += 1
 
         # Collect final stats
         train_end_time = time.time()
@@ -1121,8 +1125,7 @@ class LtxvTrainer:
             scheduler_last_epoch = scheduler_state.get("last_epoch")
             if scheduler_last_epoch is None:
                 raise RuntimeError("Stage 3 LR scheduler state is missing last_epoch")
-            scheduler_steps_per_optimizer_step = self._scheduler_steps_per_optimizer_step()
-            expected_scheduler_last_epoch = state_step * scheduler_steps_per_optimizer_step
+            expected_scheduler_last_epoch = state_step
             if int(scheduler_last_epoch) != expected_scheduler_last_epoch:
                 raise RuntimeError(
                     "Stage 3 scheduler/global_step mismatch: "
@@ -1137,13 +1140,6 @@ class LtxvTrainer:
     def _checkpoint_step(path: Path) -> int | None:
         match = re.search(r"step_(\d+)", path.name)
         return int(match.group(1)) if match else None
-
-    def _scheduler_steps_per_optimizer_step(self) -> int:
-        """Return the scheduler step multiplier used by AcceleratedScheduler."""
-        accelerator = getattr(self, "_accelerator", None)
-        if accelerator is None or getattr(accelerator, "split_batches", False):
-            return 1
-        return max(int(getattr(accelerator, "num_processes", 1)), 1)
 
     @staticmethod
     def _read_safetensors_metadata(checkpoint_path: Path) -> dict[str, str]:
@@ -1477,6 +1473,7 @@ class LtxvTrainer:
         self._accelerator = Accelerator(
             mixed_precision=self._config.acceleration.mixed_precision_mode,
             gradient_accumulation_steps=self._config.optimization.gradient_accumulation_steps,
+            step_scheduler_with_optimizer=False,
             kwargs_handlers=[ddp_kwargs],
         )
 
@@ -1627,6 +1624,12 @@ class LtxvTrainer:
         gradient_accumulation_steps: int,
     ) -> int:
         return batch_size * num_processes * gradient_accumulation_steps
+
+    @staticmethod
+    def _step_lr_scheduler(lr_scheduler: Any | None, *, sync_gradients: bool) -> None:
+        """Advance the scheduler once at a real optimizer-step boundary."""
+        if lr_scheduler is not None and sync_gradients:
+            lr_scheduler.step()
 
     @staticmethod
     def _log_training_stats(stats: TrainingStats) -> None:

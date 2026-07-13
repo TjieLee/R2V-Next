@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 import yaml
+from accelerate.scheduler import AcceleratedScheduler
 from accelerate.utils import DistributedType
 from peft import LoraConfig, get_peft_model, get_peft_model_state_dict
 from safetensors.torch import load_file, save_file
@@ -692,6 +693,7 @@ def test_stage3_resume_accepts_matching_filename_metadata_and_state(tmp_path: Pa
         state=_training_state(500, optimizer_state={}),
     )
     trainer = _resume_test_trainer(checkpoint)
+    trainer._accelerator = SimpleNamespace(num_processes=8, split_batches=False)
 
     step, state = trainer._resolve_resume_state()
 
@@ -716,7 +718,7 @@ def test_stage3_resume_rejects_scheduler_epoch_mismatch(tmp_path: Path) -> None:
         trainer._resolve_resume_state()
 
 
-def test_stage3_resume_accepts_accelerated_scheduler_epoch(tmp_path: Path) -> None:
+def test_stage3_resume_rejects_world_size_scaled_scheduler_epoch(tmp_path: Path) -> None:
     checkpoint = _write_resume_pair(
         tmp_path,
         filename_step=500,
@@ -730,10 +732,8 @@ def test_stage3_resume_accepts_accelerated_scheduler_epoch(tmp_path: Path) -> No
     trainer = _resume_test_trainer(checkpoint)
     trainer._accelerator = SimpleNamespace(num_processes=8, split_batches=False)
 
-    step, state = trainer._resolve_resume_state()
-
-    assert step == 500
-    assert state is not None and state.global_step == 500
+    with pytest.raises(RuntimeError, match="expected_last_epoch=500"):
+        trainer._resolve_resume_state()
 
 
 def test_stage3_resume_rejects_legacy_metadata_without_global_step(tmp_path: Path) -> None:
@@ -855,6 +855,87 @@ def test_warm_resume_restores_scheduler_lr_without_adam_state() -> None:
     assert resumed_optimizer.state == {}
     assert resumed_optimizer.param_groups[0]["lr"] == source_optimizer.param_groups[0]["lr"]
     assert resumed_optimizer.param_groups[0]["lr"] == resumed_scheduler.get_last_lr()[0]
+
+
+def test_setup_accelerator_disables_automatic_scheduler_stepping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_kwargs: dict[str, object] = {}
+
+    def fake_accelerator(**kwargs: object) -> SimpleNamespace:
+        captured_kwargs.update(kwargs)
+        return SimpleNamespace(
+            num_processes=1,
+            state=SimpleNamespace(dynamo_plugin=SimpleNamespace(backend="NO")),
+        )
+
+    monkeypatch.setattr("ltx_trainer.trainer.Accelerator", fake_accelerator)
+    trainer = LtxvTrainer.__new__(LtxvTrainer)
+    trainer._config = SimpleNamespace(
+        acceleration=SimpleNamespace(mixed_precision_mode="bf16"),
+        optimization=SimpleNamespace(batch_size=1, gradient_accumulation_steps=4),
+    )
+
+    trainer._setup_accelerator()
+
+    assert captured_kwargs["step_scheduler_with_optimizer"] is False
+
+
+@pytest.mark.parametrize(
+    ("world_size", "gradient_accumulation_steps"),
+    [(1, 1), (8, 1), (8, 4)],
+)
+def test_scheduler_steps_once_per_global_optimizer_step(
+    monkeypatch: pytest.MonkeyPatch,
+    world_size: int,
+    gradient_accumulation_steps: int,
+) -> None:
+    accelerator_state_calls = 0
+
+    def fake_accelerator_state() -> SimpleNamespace:
+        nonlocal accelerator_state_calls
+        accelerator_state_calls += 1
+        return SimpleNamespace(num_processes=world_size)
+
+    monkeypatch.setattr("accelerate.scheduler.AcceleratorState", fake_accelerator_state)
+    parameter = nn.Parameter(torch.tensor([1.0]))
+    optimizer = AdamW([parameter], lr=1.0e-3)
+    base_scheduler = LinearLR(optimizer, start_factor=1.0, end_factor=0.1, total_iters=2000)
+    scheduler = AcceleratedScheduler(
+        base_scheduler,
+        optimizer,
+        step_with_optimizer=False,
+        split_batches=False,
+    )
+
+    for micro_step in range(500 * gradient_accumulation_steps):
+        sync_gradients = (micro_step + 1) % gradient_accumulation_steps == 0
+        if sync_gradients:
+            optimizer.step()
+        LtxvTrainer._step_lr_scheduler(scheduler, sync_gradients=sync_gradients)
+
+    assert base_scheduler.last_epoch == 500
+    assert scheduler.get_last_lr() == base_scheduler.get_last_lr()
+    assert accelerator_state_calls == 0
+
+
+def test_linear_scheduler_finishes_at_global_step_2000() -> None:
+    parameter = nn.Parameter(torch.tensor([1.0]))
+    optimizer = AdamW([parameter], lr=1.0e-3)
+    base_scheduler = LinearLR(optimizer, start_factor=1.0, end_factor=0.1, total_iters=2000)
+    scheduler = AcceleratedScheduler(
+        base_scheduler,
+        optimizer,
+        step_with_optimizer=False,
+        split_batches=False,
+    )
+
+    for _ in range(2000):
+        optimizer.step()
+        LtxvTrainer._step_lr_scheduler(scheduler, sync_gradients=True)
+
+    assert base_scheduler.last_epoch == 2000
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(1.0e-4)
 
 
 def _write_checkpoint_pair(checkpoints_dir: Path, step: int) -> tuple[Path, Path]:
