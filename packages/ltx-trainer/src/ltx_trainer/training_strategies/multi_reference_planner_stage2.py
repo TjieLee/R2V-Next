@@ -8,6 +8,7 @@ an MSE loss aligns the VLM-predicted visual tokens to the GT visual tokens.
 """
 
 import logging
+from dataclasses import dataclass
 from functools import partial
 from typing import Any, Literal
 
@@ -31,6 +32,17 @@ from ltx_trainer.training_strategies.multi_reference_video import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class PlannerInferenceConditionParts:
+    """Explicit Stage 2 inference outputs for reusing one planner visual context."""
+
+    connected_text_conditions: dict[str, Tensor]
+    visual_context: Tensor
+    visual_mask: Tensor
+    final_conditions: dict[str, Tensor]
+    diagnostics: dict[str, Any]
 
 
 def configure_stage3_transformer_trainability(transformer: nn.Module) -> list[str]:
@@ -589,6 +601,26 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
         drop_reference_images: bool = False,
     ) -> tuple[dict[str, Tensor], dict[str, Any]]:
         """Build Stage 2 planner conditions without GT visual tokens or training-only losses/dropout."""
+        parts = MultiReferencePlannerStage2Strategy.prepare_inference_condition_parts(
+            self,
+            conditions=conditions,
+            planner_vlm_inputs=planner_vlm_inputs,
+            latents_metadata=latents_metadata,
+            visual_position_metadata=visual_position_metadata,
+            drop_reference_images=drop_reference_images,
+        )
+        return parts.final_conditions, parts.diagnostics
+
+    def prepare_inference_condition_parts(
+        self,
+        *,
+        conditions: dict[str, Tensor],
+        planner_vlm_inputs: dict[str, Any],
+        latents_metadata: dict[str, Any],
+        visual_position_metadata: dict[str, Any],
+        drop_reference_images: bool = False,
+    ) -> PlannerInferenceConditionParts:
+        """Build and expose text/planner condition parts from exactly one VLM planner forward."""
         if not self.config.use_online_vlm:
             raise RuntimeError("Stage 2 planner inference requires use_online_vlm=true")
         if self.planner_tokens is None or self.text_encoder is None:
@@ -673,7 +705,43 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
             "final_condition_shape": list(final_conditions["video_prompt_embeds"].shape),
             "drop_reference_images": drop_reference_images,
         }
-        return final_conditions, diagnostics
+        return PlannerInferenceConditionParts(
+            connected_text_conditions=connected_conditions,
+            visual_context=visual_context,
+            visual_mask=visual_mask,
+            final_conditions=final_conditions,
+            diagnostics=diagnostics,
+        )
+
+    def append_shared_inference_visual_context(
+        self,
+        connected_text_conditions: dict[str, Tensor | None],
+        *,
+        visual_context: Tensor,
+        visual_mask: Tensor,
+    ) -> dict[str, Tensor]:
+        """Append an already-computed planner context to connected text without another VLM forward."""
+        conditions = dict(connected_text_conditions)
+        feature_key = "video_prompt_embeds" if "video_prompt_embeds" in conditions else "prompt_embeds"
+        text_context = conditions.get(feature_key)
+        if not isinstance(text_context, Tensor):
+            raise ValueError("Shared planner inference conditions contain no text context tensor")
+        if text_context.shape[0] != visual_context.shape[0] or text_context.shape[-1] != visual_context.shape[-1]:
+            raise ValueError(
+                "Shared planner text/visual context shape mismatch: "
+                f"text={list(text_context.shape)}, visual={list(visual_context.shape)}"
+            )
+        if conditions.get("prompt_attention_mask") is None:
+            conditions["prompt_attention_mask"] = torch.ones(
+                text_context.shape[:2],
+                dtype=torch.long,
+                device=text_context.device,
+            )
+        return self._append_postconnector_visual_context(
+            conditions,
+            visual_context,
+            visual_mask,
+        )
 
     @staticmethod
     def _prepare_inference_planner_data(

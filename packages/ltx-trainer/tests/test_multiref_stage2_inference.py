@@ -1,4 +1,5 @@
 import importlib.util
+import inspect
 import json
 import sys
 from contextlib import nullcontext
@@ -168,6 +169,19 @@ class _InferenceHarness:
             visual_mask,
         )
 
+    def prepare_inference_conditions(self, **kwargs):
+        return MultiReferencePlannerStage2Strategy.prepare_inference_conditions(self, **kwargs)
+
+    def prepare_inference_condition_parts(self, **kwargs):
+        return MultiReferencePlannerStage2Strategy.prepare_inference_condition_parts(self, **kwargs)
+
+    def append_shared_inference_visual_context(self, conditions, **kwargs):
+        return MultiReferencePlannerStage2Strategy.append_shared_inference_visual_context(
+            self,
+            conditions,
+            **kwargs,
+        )
+
 
 def _prepare_with_harness(
     harness: _InferenceHarness,
@@ -203,6 +217,49 @@ def _prepare_with_harness(
         latents_metadata={"height": torch.tensor([64]), "width": torch.tensor([96])},
         visual_position_metadata=visual_metadata,
         drop_reference_images=drop_reference_images,
+    )
+
+
+def _prepare_guidance_with_harness(
+    harness: _InferenceHarness,
+    *,
+    ref_guidance_mode: infer.RefGuidanceMode,
+    guidance_scale: float = 2.0,
+    ref_guidance_scale: float = 2.0,
+):
+    positive_conditions = {
+        "video_prompt_embeds": torch.full((1, 2, harness.raw_dim), 1.0, dtype=torch.float16),
+        "audio_prompt_embeds": None,
+        "prompt_attention_mask": torch.ones(1, 2, dtype=torch.long),
+    }
+    text_conditions = {
+        "video_prompt_embeds": torch.full((1, 2, harness.raw_dim), 5.0, dtype=torch.float16),
+        "audio_prompt_embeds": None,
+        "prompt_attention_mask": torch.ones(1, 2, dtype=torch.long),
+    }
+    negative_conditions = {
+        "video_prompt_embeds": torch.full((1, 3, harness.target_dim), -3.0, dtype=torch.float16),
+        "audio_prompt_embeds": None,
+        "prompt_attention_mask": None,
+    }
+    return infer._prepare_guidance_condition_bundle(
+        strategy=harness,
+        conditions=positive_conditions,
+        text_conditions=text_conditions,
+        planner_vlm_inputs={
+            "input_ids": torch.tensor([[1, 2]]),
+            "pixel_values": torch.ones(1, 1, 1),
+        },
+        latents_metadata={"height": torch.tensor([64]), "width": torch.tensor([96])},
+        visual_position_metadata={
+            "tokens_per_frame": torch.tensor([max(harness.token_count, 1)]),
+            "sampled_frame_indices": torch.tensor([[0]]),
+            "source_fps": torch.tensor([24.0]),
+        },
+        negative_text_conditions=negative_conditions,
+        guidance_scale=guidance_scale,
+        ref_guidance_scale=ref_guidance_scale,
+        ref_guidance_mode=ref_guidance_mode,
     )
 
 
@@ -339,6 +396,357 @@ def test_no_ref_planner_data_removes_pixels_and_zeros_reference_count() -> None:
     assert no_ref_data["num_ref_images"].tolist() == [0, 0]
     assert "pixel_values" in planner_data
     assert planner_data["num_ref_images"].tolist() == [1, 2]
+
+
+def test_ref_guidance_mode_defaults_to_synchronized() -> None:
+    option = inspect.signature(infer.main).parameters["ref_guidance_mode"].default
+
+    assert infer._DEFAULT_REF_GUIDANCE_MODE == "synchronized"
+    assert option.default == "synchronized"
+
+
+def test_synchronized_ref_guidance_preserves_legacy_condition_construction() -> None:
+    harness = _InferenceHarness()
+    bundle = _prepare_guidance_with_harness(
+        harness,
+        ref_guidance_mode="synchronized",
+    )
+
+    assert harness.events.count("vlm_planner") == 1
+    assert harness.events.count("vlm_planner_no_ref") == 1
+    assert bundle.planner_forward_count == 2
+    assert bundle.negative_conditions is not None
+    assert bundle.negative_conditions["video_prompt_embeds"].shape == (1, 3, harness.target_dim)
+    assert bundle.no_ref_conditions is not None
+    assert bundle.shared_visual_context is None
+    assert bundle.shared_visual_mask is None
+
+
+def test_shared_planner_is_run_once_and_reused_by_positive_negative_and_no_ref() -> None:
+    harness = _InferenceHarness()
+    bundle = _prepare_guidance_with_harness(
+        harness,
+        ref_guidance_mode="shared_planner_latent_only",
+    )
+
+    assert harness.events.count("vlm_planner") == 1
+    assert harness.events.count("vlm_planner_no_ref") == 0
+    assert bundle.planner_forward_count == 1
+    assert bundle.shared_visual_context is not None
+    assert bundle.shared_visual_mask is not None
+    assert bundle.negative_conditions is not None
+    positive_context = bundle.positive_conditions["video_prompt_embeds"]
+    negative_context = bundle.negative_conditions["video_prompt_embeds"]
+    positive_mask = bundle.positive_conditions["prompt_attention_mask"]
+    negative_mask = bundle.negative_conditions["prompt_attention_mask"]
+    visual_token_count = bundle.shared_visual_context.shape[1]
+
+    assert torch.equal(positive_context[:, -visual_token_count:], bundle.shared_visual_context)
+    assert torch.equal(negative_context[:, -visual_token_count:], bundle.shared_visual_context)
+    assert torch.equal(positive_context[:, -visual_token_count:], negative_context[:, -visual_token_count:])
+    assert torch.equal(positive_mask[:, -visual_token_count:], bundle.shared_visual_mask.long())
+    assert torch.equal(negative_mask[:, -visual_token_count:], bundle.shared_visual_mask.long())
+    assert not torch.equal(positive_context[:, :2], negative_context[:, :2])
+    assert negative_context.shape[1] == 3 + visual_token_count
+    assert bundle.no_ref_conditions is None
+
+
+@pytest.mark.parametrize("ref_guidance_mode", ["synchronized", "shared_planner_latent_only"])
+def test_zero_ref_guidance_does_not_build_no_ref_condition(
+    ref_guidance_mode: infer.RefGuidanceMode,
+) -> None:
+    harness = _InferenceHarness()
+    bundle = _prepare_guidance_with_harness(
+        harness,
+        ref_guidance_mode=ref_guidance_mode,
+        ref_guidance_scale=0.0,
+    )
+
+    assert bundle.no_ref_conditions is None
+    assert harness.events.count("vlm_planner_no_ref") == 0
+
+
+def test_cfg_scale_one_does_not_build_shared_negative_condition() -> None:
+    harness = _InferenceHarness()
+    bundle = _prepare_guidance_with_harness(
+        harness,
+        ref_guidance_mode="shared_planner_latent_only",
+        guidance_scale=1.0,
+    )
+
+    assert bundle.negative_conditions is None
+    assert bundle.planner_forward_count == 1
+
+
+def test_ref_guidance_metadata_records_both_modes() -> None:
+    synchronized = infer._guidance_metadata(
+        ref_guidance_mode="synchronized",
+        planner_forward_count=2,
+        ref_guidance_enabled=True,
+    )
+    shared = infer._guidance_metadata(
+        ref_guidance_mode="shared_planner_latent_only",
+        planner_forward_count=1,
+        ref_guidance_enabled=True,
+    )
+
+    assert synchronized["ref_guidance_mode"] == "synchronized"
+    assert synchronized["negative_uses_shared_planner"] is False
+    assert synchronized["no_ref_uses_shared_planner"] is False
+    assert shared == {
+        "ref_guidance_mode": "shared_planner_latent_only",
+        "planner_forward_count": 1,
+        "negative_uses_shared_planner": True,
+        "no_ref_uses_shared_planner": True,
+        "no_ref_branch_is_synchronized": False,
+        "ref_guidance_formula": (
+            "full_shared_planner_with_refs - full_shared_planner_without_ref_latents"
+        ),
+        "guidance_formula": (
+            "N_shared_planner_with_refs + cfg*(P_shared_planner_with_refs-N_shared_planner_with_refs) + "
+            "ref*(P_shared_planner_with_refs-P_shared_planner_without_ref_latents) + "
+            "stg*(P_shared_planner_with_refs-S_stg_of_P)"
+        ),
+    }
+
+
+def test_shared_multidirectional_guidance_rescale_runs_after_all_deltas() -> None:
+    positive = torch.tensor([[[1.0, 4.0], [2.0, 8.0]]])
+    negative = torch.tensor([[[0.0, 1.0], [1.0, 2.0]]])
+    no_ref = torch.tensor([[[0.5, 2.0], [1.5, 3.0]]])
+    stg = torch.tensor([[[0.25, 1.0], [0.5, 2.0]]])
+    unscaled = infer.stage1._combine_multidirectional_denoised(
+        denoised_pos=positive,
+        denoised_neg=negative,
+        denoised_no_ref=no_ref,
+        denoised_siglip_isolated=None,
+        denoised_siglip_null=None,
+        denoised_stg=stg,
+        guidance_scale=2.0,
+        ref_guidance_scale=1.5,
+        siglip_guidance_scale=0.0,
+        stg_scale=0.75,
+        guidance_rescale=0.0,
+        target_seq_len=2,
+    )
+    rescaled = infer.stage1._combine_multidirectional_denoised(
+        denoised_pos=positive,
+        denoised_neg=negative,
+        denoised_no_ref=no_ref,
+        denoised_siglip_isolated=None,
+        denoised_siglip_null=None,
+        denoised_stg=stg,
+        guidance_scale=2.0,
+        ref_guidance_scale=1.5,
+        siglip_guidance_scale=0.0,
+        stg_scale=0.75,
+        guidance_rescale=0.7,
+        target_seq_len=2,
+    )
+    factor = 0.7 * (positive.float().std() / unscaled.float().std().clamp(min=1.0e-8)) + 0.3
+
+    assert torch.allclose(rescaled, unscaled * factor.to(dtype=unscaled.dtype))
+
+
+def _run_fake_shared_denoise(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    guidance_scale: float,
+    ref_guidance_scale: float,
+    stg_scale: float,
+) -> tuple[list[dict[str, object]], torch.Tensor]:
+    calls: list[dict[str, object]] = []
+
+    class FakePatchifier:
+        @staticmethod
+        def patchify(latents):
+            return latents.flatten(2).transpose(1, 2)
+
+        @staticmethod
+        def unpatchify(tokens, output_shape):
+            del output_shape
+            return tokens
+
+    class FakeStrategy:
+        config = SimpleNamespace(max_ref_images_per_sample=None, reference_time_stride=1.0)
+        _video_patchifier = FakePatchifier()
+
+        @staticmethod
+        def _normalize_reference_latents(latents):
+            return latents
+
+        @staticmethod
+        def _get_reference_valid_mask(ref_data, ref_latents):
+            del ref_data
+            return torch.ones(ref_latents.shape[:2], dtype=torch.bool)
+
+        @staticmethod
+        def _get_video_positions(**kwargs):
+            return torch.zeros(kwargs["batch_size"], 3, 1, 2)
+
+        @staticmethod
+        def _scale_reference_positions(positions, *args):
+            del args
+            return positions
+
+        @staticmethod
+        def _first_scalar(value, *, default):
+            del value
+            return default
+
+    class FakeTransformer(torch.nn.Module):
+        def forward(self, *, video, audio, perturbations):
+            del audio
+            calls.append(
+                {
+                    "context": video.context,
+                    "context_mask": video.context_mask,
+                    "ref_valid_mask": video.attention_mask.clone(),
+                    "latent": video.latent.clone(),
+                    "timesteps": video.timesteps.clone(),
+                    "positions": video.positions.clone(),
+                    "is_stg": perturbations is not None,
+                }
+            )
+            return torch.zeros_like(video.latent), None
+
+    class FakeScheduler:
+        @staticmethod
+        def execute(*, steps):
+            del steps
+            return torch.tensor([1.0, 0.0])
+
+    class FakeStepper:
+        @staticmethod
+        def step(latent, denoised, sigmas, step_idx):
+            del denoised, sigmas, step_idx
+            return latent
+
+    def fake_build_multiref_sequence(
+        *,
+        ref_tokens,
+        ref_positions,
+        ref_valid_mask,
+        target_tokens,
+        target_positions,
+        target_timesteps,
+        target_loss_mask,
+        reference_time_stride,
+    ):
+        del ref_positions, target_positions, target_loss_mask, reference_time_stride
+        flat_ref_tokens = ref_tokens.reshape(ref_tokens.shape[0], -1, ref_tokens.shape[-1])
+        latents = torch.cat([flat_ref_tokens, target_tokens], dim=1)
+        timesteps = torch.cat(
+            [
+                torch.zeros(latents.shape[0], flat_ref_tokens.shape[1]),
+                target_timesteps,
+            ],
+            dim=1,
+        )
+        positions = torch.zeros(latents.shape[0], 3, latents.shape[1], 2)
+        return SimpleNamespace(
+            latents=latents,
+            timesteps=timesteps,
+            positions=positions,
+            attention_mask=ref_valid_mask,
+        )
+
+    monkeypatch.setattr(infer.stage1, "LTX2Scheduler", FakeScheduler)
+    monkeypatch.setattr(infer.stage1, "EulerDiffusionStep", FakeStepper)
+    monkeypatch.setattr(infer.stage1, "build_multiref_sequence", fake_build_multiref_sequence)
+    positive_context = torch.ones(1, 4, 3)
+    positive_mask = torch.ones(1, 4, dtype=torch.long)
+    negative_context = torch.full((1, 5, 3), -1.0)
+    output = infer.stage1._denoise_stage1(
+        transformer=FakeTransformer(),
+        strategy=FakeStrategy(),
+        batch={
+            "latents": {
+                "latents": torch.zeros(1, 2, 1, 1, 1),
+                "num_frames": torch.tensor([1]),
+                "height": torch.tensor([1]),
+                "width": torch.tensor([1]),
+                "fps": torch.tensor([24.0]),
+            },
+            "multi_ref_latents": {
+                "latents": torch.ones(1, 1, 2, 1, 1, 1),
+                "fps": torch.tensor([1.0]),
+            },
+        },
+        positive_conditions={
+            "video_prompt_embeds": positive_context,
+            "prompt_attention_mask": positive_mask,
+        },
+        negative_conditions={
+            "video_prompt_embeds": negative_context,
+            "prompt_attention_mask": torch.ones(1, 5, dtype=torch.long),
+        }
+        if guidance_scale != 1.0
+        else None,
+        no_ref_conditions=None,
+        guidance_scale=guidance_scale,
+        cfg_drop_ref_latents_in_negative=False,
+        ref_guidance_scale=ref_guidance_scale,
+        siglip_guidance_scale=0.0,
+        guidance_rescale=0.7,
+        stg_scale=stg_scale,
+        stg_blocks=[28],
+        num_inference_steps=1,
+        seed=42,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    return calls, output
+
+
+def test_shared_mode_four_dit_branches_reuse_context_and_drop_only_ref_mask(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls, output = _run_fake_shared_denoise(
+        monkeypatch,
+        guidance_scale=2.0,
+        ref_guidance_scale=2.0,
+        stg_scale=1.0,
+    )
+
+    assert len(calls) == 4
+    positive, negative, no_ref, stg = calls
+    assert negative["context"] is not positive["context"]
+    assert no_ref["context"] is positive["context"]
+    assert no_ref["context_mask"] is positive["context_mask"]
+    assert stg["context"] is positive["context"]
+    assert torch.equal(positive["ref_valid_mask"], torch.ones(1, 1, dtype=torch.bool))
+    assert torch.equal(negative["ref_valid_mask"], positive["ref_valid_mask"])
+    assert torch.equal(no_ref["ref_valid_mask"], torch.zeros(1, 1, dtype=torch.bool))
+    for field in ("latent", "timesteps", "positions"):
+        assert torch.equal(no_ref[field], positive[field])
+    assert stg["is_stg"] is True
+    assert torch.isfinite(output).all()
+
+
+def test_zero_ref_scale_skips_no_ref_dit_forward(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls, _ = _run_fake_shared_denoise(
+        monkeypatch,
+        guidance_scale=2.0,
+        ref_guidance_scale=0.0,
+        stg_scale=1.0,
+    )
+
+    assert len(calls) == 3
+    assert all(torch.any(call["ref_valid_mask"]) for call in calls)
+
+
+def test_cfg_scale_one_skips_negative_dit_forward(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls, _ = _run_fake_shared_denoise(
+        monkeypatch,
+        guidance_scale=1.0,
+        ref_guidance_scale=2.0,
+        stg_scale=1.0,
+    )
+
+    assert len(calls) == 3
+    assert calls[1]["context"] is calls[0]["context"]
+    assert torch.equal(calls[1]["ref_valid_mask"], torch.zeros(1, 1, dtype=torch.bool))
 
 
 def test_gt_metrics_are_diagnostic_only() -> None:
