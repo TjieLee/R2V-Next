@@ -97,6 +97,7 @@ class _GuidanceConditionBundle:
     positive_conditions: dict[str, Tensor]
     negative_conditions: dict[str, Tensor | None] | None
     no_ref_conditions: dict[str, Tensor | None] | None
+    no_visual_conditions: dict[str, Tensor | None] | None
     inference_diagnostics: dict[str, Any]
     no_ref_diagnostics: dict[str, Any] | None
     planner_forward_count: int
@@ -525,10 +526,15 @@ def _prepare_guidance_condition_bundle(
     negative_text_conditions: dict[str, Tensor | None] | None,
     guidance_scale: float,
     ref_guidance_scale: float,
+    vision_guidance_scale: float,
     ref_guidance_mode: RefGuidanceMode,
 ) -> _GuidanceConditionBundle:
     """Build Stage 2 guidance contexts while making planner sharing explicit."""
     if ref_guidance_mode == "synchronized":
+        if vision_guidance_scale != 0.0:
+            raise ValueError(
+                "vision_guidance_scale is only supported by shared-planner ref guidance modes"
+            )
         positive_conditions, inference_diagnostics = strategy.prepare_inference_conditions(
             conditions=conditions,
             planner_vlm_inputs=planner_vlm_inputs,
@@ -550,6 +556,7 @@ def _prepare_guidance_condition_bundle(
             positive_conditions=positive_conditions,
             negative_conditions=negative_text_conditions,
             no_ref_conditions=no_ref_conditions,
+            no_visual_conditions=None,
             inference_diagnostics=inference_diagnostics,
             no_ref_diagnostics=no_ref_diagnostics,
             planner_forward_count=1 + int(ref_guidance_scale != 0.0),
@@ -581,10 +588,20 @@ def _prepare_guidance_condition_bundle(
         )
     else:
         negative_conditions = None
+    if vision_guidance_scale != 0.0:
+        no_visual_conditions = MultiReferencePlannerStage2Strategy.append_shared_inference_visual_context(
+            strategy,
+            parts.connected_text_conditions,
+            visual_context=torch.zeros_like(parts.visual_context),
+            visual_mask=parts.visual_mask,
+        )
+    else:
+        no_visual_conditions = None
     return _GuidanceConditionBundle(
         positive_conditions=parts.final_conditions,
         negative_conditions=negative_conditions,
         no_ref_conditions=None,
+        no_visual_conditions=no_visual_conditions,
         inference_diagnostics=parts.diagnostics,
         no_ref_diagnostics=None,
         planner_forward_count=1,
@@ -599,6 +616,7 @@ def _guidance_metadata(
     planner_forward_count: int,
     guidance_enabled: bool,
     ref_guidance_enabled: bool,
+    vision_guidance_enabled: bool,
 ) -> dict[str, Any]:
     if ref_guidance_mode in {
         "shared_planner_latent_only",
@@ -612,6 +630,11 @@ def _guidance_metadata(
             "positive_uses_text_only_prefix": uses_text_only_prefix,
             "negative_uses_shared_planner": guidance_enabled,
             "no_ref_uses_shared_planner": ref_guidance_enabled,
+            "vision_guidance_enabled": vision_guidance_enabled,
+            "vision_guidance_formula": (
+                "positive_shared_planner_with_refs - positive_zero_planner_with_refs"
+            ),
+            "no_visual_uses_same_reference_latents": vision_guidance_enabled,
             "no_ref_branch_is_synchronized": False,
             "ref_guidance_formula": (
                 f"{prefix_name}_shared_planner_with_refs - "
@@ -622,6 +645,8 @@ def _guidance_metadata(
                 "N_shared_planner_with_refs) + "
                 f"ref*(P_{prefix_name}_shared_planner_with_refs-"
                 f"P_{prefix_name}_shared_planner_without_ref_latents) + "
+                f"vision*(P_{prefix_name}_shared_planner_with_refs-"
+                f"Q_{prefix_name}_zero_planner_with_refs) + "
                 f"stg*(P_{prefix_name}_shared_planner_with_refs-S_stg_of_P)"
             ),
         }
@@ -630,6 +655,9 @@ def _guidance_metadata(
         "planner_forward_count": planner_forward_count,
         "negative_uses_shared_planner": False,
         "no_ref_uses_shared_planner": False,
+        "vision_guidance_enabled": False,
+        "vision_guidance_formula": None,
+        "no_visual_uses_same_reference_latents": False,
         "no_ref_branch_is_synchronized": ref_guidance_enabled,
         "ref_guidance_formula": "full_reference_planner_with_refs - synchronized_text_only_planner_without_refs",
         "guidance_formula": (
@@ -659,6 +687,7 @@ def _run_one_sample(  # noqa: PLR0913, PLR0915
     save_predicted_tokens: bool,
     guidance_scale: float,
     ref_guidance_scale: float,
+    vision_guidance_scale: float,
     ref_guidance_mode: RefGuidanceMode,
     guidance_rescale: float,
     stg_scale: float,
@@ -737,11 +766,13 @@ def _run_one_sample(  # noqa: PLR0913, PLR0915
             negative_text_conditions=runtime.negative_conditions,
             guidance_scale=guidance_scale,
             ref_guidance_scale=ref_guidance_scale,
+            vision_guidance_scale=vision_guidance_scale,
             ref_guidance_mode=ref_guidance_mode,
         )
     conditions = guidance_conditions.positive_conditions
     negative_conditions = guidance_conditions.negative_conditions
     no_ref_conditions = guidance_conditions.no_ref_conditions
+    no_visual_conditions = guidance_conditions.no_visual_conditions
     inference_diagnostics = guidance_conditions.inference_diagnostics
     no_ref_diagnostics = guidance_conditions.no_ref_diagnostics
 
@@ -779,9 +810,11 @@ def _run_one_sample(  # noqa: PLR0913, PLR0915
         positive_conditions=conditions,
         negative_conditions=negative_conditions,
         no_ref_conditions=no_ref_conditions,
+        no_visual_conditions=no_visual_conditions,
         guidance_scale=guidance_scale,
         cfg_drop_ref_latents_in_negative=False,
         ref_guidance_scale=ref_guidance_scale,
+        vision_guidance_scale=vision_guidance_scale,
         siglip_guidance_scale=0.0,
         guidance_rescale=guidance_rescale,
         stg_scale=stg_scale,
@@ -836,6 +869,7 @@ def _run_one_sample(  # noqa: PLR0913, PLR0915
         ),
         "guidance_scale": guidance_scale,
         "ref_guidance_scale": ref_guidance_scale,
+        "vision_guidance_scale": vision_guidance_scale,
         "guidance_rescale": guidance_rescale,
         "stg_scale": stg_scale,
         "stg_blocks": stg_blocks,
@@ -844,6 +878,7 @@ def _run_one_sample(  # noqa: PLR0913, PLR0915
             planner_forward_count=guidance_conditions.planner_forward_count,
             guidance_enabled=stage1._cfg_enabled(guidance_scale),
             ref_guidance_enabled=ref_guidance_scale != 0.0,
+            vision_guidance_enabled=vision_guidance_scale != 0.0,
         ),
         "uniform_sampled_frame_indices": sampled_frame_indices if position_source == "uniform_target" else None,
         "num_video_frames": num_video_frames,
@@ -936,6 +971,20 @@ def _validate_guidance(
         raise typer.BadParameter("--stg-scale must be >= 0.0")
 
 
+def _validate_vision_guidance(
+    *,
+    vision_guidance_scale: float,
+    ref_guidance_mode: RefGuidanceMode,
+) -> None:
+    if vision_guidance_scale < 0.0:
+        raise typer.BadParameter("--vision-guidance-scale must be >= 0.0")
+    if vision_guidance_scale != 0.0 and ref_guidance_mode == "synchronized":
+        raise typer.BadParameter(
+            "--vision-guidance-scale is only supported with shared_planner_latent_only or "
+            "shared_planner_full_vlm_latent_only"
+        )
+
+
 def _validate_strict_no_gt(
     *,
     strict_no_gt: bool,
@@ -993,6 +1042,7 @@ def main(  # noqa: PLR0913, PLR0915
     negative_prompt: str | None = typer.Option(None, "--negative-prompt"),
     guidance_scale: float = typer.Option(2.0, "--guidance-scale"),
     ref_guidance_scale: float = typer.Option(2.0, "--ref-guidance-scale"),
+    vision_guidance_scale: float = typer.Option(0.0, "--vision-guidance-scale"),
     ref_guidance_mode: RefGuidanceMode = typer.Option(
         _DEFAULT_REF_GUIDANCE_MODE,
         "--ref-guidance-mode",
@@ -1008,6 +1058,10 @@ def main(  # noqa: PLR0913, PLR0915
         ref_guidance_scale=ref_guidance_scale,
         siglip_guidance_scale=siglip_guidance_scale,
         stg_scale=stg_scale,
+    )
+    _validate_vision_guidance(
+        vision_guidance_scale=vision_guidance_scale,
+        ref_guidance_mode=ref_guidance_mode,
     )
     stage1._validate_guidance_rescale(guidance_rescale)
     _validate_strict_no_gt(
@@ -1093,6 +1147,7 @@ def main(  # noqa: PLR0913, PLR0915
             save_predicted_tokens=save_predicted_tokens,
             guidance_scale=guidance_scale,
             ref_guidance_scale=ref_guidance_scale,
+            vision_guidance_scale=vision_guidance_scale,
             ref_guidance_mode=ref_guidance_mode,
             guidance_rescale=guidance_rescale,
             stg_scale=stg_scale,

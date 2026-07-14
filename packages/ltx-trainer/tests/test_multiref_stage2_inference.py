@@ -226,6 +226,7 @@ def _prepare_guidance_with_harness(
     ref_guidance_mode: infer.RefGuidanceMode,
     guidance_scale: float = 2.0,
     ref_guidance_scale: float = 2.0,
+    vision_guidance_scale: float = 0.0,
 ):
     positive_conditions = {
         "video_prompt_embeds": torch.full((1, 2, harness.raw_dim), 1.0, dtype=torch.float16),
@@ -259,6 +260,7 @@ def _prepare_guidance_with_harness(
         negative_text_conditions=negative_conditions,
         guidance_scale=guidance_scale,
         ref_guidance_scale=ref_guidance_scale,
+        vision_guidance_scale=vision_guidance_scale,
         ref_guidance_mode=ref_guidance_mode,
     )
 
@@ -399,10 +401,13 @@ def test_no_ref_planner_data_removes_pixels_and_zeros_reference_count() -> None:
 
 
 def test_ref_guidance_mode_defaults_to_synchronized() -> None:
-    option = inspect.signature(infer.main).parameters["ref_guidance_mode"].default
+    signature = inspect.signature(infer.main)
+    option = signature.parameters["ref_guidance_mode"].default
+    vision_option = signature.parameters["vision_guidance_scale"].default
 
     assert infer._DEFAULT_REF_GUIDANCE_MODE == "synchronized"
     assert option.default == "synchronized"
+    assert vision_option.default == 0.0
 
 
 def test_synchronized_ref_guidance_preserves_legacy_condition_construction() -> None:
@@ -451,6 +456,46 @@ def test_shared_planner_is_run_once_and_reused_by_positive_negative_and_no_ref()
     assert not torch.equal(positive_context[:, :2], negative_context[:, :2])
     assert negative_context.shape[1] == 3 + visual_token_count
     assert bundle.no_ref_conditions is None
+    assert bundle.no_visual_conditions is None
+
+
+def test_vision_guidance_builds_zero_planner_context_without_rerunning_planner() -> None:
+    harness = _InferenceHarness()
+    bundle = _prepare_guidance_with_harness(
+        harness,
+        ref_guidance_mode="shared_planner_latent_only",
+        vision_guidance_scale=1.5,
+    )
+
+    assert harness.events.count("vlm_planner") == 1
+    assert harness.events.count("vlm_planner_no_ref") == 0
+    assert bundle.planner_forward_count == 1
+    assert bundle.no_visual_conditions is not None
+    positive_context = bundle.positive_conditions["video_prompt_embeds"]
+    no_visual_context = bundle.no_visual_conditions["video_prompt_embeds"]
+    positive_mask = bundle.positive_conditions["prompt_attention_mask"]
+    no_visual_mask = bundle.no_visual_conditions["prompt_attention_mask"]
+    visual_token_count = bundle.shared_visual_context.shape[1]
+
+    assert positive_context.shape == no_visual_context.shape
+    assert torch.equal(positive_context[:, :-visual_token_count], no_visual_context[:, :-visual_token_count])
+    assert torch.count_nonzero(no_visual_context[:, -visual_token_count:]) == 0
+    assert torch.equal(positive_mask, no_visual_mask)
+    assert torch.equal(no_visual_mask[:, -visual_token_count:], bundle.shared_visual_mask.long())
+
+
+def test_synchronized_mode_rejects_nonzero_vision_guidance() -> None:
+    with pytest.raises(infer.typer.BadParameter, match="only supported"):
+        infer._validate_vision_guidance(
+            vision_guidance_scale=1.0,
+            ref_guidance_mode="synchronized",
+        )
+    with pytest.raises(ValueError, match="only supported"):
+        _prepare_guidance_with_harness(
+            _InferenceHarness(),
+            ref_guidance_mode="synchronized",
+            vision_guidance_scale=1.0,
+        )
 
 
 def test_renamed_full_vlm_shared_mode_preserves_previous_positive_prefix() -> None:
@@ -507,12 +552,14 @@ def test_ref_guidance_metadata_records_both_modes() -> None:
         planner_forward_count=2,
         guidance_enabled=True,
         ref_guidance_enabled=True,
+        vision_guidance_enabled=False,
     )
     shared = infer._guidance_metadata(
         ref_guidance_mode="shared_planner_latent_only",
         planner_forward_count=1,
         guidance_enabled=True,
         ref_guidance_enabled=True,
+        vision_guidance_enabled=True,
     )
 
     assert synchronized["ref_guidance_mode"] == "synchronized"
@@ -524,6 +571,11 @@ def test_ref_guidance_metadata_records_both_modes() -> None:
         "positive_uses_text_only_prefix": True,
         "negative_uses_shared_planner": True,
         "no_ref_uses_shared_planner": True,
+        "vision_guidance_enabled": True,
+        "vision_guidance_formula": (
+            "positive_shared_planner_with_refs - positive_zero_planner_with_refs"
+        ),
+        "no_visual_uses_same_reference_latents": True,
         "no_ref_branch_is_synchronized": False,
         "ref_guidance_formula": (
             "positive_text_shared_planner_with_refs - "
@@ -534,6 +586,8 @@ def test_ref_guidance_metadata_records_both_modes() -> None:
             "cfg*(P_positive_text_shared_planner_with_refs-N_shared_planner_with_refs) + "
             "ref*(P_positive_text_shared_planner_with_refs-"
             "P_positive_text_shared_planner_without_ref_latents) + "
+            "vision*(P_positive_text_shared_planner_with_refs-"
+            "Q_positive_text_zero_planner_with_refs) + "
             "stg*(P_positive_text_shared_planner_with_refs-S_stg_of_P)"
         ),
     }
@@ -545,16 +599,20 @@ def test_shared_planner_metadata_flags_follow_enabled_guidance_branches() -> Non
         planner_forward_count=1,
         guidance_enabled=False,
         ref_guidance_enabled=False,
+        vision_guidance_enabled=False,
     )
 
     assert metadata["negative_uses_shared_planner"] is False
     assert metadata["no_ref_uses_shared_planner"] is False
+    assert metadata["vision_guidance_enabled"] is False
+    assert metadata["no_visual_uses_same_reference_latents"] is False
 
 
 def test_shared_multidirectional_guidance_rescale_runs_after_all_deltas() -> None:
     positive = torch.tensor([[[1.0, 4.0], [2.0, 8.0]]])
     negative = torch.tensor([[[0.0, 1.0], [1.0, 2.0]]])
     no_ref = torch.tensor([[[0.5, 2.0], [1.5, 3.0]]])
+    no_visual = torch.tensor([[[0.25, 1.5], [1.0, 2.5]]])
     stg = torch.tensor([[[0.25, 1.0], [0.5, 2.0]]])
     unscaled = infer.stage1._combine_multidirectional_denoised(
         denoised_pos=positive,
@@ -569,6 +627,8 @@ def test_shared_multidirectional_guidance_rescale_runs_after_all_deltas() -> Non
         stg_scale=0.75,
         guidance_rescale=0.0,
         target_seq_len=2,
+        denoised_no_visual=no_visual,
+        vision_guidance_scale=1.25,
     )
     rescaled = infer.stage1._combine_multidirectional_denoised(
         denoised_pos=positive,
@@ -583,9 +643,19 @@ def test_shared_multidirectional_guidance_rescale_runs_after_all_deltas() -> Non
         stg_scale=0.75,
         guidance_rescale=0.7,
         target_seq_len=2,
+        denoised_no_visual=no_visual,
+        vision_guidance_scale=1.25,
+    )
+    expected_unscaled = (
+        negative
+        + 2.0 * (positive - negative)
+        + 1.5 * (positive - no_ref)
+        + 1.25 * (positive - no_visual)
+        + 0.75 * (positive - stg)
     )
     factor = 0.7 * (positive.float().std() / unscaled.float().std().clamp(min=1.0e-8)) + 0.3
 
+    assert torch.allclose(unscaled, expected_unscaled)
     assert torch.allclose(rescaled, unscaled * factor.to(dtype=unscaled.dtype))
 
 
@@ -595,6 +665,7 @@ def _run_fake_shared_denoise(
     guidance_scale: float,
     ref_guidance_scale: float,
     stg_scale: float,
+    vision_guidance_scale: float = 0.0,
 ) -> tuple[list[dict[str, object]], torch.Tensor]:
     calls: list[dict[str, object]] = []
 
@@ -695,7 +766,10 @@ def _run_fake_shared_denoise(
     monkeypatch.setattr(infer.stage1, "LTX2Scheduler", FakeScheduler)
     monkeypatch.setattr(infer.stage1, "EulerDiffusionStep", FakeStepper)
     monkeypatch.setattr(infer.stage1, "build_multiref_sequence", fake_build_multiref_sequence)
-    positive_context = torch.ones(1, 4, 3)
+    text_prefix = torch.ones(1, 2, 3)
+    planner_context = torch.full((1, 2, 3), 2.0)
+    positive_context = torch.cat([text_prefix, planner_context], dim=1)
+    no_visual_context = torch.cat([text_prefix, torch.zeros_like(planner_context)], dim=1)
     positive_mask = torch.ones(1, 4, dtype=torch.long)
     negative_context = torch.full((1, 5, 3), -1.0)
     output = infer.stage1._denoise_stage1(
@@ -725,9 +799,16 @@ def _run_fake_shared_denoise(
         if guidance_scale != 1.0
         else None,
         no_ref_conditions=None,
+        no_visual_conditions={
+            "video_prompt_embeds": no_visual_context,
+            "prompt_attention_mask": positive_mask.clone(),
+        }
+        if vision_guidance_scale != 0.0
+        else None,
         guidance_scale=guidance_scale,
         cfg_drop_ref_latents_in_negative=False,
         ref_guidance_scale=ref_guidance_scale,
+        vision_guidance_scale=vision_guidance_scale,
         siglip_guidance_scale=0.0,
         guidance_rescale=0.7,
         stg_scale=stg_scale,
@@ -762,6 +843,29 @@ def test_shared_mode_four_dit_branches_reuse_context_and_drop_only_ref_mask(
     for field in ("latent", "timesteps", "positions"):
         assert torch.equal(no_ref[field], positive[field])
     assert stg["is_stg"] is True
+    assert torch.isfinite(output).all()
+
+
+def test_vision_guidance_adds_q_forward_with_zero_planner_and_same_refs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls, output = _run_fake_shared_denoise(
+        monkeypatch,
+        guidance_scale=2.0,
+        ref_guidance_scale=2.0,
+        vision_guidance_scale=1.5,
+        stg_scale=1.0,
+    )
+
+    assert len(calls) == 5
+    positive, _negative, _no_ref, no_visual, _stg = calls
+    assert torch.equal(no_visual["context"][:, :2], positive["context"][:, :2])
+    assert torch.count_nonzero(no_visual["context"][:, 2:]) == 0
+    assert no_visual["context"].shape == positive["context"].shape
+    assert torch.equal(no_visual["context_mask"], positive["context_mask"])
+    assert torch.equal(no_visual["ref_valid_mask"], positive["ref_valid_mask"])
+    for field in ("latent", "timesteps", "positions"):
+        assert torch.equal(no_visual[field], positive[field])
     assert torch.isfinite(output).all()
 
 

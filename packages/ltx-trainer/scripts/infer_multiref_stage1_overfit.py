@@ -141,6 +141,8 @@ def _combine_multidirectional_denoised(
     stg_scale: float,
     guidance_rescale: float,
     target_seq_len: int | None = None,
+    denoised_no_visual: Tensor | None = None,
+    vision_guidance_scale: float = 0.0,
 ) -> Tensor:
     if _cfg_enabled(guidance_scale):
         if denoised_neg is None:
@@ -160,6 +162,11 @@ def _combine_multidirectional_denoised(
         if denoised_siglip_null is None:
             raise ValueError("siglip_guidance_scale != 0 requires denoised_siglip_null")
         guided = guided + siglip_guidance_scale * (denoised_siglip_isolated - denoised_siglip_null)
+
+    if vision_guidance_scale != 0.0:
+        if denoised_no_visual is None:
+            raise ValueError("vision_guidance_scale != 0 requires denoised_no_visual")
+        guided = guided + vision_guidance_scale * (denoised_pos - denoised_no_visual)
 
     if _stg_enabled(stg_scale):
         if denoised_stg is None:
@@ -776,6 +783,8 @@ def _denoise_stage1(
     seed: int,
     device: torch.device,
     dtype: torch.dtype,
+    no_visual_conditions: dict[str, Tensor | None] | None = None,
+    vision_guidance_scale: float = 0.0,
 ) -> Tensor:
     if num_inference_steps < 1:
         raise ValueError("--num-inference-steps must be >= 1")
@@ -845,6 +854,15 @@ def _denoise_stage1(
         no_ref_context_key = _condition_feature_key(no_ref_conditions)
         no_ref_context = no_ref_conditions[no_ref_context_key]
         no_ref_context_mask = no_ref_conditions.get("prompt_attention_mask")
+    if vision_guidance_scale != 0.0:
+        if no_visual_conditions is None:
+            raise ValueError("vision_guidance_scale != 0 requires no_visual_conditions")
+        no_visual_context_key = _condition_feature_key(no_visual_conditions)
+        no_visual_context = no_visual_conditions[no_visual_context_key]
+        no_visual_context_mask = no_visual_conditions.get("prompt_attention_mask")
+    else:
+        no_visual_context = None
+        no_visual_context_mask = None
     if siglip_guidance_scale != 0.0:
         visual_token_count = int(batch.get("_visual_context_token_count", 0) or 0)
         (
@@ -910,6 +928,7 @@ def _denoise_stage1(
             denoised_pos = _velocity_to_denoised(video_pos.latent, velocity_pos, packed.timesteps)
             denoised_neg = None
             denoised_no_ref = None
+            denoised_no_visual = None
             denoised_siglip_isolated = None
             denoised_siglip_null = None
             denoised_stg = None
@@ -975,6 +994,30 @@ def _denoise_stage1(
                     video_no_ref.latent,
                     velocity_no_ref,
                     packed_no_ref.timesteps,
+                )
+
+            if vision_guidance_scale != 0.0:
+                video_no_visual = Modality(
+                    enabled=True,
+                    latent=packed.latents,
+                    sigma=sigma_batch,
+                    timesteps=packed.timesteps,
+                    positions=packed.positions,
+                    context=no_visual_context,
+                    context_mask=no_visual_context_mask,
+                    attention_mask=packed.attention_mask,
+                )
+                velocity_no_visual, _ = transformer(
+                    video=video_no_visual,
+                    audio=None,
+                    perturbations=None,
+                )
+                if velocity_no_visual is None:
+                    raise RuntimeError("Transformer returned no zero-planner video velocity")
+                denoised_no_visual = _velocity_to_denoised(
+                    video_no_visual.latent,
+                    velocity_no_visual,
+                    packed.timesteps,
                 )
 
             if siglip_guidance_scale != 0.0:
@@ -1043,6 +1086,8 @@ def _denoise_stage1(
                 stg_scale=stg_scale,
                 guidance_rescale=guidance_rescale,
                 target_seq_len=target_seq_len,
+                denoised_no_visual=denoised_no_visual,
+                vision_guidance_scale=vision_guidance_scale,
             )
             next_packed = stepper.step(packed.latents, denoised_video, sigmas, step_idx)
             target_tokens = next_packed[:, -target_seq_len:, :]
