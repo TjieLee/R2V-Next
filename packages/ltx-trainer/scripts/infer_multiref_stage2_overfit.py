@@ -56,8 +56,23 @@ app = typer.Typer(
 
 _CONDITION_MODE = "stage2_planner"
 _GT_METADATA_KEYS = ("tokens_per_frame", "sampled_frame_indices", "source_fps")
-RefGuidanceMode = Literal["synchronized", "shared_planner_latent_only"]
+RefGuidanceMode = Literal[
+    "synchronized",
+    "shared_planner_latent_only",
+    "shared_planner_full_vlm_latent_only",
+]
 _DEFAULT_REF_GUIDANCE_MODE: RefGuidanceMode = "synchronized"
+
+
+def _condition_mode_for_ref_guidance(ref_guidance_mode: RefGuidanceMode) -> str:
+    """Keep legacy synchronized outputs while isolating shared-planner variants."""
+    if ref_guidance_mode == "synchronized":
+        return _CONDITION_MODE
+    if ref_guidance_mode == "shared_planner_latent_only":
+        return "stage2_planner_shared_planner_latent_only"
+    if ref_guidance_mode == "shared_planner_full_vlm_latent_only":
+        return "stage2_planner_shared_planner_full_vlm_latent_only"
+    raise ValueError(f"Unknown ref guidance mode: {ref_guidance_mode!r}")
 
 
 @dataclass
@@ -540,11 +555,17 @@ def _prepare_guidance_condition_bundle(
             planner_forward_count=1 + int(ref_guidance_scale != 0.0),
         )
 
-    if ref_guidance_mode != "shared_planner_latent_only":
+    if ref_guidance_mode not in {
+        "shared_planner_latent_only",
+        "shared_planner_full_vlm_latent_only",
+    }:
         raise ValueError(f"Unknown ref guidance mode: {ref_guidance_mode!r}")
+    positive_text_conditions = (
+        text_conditions if ref_guidance_mode == "shared_planner_latent_only" else conditions
+    )
     parts = MultiReferencePlannerStage2Strategy.prepare_inference_condition_parts(
         strategy,
-        conditions=conditions,
+        conditions=positive_text_conditions,
         planner_vlm_inputs=planner_vlm_inputs,
         latents_metadata=latents_metadata,
         visual_position_metadata=visual_position_metadata,
@@ -576,22 +597,32 @@ def _guidance_metadata(
     *,
     ref_guidance_mode: RefGuidanceMode,
     planner_forward_count: int,
+    guidance_enabled: bool,
     ref_guidance_enabled: bool,
 ) -> dict[str, Any]:
-    if ref_guidance_mode == "shared_planner_latent_only":
+    if ref_guidance_mode in {
+        "shared_planner_latent_only",
+        "shared_planner_full_vlm_latent_only",
+    }:
+        uses_text_only_prefix = ref_guidance_mode == "shared_planner_latent_only"
+        prefix_name = "positive_text" if uses_text_only_prefix else "positive_full_vlm"
         return {
             "ref_guidance_mode": ref_guidance_mode,
             "planner_forward_count": planner_forward_count,
-            "negative_uses_shared_planner": True,
-            "no_ref_uses_shared_planner": True,
+            "positive_uses_text_only_prefix": uses_text_only_prefix,
+            "negative_uses_shared_planner": guidance_enabled,
+            "no_ref_uses_shared_planner": ref_guidance_enabled,
             "no_ref_branch_is_synchronized": False,
             "ref_guidance_formula": (
-                "full_shared_planner_with_refs - full_shared_planner_without_ref_latents"
+                f"{prefix_name}_shared_planner_with_refs - "
+                f"{prefix_name}_shared_planner_without_ref_latents"
             ),
             "guidance_formula": (
-                "N_shared_planner_with_refs + cfg*(P_shared_planner_with_refs-N_shared_planner_with_refs) + "
-                "ref*(P_shared_planner_with_refs-P_shared_planner_without_ref_latents) + "
-                "stg*(P_shared_planner_with_refs-S_stg_of_P)"
+                f"N_shared_planner_with_refs + cfg*(P_{prefix_name}_shared_planner_with_refs-"
+                "N_shared_planner_with_refs) + "
+                f"ref*(P_{prefix_name}_shared_planner_with_refs-"
+                f"P_{prefix_name}_shared_planner_without_ref_latents) + "
+                f"stg*(P_{prefix_name}_shared_planner_with_refs-S_stg_of_P)"
             ),
         }
     return {
@@ -771,7 +802,8 @@ def _run_one_sample(  # noqa: PLR0913, PLR0915
     output_fps = float(fps) if fps is not None else float(latent_fps)
     sampled_frame_indices = visual_position_metadata["sampled_frame_indices"].detach().cpu().flatten().tolist()
     num_video_frames = int(batch["latents"]["num_frames"].flatten()[0].item())
-    generated_path = stage1._expected_generated_path(output_dir, sample_index, _CONDITION_MODE)
+    condition_mode = _condition_mode_for_ref_guidance(ref_guidance_mode)
+    generated_path = stage1._expected_generated_path(output_dir, sample_index, condition_mode)
     reference_paths = [
         str(stage1._resolve_path(value, manifest_root))
         for value in stage1._parse_reference_images(sample.get(reference_column))
@@ -785,7 +817,7 @@ def _run_one_sample(  # noqa: PLR0913, PLR0915
         "reference_copies": [str(path) for path in ref_copies],
         "gt_copy": str(gt_copy) if gt_copy is not None else None,
         "generated": str(generated_path),
-        "condition_mode": _CONDITION_MODE,
+        "condition_mode": condition_mode,
         "seed": seed,
         "num_inference_steps": num_inference_steps,
         "position_source": position_source,
@@ -796,7 +828,10 @@ def _run_one_sample(  # noqa: PLR0913, PLR0915
         "negative_prompt": runtime.negative_prompt if guidance_scale > 1.0 else None,
         "cfg_negative_mode": (
             "negative_prompt_shared_planner_keep_refs"
-            if ref_guidance_mode == "shared_planner_latent_only"
+            if ref_guidance_mode in {
+                "shared_planner_latent_only",
+                "shared_planner_full_vlm_latent_only",
+            }
             else "negative_prompt_no_visual_keep_refs"
         ),
         "guidance_scale": guidance_scale,
@@ -807,6 +842,7 @@ def _run_one_sample(  # noqa: PLR0913, PLR0915
         **_guidance_metadata(
             ref_guidance_mode=ref_guidance_mode,
             planner_forward_count=guidance_conditions.planner_forward_count,
+            guidance_enabled=stage1._cfg_enabled(guidance_scale),
             ref_guidance_enabled=ref_guidance_scale != 0.0,
         ),
         "uniform_sampled_frame_indices": sampled_frame_indices if position_source == "uniform_target" else None,
@@ -1035,6 +1071,7 @@ def main(  # noqa: PLR0913, PLR0915
         resolved_stg_blocks = stage1._parse_stg_blocks(stg_blocks)
     normalized_precomputed_root = stage1._normalize_precomputed_root(Path(precomputed_root))
     output_dir_path = Path(output_dir)
+    condition_mode = _condition_mode_for_ref_guidance(ref_guidance_mode)
 
     def run_sample(index: int) -> Path:
         return _run_one_sample(
@@ -1067,7 +1104,7 @@ def main(  # noqa: PLR0913, PLR0915
     summary = stage1._run_selected_samples(
         selected_indices=selected_indices,
         output_dir=output_dir_path,
-        condition_mode=_CONDITION_MODE,
+        condition_mode=condition_mode,
         checkpoint_path=checkpoint_path,
         shard_index=shard_index,
         num_shards=num_shards,

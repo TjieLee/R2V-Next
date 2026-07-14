@@ -446,12 +446,35 @@ def test_shared_planner_is_run_once_and_reused_by_positive_negative_and_no_ref()
     assert torch.equal(positive_context[:, -visual_token_count:], negative_context[:, -visual_token_count:])
     assert torch.equal(positive_mask[:, -visual_token_count:], bundle.shared_visual_mask.long())
     assert torch.equal(negative_mask[:, -visual_token_count:], bundle.shared_visual_mask.long())
+    assert torch.all(positive_context[:, :2, : harness.raw_dim] == 5.0)
+    assert torch.all(positive_context[:, :2, harness.raw_dim :] == 0.0)
     assert not torch.equal(positive_context[:, :2], negative_context[:, :2])
     assert negative_context.shape[1] == 3 + visual_token_count
     assert bundle.no_ref_conditions is None
 
 
-@pytest.mark.parametrize("ref_guidance_mode", ["synchronized", "shared_planner_latent_only"])
+def test_renamed_full_vlm_shared_mode_preserves_previous_positive_prefix() -> None:
+    harness = _InferenceHarness()
+    bundle = _prepare_guidance_with_harness(
+        harness,
+        ref_guidance_mode="shared_planner_full_vlm_latent_only",
+    )
+
+    positive_context = bundle.positive_conditions["video_prompt_embeds"]
+
+    assert harness.events.count("vlm_planner") == 1
+    assert torch.all(positive_context[:, :2, : harness.raw_dim] == 1.0)
+    assert torch.all(positive_context[:, :2, harness.raw_dim :] == 0.0)
+
+
+@pytest.mark.parametrize(
+    "ref_guidance_mode",
+    [
+        "synchronized",
+        "shared_planner_latent_only",
+        "shared_planner_full_vlm_latent_only",
+    ],
+)
 def test_zero_ref_guidance_does_not_build_no_ref_condition(
     ref_guidance_mode: infer.RefGuidanceMode,
 ) -> None:
@@ -482,11 +505,13 @@ def test_ref_guidance_metadata_records_both_modes() -> None:
     synchronized = infer._guidance_metadata(
         ref_guidance_mode="synchronized",
         planner_forward_count=2,
+        guidance_enabled=True,
         ref_guidance_enabled=True,
     )
     shared = infer._guidance_metadata(
         ref_guidance_mode="shared_planner_latent_only",
         planner_forward_count=1,
+        guidance_enabled=True,
         ref_guidance_enabled=True,
     )
 
@@ -496,18 +521,34 @@ def test_ref_guidance_metadata_records_both_modes() -> None:
     assert shared == {
         "ref_guidance_mode": "shared_planner_latent_only",
         "planner_forward_count": 1,
+        "positive_uses_text_only_prefix": True,
         "negative_uses_shared_planner": True,
         "no_ref_uses_shared_planner": True,
         "no_ref_branch_is_synchronized": False,
         "ref_guidance_formula": (
-            "full_shared_planner_with_refs - full_shared_planner_without_ref_latents"
+            "positive_text_shared_planner_with_refs - "
+            "positive_text_shared_planner_without_ref_latents"
         ),
         "guidance_formula": (
-            "N_shared_planner_with_refs + cfg*(P_shared_planner_with_refs-N_shared_planner_with_refs) + "
-            "ref*(P_shared_planner_with_refs-P_shared_planner_without_ref_latents) + "
-            "stg*(P_shared_planner_with_refs-S_stg_of_P)"
+            "N_shared_planner_with_refs + "
+            "cfg*(P_positive_text_shared_planner_with_refs-N_shared_planner_with_refs) + "
+            "ref*(P_positive_text_shared_planner_with_refs-"
+            "P_positive_text_shared_planner_without_ref_latents) + "
+            "stg*(P_positive_text_shared_planner_with_refs-S_stg_of_P)"
         ),
     }
+
+
+def test_shared_planner_metadata_flags_follow_enabled_guidance_branches() -> None:
+    metadata = infer._guidance_metadata(
+        ref_guidance_mode="shared_planner_latent_only",
+        planner_forward_count=1,
+        guidance_enabled=False,
+        ref_guidance_enabled=False,
+    )
+
+    assert metadata["negative_uses_shared_planner"] is False
+    assert metadata["no_ref_uses_shared_planner"] is False
 
 
 def test_shared_multidirectional_guidance_rescale_runs_after_all_deltas() -> None:
@@ -820,6 +861,18 @@ def test_stage2_shard_selection_and_skip_existing(tmp_path: Path) -> None:
 
     assert summary["num_skipped"] == 1
     assert run_sample.call_count == 0
+
+
+def test_ref_guidance_modes_use_distinct_output_condition_modes() -> None:
+    synchronized = infer._condition_mode_for_ref_guidance("synchronized")
+    shared_text_only = infer._condition_mode_for_ref_guidance("shared_planner_latent_only")
+    shared_full_vlm = infer._condition_mode_for_ref_guidance("shared_planner_full_vlm_latent_only")
+
+    assert synchronized == infer._CONDITION_MODE == "stage2_planner"
+    assert len({synchronized, shared_text_only, shared_full_vlm}) == 3
+    assert infer.stage1._expected_generated_path(Path("outputs"), 0, synchronized) != (
+        infer.stage1._expected_generated_path(Path("outputs"), 0, shared_text_only)
+    )
 
 
 def test_strict_no_gt_loader_never_builds_or_loads_gt_path(monkeypatch, tmp_path: Path) -> None:
