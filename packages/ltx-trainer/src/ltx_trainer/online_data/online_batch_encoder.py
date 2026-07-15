@@ -295,6 +295,119 @@ class OnlineBatchEncoder:
         self._offload_frozen_encoders_after_encode()
         return batch
 
+    def encode_inference_conditions_from_references(
+        self,
+        *,
+        task: str,
+        caption: str,
+        reference_pixels_vae: list[Tensor],
+        reference_images_vlm: list[Tensor],
+        width: int,
+        height: int,
+        num_frames: int,
+        fps: float,
+    ) -> dict[str, Any]:
+        """Encode raw reference/text conditions without accepting or reading a target."""
+        if task not in {IMAGE_TASK, VIDEO_TASK}:
+            raise ValueError(f"Unsupported online inference task {task!r}")
+        expected_geometry = (
+            self.config.width,
+            self.config.height,
+            self.config.image_num_frames if task == IMAGE_TASK else self.config.video_num_frames,
+            self.config.image_fps if task == IMAGE_TASK else self.config.video_fps,
+        )
+        actual_geometry = (int(width), int(height), int(num_frames), float(fps))
+        if actual_geometry != expected_geometry:
+            raise ValueError(
+                f"Task {task} requires geometry {expected_geometry}, got {actual_geometry}"
+            )
+        if not caption.strip():
+            raise ValueError("Online inference caption must not be empty")
+        if len(reference_pixels_vae) != len(reference_images_vlm):
+            raise ValueError("Reference VAE/VLM counts differ; image order cannot be aligned")
+        if not 1 <= len(reference_pixels_vae) <= int(self.config.max_ref_images or 4):
+            raise ValueError(
+                f"Online inference requires 1..{self.config.max_ref_images or 4} references, "
+                f"got {len(reference_pixels_vae)}"
+            )
+
+        self.last_dtype_diagnostics = {}
+        self._move_frozen_encoders_for_encode()
+        references = self._reference_images(reference_images_vlm)
+        multi_ref_latents = self._encode_reference_latents([reference_pixels_vae])
+        text_conditions = self._encode_condition(
+            caption=caption,
+            reference_images=[],
+            task=task,
+        )
+        vlm_conditions = self._encode_condition(
+            caption=caption,
+            reference_images=references,
+            task=task,
+        )
+
+        valid_frames = 1 if task == IMAGE_TASK else MAX_VLM_FRAMES
+        planner_output_mask = torch.zeros(
+            1,
+            VISUAL_TOKEN_CAPACITY,
+            dtype=torch.bool,
+            device=self.device,
+        )
+        planner_output_mask[:, : valid_frames * TOKENS_PER_FRAME] = True
+        planner_vlm_inputs = self._build_planner_vlm_inputs(
+            caption=caption,
+            reference_images=references,
+            task=task,
+            planner_output_mask=planner_output_mask,
+        )
+        sampled_indices = (
+            torch.zeros(1, MAX_VLM_FRAMES, dtype=torch.long, device=self.device)
+            if task == IMAGE_TASK
+            else torch.tensor([VLM_TARGET_INDICES], dtype=torch.long, device=self.device)
+        )
+        visual_position_metadata = build_visual_metadata(
+            batch_size=1,
+            valid_frames=valid_frames,
+            target_num_frames=num_frames,
+            target_fps=fps,
+            sampled_frame_indices=sampled_indices,
+            device=self.device,
+        )
+        result: dict[str, Any] = {
+            "task": task,
+            "task_system_prompt_id": torch.tensor(
+                [0 if task == IMAGE_TASK else 1],
+                device=self.device,
+                dtype=torch.long,
+            ),
+            "multi_ref_latents": multi_ref_latents,
+            "multi_reference_latents": multi_ref_latents,
+            "conditions": vlm_conditions,
+            "vlm_conditions": vlm_conditions,
+            "text_conditions": text_conditions,
+            "cfg_text_conditions": text_conditions,
+            "planner_vlm_inputs": planner_vlm_inputs,
+            "visual_position_metadata": visual_position_metadata,
+            "reference_metadata": {
+                "reference_count": len(references),
+                "reference_order": list(range(len(references))),
+                "vlm_reference_preprocess": self.config.vlm_reference_preprocess,
+            },
+            "dtype_diagnostics": dict(self.last_dtype_diagnostics),
+        }
+        forbidden = {
+            "latents",
+            "target_pixels",
+            "target_latents",
+            "gt_visual_tokens",
+            "gt_siglip_tokens",
+        }
+        leaked = sorted(forbidden & result.keys())
+        if leaked:
+            raise RuntimeError(f"Strict-no-GT inference encoder emitted forbidden keys: {leaked}")
+        self._offload_frozen_encoders_after_encode()
+        return result
+
     def _encode_target_latents(self, target_pixels: Tensor, fps: Tensor) -> dict[str, Tensor]:
         video = target_pixels.to(device=self.device, dtype=self.dtype, non_blocking=True)
         video = video.permute(0, 4, 1, 2, 3).div_(127.5).sub_(1.0)
