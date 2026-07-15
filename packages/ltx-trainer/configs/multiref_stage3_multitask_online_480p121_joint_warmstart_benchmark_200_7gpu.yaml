@@ -1,4 +1,4 @@
-# Eight-GPU, 200-step gate for the Stage 3-only legacy-joint warm-start.
+# Seven-GPU, 200-step gate for the Stage 3-only legacy-joint warm-start.
 model:
   model_path: "/mnt/workspace/litengjie/LTX-2/models/LTX-2.3/ltx-2.3-22b-dev.safetensors"
   text_encoder_path: "/mnt/workspace/litengjie/LTX-2/models/gemma-3-12b-it-qat-q4_0-unquantized"
@@ -102,7 +102,7 @@ data:
   encoding_mode: "online"
   train_data_config: "/mnt/workspace/litengjie/jd_ltx_multitask_online_480p121/manifests/multitask_480p121.yaml"
   manifest_path: "/mnt/workspace/litengjie/jd_ltx_multitask_online_480p121/manifests/train_unique.jsonl"
-  num_dataloader_workers: 2
+  num_dataloader_workers: 1
   online_encoding:
     width: 832
     height: 480
@@ -120,7 +120,7 @@ data:
     video_decoder: "pyav"
     decode_timeout_seconds: 120.0
     pin_memory: true
-    prefetch_factor: 2
+    prefetch_factor: 1
     cpu_transform_chunk_frames: 4
     planner_max_length: 4096
     max_ref_images: 4
@@ -143,7 +143,7 @@ wandb:
   enabled: false
   project: "jd-ltx-multitask-online-480p121"
   entity: null
-  tags: ["multi-reference", "stage3", "online", "480p", "121f", "warmstart", "benchmark-200"]
+  tags: ["multi-reference", "stage3", "online", "480p", "121f", "warmstart", "benchmark-200", "7gpu"]
   log_validation_videos: false
 seed: 42
-output_dir: "/mnt/workspace/litengjie/jd_ltx_multitask_online_480p121/stage3_warmstart_benchmark_200"
+output_dir: "/mnt/workspace/litengjie/jd_ltx_multitask_online_480p121/stage3_warmstart_benchmark_200_7gpu"

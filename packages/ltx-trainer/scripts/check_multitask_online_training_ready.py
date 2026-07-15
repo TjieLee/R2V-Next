@@ -45,6 +45,44 @@ def _phase(config: LtxTrainerConfig) -> str:
     return str(phase or "stage1")
 
 
+def _manifest_summary_path(manifest_path: str | Path) -> Path:
+    path = Path(manifest_path).expanduser().resolve()
+    return path.with_name(path.stem + "_summary.json")
+
+
+def _planned_task_exposure_report(
+    *,
+    optimization_steps: int,
+    effective_global_batch: int,
+    image_ratio: float,
+    task_counts: dict[str, int],
+) -> dict[str, Any]:
+    image_steps = int(round(optimization_steps * image_ratio))
+    task_steps = {
+        IMAGE_TASK: image_steps,
+        VIDEO_TASK: optimization_steps - image_steps,
+    }
+    exposures = {
+        task: steps * effective_global_batch
+        for task, steps in task_steps.items()
+    }
+    repeats = {
+        task: (exposures[task] / task_counts[task] if task_counts.get(task, 0) > 0 else None)
+        for task in (IMAGE_TASK, VIDEO_TASK)
+    }
+    coverage = {
+        task: (min(1.0, repeats[task]) if repeats[task] is not None else None)
+        for task in (IMAGE_TASK, VIDEO_TASK)
+    }
+    return {
+        "planned_task_optimizer_steps": task_steps,
+        "planned_task_exposures": exposures,
+        "planned_coverage_ratio": coverage,
+        "estimated_repeats": repeats,
+        "planned_total_exposures": optimization_steps * effective_global_batch,
+    }
+
+
 def _sample_indices(indices: Any, count: int, seed: int) -> list[int]:
     size = len(indices)
     if size == 0:
@@ -253,6 +291,8 @@ def main(
     )
     if world_size == 8 and global_batch != 32:
         errors.append(f"Eight-rank effective global batch must be 32, got {global_batch}")
+    if world_size == 7 and global_batch != 28:
+        errors.append(f"Seven-rank effective global batch must be 28, got {global_batch}")
 
     try:
         assert_write_path_allowed(config.output_dir)
@@ -291,11 +331,18 @@ def main(
                     errors.append(f"Stage 3 checkpoint preflight failed: {exc}")
 
     dataset: OnlineMultiTaskDataset | None = None
+    manifest_summary: dict[str, Any] = {}
+    manifest_summary_path: Path | None = None
     decoded: dict[str, list[dict[str, Any]]] = {IMAGE_TASK: [], VIDEO_TASK: []}
     if config.data.manifest_path is None or online is None:
         errors.append("Online manifest/config is missing")
     else:
         try:
+            manifest_summary_path = _manifest_summary_path(config.data.manifest_path)
+            if manifest_summary_path.is_file():
+                manifest_summary = json.loads(manifest_summary_path.read_text(encoding="utf-8"))
+            else:
+                warnings.append(f"Manifest summary does not exist: {manifest_summary_path}")
             dataset = OnlineMultiTaskDataset(
                 config.data.manifest_path,
                 width=online.width,
@@ -304,7 +351,22 @@ def main(
                 vlm_reference_preprocess=online.vlm_reference_preprocess,
                 video_decoder=online.video_decoder,
                 decode_timeout_seconds=online.decode_timeout_seconds,
+                cpu_transform_chunk_frames=online.cpu_transform_chunk_frames,
             )
+            dataset_task_counts = {
+                task: len(dataset.task_indices[task]) for task in (IMAGE_TASK, VIDEO_TASK)
+            }
+            summary_task_counts = manifest_summary.get("task_counts")
+            if summary_task_counts is not None:
+                normalized_summary_counts = {
+                    task: int(summary_task_counts.get(task, 0))
+                    for task in (IMAGE_TASK, VIDEO_TASK)
+                }
+                if normalized_summary_counts != dataset_task_counts:
+                    errors.append(
+                        "Manifest summary task counts do not match the indexed manifest: "
+                        f"summary={normalized_summary_counts}, manifest={dataset_task_counts}"
+                    )
             for task in (IMAGE_TASK, VIDEO_TASK):
                 task_count = len(dataset.task_indices[task])
                 if task_count < global_batch:
@@ -347,16 +409,29 @@ def main(
     readiness = {name: False for name in ("stage1", "stage2", "stage3")}
     if not errors and phase in readiness:
         readiness[phase] = True
+    task_counts = (
+        {task: len(dataset.task_indices[task]) for task in (IMAGE_TASK, VIDEO_TASK)}
+        if dataset is not None
+        else {
+            task: int(manifest_summary.get("task_counts", {}).get(task, 0))
+            for task in (IMAGE_TASK, VIDEO_TASK)
+        }
+    )
+    exposure_report = _planned_task_exposure_report(
+        optimization_steps=config.optimization.steps,
+        effective_global_batch=global_batch,
+        image_ratio=online.image_ratio if online is not None else 0.3,
+        task_counts=task_counts,
+    )
     report = {
         "config": str(path),
         "phase": phase,
         "world_size": world_size,
         "effective_global_batch": global_batch,
-        "task_counts": (
-            {task: len(dataset.task_indices[task]) for task in (IMAGE_TASK, VIDEO_TASK)}
-            if dataset is not None
-            else {}
-        ),
+        "task_counts": task_counts,
+        "manifest_summary_path": str(manifest_summary_path) if manifest_summary_path else None,
+        "manifest_summary_accepted_rows": manifest_summary.get("accepted_rows"),
+        **exposure_report,
         "decoded_samples": decoded,
         **initialization_report,
         "warnings": warnings,

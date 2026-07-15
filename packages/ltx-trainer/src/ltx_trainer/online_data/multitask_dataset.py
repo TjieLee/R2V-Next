@@ -125,6 +125,7 @@ class OnlineMultiTaskDataset(Dataset[dict[str, Any] | SampleLoadError]):
         vlm_reference_preprocess: Literal["original", "target_crop"] = "original",
         video_decoder: Literal["pyav", "opencv"] = "pyav",
         decode_timeout_seconds: float = 120.0,
+        cpu_transform_chunk_frames: int = 4,
         require_all_tasks: bool = True,
     ) -> None:
         self.manifest_path = Path(manifest_path).expanduser().resolve()
@@ -137,6 +138,7 @@ class OnlineMultiTaskDataset(Dataset[dict[str, Any] | SampleLoadError]):
         self.vlm_reference_preprocess = vlm_reference_preprocess
         self.video_decoder = video_decoder
         self.decode_timeout_seconds = float(decode_timeout_seconds)
+        self.cpu_transform_chunk_frames = int(cpu_transform_chunk_frames)
         self._manifest_handle: BinaryIO | None = None
         index_path = default_manifest_index_path(self.manifest_path)
         if index_path.is_file():
@@ -201,6 +203,7 @@ class OnlineMultiTaskDataset(Dataset[dict[str, Any] | SampleLoadError]):
                     reference.unsqueeze(0),
                     target_height=self.height,
                     target_width=self.width,
+                    chunk_frames=self.cpu_transform_chunk_frames,
                 )[0]
                 for reference in original_references
             ]
@@ -265,6 +268,7 @@ class OnlineMultiTaskDataset(Dataset[dict[str, Any] | SampleLoadError]):
             target_height=self.height,
             target_width=self.width,
             crop_xyxy=record.get("crop_xyxy"),
+            chunk_frames=self.cpu_transform_chunk_frames,
         )
 
 

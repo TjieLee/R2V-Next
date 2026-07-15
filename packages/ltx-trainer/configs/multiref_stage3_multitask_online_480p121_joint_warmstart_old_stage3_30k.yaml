@@ -121,6 +121,7 @@ data:
     decode_timeout_seconds: 120.0
     pin_memory: true
     prefetch_factor: 2
+    cpu_transform_chunk_frames: 4
     planner_max_length: 4096
     max_ref_images: 4
     image_ratio: 0.3

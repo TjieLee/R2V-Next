@@ -10,8 +10,10 @@ from pathlib import Path
 from typing import Any, Literal
 
 import torch
+import torch.distributed as dist
 import typer
 import yaml
+from safetensors import safe_open
 
 from ltx_trainer.config import LtxTrainerConfig
 from ltx_trainer.online_data.constants import IMAGE_TASK, VIDEO_TASK, VLM_TARGET_INDICES
@@ -225,6 +227,157 @@ def _strategy_loss_audit(trainer: LtxvTrainer, *, phase: str) -> dict[str, float
     return metrics
 
 
+def _broadcast_main_payload(payload: dict[str, Any] | None, *, is_main_process: bool) -> dict[str, Any]:
+    if not dist.is_available() or not dist.is_initialized():
+        if payload is None:
+            raise RuntimeError("Main-process smoke payload is unavailable")
+        return payload
+    objects: list[dict[str, Any] | None] = [payload if is_main_process else None]
+    dist.broadcast_object_list(objects, src=0)
+    if objects[0] is None:
+        raise RuntimeError("Main process broadcast an empty smoke payload")
+    return objects[0]
+
+
+def _checkpoint_artifact_status(
+    checkpoint: Path | None,
+    *,
+    global_step: int,
+    phase: str,
+    is_main_process: bool,
+) -> dict[str, Any]:
+    payload: dict[str, Any] | None = None
+    if is_main_process:
+        try:
+            if checkpoint is None:
+                raise RuntimeError("Main rank received no checkpoint path")
+            checkpoint_path = Path(checkpoint)
+            if not checkpoint_path.is_file():
+                raise RuntimeError(f"Checkpoint does not exist: {checkpoint_path}")
+            training_state_path = (
+                checkpoint_path.parent / f"training_state_step_{global_step:05d}.pt"
+            )
+            if not training_state_path.is_file():
+                raise RuntimeError(
+                    f"Matching training state does not exist: {training_state_path}"
+                )
+            with safe_open(str(checkpoint_path), framework="pt", device="cpu") as handle:
+                metadata = dict(handle.metadata() or {})
+            if metadata.get("global_step") != str(global_step):
+                raise RuntimeError(
+                    "Checkpoint metadata global_step mismatch: "
+                    f"expected={global_step}, actual={metadata.get('global_step')!r}"
+                )
+            if phase in {"stage2", "stage3"} and metadata.get("training_phase") != phase:
+                raise RuntimeError(
+                    "Checkpoint metadata training_phase mismatch: "
+                    f"expected={phase}, actual={metadata.get('training_phase')!r}"
+                )
+            if phase == "stage1" and metadata.get("conditioning") != "multi_reference_video":
+                raise RuntimeError("Stage 1 checkpoint metadata has unexpected conditioning")
+            ready_marker_path = (
+                checkpoint_path.parent / f"checkpoint_step_{global_step:05d}.ready.json"
+            )
+            if not ready_marker_path.is_file():
+                raise RuntimeError(f"Checkpoint ready marker does not exist: {ready_marker_path}")
+            ready_marker = json.loads(ready_marker_path.read_text(encoding="utf-8"))
+            if (
+                int(ready_marker.get("global_step", -1)) != global_step
+                or Path(ready_marker.get("checkpoint_path", "")) != checkpoint_path.resolve()
+                or Path(ready_marker.get("training_state_path", ""))
+                != training_state_path.resolve()
+            ):
+                raise RuntimeError("Checkpoint ready marker does not match the published artifact pair")
+            payload = {
+                "success": True,
+                "checkpoint_path": str(checkpoint_path),
+                "training_state_path": str(training_state_path),
+                "ready_marker_path": str(ready_marker_path),
+                "error_message": "",
+            }
+        except Exception as exc:
+            payload = {
+                "success": False,
+                "checkpoint_path": "",
+                "training_state_path": "",
+                "ready_marker_path": "",
+                "error_message": str(exc),
+            }
+    return _broadcast_main_payload(payload, is_main_process=is_main_process)
+
+
+def _all_ranks_succeeded(success: bool, *, device: torch.device) -> bool:
+    if not dist.is_available() or not dist.is_initialized():
+        return success
+    success_tensor = torch.tensor(int(success), device=device, dtype=torch.int32)
+    dist.all_reduce(success_tensor, op=dist.ReduceOp.MIN)
+    return bool(success_tensor.item())
+
+
+def _build_one_step_smoke_report(  # noqa: PLR0915
+    trainer: LtxvTrainer,
+    *,
+    config: LtxTrainerConfig,
+    generated_config: Path,
+    checkpoint: Path | None,
+    stats: Any,
+    task: Literal["i2i", "r2v"],
+    started: float,
+) -> dict[str, Any]:
+    phase = str(getattr(config.training_strategy, "training_phase", None) or "stage1")
+    scheduler_last_epoch = int(trainer._lr_scheduler.state_dict().get("last_epoch", -1))
+    optimizer_audit: dict[str, Any] = {}
+    frozen_audit: dict[str, Any] = {}
+    loss_audit: dict[str, float] = {}
+    local_error = ""
+    try:
+        if trainer._global_step != 1 or scheduler_last_epoch != 1:
+            raise RuntimeError(
+                "One-step smoke did not preserve optimizer/scheduler semantics: "
+                f"global_step={trainer._global_step}, scheduler_last_epoch={scheduler_last_epoch}"
+            )
+        optimizer_audit = _optimizer_update_audit(trainer)
+        _assert_optimizer_update_audit(optimizer_audit, phase=phase)
+        frozen_audit = _frozen_parameter_audit(trainer)
+        loss_audit = _strategy_loss_audit(trainer, phase=phase)
+    except Exception as exc:
+        local_error = str(exc)
+
+    artifact_status = _checkpoint_artifact_status(
+        checkpoint,
+        global_step=trainer._global_step,
+        phase=phase,
+        is_main_process=trainer._accelerator.is_main_process,
+    )
+    local_success = not local_error and bool(artifact_status["success"])
+    all_success = _all_ranks_succeeded(local_success, device=trainer._accelerator.device)
+    if not all_success:
+        message = local_error or str(artifact_status["error_message"])
+        if not message:
+            message = "Another DDP rank failed its local gradient/optimizer/frozen/loss audit"
+        raise RuntimeError(f"Distributed one-step smoke failed: {message}")
+
+    return {
+        "phase": phase,
+        "task": task,
+        "generated_config": str(generated_config),
+        "checkpoint": artifact_status["checkpoint_path"],
+        "training_state": artifact_status["training_state_path"],
+        "ready_marker": artifact_status["ready_marker_path"],
+        "global_step": trainer._global_step,
+        "scheduler_last_epoch": scheduler_last_epoch,
+        "elapsed_seconds": time.perf_counter() - started,
+        "training_stats": stats.model_dump(),
+        "timings_ms": trainer._last_online_metrics,
+        "optimizer_update_audit": optimizer_audit,
+        "frozen_parameter_audit": frozen_audit,
+        "strategy_loss_audit": loss_audit,
+        "peak_vram_gb": (
+            torch.cuda.max_memory_allocated() / (1024**3) if torch.cuda.is_available() else 0.0
+        ),
+    }
+
+
 def run_one_step_training_smoke(
     config_path: str | Path,
     *,
@@ -243,42 +396,29 @@ def run_one_step_training_smoke(
     started = time.perf_counter()
     trainer = LtxvTrainer(config)
     trainer._capture_gradient_audit = True
-    checkpoint, stats = trainer.train(disable_progress_bars=True)
-    scheduler_last_epoch = int(trainer._lr_scheduler.state_dict().get("last_epoch", -1))
-    if trainer._global_step != 1 or scheduler_last_epoch != 1:
-        raise RuntimeError(
-            f"One-step smoke did not preserve optimizer/scheduler semantics: "
-            f"global_step={trainer._global_step}, scheduler_last_epoch={scheduler_last_epoch}"
+    try:
+        checkpoint, stats = trainer.train(
+            disable_progress_bars=True,
+            finalize_accelerator=False,
         )
-    checkpoint_path = Path(checkpoint)
-    training_states = sorted((Path(config.output_dir) / "checkpoints").glob("training_state_step_*.pt"))
-    if not checkpoint_path.is_file() or not training_states:
-        raise RuntimeError("One-step smoke did not produce paired checkpoint/training state files")
-    phase = str(getattr(config.training_strategy, "training_phase", None) or "stage1")
-    optimizer_audit = _optimizer_update_audit(trainer)
-    _assert_optimizer_update_audit(optimizer_audit, phase=phase)
-    frozen_audit = _frozen_parameter_audit(trainer)
-    loss_audit = _strategy_loss_audit(trainer, phase=phase)
-    report = {
-        "phase": phase,
-        "task": task,
-        "generated_config": str(generated_config),
-        "checkpoint": str(checkpoint_path),
-        "training_state": str(training_states[-1]),
-        "global_step": trainer._global_step,
-        "scheduler_last_epoch": scheduler_last_epoch,
-        "elapsed_seconds": time.perf_counter() - started,
-        "training_stats": stats.model_dump(),
-        "timings_ms": trainer._last_online_metrics,
-        "optimizer_update_audit": optimizer_audit,
-        "frozen_parameter_audit": frozen_audit,
-        "strategy_loss_audit": loss_audit,
-        "peak_vram_gb": (
-            torch.cuda.max_memory_allocated() / (1024**3) if torch.cuda.is_available() else 0.0
-        ),
-    }
-    typer.echo(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True, default=str))
-    return report
+    except BaseException:
+        trainer._accelerator.end_training()
+        raise
+    try:
+        report = _build_one_step_smoke_report(
+            trainer,
+            config=config,
+            generated_config=generated_config,
+            checkpoint=checkpoint,
+            stats=stats,
+            task=task,
+            started=started,
+        )
+        if trainer._accelerator.is_main_process:
+            typer.echo(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True, default=str))
+        return report
+    finally:
+        trainer._accelerator.end_training()
 
 
 def run_real_encode_check(

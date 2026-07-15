@@ -28,21 +28,44 @@ def deterministic_resize_center_crop(
     target_height: int,
     target_width: int,
     crop_xyxy: Sequence[int | float] | None = None,
+    chunk_frames: int = 4,
 ) -> Tensor:
-    """Transform uint8 ``[T,H,W,C]`` frames while preserving aspect ratio."""
+    """Transform uint8 ``[T,H,W,C]`` frames with bounded float-memory use."""
     if frames.ndim != 4 or frames.shape[-1] != 3:
         raise ValueError(f"frames must be [T,H,W,3], got {tuple(frames.shape)}")
     if frames.dtype != torch.uint8:
         raise ValueError(f"frames must be uint8, got {frames.dtype}")
-    _, source_height, source_width, _ = frames.shape
+    if not 1 <= chunk_frames <= 16:
+        raise ValueError(f"chunk_frames must be in [1, 16], got {chunk_frames}")
+    num_frames, source_height, source_width, _ = frames.shape
     x0, y0, x1, y1 = normalize_crop_xyxy(crop_xyxy, width=source_width, height=source_height)
-    cropped = frames[:, y0:y1, x0:x1].permute(0, 3, 1, 2).float()
-
-    scale = max(target_height / cropped.shape[-2], target_width / cropped.shape[-1])
-    resized_height = max(target_height, int(round(cropped.shape[-2] * scale)))
-    resized_width = max(target_width, int(round(cropped.shape[-1] * scale)))
-    resized = F.interpolate(cropped, size=(resized_height, resized_width), mode="bilinear", align_corners=False)
+    cropped = frames[:, y0:y1, x0:x1]
+    crop_height, crop_width = cropped.shape[1:3]
+    scale = max(target_height / crop_height, target_width / crop_width)
+    resized_height = max(target_height, int(round(crop_height * scale)))
+    resized_width = max(target_width, int(round(crop_width * scale)))
     top = (resized_height - target_height) // 2
     left = (resized_width - target_width) // 2
-    output = resized[:, :, top : top + target_height, left : left + target_width]
-    return output.round().clamp_(0, 255).to(dtype=torch.uint8).permute(0, 2, 3, 1).contiguous()
+    output = torch.empty(
+        (num_frames, target_height, target_width, 3),
+        dtype=torch.uint8,
+        device=frames.device,
+    )
+    for start in range(0, num_frames, chunk_frames):
+        stop = min(start + chunk_frames, num_frames)
+        chunk = cropped[start:stop].permute(0, 3, 1, 2).float()
+        resized = F.interpolate(
+            chunk,
+            size=(resized_height, resized_width),
+            mode="bilinear",
+            align_corners=False,
+        )
+        transformed = resized[:, :, top : top + target_height, left : left + target_width]
+        output[start:stop].copy_(
+            transformed.round()
+            .clamp_(0, 255)
+            .to(dtype=torch.uint8)
+            .permute(0, 2, 3, 1)
+        )
+        del transformed, resized, chunk
+    return output

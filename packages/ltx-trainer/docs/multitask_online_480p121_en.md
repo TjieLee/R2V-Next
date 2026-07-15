@@ -120,19 +120,21 @@ scheduler step, finite Stage 2/3 flow/MSE/NTP losses, nonzero finite Adam moment
 and paired checkpoint/training-state output. JSON reports include decode, VAE, SigLIP, frozen condition, planner,
 DiT, backward, optimizer, peak VRAM, and reference shapes.
 
-Finish with the real two-rank DDP smoke:
+Finish with real two-rank DDP smoke runs. One launch may contain only one stage, one task, and one Trainer. This
+example covers Stage 1 I2I; start a fresh launch for every other stage/task pair:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 uv run accelerate launch \
   --config_file configs/accelerate/ddp.yaml --num_processes 2 \
   scripts/check_multitask_online_ddp.py \
-  --stage1-config configs/multiref_stage1_multitask_online_480p121_full_tokens_30k.yaml \
-  --stage2-config configs/multiref_stage2_multitask_online_480p121_full_tokens_planner_30k.yaml \
-  --stage3-config configs/multiref_stage3_multitask_online_480p121_joint_30k.yaml
+  --config configs/multiref_stage1_multitask_online_480p121_full_tokens_30k.yaml \
+  --task i2i \
+  --output-dir /mnt/workspace/litengjie/jd_ltx_multitask_online_480p121/ddp_smoke/stage1_i2i
 ```
 
-It covers one I2I and one R2V optimizer step for all three stages using real DDP condition encoding,
-Gemma/Planner/DiT, checkpoint saving, and global-step scheduler semantics. Launch 30K only after these gates pass.
+That launch executes one optimizer step and checks real DDP condition encoding, the selected model path,
+checkpoint saving, and global-step scheduler semantics. Do not create multiple Trainers inside one process group.
+Launch formal training only after every required independent gate passes.
 
 ## Train Stage 1, Stage 2, and Stage 3
 
@@ -176,28 +178,68 @@ To skip new-data Stage 1/2 and initialize directly from the complete previous St
 ```bash
 uv run python scripts/check_multitask_online_training_ready.py \
   configs/multiref_stage3_multitask_online_480p121_joint_warmstart_old_stage3_30k.yaml \
-  --world-size 8 --samples-per-task 2
+  --world-size 7 --samples-per-task 2
 ```
 
 The report must contain `initialization_mode=stage3_joint_warmstart`,
 `strict_component_check_passed=true`, and `starts_from_global_step=0`. The YAML uses `no_resume=true`, so it
 loads the previous Stage 3 model weights but not its optimizer, scheduler, or global step.
 
-Run the real two-rank Stage 3-only DDP smoke with:
+The report also reads `train_unique_summary.json` and prints task row counts, planned exposures, coverage ratios,
+and estimated repeats. Seven ranks give `1 x 4 x 7 = 28` effective global samples. The 30K config therefore
+produces 840,000 exposures. A separately chosen 34,286-step run would approximate the previous eight-rank
+960,000 exposures; preflight reports these semantics without changing the configured schedule.
+
+Run I2I and R2V as two independent two-rank Stage 3 launches:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 PYTORCH_ALLOC_CONF=expandable_segments:True \
 uv run accelerate launch --config_file configs/accelerate/ddp.yaml --num_processes 2 \
   scripts/check_multitask_online_ddp.py \
-  --stages stage3 \
-  --stage3-config configs/multiref_stage3_multitask_online_480p121_joint_warmstart_old_stage3_30k.yaml \
-  --stage3-init-checkpoint /mnt/workspace/litengjie/ltx2_multiref_stage3_joint_full_tokens_planner_2048/checkpoints/lora_weights_step_02000.safetensors
+  --config configs/multiref_stage3_multitask_online_480p121_joint_warmstart_old_stage3_30k.yaml \
+  --task i2i \
+  --init-checkpoint /mnt/workspace/litengjie/ltx2_multiref_stage3_joint_full_tokens_planner_2048/checkpoints/lora_weights_step_02000.safetensors \
+  --output-dir /mnt/workspace/litengjie/jd_ltx_multitask_online_480p121/ddp_smoke/stage3_i2i
+
+# Use a second launch with r2v/stage3_r2v for --task/--output-dir.
 ```
 
-For a three-stage dependency smoke, pass `--stages stage1,stage2,stage3 --chain-smoke-checkpoints`; each smoke
-checkpoint is injected into the next stage. Before the formal 30K run, use
-`configs/multiref_stage3_multitask_online_480p121_joint_warmstart_benchmark_200.yaml` for the eight-GPU,
-200-step gate. It uses interval 100 and a separate benchmark output directory.
+`scripts/run_multitask_online_ddp_smoke_matrix.py` can create both launches with separate `subprocess.run()`
+calls and fresh Accelerate process groups. Before formal training, use
+`configs/multiref_stage3_multitask_online_480p121_joint_warmstart_benchmark_200_7gpu.yaml` for the seven-GPU,
+200-step gate. It keeps `lr=1e-5`, temporarily uses one worker and prefetch 1, and executes 60 I2I steps
+(1,680 samples) plus 140 R2V steps (3,920 samples), totaling 5,600. `cpu_transform_chunk_frames=4` prevents the 121-frame spatial transform
+from materializing a full-video float32 tensor.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6 PYTORCH_ALLOC_CONF=expandable_segments:True \
+TOKENIZERS_PARALLELISM=false OMP_NUM_THREADS=4 \
+uv run accelerate launch --config_file configs/accelerate/ddp.yaml --num_processes 7 \
+  scripts/train.py \
+  configs/multiref_stage3_multitask_online_480p121_joint_warmstart_benchmark_200_7gpu.yaml \
+  --disable-progress-bars
+```
+
+Stage 3 checkpoints are validated in a same-directory temporary file. A
+`checkpoint_step_XXXXX.ready.json` marker is published only after both weights and matching training state are
+atomically visible. The GPU 7 watcher consumes only markers and hard-links each checkpoint before inference, so
+`keep_last_n` cleanup cannot race an open checkpoint. `--command-template` is required:
+
+```bash
+CUDA_VISIBLE_DEVICES=7 uv run python scripts/watch_stage3_checkpoints_and_infer.py \
+  --checkpoint-dir /mnt/workspace/litengjie/jd_ltx_multitask_online_480p121/stage3_warmstart_old_stage3/checkpoints \
+  --output-root /mnt/workspace/litengjie/jd_ltx_multitask_online_480p121/checkpoint_inference \
+  --gpu 7 --poll-seconds 30 --min-step 2500 --step-stride 2500 \
+  --command-template 'uv run python <inference_script> --checkpoint {checkpoint} --output-dir {output_dir}'
+```
+
+Use separate fixed validation manifests and commands for R2V and I2I. I2I must emit a single image rather than a
+copied pseudo-video. Each step's success or failure is persisted in `watcher_state.json`; failures never propagate
+to training.
+
+After the 200-step gate passes, run the formal seven-GPU 30K job by switching the training config back to
+`multiref_stage3_multitask_online_480p121_joint_warmstart_old_stage3_30k.yaml` while retaining
+`CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6` and `--num_processes 7`. Do not include GPU 7 in training.
 
 Manifest indexes now use `LTXIDX02`; the header stores manifest size, nonblank row count, SHA256, and entry size.
 Legacy v1, hash/size mismatches, and truncation fail fast with a rebuild instruction, while the validator also

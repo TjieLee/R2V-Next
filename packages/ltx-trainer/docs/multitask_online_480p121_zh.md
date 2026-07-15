@@ -121,19 +121,20 @@ scheduler 只前进一步、三项 Stage 2/3 loss finite、要求的模块产生
 成对 checkpoint/training state。JSON 报告包含 decode、VAE、SigLIP、frozen condition、planner、DiT、
 backward、optimizer、峰值显存和 reference shape。
 
-最后运行真实两卡 DDP：
+最后运行真实两卡 DDP。每次 launch 只能包含一个阶段、一个 task 和一个 Trainer；以下以 Stage 1 I2I
+为例，其他阶段/task 必须重新执行独立 launch：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 uv run accelerate launch \
   --config_file configs/accelerate/ddp.yaml --num_processes 2 \
   scripts/check_multitask_online_ddp.py \
-  --stage1-config configs/multiref_stage1_multitask_online_480p121_full_tokens_30k.yaml \
-  --stage2-config configs/multiref_stage2_multitask_online_480p121_full_tokens_planner_30k.yaml \
-  --stage3-config configs/multiref_stage3_multitask_online_480p121_joint_30k.yaml
+  --config configs/multiref_stage1_multitask_online_480p121_full_tokens_30k.yaml \
+  --task i2i \
+  --output-dir /mnt/workspace/litengjie/jd_ltx_multitask_online_480p121/ddp_smoke/stage1_i2i
 ```
 
-它会顺序覆盖三个阶段的 I2I/R2V 一步优化，验证真实 DDP condition encoding、Gemma/Planner/DiT、
-checkpoint 保存和 scheduler 语义。只有这些门禁通过后才启动 30K。
+该 launch 只执行一个 optimizer step，验证真实 DDP condition encoding、对应模型链路、checkpoint 保存和
+scheduler 语义。不要在同一进程组内循环创建 Trainer；只有所需的独立门禁全部通过后才启动正式训练。
 
 ## 5. 训练
 
@@ -186,28 +187,65 @@ multimodal projector 保持 frozen/eval。
 ```bash
 uv run python scripts/check_multitask_online_training_ready.py \
   configs/multiref_stage3_multitask_online_480p121_joint_warmstart_old_stage3_30k.yaml \
-  --world-size 8 --samples-per-task 2
+  --world-size 7 --samples-per-task 2
 ```
 
 报告必须包含 `initialization_mode=stage3_joint_warmstart`、
 `strict_component_check_passed=true` 和 `starts_from_global_step=0`。该 YAML 的 `no_resume=true` 只加载
 旧 Stage 3 模型权重，不加载旧 optimizer、scheduler 或 global step。
 
-两卡只跑 Stage 3 的真实 DDP smoke：
+报告还会读取 `train_unique_summary.json`，输出每个 task 的行数、计划 exposure、coverage ratio 和
+estimated repeats。七卡下 global batch 是 `1 x 4 x 7 = 28`。30K 对应 840,000 次 exposure；若要接近
+八卡 30K 的 960,000 次 exposure，可另选 34,286 steps。Preflight 只报告两套语义，不自动改变正式配置。
+
+两卡 Stage 3 smoke 必须让 I2I 和 R2V 各自使用一次独立 launch：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 PYTORCH_ALLOC_CONF=expandable_segments:True \
 uv run accelerate launch --config_file configs/accelerate/ddp.yaml --num_processes 2 \
   scripts/check_multitask_online_ddp.py \
-  --stages stage3 \
-  --stage3-config configs/multiref_stage3_multitask_online_480p121_joint_warmstart_old_stage3_30k.yaml \
-  --stage3-init-checkpoint /mnt/workspace/litengjie/ltx2_multiref_stage3_joint_full_tokens_planner_2048/checkpoints/lora_weights_step_02000.safetensors
+  --config configs/multiref_stage3_multitask_online_480p121_joint_warmstart_old_stage3_30k.yaml \
+  --task i2i \
+  --init-checkpoint /mnt/workspace/litengjie/ltx2_multiref_stage3_joint_full_tokens_planner_2048/checkpoints/lora_weights_step_02000.safetensors \
+  --output-dir /mnt/workspace/litengjie/jd_ltx_multitask_online_480p121/ddp_smoke/stage3_i2i
+
+# 第二次独立 launch 将 --task/--output-dir 改为 r2v/stage3_r2v。
 ```
 
-需要验证三阶段依赖时可传 `--stages stage1,stage2,stage3 --chain-smoke-checkpoints`，脚本会把前一阶段
-产生的 smoke checkpoint 注入下一阶段。正式 30K 前使用
-`configs/multiref_stage3_multitask_online_480p121_joint_warmstart_benchmark_200.yaml` 完成八卡
-200-step 门禁；它使用 interval 100 和独立 benchmark output_dir。
+也可运行 `scripts/run_multitask_online_ddp_smoke_matrix.py`，它通过两个 `subprocess.run()` 创建完全独立的
+Accelerate 进程组。正式训练前使用
+`configs/multiref_stage3_multitask_online_480p121_joint_warmstart_benchmark_200_7gpu.yaml` 完成七卡
+200-step 门禁。它保持 `lr=1e-5`，临时使用 1 worker、prefetch 1；60 个 I2I step 对应 1,680 samples，
+140 个 R2V step 对应 3,920 samples，合计 5,600。`cpu_transform_chunk_frames=4` 保证 121 帧空间变换不创建完整视频的
+float32 tensor。
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6 PYTORCH_ALLOC_CONF=expandable_segments:True \
+TOKENIZERS_PARALLELISM=false OMP_NUM_THREADS=4 \
+uv run accelerate launch --config_file configs/accelerate/ddp.yaml --num_processes 7 \
+  scripts/train.py \
+  configs/multiref_stage3_multitask_online_480p121_joint_warmstart_benchmark_200_7gpu.yaml \
+  --disable-progress-bars
+```
+
+Stage 3 checkpoint 先写同目录临时文件并校验，weights 与 matching training state 原子发布后才生成
+`checkpoint_step_XXXXX.ready.json`。GPU 7 watcher 只消费 marker，并先硬链接 checkpoint，避免
+`keep_last_n` 清理与推理读文件竞争。`--command-template` 是必填项：
+
+```bash
+CUDA_VISIBLE_DEVICES=7 uv run python scripts/watch_stage3_checkpoints_and_infer.py \
+  --checkpoint-dir /mnt/workspace/litengjie/jd_ltx_multitask_online_480p121/stage3_warmstart_old_stage3/checkpoints \
+  --output-root /mnt/workspace/litengjie/jd_ltx_multitask_online_480p121/checkpoint_inference \
+  --gpu 7 --poll-seconds 30 --min-step 2500 --step-stride 2500 \
+  --command-template 'uv run python <inference_script> --checkpoint {checkpoint} --output-dir {output_dir}'
+```
+
+R2V 与 I2I 应使用各自固定的 validation manifest/命令。I2I 命令必须输出单帧图像，不能把图像复制成
+伪视频。watcher 会把每个 step 的成功或失败写入 `watcher_state.json`，失败不会影响训练进程。
+
+200-step 门禁通过后，正式七卡 30K 只需把训练配置换回
+`multiref_stage3_multitask_online_480p121_joint_warmstart_old_stage3_30k.yaml`，保持
+`CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6` 和 `--num_processes 7`。不要把 GPU 7 加入训练进程。
 
 manifest index 现为 `LTXIDX02`，header 包含 manifest size、有效行数、SHA256 和 entry size。旧 v1、
 hash/size 不匹配或截断索引都会 fail-fast 并要求重建；validator 还会逐行核对 offset/task。manifest

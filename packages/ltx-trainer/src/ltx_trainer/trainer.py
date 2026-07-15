@@ -1,4 +1,5 @@
 import contextlib
+import hashlib
 import json
 import math
 import os
@@ -72,6 +73,15 @@ if not IS_MAIN_PROCESS:
 StepCallback = Callable[[int, int, list[Path]], None]  # (step, total, list[sampled_video_path]) -> None
 
 MEMORY_CHECK_INTERVAL = 200
+
+_STAGE3_CHECKPOINT_REQUIRED_PREFIXES = (
+    "diffusion_model.",
+    "training_strategy.planner_tokens.",
+    "training_strategy.visual_token_projection.",
+    "training_strategy.visual_full_encoder.",
+    "embeddings_processor.video_connector.",
+    "text_encoder.model.model.language_model.",
+)
 
 
 def normalize_peft_adapter_key(key: str) -> str:
@@ -150,12 +160,15 @@ class LtxvTrainer:
         self,
         disable_progress_bars: bool = False,
         step_callback: StepCallback | None = None,
-    ) -> tuple[Path, TrainingStats]:
+        finalize_accelerator: bool = True,
+    ) -> tuple[Path | None, TrainingStats]:
         """
         Start the training process.
         Args:
             disable_progress_bars: Disable Rich progress bars (useful for multi-process runs).
             step_callback: Optional callback invoked after each optimization step.
+            finalize_accelerator: End trackers/process groups before returning. Smoke callers may defer this
+                until their final distributed audits have completed.
         Returns:
             Tuple of (saved_model_path, training_stats)
         """
@@ -431,6 +444,8 @@ class LtxvTrainer:
         saved_path = self._save_checkpoint()
 
         if IS_MAIN_PROCESS:
+            if saved_path is None:
+                raise RuntimeError("Main process did not receive the final checkpoint path")
             # Log the training statistics
             self._log_training_stats(stats)
 
@@ -451,7 +466,8 @@ class LtxvTrainer:
                 self._wandb_run.finish()
 
         self._accelerator.wait_for_everyone()
-        self._accelerator.end_training()
+        if finalize_accelerator:
+            self._accelerator.end_training()
 
         return saved_path, stats
 
@@ -1511,6 +1527,7 @@ class LtxvTrainer:
                 vlm_reference_preprocess=online_config.vlm_reference_preprocess,
                 video_decoder=online_config.video_decoder,
                 decode_timeout_seconds=online_config.decode_timeout_seconds,
+                cpu_transform_chunk_frames=online_config.cpu_transform_chunk_frames,
             )
 
         source_config = load_multitask_data_config(data_config.train_data_config)
@@ -1975,7 +1992,7 @@ class LtxvTrainer:
             logger.debug(
                 f"Checkpoint for step {self._global_step} already exists; skipping duplicate save"
             )
-            return self._last_saved_weights_path
+            return self._last_saved_weights_path if IS_MAIN_PROCESS else None
 
         # Get state dict (collective operation - all processes must participate)
         self._accelerator.wait_for_everyone()
@@ -1987,12 +2004,17 @@ class LtxvTrainer:
             return None
 
         save_dir.mkdir(exist_ok=True, parents=True)
+        # A same-step republish must not leave a stale marker pointing at new bytes with an old hash.
+        (save_dir / f"checkpoint_step_{self._global_step:05d}.ready.json").unlink(
+            missing_ok=True
+        )
 
         # Determine save precision
         save_dtype = torch.bfloat16 if self._config.checkpoints.precision == "bfloat16" else torch.float32
         auxiliary_state_dict = self._collect_auxiliary_checkpoint_state(save_dtype)
 
         # For LoRA: extract only adapter weights; for full: use as-is
+        checkpoint_metadata: dict[str, str] | None = None
         if is_lora:
             unwrapped = self._accelerator.unwrap_model(self._transformer, keep_torch_compile=False)
             # For FSDP, pass full_state_dict since model params aren't directly accessible
@@ -2016,10 +2038,19 @@ class LtxvTrainer:
                 validate_checkpoint(state_dict)
 
             # Build metadata for safetensors file
-            metadata = self._build_checkpoint_metadata()
+            checkpoint_metadata = self._build_checkpoint_metadata()
 
-            # Save to disk with metadata
-            save_file(state_dict, saved_weights_path, metadata=metadata)
+            # Publish only after the complete safetensors file passes structural validation.
+            self._atomic_save_safetensors(
+                state_dict,
+                saved_weights_path,
+                metadata=checkpoint_metadata,
+                required_prefixes=(
+                    _STAGE3_CHECKPOINT_REQUIRED_PREFIXES
+                    if self._is_stage3_phase()
+                    else ()
+                ),
+            )
         else:
             # Cast to configured precision
             full_state_dict = {k: v.to(save_dtype) if isinstance(v, Tensor) else v for k, v in full_state_dict.items()}
@@ -2031,7 +2062,13 @@ class LtxvTrainer:
         rel_path = saved_weights_path.relative_to(self._config.output_dir)
         logger.info(f"💾 {prefix.capitalize()} weights for step {self._global_step} saved in {rel_path}")
 
-        self._save_training_state(save_dir)
+        training_state_path = self._save_training_state(save_dir)
+        if checkpoint_metadata is not None and training_state_path is not None:
+            self._publish_checkpoint_ready_marker(
+                checkpoint_path=saved_weights_path,
+                training_state_path=training_state_path,
+                metadata=checkpoint_metadata,
+            )
 
         self._last_saved_step = self._global_step
         self._last_saved_weights_path = saved_weights_path
@@ -2040,6 +2077,104 @@ class LtxvTrainer:
         self._cleanup_checkpoints()
 
         return saved_weights_path
+
+    @staticmethod
+    def _fsync_file(path: Path) -> None:
+        descriptor = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    def _fsync_directory(path: Path) -> None:
+        descriptor = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    def _sha256_file(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def _atomic_save_safetensors(
+        self,
+        state_dict: dict[str, Tensor],
+        final_path: Path,
+        *,
+        metadata: dict[str, str],
+        required_prefixes: tuple[str, ...],
+    ) -> None:
+        temporary_path = Path(f"{final_path}.tmp.{os.getpid()}")
+        try:
+            save_file(state_dict, temporary_path, metadata=metadata)
+            self._fsync_file(temporary_path)
+            if temporary_path.stat().st_size <= 0:
+                raise RuntimeError(f"Checkpoint temporary file is empty: {temporary_path}")
+            with safe_open(str(temporary_path), framework="pt", device="cpu") as checkpoint:
+                saved_metadata = dict(checkpoint.metadata() or {})
+                keys = list(checkpoint.keys())
+            expected_step = str(self._global_step)
+            if saved_metadata.get("global_step") != expected_step:
+                raise RuntimeError(
+                    "Checkpoint global_step validation failed: "
+                    f"expected={expected_step}, actual={saved_metadata.get('global_step')!r}"
+                )
+            missing_prefixes = [
+                prefix
+                for prefix in required_prefixes
+                if not any(key.startswith(prefix) for key in keys)
+            ]
+            if missing_prefixes:
+                raise RuntimeError(
+                    f"Checkpoint is missing required component prefixes: {missing_prefixes}"
+                )
+            os.replace(temporary_path, final_path)
+            self._fsync_directory(final_path.parent)
+        except BaseException:
+            temporary_path.unlink(missing_ok=True)
+            raise
+
+    def _publish_checkpoint_ready_marker(
+        self,
+        *,
+        checkpoint_path: Path,
+        training_state_path: Path,
+        metadata: dict[str, str],
+    ) -> Path:
+        if not checkpoint_path.is_file() or not training_state_path.is_file():
+            raise RuntimeError(
+                "Cannot publish checkpoint ready marker before weights and training state exist"
+            )
+        marker_path = checkpoint_path.parent / f"checkpoint_step_{self._global_step:05d}.ready.json"
+        payload = {
+            "global_step": self._global_step,
+            "checkpoint_path": str(checkpoint_path.resolve()),
+            "training_state_path": str(training_state_path.resolve()),
+            "checkpoint_size_bytes": checkpoint_path.stat().st_size,
+            "checkpoint_sha256": self._sha256_file(checkpoint_path),
+            "metadata_training_phase": metadata.get("training_phase"),
+            "metadata_global_step": metadata.get("global_step"),
+            "config_path": str((Path(self._config.output_dir) / "training_config.yaml").resolve()),
+        }
+        temporary_path = Path(f"{marker_path}.tmp.{os.getpid()}")
+        try:
+            with temporary_path.open("w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_path, marker_path)
+            self._fsync_directory(marker_path.parent)
+        except BaseException:
+            temporary_path.unlink(missing_ok=True)
+            raise
+        return marker_path
 
     def _collect_auxiliary_checkpoint_state(self, save_dtype: torch.dtype) -> dict[str, Tensor]:
         state_dict = self._training_strategy.get_extra_checkpoint_state_dict(self._accelerator)
@@ -2155,6 +2290,11 @@ class LtxvTrainer:
             step = self._checkpoint_step(path)
             if step is not None:
                 states_by_step[step] = path
+        markers_by_step: dict[int, Path] = {}
+        for path in save_dir.glob("checkpoint_step_*.ready.json"):
+            step = self._checkpoint_step(path)
+            if step is not None:
+                markers_by_step[step] = path
 
         # Keep exactly one weight path per step, preferring the currently loaded path.
         selected_weights: dict[int, Path] = {}
@@ -2198,6 +2338,10 @@ class LtxvTrainer:
             if state_path is not None:
                 state_path.unlink(missing_ok=True)
                 logger.debug(f"Removed matching training state: {state_path}")
+            marker_path = markers_by_step.pop(step, None)
+            if marker_path is not None:
+                marker_path.unlink(missing_ok=True)
+                logger.debug(f"Removed matching checkpoint ready marker: {marker_path}")
 
         remaining_weights = {
             step: path
@@ -2209,6 +2353,11 @@ class LtxvTrainer:
                 state_path.unlink(missing_ok=True)
                 states_by_step.pop(step)
                 logger.debug(f"Removed orphan training state: {state_path}")
+        for step, marker_path in list(markers_by_step.items()):
+            if step not in remaining_weights or step not in states_by_step:
+                marker_path.unlink(missing_ok=True)
+                markers_by_step.pop(step)
+                logger.debug(f"Removed orphan checkpoint ready marker: {marker_path}")
 
         self._checkpoint_paths = [remaining_weights[step] for step in sorted(remaining_weights)]
         self._training_state_paths = [
@@ -2217,7 +2366,7 @@ class LtxvTrainer:
             if states_by_step[step].is_file()
         ]
 
-    def _save_training_state(self, save_dir: Path) -> None:
+    def _save_training_state(self, save_dir: Path) -> Path | None:
         """Save training state alongside checkpoint for resume.
         Respects checkpoints.save_training_state config:
         - "full": optimizer + scheduler + RNG + step
@@ -2225,11 +2374,11 @@ class LtxvTrainer:
         - "off": skip entirely
         """
         if not IS_MAIN_PROCESS:
-            return
+            return None
 
         mode = self._config.checkpoints.save_training_state
         if mode == "off":
-            return
+            return None
 
         is_fsdp = self._accelerator.distributed_type == DistributedType.FSDP
 
@@ -2271,14 +2420,17 @@ class LtxvTrainer:
         )
 
         state_path = save_dir / f"training_state_step_{self._global_step:05d}.pt"
-        tmp_path = state_path.with_suffix(".pt.tmp")
+        tmp_path = Path(f"{state_path}.tmp.{os.getpid()}")
         try:
             torch.save(state.to_save_dict(), tmp_path)
-        except Exception:
-            if tmp_path.exists():
-                tmp_path.unlink()
+            self._fsync_file(tmp_path)
+            if tmp_path.stat().st_size <= 0:
+                raise RuntimeError(f"Training-state temporary file is empty: {tmp_path}")
+            os.replace(tmp_path, state_path)
+            self._fsync_directory(state_path.parent)
+        except BaseException:
+            tmp_path.unlink(missing_ok=True)
             raise
-        tmp_path.rename(state_path)
 
         file_size_gb = state_path.stat().st_size / (1024**3)
         if file_size_gb > 1.0 and not self._training_state_size_warned:
@@ -2301,6 +2453,7 @@ class LtxvTrainer:
 
         rel_path = state_path.relative_to(self._config.output_dir)
         logger.debug(f"Training state saved to {rel_path}")
+        return state_path
 
     def _cleanup_training_states(self) -> None:
         """Compatibility wrapper; checkpoint cleanup now manages paired state files."""

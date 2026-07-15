@@ -438,6 +438,7 @@ class OnlineEncodingConfig(ConfigBaseModel):
     decode_timeout_seconds: float = Field(default=120.0, gt=0.0)
     pin_memory: bool = True
     prefetch_factor: int = Field(default=2, ge=1)
+    cpu_transform_chunk_frames: int = Field(default=4, ge=1, le=16)
     planner_max_length: int = Field(default=4096, ge=2051)
     max_ref_images: int | None = Field(default=4, ge=1)
     image_ratio: float = Field(default=0.3, ge=0.0, le=1.0)

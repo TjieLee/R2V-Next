@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,6 +13,7 @@ from torch import nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LinearLR
 
+from ltx_trainer import trainer as trainer_module
 from ltx_trainer.config import LtxTrainerConfig
 from ltx_trainer.trainer import LtxvTrainer, normalize_peft_adapter_key
 from ltx_trainer.training_state import ConfigFingerprint, RngStates, TrainingState
@@ -20,6 +22,7 @@ from ltx_trainer.training_strategies.multi_reference_planner_stage2 import (
     MultiReferencePlannerStage2Strategy,
     configure_stage3_transformer_trainability,
 )
+from scripts import watch_stage3_checkpoints_and_infer as checkpoint_watcher
 
 
 def _stage3_config(**overrides) -> MultiReferencePlannerStage2Config:
@@ -504,38 +507,39 @@ def _checkpoint_test_trainer(tmp_path: Path) -> LtxvTrainer:
     trainer._training_strategy = SimpleNamespace(validate_checkpoint_state_dict=lambda state: None)
     trainer._global_step = 1
     trainer._checkpoint_paths = []
+    trainer._training_state_paths = []
     trainer._last_saved_step = None
     trainer._last_saved_weights_path = None
     trainer._collect_auxiliary_checkpoint_state = lambda save_dtype: {}
-    trainer._build_checkpoint_metadata = lambda: {"training_phase": "stage3"}
+    trainer._build_checkpoint_metadata = lambda: {
+        "training_phase": "stage3",
+        "global_step": str(trainer._global_step),
+    }
     return trainer
 
 
 def test_final_save_is_idempotent_when_interval_matches_last_step(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     trainer = _checkpoint_test_trainer(tmp_path)
     write_count = 0
     state_count = 0
 
-    def fake_save_file(
-        state: dict[str, torch.Tensor],
-        path: Path,
-        metadata: dict[str, str],
-    ) -> None:
-        nonlocal write_count
-        assert state
-        assert metadata["training_phase"] == "stage3"
-        write_count += 1
-        path.write_bytes(b"checkpoint")
+    original_atomic_save = trainer._atomic_save_safetensors
 
-    def fake_save_training_state(save_dir: Path) -> None:
+    def counting_atomic_save(*args, **kwargs) -> None:
+        nonlocal write_count
+        write_count += 1
+        original_atomic_save(*args, **kwargs)
+
+    def fake_save_training_state(save_dir: Path) -> Path:
         nonlocal state_count
         state_count += 1
-        (save_dir / "training_state_step_00001.pt").write_bytes(b"state")
+        state_path = save_dir / "training_state_step_00001.pt"
+        state_path.write_bytes(b"state")
+        return state_path
 
-    monkeypatch.setattr("ltx_trainer.trainer.save_file", fake_save_file)
+    trainer._atomic_save_safetensors = counting_atomic_save
     trainer._save_training_state = fake_save_training_state
 
     interval_path = trainer._save_checkpoint()
@@ -547,7 +551,43 @@ def test_final_save_is_idempotent_when_interval_matches_last_step(
     assert final_path is not None and final_path.is_file()
     assert len(trainer._checkpoint_paths) == 1
     assert (tmp_path / "checkpoints/training_state_step_00001.pt").is_file()
+    marker_path = tmp_path / "checkpoints/checkpoint_step_00001.ready.json"
+    assert marker_path.is_file()
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    assert marker["global_step"] == 1
+    assert marker["metadata_global_step"] == "1"
+    assert len(marker["checkpoint_sha256"]) == 64
     assert trainer._accelerator.state_dict_calls == 1
+
+
+def test_nonmain_idempotent_checkpoint_save_returns_none(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = _checkpoint_test_trainer(tmp_path)
+    checkpoint = tmp_path / "checkpoints/lora_weights_step_00001.safetensors"
+    checkpoint.parent.mkdir()
+    checkpoint.write_bytes(b"already published")
+    trainer._last_saved_step = 1
+    trainer._last_saved_weights_path = checkpoint
+    monkeypatch.setattr(trainer_module, "IS_MAIN_PROCESS", False)
+
+    assert trainer._save_checkpoint() is None
+    assert trainer._accelerator.state_dict_calls == 0
+
+
+def test_ready_marker_is_not_published_when_training_state_save_fails(tmp_path: Path) -> None:
+    trainer = _checkpoint_test_trainer(tmp_path)
+
+    def fail_training_state(_save_dir: Path) -> Path:
+        raise RuntimeError("forced training-state failure")
+
+    trainer._save_training_state = fail_training_state
+    with pytest.raises(RuntimeError, match="forced training-state failure"):
+        trainer._save_checkpoint()
+
+    assert (tmp_path / "checkpoints/lora_weights_step_00001.safetensors").is_file()
+    assert not (tmp_path / "checkpoints/checkpoint_step_00001.ready.json").exists()
 
 
 def _training_state(
@@ -964,6 +1004,10 @@ def _write_checkpoint_pair(checkpoints_dir: Path, step: int) -> tuple[Path, Path
     state = checkpoints_dir / f"training_state_step_{step:05d}.pt"
     checkpoint.write_bytes(b"checkpoint")
     state.write_bytes(b"state")
+    (checkpoints_dir / f"checkpoint_step_{step:05d}.ready.json").write_text(
+        json.dumps({"global_step": step}),
+        encoding="utf-8",
+    )
     return checkpoint, state
 
 
@@ -993,6 +1037,69 @@ def test_resume_cleanup_scans_disk_and_removes_checkpoint_state_pairs(tmp_path: 
     assert not state_500.exists()
     assert len(list(checkpoints_dir.glob("lora_weights_step_*.safetensors"))) == 4
     assert len(list(checkpoints_dir.glob("training_state_step_*.pt"))) == 4
+    assert len(list(checkpoints_dir.glob("checkpoint_step_*.ready.json"))) == 4
+
+
+def test_atomic_checkpoint_failure_removes_temporary_file(tmp_path: Path) -> None:
+    trainer = _checkpoint_test_trainer(tmp_path)
+    checkpoint = tmp_path / "checkpoints" / "lora_weights_step_00001.safetensors"
+    checkpoint.parent.mkdir()
+
+    with pytest.raises(RuntimeError, match="global_step validation failed"):
+        trainer._atomic_save_safetensors(
+            {"component.weight": torch.ones(1)},
+            checkpoint,
+            metadata={"training_phase": "stage3", "global_step": "2"},
+            required_prefixes=("component.",),
+        )
+
+    assert not checkpoint.exists()
+    assert not list(checkpoint.parent.glob("*.tmp.*"))
+
+
+def test_checkpoint_watcher_stages_ready_checkpoint_and_verifies_sha256(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "lora_weights_step_02500.safetensors"
+    checkpoint.write_bytes(b"complete checkpoint")
+    training_state = tmp_path / "training_state_step_02500.pt"
+    training_state.write_bytes(b"training state")
+    config_path = tmp_path / "training_config.yaml"
+    config_path.write_text("seed: 42\n", encoding="utf-8")
+    marker_path = tmp_path / "checkpoint_step_02500.ready.json"
+    marker_path.write_text(
+        json.dumps(
+            {
+                "global_step": 2500,
+                "checkpoint_path": str(checkpoint),
+                "training_state_path": str(training_state),
+                "checkpoint_size_bytes": checkpoint.stat().st_size,
+                "checkpoint_sha256": checkpoint_watcher._sha256_file(checkpoint),
+                "metadata_training_phase": "stage3",
+                "metadata_global_step": "2500",
+                "config_path": str(config_path),
+            }
+        ),
+        encoding="utf-8",
+    )
+    staged_dir = tmp_path / "staged"
+    staged_dir.mkdir()
+
+    marker = checkpoint_watcher._load_ready_marker(marker_path)
+    staged = checkpoint_watcher._stage_checkpoint(marker, staged_dir)
+    checkpoint.unlink()
+
+    assert staged.read_bytes() == b"complete checkpoint"
+    assert checkpoint_watcher._sha256_file(staged) == marker["checkpoint_sha256"]
+
+
+def test_checkpoint_watcher_rejects_forbidden_command_path(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="must not read or write"):
+        checkpoint_watcher._format_command(
+            "python infer.py --input /mnt/workspace/liutao/private.json --checkpoint {checkpoint}",
+            checkpoint=tmp_path / "checkpoint.safetensors",
+            step=2500,
+            output_dir=tmp_path / "output",
+            gpu=7,
+        )
 
 
 def test_stage3_checkpoint_metadata_contains_global_step() -> None:

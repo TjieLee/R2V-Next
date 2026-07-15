@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import resource
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 import torch
+import torch.nn.functional as F
 import typer
 import yaml
 from PIL import Image
@@ -14,6 +17,7 @@ from safetensors.torch import save_file
 
 from ltx_core.text_encoders.gemma.config import GEMMA3_CONFIG_FOR_LTX
 from ltx_trainer.config import DataConfig, LtxTrainerConfig, OnlineEncodingConfig
+from ltx_trainer.online_data import smoke as smoke_helpers
 from ltx_trainer.online_data.constants import (
     IMAGE_TASK,
     TARGET_HEIGHT,
@@ -29,9 +33,10 @@ from ltx_trainer.online_data.media_decoder import decode_image_rgb
 from ltx_trainer.online_data.multitask_dataset import OnlineMultiTaskDataset
 from ltx_trainer.online_data.online_batch_encoder import OnlineBatchEncoder, _build_messages
 from ltx_trainer.online_data.path_safety import assert_write_path_allowed
+from ltx_trainer.online_data.transforms import deterministic_resize_center_crop
 from ltx_trainer.online_data.visual_token_packing import build_visual_metadata, pack_visual_tokens
 from scripts import check_multitask_online_training_ready as training_ready
-from scripts.check_multitask_online_ddp import _parse_stages
+from scripts.check_multitask_online_ddp import _validate_task
 
 
 def test_fixed_480p121_contract() -> None:
@@ -39,7 +44,42 @@ def test_fixed_480p121_contract() -> None:
     assert TARGET_HEIGHT % 32 == 0
     assert VIDEO_NUM_FRAMES % 8 == 1
     assert uniform_indices(121, 8) == list(VLM_TARGET_INDICES)
-    OnlineEncodingConfig()
+    assert OnlineEncodingConfig().cpu_transform_chunk_frames == 4
+    with pytest.raises(ValueError):
+        OnlineEncodingConfig(cpu_transform_chunk_frames=0)
+    with pytest.raises(ValueError):
+        OnlineEncodingConfig(cpu_transform_chunk_frames=17)
+
+
+def test_seven_gpu_preflight_reports_task_exposures_without_changing_steps() -> None:
+    report = training_ready._planned_task_exposure_report(
+        optimization_steps=30_000,
+        effective_global_batch=28,
+        image_ratio=0.3,
+        task_counts={IMAGE_TASK: 100_000, VIDEO_TASK: 200_000},
+    )
+    assert report["planned_task_optimizer_steps"] == {IMAGE_TASK: 9_000, VIDEO_TASK: 21_000}
+    assert report["planned_task_exposures"] == {IMAGE_TASK: 252_000, VIDEO_TASK: 588_000}
+    assert report["planned_total_exposures"] == 840_000
+    assert report["estimated_repeats"] == pytest.approx({IMAGE_TASK: 2.52, VIDEO_TASK: 2.94})
+
+
+def test_seven_gpu_benchmark_uses_bounded_worker_settings() -> None:
+    config_path = (
+        Path(__file__).resolve().parents[1]
+        / "configs"
+        / "multiref_stage3_multitask_online_480p121_joint_warmstart_benchmark_200_7gpu.yaml"
+    )
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert payload["optimization"]["learning_rate"] == 1.0e-5
+    assert payload["optimization"]["steps"] == 200
+    assert payload["optimization"]["batch_size"] == 1
+    assert payload["optimization"]["gradient_accumulation_steps"] == 4
+    assert payload["data"]["num_dataloader_workers"] == 1
+    assert payload["data"]["online_encoding"]["prefetch_factor"] == 1
+    assert payload["data"]["online_encoding"]["cpu_transform_chunk_frames"] == 4
+    assert payload["checkpoints"]["interval"] == 100
+    assert payload["checkpoints"]["save_training_state"] == "full"
 
 
 def test_online_messages_use_task_specific_image_edit_semantics() -> None:
@@ -219,11 +259,135 @@ def test_exact_stage3_preflight_requires_matching_full_training_state(tmp_path: 
     assert report["starts_from_global_step"] == 500
 
 
-def test_ddp_smoke_stage_selection_is_optional_and_canonical() -> None:
-    assert _parse_stages("stage3") == ["stage3"]
-    assert _parse_stages("stage3,stage1") == ["stage1", "stage3"]
-    with pytest.raises(typer.BadParameter, match="subset"):
-        _parse_stages("stage4")
+def test_ddp_smoke_accepts_exactly_one_task() -> None:
+    assert _validate_task("i2i") == "i2i"
+    assert _validate_task(" R2V ") == "r2v"
+    with pytest.raises(typer.BadParameter, match="i2i or r2v"):
+        _validate_task("stage3")
+
+
+def test_nonmain_smoke_never_constructs_path_from_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    broadcast_payload = {
+        "success": True,
+        "checkpoint_path": "/mnt/workspace/litengjie/run/checkpoint.safetensors",
+        "training_state_path": "/mnt/workspace/litengjie/run/training_state.pt",
+        "ready_marker_path": "/mnt/workspace/litengjie/run/checkpoint.ready.json",
+        "error_message": "",
+    }
+    path_calls = 0
+
+    def fail_path(*_args: Any, **_kwargs: Any) -> None:
+        nonlocal path_calls
+        path_calls += 1
+        raise AssertionError("non-main rank must not construct a Path from checkpoint=None")
+
+    monkeypatch.setattr(smoke_helpers, "Path", fail_path)
+    def fake_broadcast(_payload: Any, *, is_main_process: bool) -> dict[str, Any]:
+        del is_main_process
+        return broadcast_payload
+
+    monkeypatch.setattr(smoke_helpers, "_broadcast_main_payload", fake_broadcast)
+
+    status = smoke_helpers._checkpoint_artifact_status(
+        None,
+        global_step=1,
+        phase="stage3",
+        is_main_process=False,
+    )
+
+    assert path_calls == 0
+    assert status == broadcast_payload
+
+
+def _legacy_single_frame_transform(
+    frames: torch.Tensor,
+    *,
+    target_height: int,
+    target_width: int,
+) -> torch.Tensor:
+    cropped = frames.permute(0, 3, 1, 2).float()
+    scale = max(target_height / cropped.shape[-2], target_width / cropped.shape[-1])
+    resized_height = max(target_height, int(round(cropped.shape[-2] * scale)))
+    resized_width = max(target_width, int(round(cropped.shape[-1] * scale)))
+    resized = F.interpolate(
+        cropped,
+        size=(resized_height, resized_width),
+        mode="bilinear",
+        align_corners=False,
+    )
+    top = (resized_height - target_height) // 2
+    left = (resized_width - target_width) // 2
+    return (
+        resized[:, :, top : top + target_height, left : left + target_width]
+        .round()
+        .clamp_(0, 255)
+        .to(dtype=torch.uint8)
+        .permute(0, 2, 3, 1)
+        .contiguous()
+    )
+
+
+def test_chunked_transform_preserves_single_image_numerics() -> None:
+    torch.manual_seed(7)
+    image = torch.randint(0, 256, (1, 731, 1193, 3), dtype=torch.uint8)
+    expected = _legacy_single_frame_transform(
+        image,
+        target_height=480,
+        target_width=832,
+    )
+    actual = deterministic_resize_center_crop(
+        image,
+        target_height=480,
+        target_width=832,
+        chunk_frames=4,
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_chunked_transform_never_interpolates_more_than_configured_frames(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed_batch_sizes: list[int] = []
+    original_interpolate = F.interpolate
+
+    def recording_interpolate(input_tensor: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
+        observed_batch_sizes.append(input_tensor.shape[0])
+        return original_interpolate(input_tensor, *args, **kwargs)
+
+    monkeypatch.setattr("ltx_trainer.online_data.transforms.F.interpolate", recording_interpolate)
+    frames = torch.zeros(9, 96, 160, 3, dtype=torch.uint8)
+    output = deterministic_resize_center_crop(
+        frames,
+        target_height=48,
+        target_width=80,
+        chunk_frames=4,
+    )
+    assert output.shape == (9, 48, 80, 3)
+    assert observed_batch_sizes == [4, 4, 1]
+
+
+def _peak_rss_bytes() -> int:
+    value = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return int(value if sys.platform == "darwin" else value * 1024)
+
+
+def test_1080p_121_frame_transform_has_bounded_rss() -> None:
+    # Expanded uint8 input avoids making input allocation part of the transform RSS assertion.
+    frame = torch.zeros(1, 1080, 1920, 3, dtype=torch.uint8)
+    frames = frame.expand(121, -1, -1, -1)
+    before = _peak_rss_bytes()
+    output = deterministic_resize_center_crop(
+        frames,
+        target_height=480,
+        target_width=832,
+        chunk_frames=4,
+    )
+    rss_delta = max(0, _peak_rss_bytes() - before)
+    assert output.shape == (121, 480, 832, 3)
+    assert output.dtype == torch.uint8
+    assert rss_delta < 700 * 1024**2
 
 
 def test_image_visual_tokens_forward_one_frame_then_zero_pad() -> None:
