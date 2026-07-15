@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import torch
+from torch.utils.data import DataLoader, Dataset
+
 from ltx_trainer.online_data.constants import IMAGE_TASK, VIDEO_TASK
 from ltx_trainer.online_data.distributed_multitask_sampler import DistributedMultiTaskMicrobatchSampler
 
@@ -78,3 +81,72 @@ def test_retry_excludes_successful_retry_samples_from_later_microsteps() -> None
     later_retry = [sampler.retry_index(1) for sampler in samplers]
     assert len(set(later_retry)) == 8
     assert set(later_retry).isdisjoint(retry_microstep)
+
+
+def test_retry_excludes_entire_current_normal_block() -> None:
+    samplers = [_sampler(rank=rank, steps=2) for rank in range(8)]
+    normal_block = set(samplers[0].current_normal_block().tolist())
+    retry_block = [sampler.retry_index(1) for sampler in samplers]
+    assert len(set(retry_block)) == 8
+    assert set(retry_block).isdisjoint(normal_block)
+
+    for sampler in samplers:
+        sampler.mark_microbatch_consumed(retry_block)
+    iterators = [iter(sampler) for sampler in samplers]
+    for _ in range(3):
+        normal_microbatch = [next(iterator) for iterator in iterators]
+        assert set(normal_microbatch).isdisjoint(retry_block)
+        for sampler in samplers:
+            sampler.mark_microbatch_consumed(normal_microbatch)
+
+
+class _IndexDataset(Dataset[int]):
+    def __len__(self) -> int:
+        return 256
+
+    def __getitem__(self, index: int) -> int:
+        return index
+
+
+def test_retry_is_disjoint_from_real_dataloader_prefetch() -> None:
+    sampler = DistributedMultiTaskMicrobatchSampler(
+        {IMAGE_TASK: list(range(128)), VIDEO_TASK: list(range(128, 256))},
+        total_optimizer_steps=2,
+        gradient_accumulation_steps=4,
+        rank=0,
+        world_size=1,
+        seed=123,
+        image_ratio=0.5,
+        video_ratio=0.5,
+    )
+    loader = DataLoader(
+        _IndexDataset(),
+        batch_size=1,
+        sampler=sampler,
+        num_workers=2,
+        prefetch_factor=2,
+    )
+    iterator = iter(loader)
+    normal_block = set(sampler.current_normal_block().tolist())
+    failed_normal = int(next(iterator).item())
+    assert failed_normal in normal_block
+    retry = sampler.retry_index(1)
+    assert retry not in normal_block
+    sampler.mark_microbatch_consumed([retry])
+
+    for _ in range(3):
+        normal = int(next(iterator).item())
+        assert normal != retry
+        sampler.mark_microbatch_consumed([normal])
+
+
+def test_retry_resume_matches_uninterrupted_control() -> None:
+    control = _sampler(rank=2, steps=20)
+    control.seek_optimizer_step(7)
+    retry_before_resume = control.retry_index(3)
+    state = control.state_dict()
+
+    resumed = _sampler(rank=2, steps=20)
+    resumed.load_state_dict(state)
+    assert resumed.retry_index(3) == retry_before_resume
+    torch.testing.assert_close(resumed.current_normal_block(), control.current_normal_block())

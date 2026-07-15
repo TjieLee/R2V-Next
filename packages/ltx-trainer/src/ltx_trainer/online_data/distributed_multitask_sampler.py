@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import logging
+from array import array
 from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
 
@@ -15,11 +17,20 @@ from ltx_trainer.online_data.data_state import OnlineDataState
 
 _TASK_TO_ID = {IMAGE_TASK: 0, VIDEO_TASK: 1}
 _ID_TO_TASK = {value: key for key, value in _TASK_TO_ID.items()}
+logger = logging.getLogger(__name__)
 
 
 def _seed_for(*parts: int) -> int:
     payload = ":".join(str(int(part)) for part in parts).encode("ascii")
     return int.from_bytes(hashlib.sha256(payload).digest()[:8], "little") & 0x7FFF_FFFF_FFFF_FFFF
+
+
+def _indices_tensor(values: Sequence[int]) -> torch.Tensor:
+    if isinstance(values, array):
+        if values.typecode != "q":
+            raise ValueError(f"Compact task index arrays must use signed int64 typecode 'q', got {values.typecode!r}")
+        return torch.frombuffer(values, dtype=torch.int64).clone()
+    return torch.as_tensor(values, dtype=torch.long).clone()
 
 
 class DistributedMultiTaskMicrobatchSampler(Sampler[int]):
@@ -58,7 +69,7 @@ class DistributedMultiTaskMicrobatchSampler(Sampler[int]):
         self.seed = int(seed)
         self.global_samples_per_step = self.world_size * self.gradient_accumulation_steps
         self._indices = {
-            task: torch.tensor([int(index) for index in task_indices.get(task, ())], dtype=torch.long)
+            task: _indices_tensor(task_indices.get(task, ()))
             for task in (IMAGE_TASK, VIDEO_TASK)
         }
         for task, indices in self._indices.items():
@@ -83,6 +94,7 @@ class DistributedMultiTaskMicrobatchSampler(Sampler[int]):
         }
         self._state = OnlineDataState(sampler_seed=self.seed)
         self._consumed_indices_in_step: set[int] = set()
+        self._warned_retry_fallback_steps: set[int] = set()
 
     @property
     def current_task(self) -> str:
@@ -113,6 +125,17 @@ class DistributedMultiTaskMicrobatchSampler(Sampler[int]):
             + self._state.microstep_in_optimizer_step
         )
         return self.total_optimizer_steps * self.gradient_accumulation_steps - completed
+
+    def current_normal_block(self) -> torch.Tensor:
+        """Return the full normal sample block reserved for the current optimizer step."""
+        task = self.current_task
+        step = self._state.task_schedule_cursor
+        occurrence = int(self._task_occurrence[step].item())
+        return self._task_streams[task][occurrence].clone()
+
+    def was_consumed_in_current_step(self, index: int) -> bool:
+        """Whether ``index`` was already used by a successful microbatch in this step."""
+        return int(index) in self._consumed_indices_in_step
 
     def mark_microbatch_consumed(self, global_indices: Sequence[int] | None = None) -> None:
         if self._state.task_schedule_cursor >= self.total_optimizer_steps:
@@ -154,12 +177,6 @@ class DistributedMultiTaskMicrobatchSampler(Sampler[int]):
         task = self.current_task
         indices = self._indices[task]
         step = self._state.task_schedule_cursor
-        occurrence = int(self._task_occurrence[step].item())
-        normal_block = self._task_streams[task][occurrence]
-        previous_successes = normal_block[: self._state.microstep_in_optimizer_step * self.world_size]
-        consumed_indices = self._consumed_indices_in_step
-        if consumed_indices:
-            previous_successes = torch.tensor(sorted(consumed_indices), dtype=torch.long)
         generator = torch.Generator(device="cpu")
         generator.manual_seed(
             _seed_for(
@@ -170,21 +187,42 @@ class DistributedMultiTaskMicrobatchSampler(Sampler[int]):
                 _TASK_TO_ID[task],
             )
         )
-        if indices.numel() >= self.global_samples_per_step:
-            candidates = indices[torch.randperm(indices.numel(), generator=generator)]
-            if previous_successes.numel() > 0:
-                keep = ~torch.isin(candidates, previous_successes)
-                candidates = candidates[keep]
-            candidates = candidates[: self.world_size]
+        shuffled = indices[torch.randperm(indices.numel(), generator=generator)]
+        normal_block = self.current_normal_block()
+        consumed = torch.tensor(sorted(self._consumed_indices_in_step), dtype=torch.long)
+        strict_excluded = torch.cat([normal_block, consumed]) if consumed.numel() else normal_block
+        strict_candidates = shuffled[~torch.isin(shuffled, strict_excluded)]
+
+        if strict_candidates.numel() >= self.world_size:
+            candidate_block = strict_candidates[: self.world_size]
         else:
-            candidates = indices[
-                torch.randint(
+            # Small datasets cannot always reserve a disjoint retry pool of one
+            # complete global block. Prefer successful-step uniqueness, and let
+            # the trainer replace any prefetched normal slot that was consumed
+            # by this fallback before it enters the model.
+            if step not in self._warned_retry_fallback_steps:
+                logger.warning(
+                    "Retry pool for task %s has %d samples and cannot avoid the full %d-sample normal block; "
+                    "falling back to unused-in-step samples. Prefetched collisions will be retried.",
+                    task,
                     indices.numel(),
-                    (self.world_size,),
-                    generator=generator,
+                    self.global_samples_per_step,
                 )
-            ]
-        return int(candidates[self.rank].item())
+                self._warned_retry_fallback_steps.add(step)
+            fallback_candidates = shuffled
+            if consumed.numel():
+                fallback_candidates = fallback_candidates[~torch.isin(fallback_candidates, consumed)]
+            if fallback_candidates.numel() < self.world_size:
+                raise RuntimeError(
+                    "Cannot construct a rank-unique retry microbatch: "
+                    f"task={task}, dataset_size={indices.numel()}, already_consumed={consumed.numel()}, "
+                    f"world_size={self.world_size}"
+                )
+            candidate_block = fallback_candidates[: self.world_size]
+
+        if candidate_block.unique().numel() != self.world_size:
+            raise RuntimeError("Deterministic retry candidate block contains duplicate rank slots")
+        return int(candidate_block[self.rank].item())
 
     def state_dict(self) -> dict[str, int]:
         self._refresh_derived_state()

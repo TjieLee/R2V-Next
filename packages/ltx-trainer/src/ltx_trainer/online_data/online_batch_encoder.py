@@ -130,12 +130,19 @@ class OnlineBatchEncoder:
             "data_decode_ms": float(raw_batch["data_decode_ms"].float().mean().item()),
             "vae_encode_ms": 0.0,
             "siglip_encode_ms": 0.0,
+            "frozen_condition_ms": 0.0,
+            "planner_input_prepare_ms": 0.0,
             "vlm_planner_ms": 0.0,
+            "reference_vlm_preprocess_id": (
+                0.0 if self.config.vlm_reference_preprocess == "original" else 1.0
+            ),
+            "video_decoder_id": 0.0 if self.config.video_decoder == "pyav" else 1.0,
         }
         self._move_frozen_encoders_for_encode()
+        reference_pixels_vae, reference_images_vlm = self._resolve_reference_inputs(raw_batch)
         vae_started = time.perf_counter()
         latents = self._encode_target_latents(target_pixels, raw_batch["target_fps"])
-        multi_ref_latents = self._encode_reference_latents(raw_batch["reference_pixels"])
+        multi_ref_latents = self._encode_reference_latents(reference_pixels_vae)
         metrics["vae_encode_ms"] = (time.perf_counter() - vae_started) * 1000.0
 
         siglip_started = time.perf_counter()
@@ -144,16 +151,22 @@ class OnlineBatchEncoder:
 
         condition_started = time.perf_counter()
         caption = str(raw_batch["caption"][0])
-        references = self._reference_images(raw_batch["reference_pixels"][0])
+        references = self._reference_images(reference_images_vlm[0])
         text_conditions = self._encode_condition(caption=caption, reference_images=[])
         vlm_conditions = self._encode_condition(caption=caption, reference_images=references)
-        metrics["vlm_planner_ms"] = (time.perf_counter() - condition_started) * 1000.0
+        condition_elapsed_ms = (time.perf_counter() - condition_started) * 1000.0
+        metrics["frozen_condition_ms"] = condition_elapsed_ms
+        metrics["vlm_planner_ms"] = condition_elapsed_ms
 
         batch: dict[str, Any] = {
             "sample_key": raw_batch["sample_key"],
             "sample_plan_sha256": raw_batch["sample_plan_sha256"],
             "task": raw_batch["task"],
             "target_modality": raw_batch["target_modality"],
+            "vlm_reference_preprocess": raw_batch.get(
+                "vlm_reference_preprocess",
+                [self.config.vlm_reference_preprocess],
+            ),
             "manifest_index": raw_batch["manifest_index"],
             "target_source_frame_indices": raw_batch["target_source_frame_indices"],
             "vlm_target_frame_indices": raw_batch["vlm_target_frame_indices"],
@@ -178,7 +191,9 @@ class OnlineBatchEncoder:
                     gt_visual_tokens["visual_token_mask"]
                 ),
             )
-            metrics["vlm_planner_ms"] += (time.perf_counter() - planner_started) * 1000.0
+            planner_input_elapsed_ms = (time.perf_counter() - planner_started) * 1000.0
+            metrics["planner_input_prepare_ms"] = planner_input_elapsed_ms
+            metrics["vlm_planner_ms"] += planner_input_elapsed_ms
         self._offload_frozen_encoders_after_encode()
         return batch
 
@@ -197,8 +212,6 @@ class OnlineBatchEncoder:
 
     def _encode_reference_latents(self, reference_batches: list[list[Tensor]]) -> dict[str, Tensor]:
         max_refs = max(len(references) for references in reference_batches)
-        if self.config.max_ref_images is not None:
-            max_refs = min(max_refs, self.config.max_ref_images)
         if max_refs <= 0:
             raise ValueError("Every online sample must provide at least one reference image")
         batch_size = len(reference_batches)
@@ -434,9 +447,27 @@ class OnlineBatchEncoder:
         return getattr(self.text_encoder, "module", self.text_encoder)
 
     def _reference_images(self, references: list[Tensor]) -> list[Image.Image]:
-        if self.config.max_ref_images is not None:
-            references = references[: self.config.max_ref_images]
         return [_to_pil(reference) for reference in references]
+
+    def _resolve_reference_inputs(
+        self,
+        raw_batch: dict[str, Any],
+    ) -> tuple[list[list[Tensor]], list[list[Tensor]]]:
+        vae_batches = raw_batch.get("reference_pixels_vae", raw_batch.get("reference_pixels"))
+        vlm_batches = raw_batch.get("reference_images_vlm", raw_batch.get("reference_pixels"))
+        if not isinstance(vae_batches, list) or not isinstance(vlm_batches, list):
+            raise ValueError("Online raw batch is missing reference VAE/VLM image lists")
+        if len(vae_batches) != len(vlm_batches):
+            raise ValueError("Reference VAE and VLM batch sizes differ")
+        resolved_vae: list[list[Tensor]] = []
+        resolved_vlm: list[list[Tensor]] = []
+        for vae_references, vlm_references in zip(vae_batches, vlm_batches, strict=True):
+            if len(vae_references) != len(vlm_references):
+                raise ValueError("Reference VAE/VLM order cannot align because counts differ")
+            limit = self.config.max_ref_images
+            resolved_vae.append(list(vae_references if limit is None else vae_references[:limit]))
+            resolved_vlm.append(list(vlm_references if limit is None else vlm_references[:limit]))
+        return resolved_vae, resolved_vlm
 
     def _keep_frozen_visual_modules_eval(self) -> None:
         model = self._unwrap_text_encoder().model.model
@@ -447,10 +478,7 @@ class OnlineBatchEncoder:
 
     def _move_frozen_encoders_for_encode(self) -> None:
         if self.config.encoder_device_policy != "resident_cuda":
-            self.vae_encoder.to(device=self.device, dtype=self.dtype)
+            raise RuntimeError("Only resident_cuda online encoding is implemented")
 
     def _offload_frozen_encoders_after_encode(self) -> None:
-        if self.config.encoder_device_policy in {"sequential_cuda", "cpu_offload"}:
-            self.vae_encoder.to(device="cpu")
-            if self.device.type == "cuda":
-                torch.cuda.empty_cache()
+        return

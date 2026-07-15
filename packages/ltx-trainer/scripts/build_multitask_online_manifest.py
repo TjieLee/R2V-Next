@@ -1,9 +1,18 @@
-"""Build a deterministic I2I/R2V online manifest from raw annotations."""
+"""Build a deterministic low-memory I2I/R2V online manifest."""
 
 from __future__ import annotations
 
 import json
 import os
+import resource
+import sqlite3
+import sys
+import time
+from collections import Counter
+from collections.abc import Iterable, Iterator
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -14,127 +23,269 @@ from ltx_trainer.online_data.manifest import (
     ManifestReject,
     build_i2i_record,
     build_r2v_record,
-    deduplicate_records,
+    iter_annotation_rows,
     load_multitask_data_config,
-    read_annotation_rows,
+    probe_video,
+    resolve_media_path,
+)
+from ltx_trainer.online_data.manifest_index import (
+    build_manifest_offset_index,
+    default_manifest_index_path,
 )
 from ltx_trainer.online_data.path_safety import assert_write_path_allowed
 
 app = typer.Typer(pretty_exceptions_enable=False, no_args_is_help=True)
 
 
-def _atomic_write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
-    tmp_path = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
-    tmp_path.write_text(
-        "".join(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n" for row in rows),
-        encoding="utf-8",
-    )
-    tmp_path.replace(path)
+class _ManifestCollisionError(RuntimeError):
+    pass
+
+
+def _temporary_path(path: Path) -> Path:
+    return Path(f"{path}.tmp.{os.getpid()}")
+
+
+def _flush_and_sync(handle: Any) -> None:
+    handle.flush()
+    os.fsync(handle.fileno())
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    temporary = _temporary_path(path)
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+            _flush_and_sync(handle)
+        temporary.replace(path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _batched(rows: Iterable[dict[str, Any]], batch_size: int) -> Iterator[list[dict[str, Any]]]:
+    iterator = iter(rows)
+    while batch := list(islice(iterator, batch_size)):
+        yield batch
+
+
+def _safe_probe(
+    row: dict[str, Any],
+    data_root: str | Path | None,
+) -> tuple[dict[str, Any] | None, ManifestReject | None]:
+    try:
+        if "video_path" not in row:
+            return None, ManifestReject("r2v_schema_mismatch", "video_path field is missing")
+        target_path = resolve_media_path(row["video_path"], data_root=data_root)
+        if not Path(target_path).is_file():
+            return None, ManifestReject("missing_target", f"Target video does not exist: {target_path}")
+        return dict(probe_video(target_path)), None
+    except Exception as exc:
+        return None, ManifestReject("invalid_video_header", str(exc))
+
+
+def _iter_rows_with_bounded_probes(
+    rows: Iterable[dict[str, Any]],
+    *,
+    data_root: str | Path | None,
+    workers: int,
+    batch_size: int,
+) -> Iterator[tuple[dict[str, Any], dict[str, Any] | None, ManifestReject | None]]:
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        for row_batch in _batched(rows, batch_size):
+            results = list(executor.map(partial(_safe_probe, data_root=data_root), row_batch))
+            for row, (header, error) in zip(row_batch, results, strict=True):
+                yield row, header, error
+
+
+def _peak_rss_gb() -> float:
+    peak = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    # Linux reports KiB; macOS reports bytes.
+    peak_bytes = peak if sys.platform == "darwin" else peak * 1024.0
+    return peak_bytes / (1024.0**3)
 
 
 @app.command()
-def main(  # noqa: PLR0913
+def main(  # noqa: PLR0913, PLR0915
     train_data_config: str = typer.Option(..., "--train-data-config"),
     output: str = typer.Option(..., "--output"),
     reject_output: str | None = typer.Option(None, "--reject-output"),
+    summary_output: str | None = typer.Option(None, "--summary-output"),
     manifest_seed: int = typer.Option(42, "--manifest-seed"),
+    annotation_batch_size: int = typer.Option(4096, "--annotation-batch-size", min=1),
+    probe_workers: int = typer.Option(8, "--probe-workers", min=1),
+    probe_batch_size: int = typer.Option(256, "--probe-batch-size", min=1),
     i2i_target_field: str = typer.Option(..., "--i2i-target-field"),
     i2i_reference_field: str = typer.Option(..., "--i2i-reference-field"),
     i2i_caption_field: str = typer.Option(..., "--i2i-caption-field"),
     i2i_crop_field: str | None = typer.Option(None, "--i2i-crop-field"),
 ) -> None:
+    started = time.perf_counter()
     output_path = assert_write_path_allowed(output)
     reject_path = assert_write_path_allowed(
         reject_output or str(output_path.with_name(output_path.stem + "_rejected.jsonl"))
     )
-    config = load_multitask_data_config(train_data_config)
-    records: list[dict[str, Any]] = []
-    rejects: list[dict[str, Any]] = []
+    summary_path = assert_write_path_allowed(
+        summary_output or str(output_path.with_name(output_path.stem + "_summary.json"))
+    )
+    index_path = assert_write_path_allowed(default_manifest_index_path(output_path))
+    for path in (output_path, reject_path, summary_path, index_path):
+        path.parent.mkdir(parents=True, exist_ok=True)
 
-    for dataset in config["datasets"]:
-        if not isinstance(dataset, dict):
-            raise ValueError("Each datasets entry must be a mapping")
-        task = str(dataset.get("task", ""))
-        dataset_name = str(dataset.get("name", task))
-        annotation_path = dataset.get("ann_path") or dataset.get("parquet") or dataset.get("path")
-        if annotation_path is None:
-            raise ValueError(f"Dataset {dataset_name!r} has no ann_path/parquet/path")
-        rows = read_annotation_rows(annotation_path)
-        available_columns = sorted({key for row in rows for key in row})
-        if task == IMAGE_TASK:
-            required_i2i_fields = {i2i_target_field, i2i_reference_field, i2i_caption_field}
-            if i2i_crop_field is not None:
-                required_i2i_fields.add(i2i_crop_field)
-            missing_fields = sorted(required_i2i_fields - set(available_columns))
-            if missing_fields:
-                raise ValueError(
-                    f"I2I schema mismatch; missing adapter fields {missing_fields}. "
-                    f"Available columns: {available_columns}"
+    output_temporary = _temporary_path(output_path)
+    reject_temporary = _temporary_path(reject_path)
+    index_temporary = _temporary_path(index_path)
+    sqlite_path = assert_write_path_allowed(
+        output_path.with_suffix(output_path.suffix + f".dedup.{os.getpid()}.sqlite")
+    )
+    config = load_multitask_data_config(train_data_config)
+    raw_rows = 0
+    accepted_rows = 0
+    rejected_rows = 0
+    duplicate_rows = 0
+    task_counts: Counter[str] = Counter()
+    reject_reason_counts: Counter[str] = Counter()
+
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(sqlite_path)
+        connection.execute("PRAGMA journal_mode=OFF")
+        connection.execute("PRAGMA synchronous=OFF")
+        connection.execute("PRAGMA temp_store=FILE")
+        connection.execute("PRAGMA cache_size=-16384")
+        connection.execute(
+            "CREATE TABLE dedup (sample_key TEXT PRIMARY KEY, sample_plan_sha256 TEXT NOT NULL) WITHOUT ROWID"
+        )
+
+        with output_temporary.open("w", encoding="utf-8") as accepted_handle, reject_temporary.open(
+            "w", encoding="utf-8"
+        ) as reject_handle:
+            for dataset in config["datasets"]:
+                if not isinstance(dataset, dict):
+                    raise ValueError("Each datasets entry must be a mapping")
+                task = str(dataset.get("task", ""))
+                dataset_name = str(dataset.get("name", task))
+                annotation_path = dataset.get("ann_path") or dataset.get("parquet") or dataset.get("path")
+                if annotation_path is None:
+                    raise ValueError(f"Dataset {dataset_name!r} has no ann_path/parquet/path")
+                rows: Iterable[dict[str, Any]] = iter_annotation_rows(
+                    annotation_path,
+                    batch_size=annotation_batch_size,
                 )
-        elif task == VIDEO_TASK:
-            required_r2v_fields = {"video_path", "text", "crop", "face_cut", "ref_images"}
-            missing_fields = sorted(required_r2v_fields - set(available_columns))
-            if missing_fields:
-                raise ValueError(
-                    f"OpenS2V schema mismatch; missing fields {missing_fields}. "
-                    f"Available columns: {available_columns}"
-                )
-        max_samples = dataset.get("max_samples")
-        if max_samples is not None:
-            rows = rows[: int(max_samples)]
-        data_root = dataset.get("data_root", config.get("data_root"))
-        for row_index, row in enumerate(rows):
-            try:
-                if task == IMAGE_TASK:
-                    record = build_i2i_record(
-                        row,
-                        dataset_name=dataset_name,
-                        data_root=data_root,
-                        target_field=i2i_target_field,
-                        reference_field=i2i_reference_field,
-                        caption_field=i2i_caption_field,
-                        crop_field=i2i_crop_field,
-                    )
-                elif task == VIDEO_TASK:
-                    record = build_r2v_record(
-                        row,
-                        dataset_name=dataset_name,
-                        data_root=data_root,
-                        manifest_seed=manifest_seed,
+                max_samples = dataset.get("max_samples")
+                if max_samples is not None:
+                    rows = islice(rows, int(max_samples))
+                data_root = dataset.get("data_root", config.get("data_root"))
+                if task == VIDEO_TASK:
+                    row_stream: Iterable[
+                        tuple[dict[str, Any], dict[str, Any] | None, ManifestReject | None]
+                    ] = (
+                        _iter_rows_with_bounded_probes(
+                            rows,
+                            data_root=data_root,
+                            workers=probe_workers,
+                            batch_size=probe_batch_size,
+                        )
                     )
                 else:
-                    raise ValueError(f"Unsupported task {task!r} in dataset {dataset_name!r}")
-                records.append(record)
-            except Exception as exc:
-                reason = exc.reason if isinstance(exc, ManifestReject) else type(exc).__name__
-                rejects.append(
-                    {
-                        "dataset_name": dataset_name,
-                        "row_index": row_index,
-                        "task": task,
-                        "reason": reason,
-                        "message": str(exc),
-                    }
-                )
+                    row_stream = ((row, None, None) for row in rows)
 
-    unique_records = deduplicate_records(records)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    reject_path.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write_jsonl(output_path, unique_records)
-    _atomic_write_jsonl(reject_path, rejects)
-    task_counts = {
-        task: sum(record["task"] == task for record in unique_records)
-        for task in (IMAGE_TASK, VIDEO_TASK)
-    }
-    if any(count == 0 for count in task_counts.values()):
-        raise RuntimeError(
-            f"Built manifest does not contain both tasks: {task_counts}. "
-            f"Inspect rejects at {reject_path}."
-        )
-    typer.echo(
-        f"Wrote {len(unique_records)} deterministic samples {task_counts} to {output_path}; "
-        f"{len(rejects)} rejects to {reject_path}"
-    )
+                for row_index, (row, video_header, probe_error) in enumerate(row_stream):
+                    raw_rows += 1
+                    try:
+                        if task == IMAGE_TASK:
+                            record = build_i2i_record(
+                                row,
+                                dataset_name=dataset_name,
+                                data_root=data_root,
+                                target_field=i2i_target_field,
+                                reference_field=i2i_reference_field,
+                                caption_field=i2i_caption_field,
+                                crop_field=i2i_crop_field,
+                            )
+                        elif task == VIDEO_TASK:
+                            if probe_error is not None or video_header is None:
+                                raise probe_error or ManifestReject("invalid_video_header", "Video probe failed")
+                            record = build_r2v_record(
+                                row,
+                                dataset_name=dataset_name,
+                                data_root=data_root,
+                                manifest_seed=manifest_seed,
+                                video_header=video_header,
+                            )
+                        else:
+                            raise ValueError(f"Unsupported task {task!r} in dataset {dataset_name!r}")
+
+                        sample_key = str(record["sample_key"])
+                        plan_sha = str(record["sample_plan_sha256"])
+                        existing = connection.execute(
+                            "SELECT sample_plan_sha256 FROM dedup WHERE sample_key = ?",
+                            (sample_key,),
+                        ).fetchone()
+                        if existing is not None:
+                            if str(existing[0]) != plan_sha:
+                                raise _ManifestCollisionError(
+                                    f"sample_key collision with different plans: {sample_key}"
+                                )
+                            duplicate_rows += 1
+                            continue
+                        connection.execute("INSERT INTO dedup VALUES (?, ?)", (sample_key, plan_sha))
+                        accepted_handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+                        accepted_rows += 1
+                        task_counts[task] += 1
+                        if accepted_rows % 10_000 == 0:
+                            connection.commit()
+                    except Exception as exc:
+                        if isinstance(exc, _ManifestCollisionError):
+                            raise
+                        reason = exc.reason if isinstance(exc, ManifestReject) else type(exc).__name__
+                        reject_handle.write(
+                            json.dumps(
+                                {
+                                    "dataset_name": dataset_name,
+                                    "row_index": row_index,
+                                    "task": task,
+                                    "reason": reason,
+                                    "message": str(exc),
+                                },
+                                ensure_ascii=False,
+                                sort_keys=True,
+                            )
+                            + "\n"
+                        )
+                        rejected_rows += 1
+                        reject_reason_counts[reason] += 1
+            connection.commit()
+            _flush_and_sync(accepted_handle)
+            _flush_and_sync(reject_handle)
+
+        if any(task_counts[task] == 0 for task in (IMAGE_TASK, VIDEO_TASK)):
+            raise RuntimeError(f"Built manifest does not contain both tasks: {dict(task_counts)}")
+        build_manifest_offset_index(output_temporary, index_temporary)
+        output_temporary.replace(output_path)
+        reject_temporary.replace(reject_path)
+        index_temporary.replace(index_path)
+        summary = {
+            "raw_rows": raw_rows,
+            "accepted_rows": accepted_rows,
+            "rejected_rows": rejected_rows,
+            "duplicate_rows": duplicate_rows,
+            "task_counts": dict(sorted(task_counts.items())),
+            "reject_reason_counts": dict(sorted(reject_reason_counts.items())),
+            "elapsed_seconds": time.perf_counter() - started,
+            "peak_rss_gb": _peak_rss_gb(),
+            "manifest_path": str(output_path),
+            "manifest_index_path": str(index_path),
+        }
+        _atomic_write_json(summary_path, summary)
+        typer.echo(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
+    finally:
+        if connection is not None:
+            connection.close()
+        sqlite_path.unlink(missing_ok=True)
+        output_temporary.unlink(missing_ok=True)
+        reject_temporary.unlink(missing_ok=True)
+        index_temporary.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

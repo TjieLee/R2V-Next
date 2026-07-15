@@ -5,14 +5,18 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import logging
 import math
 import random
+import warnings
 from collections import Counter
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 import pandas as pd
 import yaml
+from PIL import Image, ImageOps
 
 from ltx_trainer.online_data.constants import (
     IMAGE_FPS,
@@ -26,6 +30,8 @@ from ltx_trainer.online_data.constants import (
     VLM_TARGET_INDICES,
 )
 from ltx_trainer.online_data.media_decoder import probe_video
+
+logger = logging.getLogger(__name__)
 
 
 class ManifestReject(ValueError):
@@ -48,44 +54,93 @@ def _json_safe(value: Any) -> Any:
     return str(value)
 
 
-def read_annotation_rows(path: str | Path) -> list[dict[str, Any]]:
+def iter_annotation_rows(
+    path: str | Path,
+    *,
+    batch_size: int = 4096,
+) -> Iterator[dict[str, Any]]:
+    """Yield normalized annotation rows while keeping memory bounded."""
     annotation_path = Path(path).expanduser().resolve()
     if not annotation_path.is_file():
         raise FileNotFoundError(f"Annotation file does not exist: {annotation_path}")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
     suffix = annotation_path.suffix.lower()
     if suffix == ".parquet":
-        rows = pd.read_parquet(annotation_path).to_dict("records")
+        try:
+            import pyarrow.parquet as parquet  # noqa: PLC0415
+        except ImportError as exc:
+            raise RuntimeError("Streaming parquet annotations requires pyarrow") from exc
+        parquet_file = parquet.ParquetFile(annotation_path)
+        for batch in parquet_file.iter_batches(batch_size=batch_size):
+            for row in batch.to_pylist():
+                yield {str(key): _json_safe(value) for key, value in row.items()}
     elif suffix == ".jsonl":
-        rows = [
-            json.loads(line)
-            for line in annotation_path.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
+        with annotation_path.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                if not isinstance(row, Mapping):
+                    raise ValueError(f"JSONL row {line_number} is not an object: {annotation_path}")
+                yield {str(key): _json_safe(value) for key, value in row.items()}
     elif suffix == ".json":
-        payload = json.loads(annotation_path.read_text(encoding="utf-8"))
-        rows = list(payload.values()) if isinstance(payload, dict) else payload
+        warnings.warn(
+            f"JSON list/object annotations are loaded in memory; prefer JSONL for large files: {annotation_path}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        with annotation_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        rows = payload.values() if isinstance(payload, dict) else payload
+        if not isinstance(rows, (list, tuple)) and not hasattr(rows, "__iter__"):
+            raise ValueError(f"JSON annotation must contain rows: {annotation_path}")
+        for row in rows:
+            if not isinstance(row, Mapping):
+                raise ValueError(f"JSON annotation contains a non-object row: {annotation_path}")
+            yield {str(key): _json_safe(value) for key, value in row.items()}
     elif suffix == ".csv":
         with annotation_path.open("r", encoding="utf-8", newline="") as handle:
-            rows = list(csv.DictReader(handle))
+            for row in csv.DictReader(handle):
+                yield {str(key): _json_safe(value) for key, value in row.items()}
     else:
         raise ValueError(f"Unsupported annotation format: {annotation_path.suffix}")
-    if not isinstance(rows, list) or any(not isinstance(row, Mapping) for row in rows):
-        raise ValueError(f"Annotation must contain object rows: {annotation_path}")
-    return [{str(key): _json_safe(value) for key, value in row.items()} for row in rows]
+
+
+def read_annotation_rows(path: str | Path) -> list[dict[str, Any]]:
+    """Backward-compatible eager wrapper for callers that explicitly need a list."""
+    return list(iter_annotation_rows(path))
 
 
 def inspect_annotation(path: str | Path, *, sample_count: int = 3) -> dict[str, Any]:
-    rows = read_annotation_rows(path)
-    fields = sorted({key for row in rows for key in row})
-    field_report: dict[str, Any] = {}
-    for field in fields:
-        values = [row.get(field) for row in rows]
-        non_null = [value for value in values if value is not None]
-        type_counts = Counter(type(value).__name__ for value in non_null)
-        field_report[field] = {
-            "types": dict(sorted(type_counts.items())),
-            "null_fraction": (len(values) - len(non_null)) / max(1, len(values)),
+    row_count = 0
+    examples: list[dict[str, Any]] = []
+    type_counts: dict[str, Counter[str]] = {}
+    null_counts: dict[str, int] = {}
+    for row in iter_annotation_rows(path):
+        if len(examples) < sample_count:
+            examples.append(row)
+        existing_fields = set(type_counts)
+        row_fields = set(row)
+        for missing_field in existing_fields - row_fields:
+            null_counts[missing_field] += 1
+        for field, value in row.items():
+            if field not in type_counts:
+                type_counts[field] = Counter()
+                null_counts[field] = row_count
+            if value is None:
+                null_counts[field] += 1
+            else:
+                type_counts[field][type(value).__name__] += 1
+        row_count += 1
+    fields = sorted(type_counts)
+    field_report = {
+        field: {
+            "types": dict(sorted(type_counts[field].items())),
+            "null_fraction": null_counts[field] / max(1, row_count),
         }
+        for field in fields
+    }
     role_terms = {
         "media_or_target": ("target", "tgt", "image", "video", "path"),
         "source_or_reference": ("source", "src", "reference", "ref"),
@@ -98,11 +153,11 @@ def inspect_annotation(path: str | Path, *, sample_count: int = 3) -> dict[str, 
     }
     return {
         "path": str(Path(path).expanduser().resolve()),
-        "row_count": len(rows),
+        "row_count": row_count,
         "fields": field_report,
         "available_columns": fields,
         "role_candidates_not_adapter_mappings": role_candidates,
-        "examples": rows[:sample_count],
+        "examples": examples,
     }
 
 
@@ -152,6 +207,54 @@ def resolve_media_path(value: Any, *, data_root: str | Path | None) -> str:
     return str(path.resolve())
 
 
+def _require_nonempty_caption(value: Any) -> str:
+    caption = str(value).strip() if value is not None else ""
+    if not caption:
+        raise ManifestReject("empty_caption", "Caption/instruction is empty")
+    return caption
+
+
+def _validate_reference_paths(paths: list[str]) -> None:
+    for path in paths:
+        image_path = Path(path)
+        if not image_path.is_file():
+            raise ManifestReject("missing_reference", f"Reference image does not exist: {image_path}")
+        try:
+            with Image.open(image_path) as image:
+                image.verify()
+        except Exception as exc:
+            raise ManifestReject("missing_reference", f"Reference image is unreadable: {image_path}") from exc
+
+
+def _resolved_reference_paths(
+    value: Any,
+    *,
+    field: str,
+    data_root: str | Path | None,
+) -> list[str]:
+    try:
+        paths = parse_path_list(value, field=field)
+    except Exception as exc:
+        raise ManifestReject("missing_reference", f"No usable reference paths in field {field!r}") from exc
+    return [resolve_media_path(path, data_root=data_root) for path in paths]
+
+
+def _validate_crop_xyxy(
+    crop: list[float] | None,
+    *,
+    width: int,
+    height: int,
+) -> None:
+    if crop is None:
+        return
+    x0, y0, x1, y1 = crop
+    if not (0 <= x0 < x1 <= width and 0 <= y0 < y1 <= height):
+        raise ManifestReject(
+            "invalid_crop",
+            f"crop_xyxy={crop} is outside media size {width}x{height}",
+        )
+
+
 def stable_sample_key(payload: Mapping[str, Any]) -> str:
     canonical = json.dumps(_json_safe(payload), sort_keys=True, ensure_ascii=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -189,19 +292,35 @@ def build_i2i_record(
             f"I2I adapter fields are missing: {missing}. Available columns: {available}",
         )
     target_path = resolve_media_path(row[target_field], data_root=data_root)
-    reference_paths = [
-        resolve_media_path(value, data_root=data_root)
-        for value in parse_path_list(row[reference_field], field=reference_field)
-    ]
+    if not Path(target_path).is_file():
+        raise ManifestReject("missing_target", f"Target image does not exist: {target_path}")
+    reference_paths = _resolved_reference_paths(
+        row[reference_field],
+        field=reference_field,
+        data_root=data_root,
+    )
     crop_xyxy = None
     if crop_field is not None and row.get(crop_field) is not None:
-        crop_xyxy = parse_numeric_list(row[crop_field], field=crop_field)
+        try:
+            crop_xyxy = parse_numeric_list(row[crop_field], field=crop_field)
+        except Exception as exc:
+            raise ManifestReject("invalid_crop", f"Invalid crop field {crop_field!r}") from exc
+    caption = _require_nonempty_caption(row[caption_field])
+    _validate_reference_paths(reference_paths)
+    try:
+        with Image.open(target_path) as target_image:
+            target_image.verify()
+        with Image.open(target_path) as target_image:
+            target_width, target_height = ImageOps.exif_transpose(target_image).size
+    except Exception as exc:
+        raise ManifestReject("missing_target", f"Target image is unreadable: {target_path}") from exc
+    _validate_crop_xyxy(crop_xyxy, width=target_width, height=target_height)
     identity = {
         "dataset_name": dataset_name,
         "task": IMAGE_TASK,
         "target_path": target_path,
         "reference_paths": reference_paths,
-        "caption": str(row[caption_field]),
+        "caption": caption,
         "crop_xyxy": crop_xyxy,
         "face_cut": None,
     }
@@ -214,7 +333,7 @@ def build_i2i_record(
             "target_modality": "image",
             "target_path": target_path,
             "reference_paths": reference_paths,
-            "caption": str(row[caption_field]),
+            "caption": caption,
             "crop_xyxy": crop_xyxy,
             "face_cut": None,
             "original_fps": IMAGE_FPS,
@@ -235,6 +354,7 @@ def build_r2v_record(
     dataset_name: str,
     data_root: str | Path | None,
     manifest_seed: int,
+    video_header: Mapping[str, float | int] | None = None,
 ) -> dict[str, Any]:
     required = {"video_path", "text", "crop", "face_cut", "ref_images"}
     missing = sorted(required - row.keys())
@@ -244,28 +364,49 @@ def build_r2v_record(
             f"OpenS2V adapter fields are missing: {missing}. Available columns: {sorted(row)}",
         )
     target_path = resolve_media_path(row["video_path"], data_root=data_root)
-    reference_paths = [
-        resolve_media_path(value, data_root=data_root)
-        for value in parse_path_list(row["ref_images"], field="ref_images")
-    ]
-    crop_raw = parse_numeric_list(row["crop"], field="crop")
+    if not Path(target_path).is_file():
+        raise ManifestReject("missing_target", f"Target video does not exist: {target_path}")
+    reference_paths = _resolved_reference_paths(
+        row["ref_images"],
+        field="ref_images",
+        data_root=data_root,
+    )
+    try:
+        crop_raw = parse_numeric_list(row["crop"], field="crop")
+    except Exception as exc:
+        raise ManifestReject("invalid_crop", "Invalid OpenS2V crop") from exc
     # OpenS2V stores (start_x, end_x, start_y, end_y).
     crop_xyxy = [crop_raw[0], crop_raw[2], crop_raw[1], crop_raw[3]]
-    face_cut = parse_pair(row["face_cut"], field="face_cut")
+    try:
+        face_cut = parse_pair(row["face_cut"], field="face_cut")
+    except Exception as exc:
+        raise ManifestReject("invalid_face_cut", "Invalid OpenS2V face_cut") from exc
     if face_cut[1] <= face_cut[0]:
         raise ManifestReject("invalid_face_cut", f"Invalid face_cut={face_cut} for {target_path}")
-    header = probe_video(target_path)
-    original_fps = float(header["fps"])
+    caption = _require_nonempty_caption(row["text"])
+    _validate_reference_paths(reference_paths)
+    try:
+        header = dict(video_header) if video_header is not None else probe_video(target_path)
+        original_fps = float(header["fps"])
+        frame_count = int(header["frame_count"])
+        video_width = int(header["width"])
+        video_height = int(header["height"])
+    except Exception as exc:
+        raise ManifestReject("invalid_video_header", f"Could not read video header: {target_path}") from exc
     if not math.isfinite(original_fps) or original_fps <= 0:
-        raise ManifestReject("invalid_video_fps", f"Could not determine FPS for {target_path}")
-    frame_count = int(header["frame_count"])
-    end_frame = min(face_cut[1], frame_count) if frame_count > 0 else face_cut[1]
+        raise ManifestReject("invalid_video_header", f"Could not determine FPS for {target_path}")
+    if frame_count <= 0 or video_width <= 0 or video_height <= 0:
+        raise ManifestReject("invalid_video_header", f"Incomplete video header for {target_path}: {header}")
+    _validate_crop_xyxy(crop_xyxy, width=video_width, height=video_height)
+    if not (0 <= face_cut[0] < face_cut[1] <= frame_count):
+        raise ManifestReject("invalid_face_cut", f"Invalid face_cut={face_cut} for frame_count={frame_count}")
+    end_frame = face_cut[1]
     identity = {
         "dataset_name": dataset_name,
         "task": VIDEO_TASK,
         "target_path": target_path,
         "reference_paths": reference_paths,
-        "caption": str(row["text"]),
+        "caption": caption,
         "crop_xyxy": crop_xyxy,
         "face_cut": [face_cut[0], end_frame],
     }
@@ -299,7 +440,7 @@ def build_r2v_record(
             "target_modality": "video",
             "target_path": target_path,
             "reference_paths": reference_paths,
-            "caption": str(row["text"]),
+            "caption": caption,
             "crop_xyxy": crop_xyxy,
             "face_cut": [face_cut[0], end_frame],
             "original_fps": original_fps,

@@ -265,8 +265,14 @@ class LtxvTrainer:
                         self._global_step += 1
 
                     output = self._training_step(batch)
+                    backward_started = time.perf_counter()
                     self._accelerator.backward(output.loss.mean())
+                    if cfg.data.encoding_mode == "online":
+                        self._last_online_metrics["backward_ms"] = (
+                            time.perf_counter() - backward_started
+                        ) * 1000.0
 
+                    optimizer_started = time.perf_counter()
                     if self._accelerator.sync_gradients and cfg.optimization.max_grad_norm > 0:
                         self._accelerator.clip_grad_norm_(
                             self._trainable_params,
@@ -280,6 +286,10 @@ class LtxvTrainer:
                         self._lr_scheduler,
                         sync_gradients=self._accelerator.sync_gradients,
                     )
+                    if cfg.data.encoding_mode == "online":
+                        self._last_online_metrics["optimizer_ms"] = (
+                            time.perf_counter() - optimizer_started
+                        ) * 1000.0
                     if cfg.data.encoding_mode == "online":
                         manifest_indices = self._accelerator.gather(
                             batch["manifest_index"].to(device=self._accelerator.device, dtype=torch.long)
@@ -446,9 +456,13 @@ class LtxvTrainer:
         conditions = self._training_strategy.prepare_conditions(batch, conditions)
         if self._config.data.encoding_mode == "online":
             online_metrics = batch.setdefault("_online_metrics", {})
-            online_metrics["vlm_planner_ms"] = float(online_metrics.get("vlm_planner_ms", 0.0)) + (
-                time.perf_counter() - planner_started
-            ) * 1000.0
+            condition_prepare_ms = (time.perf_counter() - planner_started) * 1000.0
+            online_metrics["condition_prepare_ms"] = condition_prepare_ms
+            if getattr(self._training_strategy.config, "name", "") == "multi_reference_planner_stage2":
+                online_metrics["planner_forward_ms"] = condition_prepare_ms
+                online_metrics["vlm_planner_ms"] = float(
+                    online_metrics.get("vlm_planner_ms", 0.0)
+                ) + condition_prepare_ms
         batch["conditions"] = conditions
 
         if "video_prompt_embeds" in conditions:
@@ -1482,6 +1496,9 @@ class LtxvTrainer:
                 width=online_config.width,
                 height=online_config.height,
                 max_ref_images=online_config.max_ref_images,
+                vlm_reference_preprocess=online_config.vlm_reference_preprocess,
+                video_decoder=online_config.video_decoder,
+                decode_timeout_seconds=online_config.decode_timeout_seconds,
             )
 
         source_config = load_multitask_data_config(data_config.train_data_config)
@@ -1577,11 +1594,25 @@ class LtxvTrainer:
         last_error: Exception | SampleLoadError | None = None
         for attempt in range(online_config.runtime_max_retries + 1):
             raw_errors = raw_batch.get("sample_load_errors", [])
-            local_raw_failed = bool(raw_errors)
+            manifest_indices = raw_batch.get("manifest_index")
+            local_prefetch_collision = bool(
+                isinstance(manifest_indices, Tensor)
+                and any(
+                    self._online_sampler.was_consumed_in_current_step(int(index))
+                    for index in manifest_indices.flatten().tolist()
+                )
+            )
+            local_raw_failed = bool(raw_errors) or local_prefetch_collision
             if self._synchronize_online_failure(local_raw_failed):
                 if local_raw_failed:
-                    last_error = raw_errors[0]
-                    self._log_online_reject(raw_errors[0], attempt=attempt, phase="decode")
+                    if raw_errors:
+                        last_error = raw_errors[0]
+                        self._log_online_reject(raw_errors[0], attempt=attempt, phase="decode")
+                    else:
+                        last_error = RuntimeError(
+                            "Prefetched normal sample was already consumed by a retry in this optimizer step"
+                        )
+                        self._log_online_reject(last_error, attempt=attempt, phase="prefetch_collision")
                 raw_batch = self._load_online_retry_batch(attempt + 1, collate_online_raw_batch)
                 continue
 

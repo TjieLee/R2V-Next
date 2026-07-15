@@ -114,6 +114,9 @@ data:
     raw_visual_dim: 3840
     encoder_dtype: "bfloat16"
     encoder_device_policy: "resident_cuda"
+    vlm_reference_preprocess: "original"
+    video_decoder: "pyav"
+    decode_timeout_seconds: 120.0
     pin_memory: true
     prefetch_factor: 2
     planner_max_length: 4096

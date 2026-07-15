@@ -40,7 +40,11 @@ uv run python scripts/build_multitask_online_manifest.py \
   --train-data-config /mnt/workspace/litengjie/jd_ltx_multitask_online_480p121/manifests/multitask_480p121.yaml \
   --output /mnt/workspace/litengjie/jd_ltx_multitask_online_480p121/manifests/train_unique.jsonl \
   --reject-output /mnt/workspace/litengjie/jd_ltx_multitask_online_480p121/logs/manifest_rejected.jsonl \
+  --summary-output /mnt/workspace/litengjie/jd_ltx_multitask_online_480p121/logs/manifest_summary.json \
   --manifest-seed 42 \
+  --annotation-batch-size 4096 \
+  --probe-workers 8 \
+  --probe-batch-size 256 \
   --i2i-target-field '<SOURCE_REPORT中的target字段>' \
   --i2i-reference-field '<SOURCE_REPORT中的source字段>' \
   --i2i-caption-field '<SOURCE_REPORT中的instruction字段>'
@@ -52,7 +56,86 @@ uv run python scripts/validate_multitask_online_manifest.py \
 `/mnt/workspace/liutao/` 只读。manifest、reject、训练日志、cache 和 checkpoint 的写路径都会被
 `assert_write_path_allowed()` 检查，必须位于 `/mnt/workspace/litengjie/`。
 
-## 3. 训练
+builder 对 JSONL/CSV 逐行读取，对 Parquet 使用 PyArrow batch；JSON list 仍兼容但会发出内存警告。
+accepted/rejected 文件逐行写入临时文件，完成 `flush + fsync` 后原子替换。去重键保存在输出目录下的
+临时 SQLite 中，不在内存维护百万级 Python dict。成功后会同时得到：
+
+```text
+train_unique.jsonl
+train_unique.jsonl.idx
+manifest_rejected.jsonl
+manifest_summary.json
+```
+
+`.idx` 只保存 byte offset 和 task id，`OnlineMultiTaskDataset` 按 offset 延迟读取单条 JSON；8 个 rank
+及其 DataLoader worker 不会各自复制完整 manifest。summary 包含 raw/accepted/rejected/duplicate、
+task/reject reason 统计、耗时和 builder 峰值 RSS。静态坏数据使用稳定 reason：`missing_target`、
+`missing_reference`、`empty_caption`、`invalid_crop`、`invalid_face_cut`、`invalid_video_header`、
+`insufficient_frames_for_121_at_24fps`。
+
+## 3. Reference 和视频解码语义
+
+- `reference_pixels_vae`：统一截断 reference 数量后，确定性 resize/center crop 到 832x480，再进 VAE。
+- `reference_images_vlm`：默认保留原始 sRGB 尺寸、像素和顺序，直接交给 Gemma image processor。
+- `vlm_reference_preprocess: target_crop` 仅用于显式消融；正式 YAML 默认是 `original`。
+- R2V 默认 `video_decoder: pyav`，从目标区间前的 keyframe seek 后按 presentation order 解码；PTS
+  不可靠时在同一容器中从头顺序建立精确 ordinal index。
+- `decode_timeout_seconds: 120` 的超时会成为 `SampleLoadError`，所有 DDP rank 同步进入同 task retry。
+- 目前仅开放 `encoder_device_policy: resident_cuda`。另外两种未完整实现的 policy 会在配置解析时失败，
+  不会移动或复制 DDP 包裹的可训练 Gemma。
+
+retry 候选会排除当前 optimizer step 的整个 normal block 和本 step 已成功消费的 retry。小数据 fallback
+会明确 warning；若 retry 使用了已预取的 future normal sample，trainer 会在编码/forward 前识别并再次
+确定性 retry，不推进 task schedule cursor。
+
+## 4. 正式训练前门禁
+
+先对三份 YAML 分别运行 CPU preflight：
+
+```bash
+for stage in \
+  configs/multiref_stage1_multitask_online_480p121_full_tokens_30k.yaml \
+  configs/multiref_stage2_multitask_online_480p121_full_tokens_planner_30k.yaml \
+  configs/multiref_stage3_multitask_online_480p121_joint_30k.yaml; do
+  uv run python scripts/check_multitask_online_training_ready.py "$stage" \
+    --world-size 8 --samples-per-task 1
+done
+```
+
+对应阶段必须输出 `READY_FOR_STAGE1/2/3=true`。然后运行真实模型 encode 和单卡一步训练：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run python scripts/check_multitask_online_real_encode.py \
+  --stage1-config configs/multiref_stage1_multitask_online_480p121_full_tokens_30k.yaml \
+  --num-image-samples 1 --num-video-samples 1
+
+CUDA_VISIBLE_DEVICES=0 uv run python scripts/check_multitask_online_stage1.py \
+  --config configs/multiref_stage1_multitask_online_480p121_full_tokens_30k.yaml \
+  --task i2i \
+  --output-dir /mnt/workspace/litengjie/jd_ltx_multitask_online_480p121/smoke/stage1_i2i
+```
+
+Stage 1/2/3 wrapper 的参数一致，分别用对应 YAML 并对 `--task i2i`、`--task r2v` 各运行一次。
+smoke 派生配置固定为 1 optimizer step、batch 1、accumulation 4、full-condition CFG off；它检查
+scheduler 只前进一步、三项 Stage 2/3 loss finite、要求的模块产生非零 finite Adam moment，并保存
+成对 checkpoint/training state。JSON 报告包含 decode、VAE、SigLIP、frozen condition、planner、DiT、
+backward、optimizer、峰值显存和 reference shape。
+
+最后运行真实两卡 DDP：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 uv run accelerate launch \
+  --config_file configs/accelerate/ddp.yaml --num_processes 2 \
+  scripts/check_multitask_online_ddp.py \
+  --stage1-config configs/multiref_stage1_multitask_online_480p121_full_tokens_30k.yaml \
+  --stage2-config configs/multiref_stage2_multitask_online_480p121_full_tokens_planner_30k.yaml \
+  --stage3-config configs/multiref_stage3_multitask_online_480p121_joint_30k.yaml
+```
+
+它会顺序覆盖三个阶段的 I2I/R2V 一步优化，验证真实 DDP condition encoding、Gemma/Planner/DiT、
+checkpoint 保存和 scheduler 语义。只有这些门禁通过后才启动 30K。
+
+## 5. 训练
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 PYTORCH_ALLOC_CONF=expandable_segments:True \

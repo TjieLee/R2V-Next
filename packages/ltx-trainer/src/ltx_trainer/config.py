@@ -433,6 +433,9 @@ class OnlineEncodingConfig(ConfigBaseModel):
     raw_visual_dim: int = Field(default=3840, ge=1)
     encoder_dtype: Literal["bfloat16", "float16", "float32"] = "bfloat16"
     encoder_device_policy: Literal["resident_cuda", "sequential_cuda", "cpu_offload"] = "resident_cuda"
+    vlm_reference_preprocess: Literal["original", "target_crop"] = "original"
+    video_decoder: Literal["pyav", "opencv"] = "pyav"
+    decode_timeout_seconds: float = Field(default=120.0, gt=0.0)
     pin_memory: bool = True
     prefetch_factor: int = Field(default=2, ge=1)
     planner_max_length: int = Field(default=4096, ge=2051)
@@ -456,6 +459,11 @@ class OnlineEncodingConfig(ConfigBaseModel):
             raise ValueError("Online full-token training requires visual_token_capacity=2048 and tokens_per_frame=256")
         if self.raw_visual_dim != 3840:
             raise ValueError("Online SigLIP/projector tokens must use raw_visual_dim=3840")
+        if self.encoder_device_policy != "resident_cuda":
+            raise ValueError(
+                "Only encoder_device_policy='resident_cuda' is currently implemented end to end; "
+                "sequential_cuda/cpu_offload are disabled to protect trainable Gemma DDP modules"
+            )
         if abs(self.image_ratio + self.video_ratio - 1.0) > 1.0e-8:
             raise ValueError("image_ratio and video_ratio must sum to 1.0")
         return self
