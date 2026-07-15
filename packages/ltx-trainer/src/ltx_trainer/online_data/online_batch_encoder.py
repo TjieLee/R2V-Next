@@ -36,10 +36,26 @@ def _to_pil(image: Tensor) -> Image.Image:
     return Image.fromarray(image.cpu().numpy(), mode="RGB")
 
 
-def _build_messages(system_prompt: str, user_prompt: str, num_images: int) -> list[dict[str, Any]]:
-    content: list[dict[str, str]] = [{"type": "text", "text": f"User Raw Input Prompt: {user_prompt}."}]
+def _build_messages(
+    system_prompt: str,
+    user_prompt: str,
+    num_images: int,
+    *,
+    task: str,
+) -> list[dict[str, Any]]:
+    if task == IMAGE_TASK:
+        content: list[dict[str, str]] = [
+            {"type": "text", "text": f"Image editing instruction: {user_prompt}"}
+        ]
+        reference_heading = "Source/reference images:"
+    elif task == VIDEO_TASK:
+        # Keep the established R2V chat serialization token-compatible.
+        content = [{"type": "text", "text": f"User Raw Input Prompt: {user_prompt}."}]
+        reference_heading = "Reference images:"
+    else:
+        raise ValueError(f"Unsupported online task {task!r}")
     if num_images:
-        content.append({"type": "text", "text": "Reference images:"})
+        content.append({"type": "text", "text": reference_heading})
         for index in range(num_images):
             content.extend(
                 [
@@ -93,7 +109,7 @@ class OnlineBatchEncoder:
             use_fast=False,
         )
         self.processor = Gemma3Processor(image_processor=self.image_processor, tokenizer=self.tokenizer)
-        prompt_path = (
+        prompt_root = (
             Path(__file__).resolve().parents[4]
             / "ltx-core"
             / "src"
@@ -102,9 +118,15 @@ class OnlineBatchEncoder:
             / "gemma"
             / "encoders"
             / "prompts"
-            / "gemma_multiref_video_planner_system_prompt.txt"
         )
-        self.system_prompt = prompt_path.read_text(encoding="utf-8")
+        self.system_prompts = {
+            IMAGE_TASK: (prompt_root / "gemma_multiref_image_edit_planner_system_prompt.txt").read_text(
+                encoding="utf-8"
+            ),
+            VIDEO_TASK: (prompt_root / "gemma_multiref_video_planner_system_prompt.txt").read_text(
+                encoding="utf-8"
+            ),
+        }
         self.vae_encoder.requires_grad_(False).eval()
         self._keep_frozen_visual_modules_eval()
 
@@ -152,8 +174,8 @@ class OnlineBatchEncoder:
         condition_started = time.perf_counter()
         caption = str(raw_batch["caption"][0])
         references = self._reference_images(reference_images_vlm[0])
-        text_conditions = self._encode_condition(caption=caption, reference_images=[])
-        vlm_conditions = self._encode_condition(caption=caption, reference_images=references)
+        text_conditions = self._encode_condition(caption=caption, reference_images=[], task=task)
+        vlm_conditions = self._encode_condition(caption=caption, reference_images=references, task=task)
         condition_elapsed_ms = (time.perf_counter() - condition_started) * 1000.0
         metrics["frozen_condition_ms"] = condition_elapsed_ms
         metrics["vlm_planner_ms"] = condition_elapsed_ms
@@ -162,6 +184,11 @@ class OnlineBatchEncoder:
             "sample_key": raw_batch["sample_key"],
             "sample_plan_sha256": raw_batch["sample_plan_sha256"],
             "task": raw_batch["task"],
+            "task_system_prompt_id": torch.tensor(
+                [0 if task == IMAGE_TASK else 1],
+                device=self.device,
+                dtype=torch.long,
+            ),
             "target_modality": raw_batch["target_modality"],
             "vlm_reference_preprocess": raw_batch.get(
                 "vlm_reference_preprocess",
@@ -187,6 +214,7 @@ class OnlineBatchEncoder:
             batch["planner_vlm_inputs"] = self._build_planner_vlm_inputs(
                 caption=caption,
                 reference_images=references,
+                task=task,
                 planner_output_mask=planner_output_mask_from_visual_mask(
                     gt_visual_tokens["visual_token_mask"]
                 ),
@@ -275,9 +303,20 @@ class OnlineBatchEncoder:
             **metadata,
         }
 
-    def _encode_condition(self, *, caption: str, reference_images: list[Image.Image]) -> dict[str, Tensor]:
+    def _encode_condition(
+        self,
+        *,
+        caption: str,
+        reference_images: list[Image.Image],
+        task: str,
+    ) -> dict[str, Tensor]:
         text = self.tokenizer.apply_chat_template(
-            _build_messages(self.system_prompt, caption, len(reference_images)),
+            _build_messages(
+                self.system_prompts[task],
+                caption,
+                len(reference_images),
+                task=task,
+            ),
             tokenize=False,
             add_generation_prompt=True,
         )
@@ -351,12 +390,18 @@ class OnlineBatchEncoder:
         caption: str,
         reference_images: list[Image.Image],
         planner_output_mask: Tensor,
+        task: str,
     ) -> dict[str, Tensor]:
         source_max_length = self.config.planner_max_length - VISUAL_TOKEN_CAPACITY - 2
         if source_max_length <= 0:
             raise ValueError("planner_max_length must reserve 2048 placeholders and two boundary tokens")
         text = self.tokenizer.apply_chat_template(
-            _build_messages(self.system_prompt, caption, len(reference_images)),
+            _build_messages(
+                self.system_prompts[task],
+                caption,
+                len(reference_images),
+                task=task,
+            ),
             tokenize=False,
             add_generation_prompt=True,
         )

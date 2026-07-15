@@ -114,6 +114,8 @@ class LtxvTrainer:
         self._pending_online_data_state: dict[str, Any] | None = None
         self._resume_initial_step = 0
         self._last_online_metrics: dict[str, float] = {}
+        self._capture_gradient_audit = False
+        self._last_gradient_audit_by_parameter_id: dict[int, dict[str, bool]] = {}
         if IS_MAIN_PROCESS:
             print_config(trainer_config)
         self._training_strategy = get_training_strategy(self._config.training_strategy)
@@ -278,6 +280,16 @@ class LtxvTrainer:
                             self._trainable_params,
                             cfg.optimization.max_grad_norm,
                         )
+
+                    if self._accelerator.sync_gradients and self._capture_gradient_audit:
+                        self._last_gradient_audit_by_parameter_id = {
+                            id(parameter): {
+                                "finite": bool(torch.isfinite(parameter.grad).all()),
+                                "nonzero": bool(torch.count_nonzero(parameter.grad).item()),
+                            }
+                            for parameter in self._trainable_params
+                            if parameter.grad is not None
+                        }
 
                     self._optimizer.step()
                     self._optimizer.zero_grad()

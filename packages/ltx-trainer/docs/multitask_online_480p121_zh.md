@@ -172,3 +172,43 @@ GPU 编码完成后复用现有 strategy keys：`latents`、`multi_ref_latents`�
 `vlm_conditions`、`text_conditions`、`cfg_text_conditions`、`gt_visual_tokens`，Stage 2/3 额外包含
 `planner_vlm_inputs`。Stage 2/3 的 Gemma/Planner forward 仍在训练图内；VAE、SigLIP vision tower 和
 multimodal projector 保持 frozen/eval。
+
+## Stage 3-only 旧模型 warm-start
+
+在线编码按任务选择 system prompt。I2I 使用
+`gemma_multiref_image_edit_planner_system_prompt.txt`，明确生成单张 target image；R2V 继续使用原
+`gemma_multiref_video_planner_system_prompt.txt`，其 chat serialization 保持不变。`conditions`、
+`text_conditions` 和 `planner_vlm_inputs` 使用同一任务 prompt，batch 中
+`task_system_prompt_id=0/1` 分别表示 image/video。
+
+如果不准备先在新数据上重跑 Stage 1/2，可从完整旧 Stage 3 checkpoint 启动独立 joint warm-start：
+
+```bash
+uv run python scripts/check_multitask_online_training_ready.py \
+  configs/multiref_stage3_multitask_online_480p121_joint_warmstart_old_stage3_30k.yaml \
+  --world-size 8 --samples-per-task 2
+```
+
+报告必须包含 `initialization_mode=stage3_joint_warmstart`、
+`strict_component_check_passed=true` 和 `starts_from_global_step=0`。该 YAML 的 `no_resume=true` 只加载
+旧 Stage 3 模型权重，不加载旧 optimizer、scheduler 或 global step。
+
+两卡只跑 Stage 3 的真实 DDP smoke：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 PYTORCH_ALLOC_CONF=expandable_segments:True \
+uv run accelerate launch --config_file configs/accelerate/ddp.yaml --num_processes 2 \
+  scripts/check_multitask_online_ddp.py \
+  --stages stage3 \
+  --stage3-config configs/multiref_stage3_multitask_online_480p121_joint_warmstart_old_stage3_30k.yaml \
+  --stage3-init-checkpoint /mnt/workspace/litengjie/ltx2_multiref_stage3_joint_full_tokens_planner_2048/checkpoints/lora_weights_step_02000.safetensors
+```
+
+需要验证三阶段依赖时可传 `--stages stage1,stage2,stage3 --chain-smoke-checkpoints`，脚本会把前一阶段
+产生的 smoke checkpoint 注入下一阶段。正式 30K 前使用
+`configs/multiref_stage3_multitask_online_480p121_joint_warmstart_benchmark_200.yaml` 完成八卡
+200-step 门禁；它使用 interval 100 和独立 benchmark output_dir。
+
+manifest index 现为 `LTXIDX02`，header 包含 manifest size、有效行数、SHA256 和 entry size。旧 v1、
+hash/size 不匹配或截断索引都会 fail-fast 并要求重建；validator 还会逐行核对 offset/task。manifest
+builder 在同一次构建的临时 SQLite 中按 path/size/mtime 缓存图片验证与视频 probe，不写入源数据目录。

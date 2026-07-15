@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 from pathlib import Path
 from typing import Any
 
+import torch
 import typer
 import yaml
 from safetensors import safe_open
@@ -18,6 +20,24 @@ from ltx_trainer.online_data.multitask_dataset import OnlineMultiTaskDataset, Sa
 from ltx_trainer.online_data.path_safety import assert_write_path_allowed
 
 app = typer.Typer(pretty_exceptions_enable=False, no_args_is_help=True)
+
+_STAGE3_REQUIRED_PREFIXES = (
+    "diffusion_model.",
+    "training_strategy.planner_tokens.",
+    "training_strategy.visual_token_projection.",
+    "training_strategy.visual_full_encoder.",
+    "embeddings_processor.video_connector.",
+    "text_encoder.model.model.language_model.",
+)
+_ONLINE_STATE_FIELDS = {
+    "task_schedule_cursor",
+    "image_permutation_epoch",
+    "image_cursor",
+    "video_permutation_epoch",
+    "video_cursor",
+    "microstep_in_optimizer_step",
+    "sampler_seed",
+}
 
 
 def _phase(config: LtxTrainerConfig) -> str:
@@ -41,6 +61,160 @@ def _checkpoint_metadata(path: Path) -> dict[str, str]:
         return dict(handle.metadata() or {})
 
 
+def _strict_stage3_component_audit(path: Path) -> dict[str, Any]:
+    """Validate the portable checkpoint invariants before constructing the 22B runtime."""
+    with safe_open(path, framework="pt", device="cpu") as handle:
+        keys = list(handle.keys())
+        missing = [prefix for prefix in _STAGE3_REQUIRED_PREFIXES if not any(key.startswith(prefix) for key in keys)]
+        if missing:
+            raise ValueError(f"Stage 3 initialization checkpoint is missing component prefixes: {missing}")
+
+        dit_keys = [key for key in keys if key.startswith("diffusion_model.")]
+        non_lora_dit = [key for key in dit_keys if "lora_" not in key]
+        if non_lora_dit:
+            raise ValueError(f"Stage 3 checkpoint contains non-LoRA DiT weights: {non_lora_dit[:20]}")
+
+        gemma_prefix = "text_encoder.model.model.language_model."
+        gemma_keys = [key for key in keys if key.startswith(gemma_prefix)]
+        non_lora_gemma = [key for key in gemma_keys if "lora_" not in key]
+        if non_lora_gemma:
+            raise ValueError(f"Stage 3 checkpoint contains non-LoRA Gemma LM weights: {non_lora_gemma[:20]}")
+
+        frozen_visual = [
+            key
+            for key in keys
+            if "vision_tower" in key or "multi_modal_projector" in key
+        ]
+        if frozen_visual:
+            raise ValueError(
+                "Stage 3 checkpoint unexpectedly stores frozen vision/projector weights: "
+                f"{frozen_visual[:20]}"
+            )
+
+        non_finite: list[str] = []
+        for key in keys:
+            tensor = handle.get_tensor(key)
+            if tensor.is_floating_point() and not bool(torch.isfinite(tensor).all()):
+                non_finite.append(key)
+                if len(non_finite) == 20:
+                    break
+        if non_finite:
+            raise ValueError(f"Stage 3 checkpoint contains non-finite tensors: {non_finite}")
+
+    return {
+        "checkpoint_tensor_count": len(keys),
+        "required_component_prefixes": list(_STAGE3_REQUIRED_PREFIXES),
+    }
+
+
+def _validate_exact_stage3_resume(
+    checkpoint_path: Path,
+    *,
+    metadata: dict[str, str],
+    optimization_steps: int,
+) -> int:
+    step_match = re.search(r"step_(\d+)", checkpoint_path.name)
+    if step_match is None:
+        raise ValueError(f"Cannot parse checkpoint step from {checkpoint_path.name}")
+    filename_step = int(step_match.group(1))
+    metadata_step_raw = metadata.get("global_step")
+    if metadata_step_raw is None:
+        raise ValueError("Exact Stage 3 resume checkpoint metadata is missing global_step")
+    try:
+        metadata_step = int(metadata_step_raw)
+    except ValueError as exc:
+        raise ValueError(f"Invalid checkpoint metadata global_step={metadata_step_raw!r}") from exc
+
+    state_path = checkpoint_path.parent / f"training_state_step_{step_match.group(1)}.pt"
+    if not state_path.is_file():
+        raise ValueError(f"Exact Stage 3 resume requires matching training state: {state_path}")
+    state = torch.load(state_path, map_location="cpu", weights_only=False)
+    state_step = int(state.get("global_step", -1))
+    if filename_step != metadata_step or filename_step != state_step:
+        raise ValueError(
+            "Stage 3 resume step mismatch: "
+            f"filename={filename_step}, metadata={metadata_step}, training_state={state_step}"
+        )
+    if state_step < 0 or state_step >= optimization_steps:
+        raise ValueError(
+            f"Stage 3 resume global_step={state_step} must be in [0, {optimization_steps})"
+        )
+    if not state.get("optimizer_state_dict"):
+        raise ValueError("Exact Stage 3 resume requires optimizer state")
+    scheduler_state = state.get("lr_scheduler_state_dict")
+    if not scheduler_state:
+        raise ValueError("Exact Stage 3 resume requires scheduler state")
+    if int(scheduler_state.get("last_epoch", -1)) != state_step:
+        raise ValueError(
+            "Stage 3 scheduler/global_step mismatch: "
+            f"last_epoch={scheduler_state.get('last_epoch')}, global_step={state_step}"
+        )
+    saved_lrs = scheduler_state.get("_last_lr")
+    if not isinstance(saved_lrs, list) or not saved_lrs:
+        raise ValueError("Exact Stage 3 resume scheduler state is missing _last_lr")
+
+    data_state = state.get("data_state")
+    if not isinstance(data_state, dict):
+        raise ValueError("Exact online Stage 3 resume requires online sampler state")
+    missing_data_fields = sorted(_ONLINE_STATE_FIELDS - data_state.keys())
+    if missing_data_fields:
+        raise ValueError(f"Online sampler state is missing fields: {missing_data_fields}")
+    if int(data_state["task_schedule_cursor"]) != state_step:
+        raise ValueError(
+            "Online sampler/global_step mismatch: "
+            f"task_schedule_cursor={data_state['task_schedule_cursor']}, global_step={state_step}"
+        )
+    if int(data_state["microstep_in_optimizer_step"]) != 0:
+        raise ValueError("Exact Stage 3 checkpoint must be saved on an optimizer-step boundary")
+    return state_step
+
+
+def _inspect_stage3_initialization(
+    checkpoint_path: Path,
+    *,
+    no_resume: bool,
+    optimization_steps: int,
+) -> dict[str, Any]:
+    metadata = _checkpoint_metadata(checkpoint_path)
+    checkpoint_phase = metadata.get("training_phase")
+    component_report = _strict_stage3_component_audit(checkpoint_path)
+    if no_resume:
+        modes = {
+            "stage2": "stage2_to_stage3_init",
+            "stage3": "stage3_joint_warmstart",
+        }
+        if checkpoint_phase not in modes:
+            raise ValueError(
+                "Stage 3 no-resume initialization requires checkpoint metadata.training_phase "
+                f"to be stage2 or stage3, got {checkpoint_phase!r}"
+            )
+        return {
+            "initialization_mode": modes[checkpoint_phase],
+            "initial_checkpoint_training_phase": checkpoint_phase,
+            "strict_component_check_passed": True,
+            "starts_from_global_step": 0,
+            **component_report,
+        }
+
+    if checkpoint_phase != "stage3":
+        raise ValueError(
+            "Exact Stage 3 resume requires checkpoint metadata.training_phase='stage3', "
+            f"got {checkpoint_phase!r}"
+        )
+    resume_step = _validate_exact_stage3_resume(
+        checkpoint_path,
+        metadata=metadata,
+        optimization_steps=optimization_steps,
+    )
+    return {
+        "initialization_mode": "exact_resume",
+        "initial_checkpoint_training_phase": checkpoint_phase,
+        "strict_component_check_passed": True,
+        "starts_from_global_step": resume_step,
+        **component_report,
+    }
+
+
 @app.command()
 def main(
     config_path: str = typer.Argument(...),
@@ -54,6 +228,12 @@ def main(
     with path.open("r", encoding="utf-8") as handle:
         config = LtxTrainerConfig(**yaml.safe_load(handle))
     phase = _phase(config)
+    initialization_report: dict[str, Any] = {
+        "initialization_mode": "base_model",
+        "initial_checkpoint_training_phase": None,
+        "strict_component_check_passed": False,
+        "starts_from_global_step": 0,
+    }
 
     if config.data.encoding_mode != "online":
         errors.append("data.encoding_mode must be online")
@@ -100,11 +280,15 @@ def main(
                     "Stage 2 must initialize from a Stage 1 multi_reference_video checkpoint; "
                     f"metadata={metadata}"
                 )
-            if phase == "stage3" and metadata.get("training_phase") != "stage2":
-                errors.append(
-                    "Stage 3 must initialize from a Stage 2 planner checkpoint; "
-                    f"metadata={metadata}"
-                )
+            if phase == "stage3":
+                try:
+                    initialization_report = _inspect_stage3_initialization(
+                        checkpoint_path,
+                        no_resume=config.checkpoints.no_resume,
+                        optimization_steps=config.optimization.steps,
+                    )
+                except (OSError, RuntimeError, ValueError) as exc:
+                    errors.append(f"Stage 3 checkpoint preflight failed: {exc}")
 
     dataset: OnlineMultiTaskDataset | None = None
     decoded: dict[str, list[dict[str, Any]]] = {IMAGE_TASK: [], VIDEO_TASK: []}
@@ -174,6 +358,7 @@ def main(
             else {}
         ),
         "decoded_samples": decoded,
+        **initialization_report,
         "warnings": warnings,
         "errors": errors,
         **{f"READY_FOR_{name.upper()}": ready for name, ready in readiness.items()},

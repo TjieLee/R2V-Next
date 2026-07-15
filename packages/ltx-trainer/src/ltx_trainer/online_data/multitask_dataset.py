@@ -140,7 +140,10 @@ class OnlineMultiTaskDataset(Dataset[dict[str, Any] | SampleLoadError]):
         self._manifest_handle: BinaryIO | None = None
         index_path = default_manifest_index_path(self.manifest_path)
         if index_path.is_file():
-            self._offsets, self.task_indices = read_manifest_index(index_path)
+            self._offsets, self.task_indices = read_manifest_index(
+                index_path,
+                manifest_path=self.manifest_path,
+            )
         else:
             self._offsets, self.task_indices = self._scan_manifest_offsets()
         if not self._offsets:

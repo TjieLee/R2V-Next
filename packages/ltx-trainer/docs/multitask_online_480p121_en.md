@@ -162,3 +162,44 @@ The GPU encoder emits the existing strategy interface: `latents`, `multi_ref_lat
 `vlm_conditions`, `text_conditions`, `cfg_text_conditions`, and `gt_visual_tokens`; Stage 2/3 also receive
 `planner_vlm_inputs`. Gemma/Planner remains in the Stage 2/3 gradient graph, while VAE, SigLIP vision, and the
 multimodal projector remain frozen and in eval mode.
+
+## Stage 3-only warm-start from the previous joint model
+
+Online encoding now selects a system prompt by task. I2I uses
+`gemma_multiref_image_edit_planner_system_prompt.txt` and describes one target image. R2V keeps the existing
+`gemma_multiref_video_planner_system_prompt.txt` and its chat serialization unchanged. `conditions`,
+`text_conditions`, and `planner_vlm_inputs` share the same task prompt; batch metadata uses
+`task_system_prompt_id=0/1` for image/video.
+
+To skip new-data Stage 1/2 and initialize directly from the complete previous Stage 3 checkpoint, run:
+
+```bash
+uv run python scripts/check_multitask_online_training_ready.py \
+  configs/multiref_stage3_multitask_online_480p121_joint_warmstart_old_stage3_30k.yaml \
+  --world-size 8 --samples-per-task 2
+```
+
+The report must contain `initialization_mode=stage3_joint_warmstart`,
+`strict_component_check_passed=true`, and `starts_from_global_step=0`. The YAML uses `no_resume=true`, so it
+loads the previous Stage 3 model weights but not its optimizer, scheduler, or global step.
+
+Run the real two-rank Stage 3-only DDP smoke with:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 PYTORCH_ALLOC_CONF=expandable_segments:True \
+uv run accelerate launch --config_file configs/accelerate/ddp.yaml --num_processes 2 \
+  scripts/check_multitask_online_ddp.py \
+  --stages stage3 \
+  --stage3-config configs/multiref_stage3_multitask_online_480p121_joint_warmstart_old_stage3_30k.yaml \
+  --stage3-init-checkpoint /mnt/workspace/litengjie/ltx2_multiref_stage3_joint_full_tokens_planner_2048/checkpoints/lora_weights_step_02000.safetensors
+```
+
+For a three-stage dependency smoke, pass `--stages stage1,stage2,stage3 --chain-smoke-checkpoints`; each smoke
+checkpoint is injected into the next stage. Before the formal 30K run, use
+`configs/multiref_stage3_multitask_online_480p121_joint_warmstart_benchmark_200.yaml` for the eight-GPU,
+200-step gate. It uses interval 100 and a separate benchmark output directory.
+
+Manifest indexes now use `LTXIDX02`; the header stores manifest size, nonblank row count, SHA256, and entry size.
+Legacy v1, hash/size mismatches, and truncation fail fast with a rebuild instruction, while the validator also
+checks every offset/task pair. During one build, the temporary SQLite database caches image validation and video
+probing by path/size/mtime, including failures, without writing into the source-data directory.

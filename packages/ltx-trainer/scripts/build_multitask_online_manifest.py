@@ -6,17 +6,20 @@ import json
 import os
 import resource
 import sqlite3
+import stat
 import sys
 import time
 from collections import Counter
 from collections.abc import Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from functools import partial
 from itertools import islice
 from pathlib import Path
 from typing import Any
 
 import typer
+from PIL import Image, ImageOps
 
 from ltx_trainer.online_data.constants import IMAGE_TASK, VIDEO_TASK
 from ltx_trainer.online_data.manifest import (
@@ -39,6 +42,126 @@ app = typer.Typer(pretty_exceptions_enable=False, no_args_is_help=True)
 
 class _ManifestCollisionError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class _MediaSignature:
+    path: str
+    size: int
+    mtime_ns: int
+
+
+@dataclass(frozen=True)
+class _ValidationResult:
+    payload: dict[str, Any] | None
+    error_reason: str | None = None
+    error_message: str | None = None
+
+    def unwrap_image_size(self) -> tuple[int, int]:
+        if self.error_reason is not None or self.payload is None:
+            raise RuntimeError(self.error_message or "Image validation failed")
+        return int(self.payload["width"]), int(self.payload["height"])
+
+    def as_probe_result(self) -> tuple[dict[str, Any] | None, ManifestReject | None]:
+        if self.error_reason is None:
+            return self.payload, None
+        return None, ManifestReject(self.error_reason, self.error_message or self.error_reason)
+
+
+def _verified_image_size(path: str) -> tuple[int, int]:
+    with Image.open(path) as image:
+        image.verify()
+    with Image.open(path) as image:
+        return ImageOps.exif_transpose(image).size
+
+
+class _MediaValidationCache:
+    """Bounded same-build validation cache backed by the builder's temporary SQLite DB."""
+
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self.connection = connection
+        self.hits = 0
+        self.misses = 0
+        connection.execute(
+            """
+            CREATE TABLE media_validation_cache (
+                kind TEXT NOT NULL,
+                path TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                mtime_ns INTEGER NOT NULL,
+                ok INTEGER NOT NULL,
+                payload_json TEXT,
+                error_reason TEXT,
+                error_message TEXT,
+                PRIMARY KEY (kind, path, size, mtime_ns)
+            ) WITHOUT ROWID
+            """
+        )
+
+    @staticmethod
+    def signature(path: str) -> _MediaSignature:
+        resolved = str(Path(path).expanduser().resolve())
+        try:
+            metadata = Path(resolved).stat()
+            if not stat.S_ISREG(metadata.st_mode):
+                raise FileNotFoundError(resolved)
+            return _MediaSignature(resolved, int(metadata.st_size), int(metadata.st_mtime_ns))
+        except OSError:
+            return _MediaSignature(resolved, -1, -1)
+
+    def get(self, kind: str, signature: _MediaSignature) -> _ValidationResult | None:
+        row = self.connection.execute(
+            """
+            SELECT ok, payload_json, error_reason, error_message
+            FROM media_validation_cache
+            WHERE kind = ? AND path = ? AND size = ? AND mtime_ns = ?
+            """,
+            (kind, signature.path, signature.size, signature.mtime_ns),
+        ).fetchone()
+        if row is None:
+            self.misses += 1
+            return None
+        self.hits += 1
+        payload = json.loads(row[1]) if row[1] is not None else None
+        return _ValidationResult(
+            payload=payload,
+            error_reason=None if int(row[0]) else str(row[2]),
+            error_message=None if int(row[0]) else str(row[3]),
+        )
+
+    def put(self, kind: str, signature: _MediaSignature, result: _ValidationResult) -> None:
+        self.connection.execute(
+            """
+            INSERT OR REPLACE INTO media_validation_cache
+            (kind, path, size, mtime_ns, ok, payload_json, error_reason, error_message)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                kind,
+                signature.path,
+                signature.size,
+                signature.mtime_ns,
+                int(result.error_reason is None),
+                json.dumps(result.payload, sort_keys=True) if result.payload is not None else None,
+                result.error_reason,
+                result.error_message,
+            ),
+        )
+
+    def validate_image(self, path: str) -> tuple[int, int]:
+        signature = self.signature(path)
+        result = self.get("image", signature)
+        if result is None:
+            if signature.size < 0:
+                result = _ValidationResult(None, "missing_media", f"Image does not exist: {signature.path}")
+            else:
+                try:
+                    width, height = _verified_image_size(signature.path)
+                    result = _ValidationResult({"width": width, "height": height})
+                except Exception as exc:
+                    result = _ValidationResult(None, "invalid_image", f"Unreadable image {signature.path}: {exc}")
+            self.put("image", signature, result)
+        return result.unwrap_image_size()
 
 
 def _temporary_path(path: Path) -> Path:
@@ -84,17 +207,66 @@ def _safe_probe(
         return None, ManifestReject("invalid_video_header", str(exc))
 
 
+def _probe_resolved_video(path: str) -> _ValidationResult:
+    try:
+        if not Path(path).is_file():
+            return _ValidationResult(None, "missing_target", f"Target video does not exist: {path}")
+        return _ValidationResult(dict(probe_video(path)))
+    except Exception as exc:
+        return _ValidationResult(None, "invalid_video_header", str(exc))
+
+
 def _iter_rows_with_bounded_probes(
     rows: Iterable[dict[str, Any]],
     *,
     data_root: str | Path | None,
     workers: int,
     batch_size: int,
+    validation_cache: _MediaValidationCache | None = None,
 ) -> Iterator[tuple[dict[str, Any], dict[str, Any] | None, ManifestReject | None]]:
     with ThreadPoolExecutor(max_workers=workers) as executor:
         for row_batch in _batched(rows, batch_size):
-            results = list(executor.map(partial(_safe_probe, data_root=data_root), row_batch))
-            for row, (header, error) in zip(row_batch, results, strict=True):
+            if validation_cache is None:
+                results = list(executor.map(partial(_safe_probe, data_root=data_root), row_batch))
+                for row, (header, error) in zip(row_batch, results, strict=True):
+                    yield row, header, error
+                continue
+
+            requests: list[_MediaSignature | _ValidationResult] = []
+            results_by_signature: dict[_MediaSignature, _ValidationResult] = {}
+            misses: dict[_MediaSignature, str] = {}
+            for row in row_batch:
+                if "video_path" not in row:
+                    requests.append(
+                        _ValidationResult(None, "r2v_schema_mismatch", "video_path field is missing")
+                    )
+                    continue
+                target_path = resolve_media_path(row["video_path"], data_root=data_root)
+                signature = validation_cache.signature(target_path)
+                requests.append(signature)
+                cached = validation_cache.get("video", signature)
+                if cached is not None:
+                    results_by_signature[signature] = cached
+                elif signature.size < 0:
+                    result = _ValidationResult(
+                        None,
+                        "missing_target",
+                        f"Target video does not exist: {signature.path}",
+                    )
+                    validation_cache.put("video", signature, result)
+                    results_by_signature[signature] = result
+                else:
+                    misses.setdefault(signature, signature.path)
+
+            missing_signatures = list(misses)
+            probed = executor.map(_probe_resolved_video, [misses[item] for item in missing_signatures])
+            for signature, result in zip(missing_signatures, probed, strict=True):
+                validation_cache.put("video", signature, result)
+                results_by_signature[signature] = result
+
+            for row, request in zip(row_batch, requests, strict=True):
+                result = request if isinstance(request, _ValidationResult) else results_by_signature[request]
+                header, error = result.as_probe_result()
                 yield row, header, error
 
 
@@ -156,6 +328,7 @@ def main(  # noqa: PLR0913, PLR0915
         connection.execute(
             "CREATE TABLE dedup (sample_key TEXT PRIMARY KEY, sample_plan_sha256 TEXT NOT NULL) WITHOUT ROWID"
         )
+        validation_cache = _MediaValidationCache(connection)
 
         with output_temporary.open("w", encoding="utf-8") as accepted_handle, reject_temporary.open(
             "w", encoding="utf-8"
@@ -185,6 +358,7 @@ def main(  # noqa: PLR0913, PLR0915
                             data_root=data_root,
                             workers=probe_workers,
                             batch_size=probe_batch_size,
+                            validation_cache=validation_cache,
                         )
                     )
                 else:
@@ -202,6 +376,7 @@ def main(  # noqa: PLR0913, PLR0915
                                 reference_field=i2i_reference_field,
                                 caption_field=i2i_caption_field,
                                 crop_field=i2i_crop_field,
+                                image_validator=validation_cache.validate_image,
                             )
                         elif task == VIDEO_TASK:
                             if probe_error is not None or video_header is None:
@@ -212,6 +387,8 @@ def main(  # noqa: PLR0913, PLR0915
                                 data_root=data_root,
                                 manifest_seed=manifest_seed,
                                 video_header=video_header,
+                                image_validator=validation_cache.validate_image,
+                                target_path_validated=True,
                             )
                         else:
                             raise ValueError(f"Unsupported task {task!r} in dataset {dataset_name!r}")
@@ -276,6 +453,8 @@ def main(  # noqa: PLR0913, PLR0915
             "peak_rss_gb": _peak_rss_gb(),
             "manifest_path": str(output_path),
             "manifest_index_path": str(index_path),
+            "media_validation_cache_hits": validation_cache.hits,
+            "media_validation_cache_misses": validation_cache.misses,
         }
         _atomic_write_json(summary_path, summary)
         typer.echo(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))

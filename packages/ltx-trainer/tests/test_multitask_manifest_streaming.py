@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import tracemalloc
 from collections.abc import Iterable, Iterator
 from pathlib import Path
@@ -10,9 +11,14 @@ import pytest
 
 from ltx_trainer.online_data.manifest import iter_annotation_rows, read_annotation_rows
 from ltx_trainer.online_data.manifest_index import (
+    INDEX_ENTRY,
+    INDEX_HEADER,
+    INDEX_MAGIC,
+    LEGACY_INDEX_MAGIC,
     build_manifest_offset_index,
     read_jsonl_record_at,
     read_manifest_index,
+    validate_manifest_index,
 )
 from scripts import build_multitask_online_manifest as manifest_builder
 
@@ -53,12 +59,66 @@ def test_binary_manifest_index_preserves_offsets_and_compact_task_indices(tmp_pa
     ]
     manifest.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
     index_path = build_manifest_offset_index(manifest)
-    offsets, task_indices = read_manifest_index(index_path)
+    offsets, task_indices = read_manifest_index(index_path, manifest_path=manifest)
     assert len(offsets) == 1000
     assert len(task_indices["i2i"]) == 500
     assert len(task_indices["r2v"]) == 500
     with manifest.open("rb") as handle:
         assert read_jsonl_record_at(handle, offsets[731]) == rows[731]
+    metadata = validate_manifest_index(manifest, index_path)
+    assert metadata.manifest_row_count == 1000
+    assert metadata.manifest_size_bytes == manifest.stat().st_size
+
+
+def test_manifest_index_rejects_same_row_count_content_replacement(tmp_path: Path) -> None:
+    manifest = tmp_path / "train.jsonl"
+    manifest.write_text('{"task":"i2i","value":"aaaa"}\n', encoding="utf-8")
+    index_path = build_manifest_offset_index(manifest)
+    manifest.write_text('{"task":"i2i","value":"bbbb"}\n', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="SHA256 mismatch.*Rebuild"):
+        read_manifest_index(index_path, manifest_path=manifest)
+
+
+def test_manifest_index_rejects_manifest_size_or_offset_change(tmp_path: Path) -> None:
+    manifest = tmp_path / "train.jsonl"
+    manifest.write_text('{"task":"i2i"}\n{"task":"r2v"}\n', encoding="utf-8")
+    index_path = build_manifest_offset_index(manifest)
+    manifest.write_text('{"task":"i2i","longer":true}\n{"task":"r2v"}\n', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="file-size mismatch.*Rebuild"):
+        read_manifest_index(index_path, manifest_path=manifest)
+
+
+def test_manifest_index_rejects_truncated_index(tmp_path: Path) -> None:
+    manifest = tmp_path / "train.jsonl"
+    manifest.write_text('{"task":"i2i"}\n', encoding="utf-8")
+    index_path = build_manifest_offset_index(manifest)
+    index_path.write_bytes(index_path.read_bytes()[:-1])
+
+    with pytest.raises(ValueError, match="index size mismatch.*Rebuild"):
+        read_manifest_index(index_path, manifest_path=manifest)
+
+
+def test_manifest_index_rejects_legacy_v1_with_rebuild_message(tmp_path: Path) -> None:
+    index_path = tmp_path / "train.jsonl.idx"
+    index_path.write_bytes(LEGACY_INDEX_MAGIC + INDEX_ENTRY.pack(0, 0))
+
+    with pytest.raises(ValueError, match="Legacy LTXIDX01.*Rebuild"):
+        read_manifest_index(index_path)
+
+
+def test_strict_manifest_index_validation_checks_offsets_and_tasks(tmp_path: Path) -> None:
+    manifest = tmp_path / "train.jsonl"
+    manifest.write_text('{"task":"i2i"}\n{"task":"r2v"}\n', encoding="utf-8")
+    index_path = build_manifest_offset_index(manifest)
+    payload = bytearray(index_path.read_bytes())
+    first_entry = len(INDEX_MAGIC) + INDEX_HEADER.size
+    payload[first_entry : first_entry + INDEX_ENTRY.size] = INDEX_ENTRY.pack(1, 0)
+    index_path.write_bytes(payload)
+
+    with pytest.raises(ValueError, match="entry mismatch.*Rebuild"):
+        validate_manifest_index(manifest, index_path)
 
 
 def test_manifest_index_failure_does_not_replace_existing_index(tmp_path: Path) -> None:
@@ -70,6 +130,86 @@ def test_manifest_index_failure_does_not_replace_existing_index(tmp_path: Path) 
         build_manifest_offset_index(manifest, index_path)
     assert index_path.read_bytes() == b"existing-index"
     assert not list(tmp_path.glob("bad.jsonl.idx.tmp.*"))
+
+
+def test_same_build_image_validation_cache_reuses_results_and_invalidates_on_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = sqlite3.connect(":memory:")
+    cache = manifest_builder._MediaValidationCache(connection)
+    image_path = tmp_path / "image.bin"
+    image_path.write_bytes(b"first")
+    calls = 0
+
+    def _verify(_path: str) -> tuple[int, int]:
+        nonlocal calls
+        calls += 1
+        return (64, 48)
+
+    monkeypatch.setattr(manifest_builder, "_verified_image_size", _verify)
+    assert cache.validate_image(str(image_path)) == (64, 48)
+    assert cache.validate_image(str(image_path)) == (64, 48)
+    assert calls == 1
+
+    image_path.write_bytes(b"second-version-is-longer")
+    assert cache.validate_image(str(image_path)) == (64, 48)
+    assert calls == 2
+    connection.close()
+
+
+def test_same_build_media_cache_reuses_negative_image_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = sqlite3.connect(":memory:")
+    cache = manifest_builder._MediaValidationCache(connection)
+    image_path = tmp_path / "broken.bin"
+    image_path.write_bytes(b"broken")
+    calls = 0
+
+    def _fail(_path: str) -> tuple[int, int]:
+        nonlocal calls
+        calls += 1
+        raise ValueError("bad image")
+
+    monkeypatch.setattr(manifest_builder, "_verified_image_size", _fail)
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="Unreadable image"):
+            cache.validate_image(str(image_path))
+    assert calls == 1
+    connection.close()
+
+
+def test_bounded_video_probe_cache_deduplicates_repeated_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = sqlite3.connect(":memory:")
+    cache = manifest_builder._MediaValidationCache(connection)
+    video_path = tmp_path / "video.mp4"
+    video_path.write_bytes(b"video")
+    calls = 0
+
+    def _probe(_path: str) -> dict[str, float | int]:
+        nonlocal calls
+        calls += 1
+        return {"fps": 24.0, "frame_count": 240, "width": 832, "height": 480}
+
+    monkeypatch.setattr(manifest_builder, "probe_video", _probe)
+    rows = [{"video_path": str(video_path)} for _ in range(8)]
+    results = list(
+        manifest_builder._iter_rows_with_bounded_probes(
+            rows,
+            data_root=None,
+            workers=2,
+            batch_size=8,
+            validation_cache=cache,
+        )
+    )
+    assert calls == 1
+    assert all(header is not None and error is None for _, header, error in results)
+    connection.close()
 
 
 def _patch_synthetic_builder(

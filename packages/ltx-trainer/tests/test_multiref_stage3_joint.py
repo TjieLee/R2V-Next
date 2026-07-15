@@ -660,6 +660,27 @@ def test_stage3_warm_resume_logs_optimizer_reset_warning(
     assert "Warm Stage 3 resume: optimizer moments are reset." in caplog.text
 
 
+def test_stage3_no_resume_warmstart_ignores_training_state_and_starts_at_zero(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint = _write_resume_pair(
+        tmp_path,
+        filename_step=500,
+        metadata_step=500,
+        state=_training_state(500, optimizer_state={"state": {}}),
+    )
+    trainer = _resume_test_trainer(checkpoint)
+    trainer._config.checkpoints.no_resume = True
+
+    def _forbid_training_state_load(_path: Path) -> None:
+        raise AssertionError("training state must not load")
+
+    monkeypatch.setattr(trainer, "_load_training_state", _forbid_training_state_load)
+
+    assert trainer._resolve_resume_state() == (0, None)
+
+
 @pytest.mark.parametrize(
     ("metadata_step", "state_step", "expected"),
     [

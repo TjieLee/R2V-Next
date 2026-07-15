@@ -12,7 +12,7 @@ import warnings
 from collections import Counter
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 import pandas as pd
 import yaml
@@ -214,14 +214,24 @@ def _require_nonempty_caption(value: Any) -> str:
     return caption
 
 
-def _validate_reference_paths(paths: list[str]) -> None:
+ImageValidator = Callable[[str], tuple[int, int]]
+
+
+def _validate_reference_paths(
+    paths: list[str],
+    *,
+    image_validator: ImageValidator | None = None,
+) -> None:
     for path in paths:
         image_path = Path(path)
-        if not image_path.is_file():
-            raise ManifestReject("missing_reference", f"Reference image does not exist: {image_path}")
         try:
-            with Image.open(image_path) as image:
-                image.verify()
+            if image_validator is not None:
+                image_validator(str(image_path))
+            else:
+                if not image_path.is_file():
+                    raise FileNotFoundError(image_path)
+                with Image.open(image_path) as image:
+                    image.verify()
         except Exception as exc:
             raise ManifestReject("missing_reference", f"Reference image is unreadable: {image_path}") from exc
 
@@ -282,6 +292,7 @@ def build_i2i_record(
     reference_field: str,
     caption_field: str,
     crop_field: str | None = None,
+    image_validator: ImageValidator | None = None,
 ) -> dict[str, Any]:
     available = sorted(row)
     required = [target_field, reference_field, caption_field]
@@ -292,7 +303,7 @@ def build_i2i_record(
             f"I2I adapter fields are missing: {missing}. Available columns: {available}",
         )
     target_path = resolve_media_path(row[target_field], data_root=data_root)
-    if not Path(target_path).is_file():
+    if image_validator is None and not Path(target_path).is_file():
         raise ManifestReject("missing_target", f"Target image does not exist: {target_path}")
     reference_paths = _resolved_reference_paths(
         row[reference_field],
@@ -306,12 +317,15 @@ def build_i2i_record(
         except Exception as exc:
             raise ManifestReject("invalid_crop", f"Invalid crop field {crop_field!r}") from exc
     caption = _require_nonempty_caption(row[caption_field])
-    _validate_reference_paths(reference_paths)
+    _validate_reference_paths(reference_paths, image_validator=image_validator)
     try:
-        with Image.open(target_path) as target_image:
-            target_image.verify()
-        with Image.open(target_path) as target_image:
-            target_width, target_height = ImageOps.exif_transpose(target_image).size
+        if image_validator is not None:
+            target_width, target_height = image_validator(target_path)
+        else:
+            with Image.open(target_path) as target_image:
+                target_image.verify()
+            with Image.open(target_path) as target_image:
+                target_width, target_height = ImageOps.exif_transpose(target_image).size
     except Exception as exc:
         raise ManifestReject("missing_target", f"Target image is unreadable: {target_path}") from exc
     _validate_crop_xyxy(crop_xyxy, width=target_width, height=target_height)
@@ -355,6 +369,8 @@ def build_r2v_record(
     data_root: str | Path | None,
     manifest_seed: int,
     video_header: Mapping[str, float | int] | None = None,
+    image_validator: ImageValidator | None = None,
+    target_path_validated: bool = False,
 ) -> dict[str, Any]:
     required = {"video_path", "text", "crop", "face_cut", "ref_images"}
     missing = sorted(required - row.keys())
@@ -364,7 +380,7 @@ def build_r2v_record(
             f"OpenS2V adapter fields are missing: {missing}. Available columns: {sorted(row)}",
         )
     target_path = resolve_media_path(row["video_path"], data_root=data_root)
-    if not Path(target_path).is_file():
+    if not target_path_validated and not Path(target_path).is_file():
         raise ManifestReject("missing_target", f"Target video does not exist: {target_path}")
     reference_paths = _resolved_reference_paths(
         row["ref_images"],
@@ -384,7 +400,7 @@ def build_r2v_record(
     if face_cut[1] <= face_cut[0]:
         raise ManifestReject("invalid_face_cut", f"Invalid face_cut={face_cut} for {target_path}")
     caption = _require_nonempty_caption(row["text"])
-    _validate_reference_paths(reference_paths)
+    _validate_reference_paths(reference_paths, image_validator=image_validator)
     try:
         header = dict(video_header) if video_header is not None else probe_video(target_path)
         original_fps = float(header["fps"])

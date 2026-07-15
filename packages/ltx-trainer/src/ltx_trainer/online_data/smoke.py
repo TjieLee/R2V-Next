@@ -38,12 +38,15 @@ def make_one_step_smoke_config(
     *,
     task: Literal["i2i", "r2v"],
     output_dir: str | Path,
+    init_checkpoint: str | Path | None = None,
 ) -> tuple[LtxTrainerConfig, Path]:
     output = assert_write_path_allowed(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     source = Path(config_path).expanduser().resolve()
     with source.open("r", encoding="utf-8") as handle:
         payload = yaml.safe_load(handle)
+    if init_checkpoint is not None:
+        payload["model"]["load_checkpoint"] = str(Path(init_checkpoint).expanduser().resolve())
 
     source_data_config = Path(payload["data"]["train_data_config"]).expanduser().resolve()
     with source_data_config.open("r", encoding="utf-8") as handle:
@@ -97,21 +100,35 @@ def _optimizer_update_audit(trainer: LtxvTrainer) -> dict[str, Any]:
             continue
         trainable = 0
         updated = 0
-        finite = True
+        moments_finite = True
+        parameters_finite = True
+        gradient_parameters = 0
+        gradients_finite = True
+        nonzero_gradients = 0
         for parameter in module.parameters():
             if not parameter.requires_grad:
                 continue
             trainable += parameter.numel()
+            parameters_finite = parameters_finite and bool(torch.isfinite(parameter).all())
+            gradient_state = trainer._last_gradient_audit_by_parameter_id.get(id(parameter))
+            if gradient_state is not None:
+                gradient_parameters += 1
+                gradients_finite = gradients_finite and gradient_state["finite"]
+                nonzero_gradients += int(gradient_state["nonzero"])
             state = trainer._optimizer.state.get(parameter, {})
             moment = state.get("exp_avg")
             if isinstance(moment, torch.Tensor):
-                finite = finite and bool(torch.isfinite(moment).all())
+                moments_finite = moments_finite and bool(torch.isfinite(moment).all())
                 updated += int(torch.count_nonzero(moment).item() > 0)
         if trainable:
             audit[module_name] = {
                 "trainable_parameters": trainable,
                 "parameters_with_nonzero_adam_moment": updated,
-                "moments_finite": finite,
+                "moments_finite": moments_finite,
+                "parameters_finite": parameters_finite,
+                "gradient_parameters": gradient_parameters,
+                "gradients_finite": gradients_finite,
+                "parameters_with_nonzero_gradient": nonzero_gradients,
             }
     return audit
 
@@ -127,6 +144,8 @@ def _assert_optimizer_update_audit(audit: dict[str, Any], *, phase: str) -> None
             "text_encoder",
             "text_connector",
             "strategy.planner_tokens",
+            "strategy.visual_token_projection",
+            "strategy.visual_full_encoder",
         },
         "stage3": {
             "transformer",
@@ -145,6 +164,9 @@ def _assert_optimizer_update_audit(audit: dict[str, Any], *, phase: str) -> None
         name
         for name in required
         if not audit[name]["moments_finite"]
+        or not audit[name]["parameters_finite"]
+        or not audit[name]["gradients_finite"]
+        or audit[name]["gradient_parameters"] <= 0
         or audit[name]["parameters_with_nonzero_adam_moment"] <= 0
     )
     if failed:
@@ -208,16 +230,19 @@ def run_one_step_training_smoke(
     *,
     task: Literal["i2i", "r2v"],
     output_dir: str | Path,
+    init_checkpoint: str | Path | None = None,
 ) -> dict[str, Any]:
     config, generated_config = make_one_step_smoke_config(
         config_path,
         task=task,
         output_dir=output_dir,
+        init_checkpoint=init_checkpoint,
     )
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
     started = time.perf_counter()
     trainer = LtxvTrainer(config)
+    trainer._capture_gradient_audit = True
     checkpoint, stats = trainer.train(disable_progress_bars=True)
     scheduler_last_epoch = int(trainer._lr_scheduler.state_dict().get("last_epoch", -1))
     if trainer._global_step != 1 or scheduler_last_epoch != 1:
@@ -284,8 +309,11 @@ def run_real_encode_check(
             )
             visual = encoded["gt_visual_tokens"]
             expected_valid = 256 if task == IMAGE_TASK else 2048
+            expected_prompt_id = 0 if task == IMAGE_TASK else 1
             if int(visual["visual_token_mask"].sum().item()) != expected_valid:
                 raise RuntimeError(f"{task} valid visual token count is not {expected_valid}")
+            if int(encoded["task_system_prompt_id"].item()) != expected_prompt_id:
+                raise RuntimeError(f"{task} used the wrong task system prompt id")
             if task == VIDEO_TASK and tuple(raw_batch["vlm_target_frame_indices"][0].tolist()) != VLM_TARGET_INDICES:
                 raise RuntimeError("Real R2V encode used unexpected target frame indices")
             expected_latent_frames = 1 if task == IMAGE_TASK else 16
@@ -302,6 +330,7 @@ def run_real_encode_check(
                     "latent_shape": list(encoded["latents"]["latents"].shape),
                     "visual_shape": list(visual["visual_tokens"].shape),
                     "valid_visual_tokens": expected_valid,
+                    "task_system_prompt_id": expected_prompt_id,
                     "reference_vae_shapes": [
                         list(reference.shape) for reference in sample["reference_pixels_vae"]
                     ],

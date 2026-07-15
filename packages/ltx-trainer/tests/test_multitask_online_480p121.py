@@ -2,17 +2,24 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
+import typer
 import yaml
 from PIL import Image
+from safetensors.torch import save_file
 
+from ltx_core.text_encoders.gemma.config import GEMMA3_CONFIG_FOR_LTX
 from ltx_trainer.config import DataConfig, LtxTrainerConfig, OnlineEncodingConfig
 from ltx_trainer.online_data.constants import (
+    IMAGE_TASK,
     TARGET_HEIGHT,
     TARGET_WIDTH,
     VIDEO_NUM_FRAMES,
+    VIDEO_TASK,
     VLM_TARGET_INDICES,
     uniform_indices,
 )
@@ -20,8 +27,11 @@ from ltx_trainer.online_data.manifest import ManifestReject, build_i2i_record, b
 from ltx_trainer.online_data.manifest_index import build_manifest_offset_index
 from ltx_trainer.online_data.media_decoder import decode_image_rgb
 from ltx_trainer.online_data.multitask_dataset import OnlineMultiTaskDataset
+from ltx_trainer.online_data.online_batch_encoder import OnlineBatchEncoder, _build_messages
 from ltx_trainer.online_data.path_safety import assert_write_path_allowed
 from ltx_trainer.online_data.visual_token_packing import build_visual_metadata, pack_visual_tokens
+from scripts import check_multitask_online_training_ready as training_ready
+from scripts.check_multitask_online_ddp import _parse_stages
 
 
 def test_fixed_480p121_contract() -> None:
@@ -30,6 +40,190 @@ def test_fixed_480p121_contract() -> None:
     assert VIDEO_NUM_FRAMES % 8 == 1
     assert uniform_indices(121, 8) == list(VLM_TARGET_INDICES)
     OnlineEncodingConfig()
+
+
+def test_online_messages_use_task_specific_image_edit_semantics() -> None:
+    system_prompt = (
+        Path(__file__).resolve().parents[2]
+        / "ltx-core"
+        / "src"
+        / "ltx_core"
+        / "text_encoders"
+        / "gemma"
+        / "encoders"
+        / "prompts"
+        / "gemma_multiref_image_edit_planner_system_prompt.txt"
+    ).read_text(encoding="utf-8")
+    messages = _build_messages(system_prompt, "replace the shirt", 2, task=IMAGE_TASK)
+    serialized = json.dumps(messages)
+
+    assert "target image" in serialized
+    assert "target video" not in serialized
+    assert "motion sequence" not in serialized
+    assert messages[1]["content"][0]["text"] == "Image editing instruction: replace the shirt"
+    assert messages[1]["content"][1]["text"] == "Source/reference images:"
+
+
+def test_online_video_messages_preserve_existing_serialization() -> None:
+    system_prompt = "target video"
+    messages = _build_messages(system_prompt, "a person walks", 1, task=VIDEO_TASK)
+
+    assert messages == [
+        {"role": "system", "content": system_prompt},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "User Raw Input Prompt: a person walks."},
+                {"type": "text", "text": "Reference images:"},
+                {"type": "text", "text": "Reference image 1:"},
+                {"type": "image"},
+            ],
+        },
+    ]
+
+
+@pytest.mark.parametrize(("task", "valid_tokens"), [(IMAGE_TASK, 256), (VIDEO_TASK, 2048)])
+def test_task_specific_planner_inputs_keep_fixed_capacity_and_ntp_masks(
+    task: str,
+    valid_tokens: int,
+) -> None:
+    class _Tokenizer:
+        pad_token_id = 0
+
+        def __init__(self) -> None:
+            self.messages = None
+
+        def apply_chat_template(self, messages: list[dict[str, Any]], **_kwargs: Any) -> str:
+            self.messages = messages
+            return "serialized"
+
+    class _Processor:
+        def __call__(self, **_kwargs: Any) -> dict[str, torch.Tensor]:
+            return {
+                "input_ids": torch.tensor(
+                    [[
+                        10,
+                        GEMMA3_CONFIG_FOR_LTX.boi_token_index,
+                        GEMMA3_CONFIG_FOR_LTX.image_token_index,
+                        GEMMA3_CONFIG_FOR_LTX.eoi_token_index,
+                        11,
+                    ]],
+                    dtype=torch.long,
+                ),
+                "attention_mask": torch.ones(1, 5, dtype=torch.long),
+            }
+
+    encoder = object.__new__(OnlineBatchEncoder)
+    encoder.config = SimpleNamespace(planner_max_length=2070)
+    encoder.tokenizer = _Tokenizer()
+    encoder.processor = _Processor()
+    encoder.system_prompts = {
+        IMAGE_TASK: "target image",
+        VIDEO_TASK: "target video",
+    }
+    planner_output_mask = torch.zeros(1, 2048, dtype=torch.bool)
+    planner_output_mask[:, :valid_tokens] = True
+
+    result = encoder._build_planner_vlm_inputs(
+        caption="instruction",
+        reference_images=[object()],
+        planner_output_mask=planner_output_mask,
+        task=task,
+    )
+
+    assert result["planner_placeholder_mask"].sum().item() == 2048
+    assert result["planner_output_mask"].sum().item() == valid_tokens
+    assert not bool((result["ntp_label_mask"] & result["planner_region_mask"]).any())
+    assert not bool((result["ntp_label_mask"] & result["ref_image_region_mask"]).any())
+    serialized_messages = json.dumps(encoder.tokenizer.messages)
+    assert ("target image" in serialized_messages) is (task == IMAGE_TASK)
+    assert ("target video" in serialized_messages) is (task == VIDEO_TASK)
+
+
+def _write_complete_stage3_checkpoint(
+    path: Path,
+    *,
+    training_phase: str,
+    global_step: int = 2000,
+) -> None:
+    save_file(
+        {
+            "diffusion_model.block.lora_A.default.weight": torch.ones(1),
+            "diffusion_model.block.lora_B.default.weight": torch.ones(1),
+            "training_strategy.planner_tokens.query_tokens": torch.ones(1),
+            "training_strategy.visual_token_projection.weight": torch.ones(1),
+            "training_strategy.visual_full_encoder.input_norm.weight": torch.ones(1),
+            "embeddings_processor.video_connector.weight": torch.ones(1),
+            "text_encoder.model.model.language_model.block.lora_A.default.weight": torch.ones(1),
+            "text_encoder.model.model.language_model.block.lora_B.default.weight": torch.ones(1),
+        },
+        path,
+        metadata={"training_phase": training_phase, "global_step": str(global_step)},
+    )
+
+
+@pytest.mark.parametrize(
+    ("checkpoint_phase", "expected_mode"),
+    [
+        ("stage2", "stage2_to_stage3_init"),
+        ("stage3", "stage3_joint_warmstart"),
+    ],
+)
+def test_stage3_no_resume_preflight_accepts_complete_stage2_or_stage3_checkpoint(
+    tmp_path: Path,
+    checkpoint_phase: str,
+    expected_mode: str,
+) -> None:
+    checkpoint = tmp_path / "lora_weights_step_02000.safetensors"
+    _write_complete_stage3_checkpoint(checkpoint, training_phase=checkpoint_phase)
+
+    report = training_ready._inspect_stage3_initialization(
+        checkpoint,
+        no_resume=True,
+        optimization_steps=30_000,
+    )
+
+    assert report["initialization_mode"] == expected_mode
+    assert report["initial_checkpoint_training_phase"] == checkpoint_phase
+    assert report["strict_component_check_passed"] is True
+    assert report["starts_from_global_step"] == 0
+
+
+def test_exact_stage3_preflight_requires_matching_full_training_state(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "lora_weights_step_00500.safetensors"
+    _write_complete_stage3_checkpoint(checkpoint, training_phase="stage3", global_step=500)
+    torch.save(
+        {
+            "global_step": 500,
+            "optimizer_state_dict": {"state": {0: {"step": 500}}},
+            "lr_scheduler_state_dict": {"last_epoch": 500, "_last_lr": [1.0e-5]},
+            "data_state": {
+                "task_schedule_cursor": 500,
+                "image_permutation_epoch": 0,
+                "image_cursor": 0,
+                "video_permutation_epoch": 0,
+                "video_cursor": 0,
+                "microstep_in_optimizer_step": 0,
+                "sampler_seed": 42,
+            },
+        },
+        tmp_path / "training_state_step_00500.pt",
+    )
+
+    report = training_ready._inspect_stage3_initialization(
+        checkpoint,
+        no_resume=False,
+        optimization_steps=30_000,
+    )
+    assert report["initialization_mode"] == "exact_resume"
+    assert report["starts_from_global_step"] == 500
+
+
+def test_ddp_smoke_stage_selection_is_optional_and_canonical() -> None:
+    assert _parse_stages("stage3") == ["stage3"]
+    assert _parse_stages("stage3,stage1") == ["stage1", "stage3"]
+    with pytest.raises(typer.BadParameter, match="subset"):
+        _parse_stages("stage4")
 
 
 def test_image_visual_tokens_forward_one_frame_then_zero_pad() -> None:

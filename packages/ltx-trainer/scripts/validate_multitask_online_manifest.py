@@ -11,7 +11,7 @@ import typer
 
 from ltx_trainer.online_data.constants import VIDEO_NUM_FRAMES, VIDEO_TASK
 from ltx_trainer.online_data.media_decoder import probe_video
-from ltx_trainer.online_data.manifest_index import default_manifest_index_path, iter_index_entries
+from ltx_trainer.online_data.manifest_index import default_manifest_index_path, validate_manifest_index
 from ltx_trainer.online_data.multitask_dataset import validate_manifest_record
 from ltx_trainer.online_data.path_safety import assert_write_path_allowed
 
@@ -62,9 +62,11 @@ def main(
         dedup_path.unlink(missing_ok=True)
     index_path = default_manifest_index_path(manifest_path)
     if index_path.is_file():
-        indexed_rows = sum(1 for _ in iter_index_entries(index_path))
-        if indexed_rows != row_count:
-            raise ValueError(f"Manifest/index row mismatch: manifest={row_count}, index={indexed_rows}")
+        metadata = validate_manifest_index(manifest_path, index_path)
+        if metadata.manifest_row_count != row_count:
+            raise ValueError(
+                f"Manifest/index row mismatch: manifest={row_count}, index={metadata.manifest_row_count}"
+            )
     typer.echo(f"Validated {row_count} online manifest rows: {task_counts}")
 
 
