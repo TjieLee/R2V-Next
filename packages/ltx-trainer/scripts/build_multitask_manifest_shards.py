@@ -8,7 +8,12 @@ from pathlib import Path
 
 import typer
 
-from ltx_trainer.online_data.parallel_manifest import BuildOptions, build_task_shards, parse_tasks
+from ltx_trainer.online_data.parallel_manifest import (
+    BuildOptions,
+    build_task_shards,
+    parse_tasks,
+    run_r2v_prefilter,
+)
 from ltx_trainer.online_data.path_safety import assert_write_path_allowed
 
 app = typer.Typer(pretty_exceptions_enable=False, no_args_is_help=True)
@@ -25,6 +30,9 @@ def main(  # noqa: PLR0913
     max_in_flight: int = typer.Option(256, "--max-in-flight"),
     annotation_batch_size: int = typer.Option(4096, "--annotation-batch-size"),
     probe_timeout_seconds: float = typer.Option(60.0, "--probe-timeout-seconds"),
+    video_probe_mode: str = typer.Option("persistent", "--video-probe-mode"),
+    video_probe_max_tasks_per_worker: int = typer.Option(1000, "--video-probe-max-tasks-per-worker"),
+    prefilter_only: bool = typer.Option(False, "--prefilter-only"),
     resume_build: bool = typer.Option(True, "--resume-build/--no-resume-build"),
     progress_interval_seconds: float = typer.Option(10.0, "--progress-interval-seconds"),
     manifest_seed: int = typer.Option(42, "--manifest-seed"),
@@ -47,6 +55,8 @@ def main(  # noqa: PLR0913
         max_in_flight=max_in_flight,
         annotation_batch_size=annotation_batch_size,
         probe_timeout_seconds=probe_timeout_seconds,
+        video_probe_mode=video_probe_mode,
+        video_probe_max_tasks_per_worker=video_probe_max_tasks_per_worker,
         resume_build=resume_build,
         progress_interval_seconds=progress_interval_seconds,
         manifest_seed=manifest_seed,
@@ -60,6 +70,16 @@ def main(  # noqa: PLR0913
     )
     options.validate()
     root.mkdir(parents=True, exist_ok=True)
+    if prefilter_only:
+        if selected_tasks != ["r2v"]:
+            raise typer.BadParameter("--prefilter-only requires --tasks r2v")
+        summary = run_r2v_prefilter(
+            Path(train_data_config),
+            shard_root=root,
+            options=options,
+        )
+        typer.echo(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
+        return
     summaries = []
     for task in selected_tasks:
         summary = build_task_shards(

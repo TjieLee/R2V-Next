@@ -27,13 +27,16 @@ from typing import Any
 
 from PIL import Image, ImageOps
 
-from ltx_trainer.online_data.constants import IMAGE_TASK, VIDEO_TASK
+from ltx_trainer.online_data.constants import IMAGE_TASK, VIDEO_NUM_FRAMES, VIDEO_TASK
 from ltx_trainer.online_data.manifest import (
     ManifestReject,
     build_i2i_record,
     build_r2v_record,
     iter_annotation_rows,
     load_multitask_data_config,
+    parse_numeric_list,
+    parse_pair,
+    parse_path_list,
     probe_video,
 )
 from ltx_trainer.online_data.manifest_index import (
@@ -41,12 +44,14 @@ from ltx_trainer.online_data.manifest_index import (
     default_manifest_index_path,
     validate_manifest_index,
 )
+from ltx_trainer.online_data.video_probe_pool import PersistentVideoProbePool, VideoProbeError
 
 JSONL_INDEX_MAGIC = b"LTXJIDX1"
 JSONL_INDEX_HEADER = struct.Struct("<Q")
 JSONL_INDEX_ENTRY = struct.Struct("<Q")
 BUILD_METADATA_VERSION = 1
 SHARD_MARKER_VERSION = 1
+R2V_FILTER_SEMANTIC_VERSION = 2
 TASK_ORDER = (IMAGE_TASK, VIDEO_TASK)
 logger = logging.getLogger(__name__)
 
@@ -86,6 +91,8 @@ class BuildOptions:
     max_in_flight: int = 256
     annotation_batch_size: int = 4096
     probe_timeout_seconds: float = 60.0
+    video_probe_mode: str = "persistent"
+    video_probe_max_tasks_per_worker: int = 1000
     resume_build: bool = True
     progress_interval_seconds: float = 10.0
     manifest_seed: int = 42
@@ -104,12 +111,15 @@ class BuildOptions:
             "video_workers": self.video_workers,
             "max_in_flight": self.max_in_flight,
             "annotation_batch_size": self.annotation_batch_size,
+            "video_probe_max_tasks_per_worker": self.video_probe_max_tasks_per_worker,
         }
         for name, value in integer_values.items():
             if value <= 0:
                 raise ValueError(f"{name} must be positive, got {value}")
         if self.probe_timeout_seconds <= 0:
             raise ValueError("probe_timeout_seconds must be positive")
+        if self.video_probe_mode not in {"persistent", "isolated"}:
+            raise ValueError("video_probe_mode must be 'persistent' or 'isolated'")
         if self.progress_interval_seconds <= 0:
             raise ValueError("progress_interval_seconds must be positive")
         if self.max_samples_per_task is not None and self.max_samples_per_task <= 0:
@@ -124,6 +134,87 @@ class RowBuildResult:
     dataset_name: str
     record: dict[str, Any] | None = None
     rejection: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class R2VPrefilterResult:
+    target_path: str
+    reference_paths: tuple[str, ...]
+    caption: str
+    crop_xyxy: tuple[float, float, float, float]
+    face_cut: tuple[int, int]
+
+
+class BuildRuntimeStats:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._counts: Counter[str] = Counter()
+
+    def increment(self, name: str, value: int = 1) -> None:
+        with self._lock:
+            self._counts[name] += value
+
+    def snapshot(self) -> dict[str, int]:
+        with self._lock:
+            return dict(self._counts)
+
+    def update(self, values: Mapping[str, int]) -> None:
+        with self._lock:
+            self._counts.update(values)
+
+
+def prefilter_r2v_annotation(
+    row: Mapping[str, Any],
+    *,
+    data_root: str | Path | None,
+) -> R2VPrefilterResult:
+    """Reject annotation-only impossibilities without touching any media."""
+    required = {"video_path", "text", "crop", "face_cut", "ref_images"}
+    missing = sorted(required - row.keys())
+    if missing:
+        raise ManifestReject(
+            "r2v_schema_mismatch",
+            f"OpenS2V adapter fields are missing: {missing}. Available columns: {sorted(row)}",
+        )
+    caption = str(row["text"]).strip() if row["text"] is not None else ""
+    if not caption:
+        raise ManifestReject("empty_caption", "Caption/instruction is empty")
+    try:
+        crop_raw = parse_numeric_list(row["crop"], field="crop")
+    except Exception as exc:
+        raise ManifestReject("invalid_crop", "Invalid OpenS2V crop") from exc
+    if not all(math.isfinite(value) for value in crop_raw):
+        raise ManifestReject("invalid_crop", f"OpenS2V crop contains non-finite values: {crop_raw}")
+    if crop_raw[1] <= crop_raw[0] or crop_raw[3] <= crop_raw[2]:
+        raise ManifestReject("invalid_crop", f"OpenS2V crop has non-positive extent: {crop_raw}")
+    try:
+        face_cut = parse_pair(row["face_cut"], field="face_cut")
+    except Exception as exc:
+        raise ManifestReject("invalid_face_cut", "Invalid OpenS2V face_cut") from exc
+    if face_cut[0] < 0 or face_cut[1] <= face_cut[0]:
+        raise ManifestReject("invalid_face_cut", f"Invalid face_cut={face_cut}")
+    try:
+        reference_values = parse_path_list(row["ref_images"], field="ref_images")
+    except Exception as exc:
+        raise ManifestReject("missing_reference", "No usable reference paths in ref_images") from exc
+    if face_cut[1] - face_cut[0] < VIDEO_NUM_FRAMES:
+        raise ManifestReject(
+            "insufficient_face_cut_span_for_121",
+            f"face_cut={face_cut} contains fewer than {VIDEO_NUM_FRAMES} source frames",
+        )
+    def annotation_path(value: Any) -> str:
+        path = Path(str(value)).expanduser()
+        if not path.is_absolute() and data_root is not None:
+            path = Path(data_root).expanduser() / path
+        return os.path.abspath(path)  # noqa: PTH100 - Stage A must not resolve or stat media.
+
+    return R2VPrefilterResult(
+        target_path=annotation_path(row["video_path"]),
+        reference_paths=tuple(annotation_path(path) for path in reference_values),
+        caption=caption,
+        crop_xyxy=(crop_raw[0], crop_raw[2], crop_raw[1], crop_raw[3]),
+        face_cut=(face_cut[0], face_cut[1]),
+    )
 
 
 def utc_now() -> str:
@@ -616,6 +707,10 @@ class PersistentMediaCache:
         self._inflight: dict[tuple[str, str, int, int], Future[dict[str, Any]]] = {}
         self.hits = 0
         self.misses = 0
+        self.image_hits = 0
+        self.image_misses = 0
+        self.video_hits = 0
+        self.video_misses = 0
         self.probe_success = 0
         self.probe_timeout = 0
         self.invalid_video_header = 0
@@ -760,18 +855,22 @@ class PersistentMediaCache:
             raise MediaValidationError("missing_media", f"Media is missing or unreadable: {path}") from exc
         owner = False
         with self._lock:
-            cached = self._lookup(signature)
+            try:
+                cached = self._lookup(signature)
+            except MediaValidationError:
+                self._record_cache_hit(kind)
+                raise
             if cached is not None:
-                self.hits += 1
+                self._record_cache_hit(kind)
                 return cached[1]
             future = self._inflight.get(signature)
             if future is None:
                 future = Future()
                 self._inflight[signature] = future
-                self.misses += 1
+                self._record_cache_miss(kind)
                 owner = True
             else:
-                self.hits += 1
+                self._record_cache_hit(kind)
         if not owner:
             return future.result()
         try:
@@ -814,6 +913,20 @@ class PersistentMediaCache:
             self._inflight.pop(signature, None)
         return payload
 
+    def _record_cache_hit(self, kind: str) -> None:
+        self.hits += 1
+        if kind == "video":
+            self.video_hits += 1
+        else:
+            self.image_hits += 1
+
+    def _record_cache_miss(self, kind: str) -> None:
+        self.misses += 1
+        if kind == "video":
+            self.video_misses += 1
+        else:
+            self.image_misses += 1
+
     def validate_image(self, path: str) -> tuple[int, int]:
         def compute(resolved: str) -> Mapping[str, Any]:
             with Image.open(resolved) as image:
@@ -829,6 +942,14 @@ class PersistentMediaCache:
         def compute(resolved: str) -> Mapping[str, Any]:
             try:
                 result = self.probe_runner(resolved, self.probe_timeout_seconds)
+            except VideoProbeError as exc:
+                error = MediaValidationError(exc.reason, str(exc))
+                with self._lock:
+                    if error.reason == "video_probe_timeout":
+                        self.probe_timeout += 1
+                    else:
+                        self.invalid_video_header += 1
+                raise error from exc
             except MediaValidationError as exc:
                 with self._lock:
                     if exc.reason == "video_probe_timeout":
@@ -850,7 +971,7 @@ class PersistentMediaCache:
 
 
 def _semantic_build_payload(task: str, options: BuildOptions, sources: Iterable[AnnotationSource]) -> dict[str, Any]:
-    return {
+    payload = {
         "version": BUILD_METADATA_VERSION,
         "task": task,
         "shards_per_task": options.shards_per_task,
@@ -875,6 +996,9 @@ def _semantic_build_payload(task: str, options: BuildOptions, sources: Iterable[
             for source in sources
         ],
     }
+    if task == VIDEO_TASK:
+        payload["r2v_filter_semantic_version"] = R2V_FILTER_SEMANTIC_VERSION
+    return payload
 
 
 def task_build_fingerprint(task: str, options: BuildOptions, sources: Iterable[AnnotationSource]) -> str:
@@ -929,6 +1053,8 @@ def _update_build_metadata(
             "build_config_fingerprint": build_fingerprint,
             "image_workers": options.image_workers,
             "video_workers": options.video_workers,
+            "video_probe_mode": options.video_probe_mode,
+            "video_probe_max_tasks_per_worker": options.video_probe_max_tasks_per_worker,
             "max_in_flight": options.max_in_flight,
             "sources": [asdict(source) for source in sources],
             "updated_at": utc_now(),
@@ -1018,6 +1144,7 @@ def _build_row(
     task: str,
     options: BuildOptions,
     cache: PersistentMediaCache,
+    runtime_stats: BuildRuntimeStats | None = None,
 ) -> RowBuildResult:
     task_row_index, source, source_row_index, row = item
     try:
@@ -1033,28 +1160,39 @@ def _build_row(
                 image_validator=cache.validate_image,
             )
         elif task == VIDEO_TASK:
-            required = {"video_path", "text", "crop", "face_cut", "ref_images"}
-            missing = sorted(required - row.keys())
-            if missing:
-                raise ManifestReject(
-                    "r2v_schema_mismatch",
-                    f"OpenS2V adapter fields are missing: {missing}. Available columns: {sorted(row)}",
-                )
-            if not str(row["text"]).strip():
-                raise ManifestReject("empty_caption", "Caption/instruction is empty")
-            from ltx_trainer.online_data.manifest import resolve_media_path  # noqa: PLC0415
+            try:
+                prefilter = prefilter_r2v_annotation(row, data_root=source.data_root)
+            except Exception:
+                if runtime_stats is not None:
+                    runtime_stats.increment("annotation_prefilter_rejected")
+                raise
+            if runtime_stats is not None:
+                runtime_stats.increment("rows_sent_to_video_probe")
+            reference_validation_started = False
 
-            target_path = resolve_media_path(row["video_path"], data_root=source.data_root)
-            header = cache.probe_video(target_path)
-            record = build_r2v_record(
-                row,
-                dataset_name=source.dataset_name,
-                data_root=source.data_root,
-                manifest_seed=options.manifest_seed,
-                video_header=header,
-                image_validator=cache.validate_image,
-                target_path_validated=True,
-            )
+            def validate_reference(path: str) -> tuple[int, int]:
+                nonlocal reference_validation_started
+                if not reference_validation_started:
+                    reference_validation_started = True
+                    if runtime_stats is not None:
+                        runtime_stats.increment("reference_validation_started")
+                return cache.validate_image(path)
+
+            try:
+                header = cache.probe_video(prefilter.target_path)
+                record = build_r2v_record(
+                    row,
+                    dataset_name=source.dataset_name,
+                    data_root=source.data_root,
+                    manifest_seed=options.manifest_seed,
+                    video_header=header,
+                    image_validator=validate_reference,
+                    target_path_validated=True,
+                )
+            except Exception:
+                if runtime_stats is not None and not reference_validation_started:
+                    runtime_stats.increment("reference_validation_skipped_due_to_video_reject")
+                raise
         else:
             raise ValueError(f"Unsupported task: {task}")
         record.update(
@@ -1174,6 +1312,8 @@ def _write_progress(  # noqa: PLR0913
     interval_started: float,
     interval_rows: int,
     cache: PersistentMediaCache,
+    runtime_stats: BuildRuntimeStats,
+    probe_pool: PersistentVideoProbePool | None,
 ) -> None:
     now = time.perf_counter()
     elapsed = max(now - started, 1.0e-9)
@@ -1181,6 +1321,7 @@ def _write_progress(  # noqa: PLR0913
     average_rate = processed / elapsed
     current_rate = interval_rows / interval_elapsed
     eta = (total - processed) / average_rate if average_rate > 0 else None
+    runtime = runtime_stats.snapshot()
     payload = {
         "version": 1,
         "updated_at": utc_now(),
@@ -1197,11 +1338,32 @@ def _write_progress(  # noqa: PLR0913
         "rate_avg": average_rate,
         "eta_seconds": eta,
         "eta": _format_eta(eta),
+        "stage": (
+            "media_validation"
+            if task != VIDEO_TASK or runtime.get("rows_sent_to_video_probe", 0)
+            else "annotation_prefilter"
+        ),
         "cache_hits": cache.hits,
         "cache_misses": cache.misses,
-        "probe_success": cache.probe_success,
-        "probe_timeout": cache.probe_timeout,
-        "invalid_video_header": cache.invalid_video_header,
+        "image_cache_hits": cache.image_hits,
+        "image_cache_misses": cache.image_misses,
+        "video_cache_hits": cache.video_hits,
+        "video_cache_misses": cache.video_misses,
+        "annotation_prefilter_rejected": runtime.get("annotation_prefilter_rejected", 0),
+        "rows_sent_to_video_probe": runtime.get("rows_sent_to_video_probe", 0),
+        "video_probe_success": cache.probe_success,
+        "video_probe_timeout": cache.probe_timeout,
+        "video_probe_invalid": cache.invalid_video_header,
+        "video_probe_submissions": (
+            probe_pool.probe_submit_count if probe_pool is not None else cache.video_misses
+        ),
+        "video_probe_worker_starts": probe_pool.worker_start_count if probe_pool is not None else 0,
+        "video_probe_worker_restarts": probe_pool.worker_restart_count if probe_pool is not None else 0,
+        "reference_validation_started": runtime.get("reference_validation_started", 0),
+        "reference_validation_skipped_due_to_video_reject": runtime.get(
+            "reference_validation_skipped_due_to_video_reject",
+            0,
+        ),
     }
     atomic_write_json(shard_root / f"build_{task}.progress.json", payload)
     logger.info(
@@ -1213,13 +1375,125 @@ def _write_progress(  # noqa: PLR0913
     )
 
 
+def run_r2v_prefilter(
+    train_data_config: str | Path,
+    *,
+    shard_root: str | Path,
+    options: BuildOptions,
+) -> dict[str, Any]:
+    """Scan R2V annotations without opening or statting target/reference media."""
+    options.validate()
+    root = Path(shard_root).expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    sources = discover_annotation_sources(
+        train_data_config,
+        shard_root=root,
+        tasks=[VIDEO_TASK],
+        max_samples_per_task=options.max_samples_per_task,
+        recover_stale_locks=options.recover_stale_locks,
+    )[VIDEO_TASK]
+    total_rows = sum(source.row_count for source in sources)
+    accepted_path = root / "r2v_prefilter.accepted.jsonl"
+    rejected_path = root / "r2v_prefilter.rejected.jsonl"
+    summary_path = root / "r2v_prefilter_summary.json"
+    accepted_temp = Path(f"{accepted_path}.tmp.{os.getpid()}")
+    rejected_temp = Path(f"{rejected_path}.tmp.{os.getpid()}")
+    started = time.perf_counter()
+    passed = 0
+    rejected = 0
+    reject_reasons: Counter[str] = Counter()
+    span_histogram: Counter[str] = Counter()
+    ref_count_histogram: Counter[str] = Counter()
+    try:
+        rows = iter_task_range(
+            sources,
+            0,
+            total_rows,
+            batch_size=options.annotation_batch_size,
+        )
+        with accepted_temp.open("w", encoding="utf-8") as accepted_handle, rejected_temp.open(
+            "w",
+            encoding="utf-8",
+        ) as rejected_handle:
+            for task_row_index, source, source_row_index, row in rows:
+                try:
+                    histogram_face_cut = parse_pair(row.get("face_cut"), field="face_cut")
+                except Exception:
+                    pass
+                else:
+                    span_histogram[str(histogram_face_cut[1] - histogram_face_cut[0])] += 1
+                try:
+                    histogram_references = parse_path_list(row.get("ref_images"), field="ref_images")
+                except Exception:
+                    pass
+                else:
+                    ref_count_histogram[str(len(histogram_references))] += 1
+                try:
+                    prefilter_r2v_annotation(row, data_root=source.data_root)
+                except Exception as exc:
+                    rejection = _make_rejection(
+                        task=VIDEO_TASK,
+                        source=source,
+                        source_row_index=source_row_index,
+                        task_row_index=task_row_index,
+                        exc=exc,
+                    )
+                    rejected_handle.write(json.dumps(rejection, ensure_ascii=False, sort_keys=True) + "\n")
+                    rejected += 1
+                    reject_reasons[str(rejection["reason"])] += 1
+                    continue
+                accepted_handle.write(
+                    json.dumps(
+                        {
+                            "dataset_name": source.dataset_name,
+                            "dataset_order": source.dataset_order,
+                            "source_row_index": source_row_index,
+                            "task_row_index": task_row_index,
+                            "row": row,
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
+                passed += 1
+            _flush_and_sync(accepted_handle)
+            _flush_and_sync(rejected_handle)
+        accepted_temp.replace(accepted_path)
+        rejected_temp.replace(rejected_path)
+        elapsed = time.perf_counter() - started
+        summary = {
+            "version": 1,
+            "build_mode": "r2v_annotation_prefilter_only",
+            "raw_rows": total_rows,
+            "prefilter_passed": passed,
+            "prefilter_rejected": rejected,
+            "reject_reason_counts": dict(sorted(reject_reasons.items())),
+            "face_cut_span_histogram": dict(sorted(span_histogram.items(), key=lambda item: int(item[0]))),
+            "ref_count_histogram": dict(sorted(ref_count_histogram.items(), key=lambda item: int(item[0]))),
+            "elapsed_seconds": elapsed,
+            "rows_per_second": total_rows / max(elapsed, 1.0e-9),
+            "peak_rss_gb": peak_rss_gb(),
+            "accepted_path": str(accepted_path),
+            "rejected_path": str(rejected_path),
+            "accepted_sha256": file_sha256(accepted_path),
+            "rejected_sha256": file_sha256(rejected_path),
+            "media_open_count": 0,
+        }
+        atomic_write_json(summary_path, summary)
+        return summary
+    finally:
+        accepted_temp.unlink(missing_ok=True)
+        rejected_temp.unlink(missing_ok=True)
+
+
 def build_task_shards(  # noqa: PLR0912, PLR0915
     train_data_config: str | Path,
     *,
     task: str,
     shard_root: str | Path,
     options: BuildOptions,
-    probe_runner: Callable[[str, float], Mapping[str, Any]] = probe_video_isolated,
+    probe_runner: Callable[[str, float], Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     options.validate()
     task = parse_tasks([task])[0]
@@ -1245,12 +1519,33 @@ def build_task_shards(  # noqa: PLR0912, PLR0915
         sources=sources,
         build_fingerprint=build_fingerprint,
     )
-    cache = PersistentMediaCache(
-        task_dir / "media_cache.sqlite",
-        probe_timeout_seconds=options.probe_timeout_seconds,
-        probe_runner=probe_runner,
-    )
+    probe_pool: PersistentVideoProbePool | None = None
+    if probe_runner is None and task == VIDEO_TASK and options.video_probe_mode == "persistent":
+        probe_pool = PersistentVideoProbePool(
+            workers=options.video_workers,
+            timeout_seconds=options.probe_timeout_seconds,
+            max_tasks_per_worker=options.video_probe_max_tasks_per_worker,
+        )
+
+        def persistent_probe(path: str, _timeout_seconds: float) -> Mapping[str, Any]:
+            assert probe_pool is not None
+            return probe_pool.submit(path).result()
+
+        effective_probe_runner = persistent_probe
+    else:
+        effective_probe_runner = probe_runner or probe_video_isolated
+    try:
+        cache = PersistentMediaCache(
+            task_dir / "media_cache.sqlite",
+            probe_timeout_seconds=options.probe_timeout_seconds,
+            probe_runner=effective_probe_runner,
+        )
+    except BaseException:
+        if probe_pool is not None:
+            probe_pool.close(wait=False)
+        raise
     started = time.perf_counter()
+    runtime_stats = BuildRuntimeStats()
     aggregate = Counter()
     reject_reasons: Counter[str] = Counter()
     completed_shards = 0
@@ -1278,6 +1573,7 @@ def build_task_shards(  # noqa: PLR0912, PLR0915
                         duplicate_rows_local=int(marker["duplicate_rows_local"]),
                     )
                     reject_reasons.update(marker.get("reject_reason_counts", {}))
+                    runtime_stats.update(marker.get("runtime_stats", {}))
                     completed_shards += 1
                     continue
 
@@ -1303,6 +1599,7 @@ def build_task_shards(  # noqa: PLR0912, PLR0915
                 local_keys: dict[str, str] = {}
                 progress_started = time.perf_counter()
                 progress_rows = 0
+                shard_runtime_start = runtime_stats.snapshot()
                 try:
                     rows = iter_task_range(
                         sources,
@@ -1310,7 +1607,13 @@ def build_task_shards(  # noqa: PLR0912, PLR0915
                         end_row,
                         batch_size=options.annotation_batch_size,
                     )
-                    worker = partial(_build_row, task=task, options=options, cache=cache)
+                    worker = partial(
+                        _build_row,
+                        task=task,
+                        options=options,
+                        cache=cache,
+                        runtime_stats=runtime_stats,
+                    )
                     with accepted_temp.open("w", encoding="utf-8") as accepted_handle, rejected_temp.open(
                         "w", encoding="utf-8"
                     ) as rejected_handle:
@@ -1364,6 +1667,8 @@ def build_task_shards(  # noqa: PLR0912, PLR0915
                                     interval_started=progress_started,
                                     interval_rows=progress_rows,
                                     cache=cache,
+                                    runtime_stats=runtime_stats,
+                                    probe_pool=probe_pool,
                                 )
                                 progress_started = now
                                 progress_rows = 0
@@ -1375,6 +1680,12 @@ def build_task_shards(  # noqa: PLR0912, PLR0915
                             f"processed={local['raw_rows']}, expected={end_row - start_row}"
                         )
                     elapsed = time.perf_counter() - shard_started
+                    runtime_snapshot = runtime_stats.snapshot()
+                    shard_runtime = {
+                        key: value - shard_runtime_start.get(key, 0)
+                        for key, value in runtime_snapshot.items()
+                        if value - shard_runtime_start.get(key, 0)
+                    }
                     summary = {
                         "version": SHARD_MARKER_VERSION,
                         "task": task,
@@ -1388,9 +1699,17 @@ def build_task_shards(  # noqa: PLR0912, PLR0915
                         "peak_rss_gb": peak_rss_gb(),
                         "media_cache_hits": cache.hits,
                         "media_cache_misses": cache.misses,
+                        "image_cache_hits": cache.image_hits,
+                        "image_cache_misses": cache.image_misses,
+                        "video_cache_hits": cache.video_hits,
+                        "video_cache_misses": cache.video_misses,
                         "probe_success": cache.probe_success,
                         "probe_timeouts": cache.probe_timeout,
                         "invalid_video_header": cache.invalid_video_header,
+                        "video_probe_worker_restarts": (
+                            probe_pool.worker_restart_count if probe_pool is not None else 0
+                        ),
+                        "runtime_stats": shard_runtime,
                     }
                     with summary_temp.open("w", encoding="utf-8") as summary_handle:
                         json.dump(summary, summary_handle, ensure_ascii=False, indent=2, sort_keys=True)
@@ -1431,6 +1750,7 @@ def build_task_shards(  # noqa: PLR0912, PLR0915
                             for source in overlapping
                         ],
                         "build_config_fingerprint": build_fingerprint,
+                        "runtime_stats": shard_runtime,
                         "elapsed_seconds": elapsed,
                         "peak_rss_gb": peak_rss_gb(),
                         "files": {
@@ -1462,6 +1782,8 @@ def build_task_shards(  # noqa: PLR0912, PLR0915
             interval_started=started,
             interval_rows=aggregate["raw_rows"],
             cache=cache,
+            runtime_stats=runtime_stats,
+            probe_pool=probe_pool,
         )
         return {
             "task": task,
@@ -1474,10 +1796,23 @@ def build_task_shards(  # noqa: PLR0912, PLR0915
             "elapsed_seconds": time.perf_counter() - started,
             "media_cache_hits": cache.hits,
             "media_cache_misses": cache.misses,
+            "image_cache_hits": cache.image_hits,
+            "image_cache_misses": cache.image_misses,
+            "video_cache_hits": cache.video_hits,
+            "video_cache_misses": cache.video_misses,
             "probe_timeouts": cache.probe_timeout,
+            "video_probe_mode": options.video_probe_mode,
+            "video_probe_submissions": (
+                probe_pool.probe_submit_count if probe_pool is not None else cache.video_misses
+            ),
+            "video_probe_worker_starts": probe_pool.worker_start_count if probe_pool is not None else 0,
+            "video_probe_worker_restarts": probe_pool.worker_restart_count if probe_pool is not None else 0,
+            "runtime_stats": runtime_stats.snapshot(),
         }
     finally:
         cache.close()
+        if probe_pool is not None:
+            probe_pool.close()
 
 
 def _strip_build_fields(record: Mapping[str, Any]) -> dict[str, Any]:

@@ -380,8 +380,6 @@ def build_r2v_record(
             f"OpenS2V adapter fields are missing: {missing}. Available columns: {sorted(row)}",
         )
     target_path = resolve_media_path(row["video_path"], data_root=data_root)
-    if not target_path_validated and not Path(target_path).is_file():
-        raise ManifestReject("missing_target", f"Target video does not exist: {target_path}")
     reference_paths = _resolved_reference_paths(
         row["ref_images"],
         field="ref_images",
@@ -391,16 +389,26 @@ def build_r2v_record(
         crop_raw = parse_numeric_list(row["crop"], field="crop")
     except Exception as exc:
         raise ManifestReject("invalid_crop", "Invalid OpenS2V crop") from exc
+    if not all(math.isfinite(value) for value in crop_raw):
+        raise ManifestReject("invalid_crop", f"OpenS2V crop contains non-finite values: {crop_raw}")
+    if crop_raw[1] <= crop_raw[0] or crop_raw[3] <= crop_raw[2]:
+        raise ManifestReject("invalid_crop", f"OpenS2V crop has non-positive extent: {crop_raw}")
     # OpenS2V stores (start_x, end_x, start_y, end_y).
     crop_xyxy = [crop_raw[0], crop_raw[2], crop_raw[1], crop_raw[3]]
     try:
         face_cut = parse_pair(row["face_cut"], field="face_cut")
     except Exception as exc:
         raise ManifestReject("invalid_face_cut", "Invalid OpenS2V face_cut") from exc
-    if face_cut[1] <= face_cut[0]:
+    if face_cut[0] < 0 or face_cut[1] <= face_cut[0]:
         raise ManifestReject("invalid_face_cut", f"Invalid face_cut={face_cut} for {target_path}")
     caption = _require_nonempty_caption(row["text"])
-    _validate_reference_paths(reference_paths, image_validator=image_validator)
+    if face_cut[1] - face_cut[0] < VIDEO_NUM_FRAMES:
+        raise ManifestReject(
+            "insufficient_face_cut_span_for_121",
+            f"face_cut={face_cut} contains fewer than {VIDEO_NUM_FRAMES} source frames",
+        )
+    if not target_path_validated and not Path(target_path).is_file():
+        raise ManifestReject("missing_target", f"Target video does not exist: {target_path}")
     try:
         header = dict(video_header) if video_header is not None else probe_video(target_path)
         original_fps = float(header["fps"])
@@ -411,12 +419,26 @@ def build_r2v_record(
         raise ManifestReject("invalid_video_header", f"Could not read video header: {target_path}") from exc
     if not math.isfinite(original_fps) or original_fps <= 0:
         raise ManifestReject("invalid_video_header", f"Could not determine FPS for {target_path}")
+    if original_fps < VIDEO_FPS:
+        raise ManifestReject(
+            "source_fps_below_24",
+            f"Source FPS {original_fps} is below required target FPS {VIDEO_FPS}: {target_path}",
+        )
     if frame_count <= 0 or video_width <= 0 or video_height <= 0:
         raise ManifestReject("invalid_video_header", f"Incomplete video header for {target_path}: {header}")
     _validate_crop_xyxy(crop_xyxy, width=video_width, height=video_height)
     if not (0 <= face_cut[0] < face_cut[1] <= frame_count):
         raise ManifestReject("invalid_face_cut", f"Invalid face_cut={face_cut} for frame_count={frame_count}")
     end_frame = face_cut[1]
+    frame_step = original_fps / VIDEO_FPS
+    max_possible_frames = math.floor(
+        (end_frame - 1 - face_cut[0]) / frame_step + 1.0e-9
+    ) + 1
+    if max_possible_frames < VIDEO_NUM_FRAMES:
+        raise ManifestReject(
+            "insufficient_frames_for_121_at_24fps",
+            f"Only {max_possible_frames} exact 24-fps frames fit face_cut={face_cut} at fps={original_fps}",
+        )
     identity = {
         "dataset_name": dataset_name,
         "task": VIDEO_TASK,
@@ -447,6 +469,7 @@ def build_r2v_record(
             "insufficient_frames_for_121_at_24fps",
             f"Exact source indices are not strictly increasing inside face_cut for {target_path}",
         )
+    _validate_reference_paths(reference_paths, image_validator=image_validator)
     vlm_source_indices = [source_indices[index] for index in VLM_TARGET_INDICES]
     return finalize_manifest_record(
         {

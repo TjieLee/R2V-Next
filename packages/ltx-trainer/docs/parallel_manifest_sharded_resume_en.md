@@ -22,6 +22,27 @@ SHARDS=${ROOT}/manifests/build_shards
 mkdir -p "${ROOT}/manifests" "${ROOT}/logs"
 ```
 
+## Two-stage R2V filtering
+
+R2V starts with media-free Stage A validation: required fields, non-empty text, finite and valid crop,
+valid `face_cut`, at least one parseable reference, and immediate rejection when the face-cut span is below
+121. Only Stage A survivors enter Stage B: video header probing, source FPS/frame/crop checks, construction of
+an exact 121-frame plan, and finally reference-image validation. A failed video plan never stats or decodes a
+reference image.
+
+Run Stage A alone to estimate the number of rows that really require video probing:
+
+```bash
+uv run python scripts/build_multitask_manifest_shards.py \
+  --train-data-config "${CONFIG}" \
+  --tasks r2v \
+  --shard-root "${SHARDS}" \
+  --prefilter-only
+```
+
+This writes `r2v_prefilter.accepted.jsonl`, `r2v_prefilter.rejected.jsonl`, and
+`r2v_prefilter_summary.json` without opening or statting target videos or reference images.
+
 ## Concurrent builds
 
 Terminal 1 builds I2I. Target and reference images run bounded parallel `stat`, Pillow verification, and
@@ -48,8 +69,9 @@ nohup uv run python scripts/build_multitask_manifest_shards.py \
 echo $! > "${ROOT}/logs/build_i2i.pid"
 ```
 
-Terminal 2 builds R2V concurrently. Every PyAV header probe runs in an isolated child process. A probe exceeding
-60 seconds is terminated and rejected as `video_probe_timeout`; it cannot permanently block the worker pool.
+Terminal 2 builds R2V concurrently. The default is a persistent PyAV probe pool: each process handles many
+videos and is recycled after `max_tasks_per_worker`. A task exceeding 60 seconds terminates and replaces only
+its assigned worker; other workers continue.
 
 ```bash
 nohup uv run python scripts/build_multitask_manifest_shards.py \
@@ -59,6 +81,8 @@ nohup uv run python scripts/build_multitask_manifest_shards.py \
   --shards-per-task 16 \
   --image-workers 1 \
   --video-workers 32 \
+  --video-probe-mode persistent \
+  --video-probe-max-tasks-per-worker 1000 \
   --max-in-flight 256 \
   --annotation-batch-size 4096 \
   --probe-timeout-seconds 60 \
@@ -69,6 +93,11 @@ nohup uv run python scripts/build_multitask_manifest_shards.py \
 
 echo $! > "${ROOT}/logs/build_r2v.pid"
 ```
+
+`--video-probe-mode isolated` retains the legacy one-child-per-video implementation for regression testing and
+pathological-file diagnosis. Use the default `persistent` mode for production. The task SQLite cache and
+in-flight Future deduplication sit in front of the pool, so concurrent occurrences of one path submit one probe;
+successful and failed probes are reusable after resume.
 
 Conservative defaults are `image_workers=16`, `video_workers=8`, `shards_per_task=8`, and
 `max_in_flight=256`. The 64/32 values above are a first server trial for roughly 192 CPU cores. Do not start at
@@ -100,8 +129,9 @@ tail -f "${ROOT}/logs/build_i2i.log"
 tail -f "${ROOT}/logs/build_r2v.log"
 ```
 
-Progress includes processed/total, accepted/rejected, current and average rate, ETA, in-flight rows, and cache
-hits. R2V also reports successful, timed-out, and invalid header probes.
+Progress includes processed/total, accepted/rejected, current and average rate, ETA, in-flight rows, and stage.
+R2V separately reports image/video cache hit/miss counts, annotation prefilter rejects, rows sent to probing,
+probe submission/success/timeout/invalid counts, worker starts/restarts, and started/skipped reference validation.
 
 JSONL sources receive one byte-offset index, after which every shard seeks directly to its contiguous row range.
 Parquet uses metadata row counts and row-group/batch range reads. Workers may finish out of order, but records are
@@ -113,7 +143,7 @@ Each shard publishes `.done.json` last. `--resume-build` reuses a shard only whe
 
 1. task, shard id, and source range match;
 2. source path/size/mtime fingerprints match;
-3. semantic build settings, including seed, field mapping, timeout, and shard count, match;
+3. semantic build settings, including seed, field mapping, timeout, shard count, and R2V filter version, match;
 4. accepted, rejected, and summary artifacts exist and their SHA256 values match.
 
 Any failure cleans and rebuilds that shard only. Other completed shards and legacy builder temporary files are
@@ -131,6 +161,11 @@ uv run python scripts/build_multitask_manifest_shards.py \
 
 Each task has a persistent `media_cache.sqlite`, keyed by kind/path/size/mtime. Resume reuses valid entries, a
 changed file naturally misses, and a corrupt cache is rebuilt without invalidating completed shards.
+
+`video_probe_mode`, `video_workers`, `max_in_flight`, and `video_probe_max_tasks_per_worker` are performance
+settings and do not enter the semantic fingerprint. This R2V filter reorder has its own semantic version, so old
+R2V shards are revalidated while I2I fingerprints remain unchanged. Resume cleans and rebuilds an unfinished old
+R2V shard without a `.done.json`; keep completed I2I shards.
 
 ## Deterministic merge
 
@@ -181,6 +216,11 @@ uv run python scripts/build_multitask_manifest_shards.py \
   --no-resume-build
 ```
 
-Measure the real performance matrix on the target server and storage: I2I with 16/32/64 workers and R2V with
-8/16/32 workers. Record rows/s, elapsed time, peak RSS, cache hit rate, and iowait. Do not scan all production
+Benchmark on the target server and storage: first 50,000 rows with `--prefilter-only`, then 5,000 rows with full
+media validation. Try R2V 16/32/48 workers and max-tasks 500/1000. Record rows/s, elapsed time, peak RSS, actual
+probe submissions, worker starts/restarts, saved reference validations, and iowait. Do not scan all production
 data merely for a benchmark.
+
+This optimization does not restore the old reader's variable 41-to-120-frame behavior. Every accepted R2V row
+still requires exactly 121 strictly increasing, unique 24 FPS source indices inside
+`[face_cut_start, face_cut_end)`; source FPS below 24 is rejected explicitly.
