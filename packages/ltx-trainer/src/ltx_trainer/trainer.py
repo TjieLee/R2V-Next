@@ -1,4 +1,5 @@
 import contextlib
+import json
 import math
 import os
 import re
@@ -39,7 +40,12 @@ from ltx_trainer.config_display import print_config
 from ltx_trainer.datasets import PrecomputedDataset, collate_precomputed_batch
 from ltx_trainer.gpu_utils import free_gpu_memory, get_gpu_memory_gb
 from ltx_trainer.hf_hub_utils import push_to_hub
-from ltx_trainer.model_loader import load_embeddings_processor, load_text_encoder, load_transformer
+from ltx_trainer.model_loader import (
+    load_embeddings_processor,
+    load_text_encoder,
+    load_transformer,
+    load_video_vae_encoder,
+)
 from ltx_trainer.progress import TrainingProgress
 from ltx_trainer.quantization import quantize_model
 from ltx_trainer.sigma_tracker import SigmaBucketTracker
@@ -102,6 +108,12 @@ class TrainingStepOutput:
 class LtxvTrainer:
     def __init__(self, trainer_config: LtxTrainerConfig) -> None:
         self._config = trainer_config
+        self._online_batch_encoder = None
+        self._online_vae_encoder = None
+        self._online_sampler = None
+        self._pending_online_data_state: dict[str, Any] | None = None
+        self._resume_initial_step = 0
+        self._last_online_metrics: dict[str, float] = {}
         if IS_MAIN_PROCESS:
             print_config(trainer_config)
         self._training_strategy = get_training_strategy(self._config.training_strategy)
@@ -169,6 +181,9 @@ class LtxvTrainer:
         resume_run_id = training_state.wandb_run_id if resuming and training_state is not None else None
         self._init_wandb(resume_run_id=resume_run_id)
 
+        self._resume_initial_step = initial_step
+        if training_state is not None:
+            self._pending_online_data_state = training_state.data_state
         self._init_dataloader()
         data_iter = iter(self._dataloader)
         self._init_timestep_sampler()
@@ -233,10 +248,15 @@ class LtxvTrainer:
             while self._global_step < cfg.optimization.steps:
                 # Get next batch, reset the dataloader if needed
                 try:
+                    data_wait_started = time.perf_counter()
                     batch = next(data_iter)
                 except StopIteration:
                     data_iter = iter(self._dataloader)
                     batch = next(data_iter)
+                data_wait_ms = (time.perf_counter() - data_wait_started) * 1000.0
+                if cfg.data.encoding_mode == "online":
+                    batch = self._prepare_online_batch_with_retry(batch)
+                    batch.setdefault("_online_metrics", {})["data_wait_ms"] = data_wait_ms
 
                 step_start_time = time.time()
                 with self._accelerator.accumulate(*self._accumulation_models):
@@ -260,6 +280,13 @@ class LtxvTrainer:
                         self._lr_scheduler,
                         sync_gradients=self._accelerator.sync_gradients,
                     )
+                    if cfg.data.encoding_mode == "online":
+                        manifest_indices = self._accelerator.gather(
+                            batch["manifest_index"].to(device=self._accelerator.device, dtype=torch.long)
+                        )
+                        self._online_sampler.mark_microbatch_consumed(
+                            manifest_indices.detach().cpu().flatten().tolist()
+                        )
 
                     # Run validation if needed (handles DDP/FSDP work distribution internally)
                     if (
@@ -320,6 +347,9 @@ class LtxvTrainer:
                             "train/global_step": self._global_step,
                         }
                         metrics.update(strategy_metrics)
+                        metrics.update(
+                            {f"train/{name}": value for name, value in self._last_online_metrics.items()}
+                        )
                         metrics.update(self._sigma_tracker.get_metrics())
                         self._log_metrics(metrics)
 
@@ -412,7 +442,13 @@ class LtxvTrainer:
         """Perform the full training step inside the caller's autocast context."""
         # Apply embedding connectors to transform pre-computed text embeddings
         conditions = batch["conditions"]
+        planner_started = time.perf_counter()
         conditions = self._training_strategy.prepare_conditions(batch, conditions)
+        if self._config.data.encoding_mode == "online":
+            online_metrics = batch.setdefault("_online_metrics", {})
+            online_metrics["vlm_planner_ms"] = float(online_metrics.get("vlm_planner_ms", 0.0)) + (
+                time.perf_counter() - planner_started
+            ) * 1000.0
         batch["conditions"] = conditions
 
         if "video_prompt_embeds" in conditions:
@@ -441,11 +477,27 @@ class LtxvTrainer:
         model_inputs = self._training_strategy.prepare_training_inputs(batch, self._timestep_sampler)
 
         # Run transformer forward pass with Modality-based interface
+        dit_started = time.perf_counter()
         video_pred, audio_pred = self._transformer(
             video=model_inputs.video,
             audio=model_inputs.audio,
             perturbations=None,
         )
+        if self._config.data.encoding_mode == "online":
+            batch["_online_metrics"]["dit_ms"] = (time.perf_counter() - dit_started) * 1000.0
+            self._last_online_metrics = {
+                name: float(value)
+                for name, value in batch["_online_metrics"].items()
+            }
+            task = str(batch["task"][0])
+            self._last_online_metrics.update(
+                {
+                    "task_id": 0.0 if task == "i2i" else 1.0,
+                    "is_image": 1.0 if task == "i2i" else 0.0,
+                    "target_num_frames": 1.0 if task == "i2i" else 121.0,
+                    "valid_visual_tokens": 256.0 if task == "i2i" else 2048.0,
+                }
+            )
 
         # Use strategy to compute loss (returns per-element [B,] for sigma-bucket tracking)
         loss = self._training_strategy.compute_loss(video_pred, audio_pred, model_inputs)
@@ -478,11 +530,12 @@ class LtxvTrainer:
             device=init_device,
             dtype=torch.bfloat16,
         )
-        self._embeddings_processor.feature_extractor = None
+        if self._config.data.encoding_mode == "precomputed":
+            self._embeddings_processor.feature_extractor = None
         self._embeddings_processor.requires_grad_(False)
 
         self._text_encoder = None
-        if self._training_strategy.requires_text_encoder():
+        if self._training_strategy.requires_text_encoder() or self._config.data.encoding_mode == "online":
             logger.debug("Loading Gemma/VLM text encoder for training strategy...")
             self._text_encoder = load_text_encoder(
                 gemma_model_path=self._config.model.text_encoder_path,
@@ -512,6 +565,33 @@ class LtxvTrainer:
             embeddings_processor=self._embeddings_processor,
             text_encoder=self._text_encoder,
         )
+        if self._config.data.encoding_mode == "online":
+            if self._text_encoder is None or self._config.data.online_encoding is None:
+                raise RuntimeError("Online encoding requires a loaded Gemma text encoder and online_encoding config")
+            online_config = self._config.data.online_encoding
+            encoder_dtype = {
+                "bfloat16": torch.bfloat16,
+                "float16": torch.float16,
+                "float32": torch.float32,
+            }[online_config.encoder_dtype]
+            vae_device = init_device if online_config.encoder_device_policy == "resident_cuda" else torch.device("cpu")
+            logger.debug("Loading frozen video VAE encoder for online target/reference encoding...")
+            self._online_vae_encoder = load_video_vae_encoder(
+                self._config.model.model_path,
+                device=vae_device,
+                dtype=encoder_dtype,
+            )
+            from ltx_trainer.online_data.online_batch_encoder import OnlineBatchEncoder  # noqa: PLC0415
+
+            self._online_batch_encoder = OnlineBatchEncoder(
+                config=online_config,
+                model_path=self._config.model.model_path,
+                text_encoder_path=self._config.model.text_encoder_path,
+                vae_encoder=self._online_vae_encoder,
+                text_encoder=self._text_encoder,
+                embeddings_processor=self._embeddings_processor,
+                device=init_device,
+            )
 
     def _setup_trainable_model_wrappers(self) -> None:
         """Create LoRA wrappers before loading an initialization checkpoint."""
@@ -1358,6 +1438,9 @@ class LtxvTrainer:
 
     def _init_dataloader(self) -> None:
         """Initialize the training data loader using the strategy's data sources."""
+        if self._config.data.encoding_mode == "online":
+            self._init_online_dataloader()
+            return
         if self._dataset is None:
             # Get data sources from the training strategy
             data_sources = self._config.training_strategy.get_data_sources()
@@ -1378,6 +1461,189 @@ class LtxvTrainer:
         )
 
         self._dataloader = self._accelerator.prepare(dataloader)
+
+    def _init_online_dataloader(self) -> None:
+        from ltx_trainer.online_data.distributed_multitask_sampler import (  # noqa: PLC0415
+            DistributedMultiTaskMicrobatchSampler,
+        )
+        from ltx_trainer.online_data.manifest import load_multitask_data_config  # noqa: PLC0415
+        from ltx_trainer.online_data.multitask_dataset import (  # noqa: PLC0415
+            OnlineMultiTaskDataset,
+            collate_online_raw_batch,
+        )
+
+        data_config = self._config.data
+        online_config = data_config.online_encoding
+        if online_config is None or data_config.manifest_path is None or data_config.train_data_config is None:
+            raise RuntimeError("Online dataloader requires manifest_path, train_data_config, and online_encoding")
+        if self._dataset is None:
+            self._dataset = OnlineMultiTaskDataset(
+                data_config.manifest_path,
+                width=online_config.width,
+                height=online_config.height,
+                max_ref_images=online_config.max_ref_images,
+            )
+
+        source_config = load_multitask_data_config(data_config.train_data_config)
+        configured_ratios: dict[str, float] = {}
+        for dataset in source_config["datasets"]:
+            task = str(dataset.get("task"))
+            configured_ratios[task] = configured_ratios.get(task, 0.0) + float(
+                dataset.get("ratio", dataset.get("weight", 0.0))
+            )
+        expected_ratios = {"i2i": online_config.image_ratio, "r2v": online_config.video_ratio}
+        if any(abs(configured_ratios.get(task, -1.0) - ratio) > 1.0e-8 for task, ratio in expected_ratios.items()):
+            raise ValueError(
+                f"train_data_config ratios {configured_ratios} do not match online_encoding ratios {expected_ratios}"
+            )
+
+        self._online_sampler = DistributedMultiTaskMicrobatchSampler(
+            self._dataset.task_indices,
+            total_optimizer_steps=self._config.optimization.steps,
+            gradient_accumulation_steps=self._config.optimization.gradient_accumulation_steps,
+            rank=self._accelerator.process_index,
+            world_size=self._accelerator.num_processes,
+            seed=self._config.seed,
+            image_ratio=online_config.image_ratio,
+            video_ratio=online_config.video_ratio,
+        )
+        if self._pending_online_data_state is not None:
+            self._online_sampler.load_state_dict(self._pending_online_data_state)
+            sampler_state = self._online_sampler.state_dict()
+            if (
+                sampler_state["task_schedule_cursor"] != self._resume_initial_step
+                or sampler_state["microstep_in_optimizer_step"] != 0
+            ):
+                raise RuntimeError(
+                    "Online sampler/training-state step mismatch: "
+                    f"global_step={self._resume_initial_step}, "
+                    f"task_schedule_cursor={sampler_state['task_schedule_cursor']}, "
+                    f"microstep={sampler_state['microstep_in_optimizer_step']}"
+                )
+        elif self._resume_initial_step > 0:
+            logger.warning(
+                "Online resume state has no sampler fields; reconstructing the deterministic sampler "
+                f"at optimizer step {self._resume_initial_step}."
+            )
+            self._online_sampler.seek_optimizer_step(self._resume_initial_step)
+
+        workers = data_config.num_dataloader_workers
+        dataloader_kwargs: dict[str, Any] = {
+            "dataset": self._dataset,
+            "batch_size": 1,
+            "sampler": self._online_sampler,
+            "shuffle": False,
+            "drop_last": True,
+            "collate_fn": collate_online_raw_batch,
+            "num_workers": workers,
+            "pin_memory": online_config.pin_memory,
+            "persistent_workers": workers > 0,
+        }
+        if workers > 0:
+            dataloader_kwargs["prefetch_factor"] = online_config.prefetch_factor
+        # The sampler is already rank-aware. Preparing this DataLoader would
+        # shard it a second time under Accelerate.
+        self._dataloader = DataLoader(**dataloader_kwargs)
+
+        image_steps = int(round(self._config.optimization.steps * online_config.image_ratio))
+        video_steps = self._config.optimization.steps - image_steps
+        effective_batch = self._effective_global_batch_size(
+            batch_size=1,
+            num_processes=self._accelerator.num_processes,
+            gradient_accumulation_steps=self._config.optimization.gradient_accumulation_steps,
+        )
+        logger.info(
+            "Online multi-task schedule: "
+            f"{image_steps} I2I optimizer steps, {video_steps} R2V optimizer steps, "
+            f"effective global batch={effective_batch}, "
+            f"exposures/stage={effective_batch * self._config.optimization.steps}. "
+            "If Stage 1, Stage 2, and Stage 3 each run this schedule, "
+            f"three-stage exposures={3 * effective_batch * self._config.optimization.steps}."
+        )
+
+    def _prepare_online_batch_with_retry(self, initial_raw_batch: dict[str, Any]) -> dict[str, Any]:
+        from ltx_trainer.online_data.multitask_dataset import (  # noqa: PLC0415
+            SampleLoadError,
+            collate_online_raw_batch,
+        )
+
+        if self._online_batch_encoder is None or self._online_sampler is None:
+            raise RuntimeError("Online batch encoder/sampler were not initialized")
+        online_config = self._config.data.online_encoding
+        if online_config is None:
+            raise RuntimeError("online_encoding config is missing")
+
+        raw_batch = initial_raw_batch
+        last_error: Exception | SampleLoadError | None = None
+        for attempt in range(online_config.runtime_max_retries + 1):
+            raw_errors = raw_batch.get("sample_load_errors", [])
+            local_raw_failed = bool(raw_errors)
+            if self._synchronize_online_failure(local_raw_failed):
+                if local_raw_failed:
+                    last_error = raw_errors[0]
+                    self._log_online_reject(raw_errors[0], attempt=attempt, phase="decode")
+                raw_batch = self._load_online_retry_batch(attempt + 1, collate_online_raw_batch)
+                continue
+
+            encoded_batch = None
+            encode_error: Exception | None = None
+            try:
+                encoded_batch = self._online_batch_encoder.encode_for_strategy(
+                    raw_batch,
+                    strategy=self._training_strategy,
+                    training_phase=getattr(self._training_strategy.config, "training_phase", "stage1"),
+                )
+            except Exception as exc:  # synchronize before any rank enters the trainable graph
+                encode_error = exc
+            if not self._synchronize_online_failure(encode_error is not None):
+                if encoded_batch is None:
+                    raise RuntimeError("Online encoding returned no batch without reporting an error")
+                return encoded_batch
+            if encode_error is not None:
+                last_error = encode_error
+                self._log_online_reject(encode_error, attempt=attempt, phase="encode")
+            raw_batch = self._load_online_retry_batch(attempt + 1, collate_online_raw_batch)
+
+        raise RuntimeError(
+            f"Online data exceeded runtime_max_retries={online_config.runtime_max_retries}; "
+            f"last error: {last_error}"
+        )
+
+    def _load_online_retry_batch(self, attempt: int, collate_fn: Callable) -> dict[str, Any]:
+        retry_index = self._online_sampler.retry_index(attempt)
+        return collate_fn([self._dataset[retry_index]])
+
+    def _synchronize_online_failure(self, local_failed: bool) -> bool:
+        flag = torch.tensor(
+            [1 if local_failed else 0],
+            dtype=torch.int32,
+            device=self._accelerator.device,
+        )
+        reduced = self._accelerator.reduce(flag, reduction="max")
+        return bool(reduced.item())
+
+    def _log_online_reject(self, error: Any, *, attempt: int, phase: str) -> None:
+        from ltx_trainer.online_data.path_safety import assert_write_path_allowed  # noqa: PLC0415
+
+        online_config = self._config.data.online_encoding
+        if online_config is None:
+            return
+        log_dir = (
+            Path(online_config.runtime_reject_log_dir)
+            if online_config.runtime_reject_log_dir is not None
+            else Path(self._config.output_dir).parent / "logs"
+        )
+        log_path = assert_write_path_allowed(
+            log_dir / f"runtime_rejected_rank_{self._accelerator.process_index}.jsonl"
+        )
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        if hasattr(error, "to_dict"):
+            payload = error.to_dict()
+        else:
+            payload = {"error_type": type(error).__name__, "message": str(error)}
+        payload.update({"attempt": attempt, "phase": phase, "global_step": self._global_step})
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
 
     def _init_lora_weights(self) -> None:
         """Initialize LoRA weights for the transformer."""
@@ -1954,6 +2220,11 @@ class LtxvTrainer:
             lr_scheduler_state_dict=self._lr_scheduler.state_dict() if self._lr_scheduler is not None else None,
             optimizer_state_dict=optimizer_state,
             wandb_run_id=self._wandb_run.id if self._wandb_run is not None else None,
+            data_state=(
+                self._online_sampler.state_dict()
+                if self._config.data.encoding_mode == "online" and self._online_sampler is not None
+                else None
+            ),
         )
 
         state_path = save_dir / f"training_state_step_{self._global_step:05d}.pt"

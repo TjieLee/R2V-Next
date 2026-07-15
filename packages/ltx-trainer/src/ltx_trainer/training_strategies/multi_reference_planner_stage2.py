@@ -108,6 +108,14 @@ class MultiReferencePlannerStage2Config(MultiReferenceVideoConfig):
         description="Bool mask selecting the fixed learnable planner placeholder positions in the VLM sequence.",
     )
 
+    vlm_output_mask_key: str = Field(
+        default="planner_output_mask",
+        description=(
+            "Bool [B,planner_token_count] mask selecting valid planner outputs. "
+            "Missing legacy caches fall back to all placeholder outputs being valid."
+        ),
+    )
+
     vlm_hidden_layer: int = Field(
         default=-1,
         description="Gemma language-model hidden-state layer used as predicted visual tokens.",
@@ -577,14 +585,14 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
             )
             self._last_siglip_loss = self._last_planner_mse_loss
 
-        diagnostic_mask = predicted_mask.unsqueeze(-1).to(dtype=predicted_tokens.dtype)
-        masked_predicted = predicted_tokens * diagnostic_mask
-        masked_gt = gt_tokens * diagnostic_mask
-        self._last_siglip_cosine = F.cosine_similarity(masked_predicted, masked_gt, dim=-1).mean(dim=1)
-        self._last_predicted_token_std = predicted_tokens.float().std(dim=(1, 2))
-        self._last_gt_token_std = gt_tokens.float().std(dim=(1, 2))
-        self._last_predicted_token_norm = predicted_tokens.float().norm(dim=-1).mean(dim=1)
-        self._last_gt_token_norm = gt_tokens.float().norm(dim=-1).mean(dim=1)
+        cosine = F.cosine_similarity(predicted_tokens, gt_tokens, dim=-1)
+        mask_float = predicted_mask.to(dtype=cosine.dtype)
+        mask_denominator = mask_float.sum(dim=1).clamp(min=1.0)
+        self._last_siglip_cosine = cosine.mul(mask_float).sum(dim=1) / mask_denominator
+        self._last_predicted_token_std = self._masked_visual_stat(predicted_tokens, predicted_mask, "std")
+        self._last_gt_token_std = self._masked_visual_stat(gt_tokens, predicted_mask, "std")
+        self._last_predicted_token_norm = self._masked_visual_stat(predicted_tokens, predicted_mask, "norm")
+        self._last_gt_token_norm = self._masked_visual_stat(gt_tokens, predicted_mask, "norm")
 
         batch["_planner_predicted_raw_tokens"] = predicted_tokens
         batch["_planner_predicted_mask"] = predicted_mask
@@ -827,6 +835,7 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
             planner_hidden_source,
             placeholder_mask,
         )
+        selected_mask = self._resolve_planner_output_mask(planner_forward_data, selected_mask)
         predicted_tokens = self.planner_tokens(
             planner_hidden=selected_hidden,
             query_registers=self._planner_query_registers,
@@ -1120,6 +1129,7 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
             planner_hidden_source,
             placeholder_mask,
         )
+        selected_mask = self._resolve_planner_output_mask(planner_data, selected_mask)
         predicted_tokens = self.planner_tokens(
             planner_hidden=selected_hidden,
             query_registers=self._planner_query_registers,
@@ -1570,11 +1580,45 @@ class MultiReferencePlannerStage2Strategy(MultiReferenceVideoStrategy):
         if mask.shape != tokens.shape[:2]:
             raise ValueError(f"{name} mask must be [B,K], got {tuple(mask.shape)}")
         counts = mask.sum(dim=1)
-        if not torch.all(counts == self.config.planner_token_count):
+        if torch.any(counts <= 0) or torch.any(counts > self.config.planner_token_count):
             raise ValueError(
-                f"{name} valid counts {counts.tolist()} must all equal planner_token_count="
-                f"{self.config.planner_token_count}."
+                f"{name} valid counts {counts.tolist()} must be in [1,{self.config.planner_token_count}]."
             )
+
+    def _resolve_planner_output_mask(self, planner_data: dict[str, Any], fallback_mask: Tensor) -> Tensor:
+        output_mask = planner_data.get(self.config.vlm_output_mask_key)
+        if output_mask is None:
+            return fallback_mask
+        if not isinstance(output_mask, Tensor):
+            raise ValueError(f"{self.config.vlm_output_mask_key} must be a tensor")
+        output_mask = output_mask.to(device=fallback_mask.device, dtype=torch.bool)
+        if output_mask.ndim == 1:
+            output_mask = output_mask.unsqueeze(0)
+        if output_mask.shape != fallback_mask.shape:
+            raise ValueError(
+                f"{self.config.vlm_output_mask_key} must have shape {tuple(fallback_mask.shape)}, "
+                f"got {tuple(output_mask.shape)}"
+            )
+        if torch.any(output_mask & ~fallback_mask):
+            raise ValueError("planner_output_mask cannot select positions outside planner placeholders")
+        if torch.any(output_mask.sum(dim=1) <= 0):
+            raise ValueError("planner_output_mask must keep at least one output per sample")
+        return output_mask
+
+    @staticmethod
+    def _masked_visual_stat(tokens: Tensor, mask: Tensor, statistic: str) -> Tensor:
+        values: list[Tensor] = []
+        for sample, sample_mask in zip(tokens.float(), mask, strict=True):
+            valid = sample[sample_mask]
+            if valid.numel() == 0:
+                values.append(sample.new_zeros(()))
+            elif statistic == "std":
+                values.append(valid.std(unbiased=False))
+            elif statistic == "norm":
+                values.append(valid.norm(dim=-1).mean())
+            else:
+                raise ValueError(f"Unsupported visual statistic {statistic!r}")
+        return torch.stack(values)
 
     def _assert_placeholder_mask(self, placeholder_mask: Tensor) -> None:
         counts = placeholder_mask.sum(dim=1)

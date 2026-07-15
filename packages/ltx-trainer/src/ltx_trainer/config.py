@@ -418,12 +418,65 @@ class AccelerationConfig(ConfigBaseModel):
     )
 
 
+class OnlineEncodingConfig(ConfigBaseModel):
+    """GPU encoder and fixed-shape contract for online multi-task data."""
+
+    width: int = Field(default=832, ge=32)
+    height: int = Field(default=480, ge=32)
+    image_num_frames: int = Field(default=1, ge=1)
+    image_fps: float = Field(default=1.0, gt=0.0)
+    video_num_frames: int = Field(default=121, ge=1)
+    video_fps: float = Field(default=24.0, gt=0.0)
+    vlm_video_frame_indices: list[int] = Field(default_factory=lambda: [0, 17, 34, 51, 69, 86, 103, 120])
+    visual_token_capacity: int = Field(default=2048, ge=1)
+    tokens_per_frame: int = Field(default=256, ge=1)
+    raw_visual_dim: int = Field(default=3840, ge=1)
+    encoder_dtype: Literal["bfloat16", "float16", "float32"] = "bfloat16"
+    encoder_device_policy: Literal["resident_cuda", "sequential_cuda", "cpu_offload"] = "resident_cuda"
+    pin_memory: bool = True
+    prefetch_factor: int = Field(default=2, ge=1)
+    planner_max_length: int = Field(default=4096, ge=2051)
+    max_ref_images: int | None = Field(default=4, ge=1)
+    image_ratio: float = Field(default=0.3, ge=0.0, le=1.0)
+    video_ratio: float = Field(default=0.7, ge=0.0, le=1.0)
+    runtime_max_retries: int = Field(default=8, ge=0)
+    runtime_reject_log_dir: str | None = None
+
+    @model_validator(mode="after")
+    def validate_online_contract(self) -> "OnlineEncodingConfig":
+        if self.width % 32 != 0 or self.height % 32 != 0:
+            raise ValueError(f"Online width/height must be divisible by 32, got {self.width}x{self.height}")
+        if self.image_num_frames != 1 or self.image_fps != 1.0:
+            raise ValueError("Online I2I requires image_num_frames=1 and image_fps=1.0")
+        if self.video_num_frames != 121 or self.video_num_frames % 8 != 1 or self.video_fps != 24.0:
+            raise ValueError("Online R2V requires video_num_frames=121, frames % 8 == 1, and video_fps=24.0")
+        if self.vlm_video_frame_indices != [0, 17, 34, 51, 69, 86, 103, 120]:
+            raise ValueError("Online 121-frame training requires fixed VLM indices [0,17,34,51,69,86,103,120]")
+        if self.visual_token_capacity != 2048 or self.tokens_per_frame != 256:
+            raise ValueError("Online full-token training requires visual_token_capacity=2048 and tokens_per_frame=256")
+        if self.raw_visual_dim != 3840:
+            raise ValueError("Online SigLIP/projector tokens must use raw_visual_dim=3840")
+        if abs(self.image_ratio + self.video_ratio - 1.0) > 1.0e-8:
+            raise ValueError("image_ratio and video_ratio must sum to 1.0")
+        return self
+
+
 class DataConfig(ConfigBaseModel):
     """Configuration for data loading and processing"""
 
-    preprocessed_data_root: str = Field(
+    encoding_mode: Literal["precomputed", "online"] = Field(
+        default="precomputed",
+        description="Data encoding path. The default preserves legacy PrecomputedDataset behavior.",
+    )
+
+    preprocessed_data_root: str | None = Field(
+        default=None,
         description="Path to folder containing preprocessed training data",
     )
+
+    train_data_config: str | None = Field(default=None, description="Multi-task source configuration for online data")
+    manifest_path: str | None = Field(default=None, description="Final deterministic online JSONL manifest")
+    online_encoding: OnlineEncodingConfig | None = None
 
     num_dataloader_workers: int = Field(
         default=2,
@@ -433,14 +486,41 @@ class DataConfig(ConfigBaseModel):
 
     @field_validator("preprocessed_data_root")
     @classmethod
-    def validate_preprocessed_data_root(cls, v: str) -> str:
+    def validate_preprocessed_data_root(cls, v: str | None) -> str | None:
         """Validate that preprocessed_data_root exists."""
+        if v is None:
+            return None
         path = Path(v).expanduser().resolve()
         if not path.exists():
             raise ValueError(f"Dataset path does not exist: {v}")
         if not path.is_dir():
             raise ValueError(f"Dataset path is not a directory: {v}")
         return str(path)
+
+    @model_validator(mode="after")
+    def validate_encoding_mode(self) -> "DataConfig":
+        if self.encoding_mode == "precomputed":
+            if self.preprocessed_data_root is None:
+                raise ValueError("precomputed data requires preprocessed_data_root")
+            return self
+
+        missing = [
+            name
+            for name, value in (
+                ("train_data_config", self.train_data_config),
+                ("manifest_path", self.manifest_path),
+                ("online_encoding", self.online_encoding),
+            )
+            if value is None
+        ]
+        if missing:
+            raise ValueError(f"online data requires: {', '.join(missing)}")
+        for name, value in (("train_data_config", self.train_data_config), ("manifest_path", self.manifest_path)):
+            path = Path(str(value)).expanduser().resolve()
+            if not path.is_file():
+                raise ValueError(f"Online {name} does not exist: {path}")
+            setattr(self, name, str(path))
+        return self
 
 
 class ValidationConfig(ConfigBaseModel):
@@ -836,6 +916,10 @@ class LtxTrainerConfig(ConfigBaseModel):
 
     def _validate_data_dirs_exist(self) -> None:
         """Verify that every directory declared by the training strategy exists under the data root."""
+        if self.data.encoding_mode == "online":
+            return
+        if self.data.preprocessed_data_root is None:
+            raise ValueError("preprocessed_data_root is required for precomputed data")
         data_root = Path(self.data.preprocessed_data_root)
         for dir_name in self.training_strategy.get_data_sources():
             dir_path = data_root / dir_name
@@ -848,6 +932,16 @@ class LtxTrainerConfig(ConfigBaseModel):
     def validate_strategy_compatibility(self) -> "LtxTrainerConfig":
         """Validate that training strategy and other configurations are compatible."""
         self._validate_data_dirs_exist()
+
+        if self.data.encoding_mode == "online":
+            from ltx_trainer.online_data.path_safety import assert_write_path_allowed  # noqa: PLC0415
+
+            assert_write_path_allowed(self.output_dir)
+            online = self.data.online_encoding
+            if online is not None and online.runtime_reject_log_dir is not None:
+                assert_write_path_allowed(online.runtime_reject_log_dir)
+            if self.optimization.batch_size != 1:
+                raise ValueError("Online synchronized multi-task sampling currently requires optimization.batch_size=1")
 
         # Check that reference videos are provided when using video_to_video strategy
         if self.training_strategy.name == "video_to_video" and self.validation.interval:

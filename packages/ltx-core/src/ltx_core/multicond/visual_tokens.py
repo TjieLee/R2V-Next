@@ -266,7 +266,10 @@ class VisualPlannerTokens(nn.Module):
         ffn_out = self.ffn_fc2(ffn_hidden)
         if self.training and self.ffn_dropout > 0:
             ffn_out = F.dropout(ffn_out, p=self.ffn_dropout)
-        return x + ffn_out
+        output = x + ffn_out
+        if planner_mask is not None:
+            output = output * planner_mask.to(device=output.device, dtype=output.dtype).unsqueeze(-1)
+        return output
 
     def _scaled_dot_product_attention(
         self,

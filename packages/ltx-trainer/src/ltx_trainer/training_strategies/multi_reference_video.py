@@ -929,6 +929,33 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
                 "Expected 2048-token layout as 8 frames * 16 * 16 tokens, got "
                 f"frame_count={frame_count}, spatial_grid={spatial_grid}, tokens_per_frame={tokens_per_frame}"
             )
+        sampled_frame_mask = visual_data.get("sampled_frame_mask")
+        valid_frame_counts = visual_data.get("num_valid_vlm_frames")
+        visual_token_mask = visual_data.get(self.config.visual_token_mask_key)
+        if sampled_frame_mask is not None:
+            sampled_frame_mask = sampled_frame_mask.to(dtype=torch.bool)
+            if sampled_frame_mask.ndim == 1:
+                sampled_frame_mask = sampled_frame_mask.unsqueeze(0)
+            if sampled_frame_mask.shape[1] != frame_count:
+                raise ValueError(
+                    f"sampled_frame_mask must have {frame_count} frame slots, got {tuple(sampled_frame_mask.shape)}"
+                )
+            if valid_frame_counts is not None:
+                valid_frame_counts = valid_frame_counts.to(dtype=torch.long).flatten()
+                if not torch.equal(
+                    sampled_frame_mask.sum(dim=1),
+                    valid_frame_counts.to(device=sampled_frame_mask.device),
+                ):
+                    raise ValueError("sampled_frame_mask does not match num_valid_vlm_frames")
+            if visual_token_mask is not None:
+                token_mask = visual_token_mask.to(dtype=torch.bool)
+                if token_mask.ndim == 1:
+                    token_mask = token_mask.unsqueeze(0)
+                expected_mask = sampled_frame_mask.repeat_interleave(tokens_per_frame, dim=1)
+                if token_mask.shape != expected_mask.shape or not torch.equal(
+                    token_mask.to(device=expected_mask.device), expected_mask
+                ):
+                    raise ValueError("visual_token_mask must match sampled_frame_mask expanded by tokens_per_frame")
 
     def _run_visual_connector(self, visual_context: Tensor, visual_mask: Tensor) -> tuple[Tensor, Tensor]:
         if self._visual_connector is None:
@@ -1118,6 +1145,18 @@ class MultiReferenceVideoStrategy(TrainingStrategy):
                         f"{frame_count} after stride={self.config.visual_token_frame_stride}"
                     )
                 sampled_indices = strided[:, :frame_count]
+
+        sampled_frame_mask = visual_data.get("sampled_frame_mask")
+        if sampled_frame_mask is not None:
+            sampled_frame_mask = sampled_frame_mask.to(device=device, dtype=torch.bool)
+            if sampled_frame_mask.ndim == 1:
+                sampled_frame_mask = sampled_frame_mask.unsqueeze(0)
+            if sampled_frame_mask.shape != sampled_indices.shape:
+                raise ValueError(
+                    f"sampled_frame_mask shape {tuple(sampled_frame_mask.shape)} does not match "
+                    f"sampled_frame_indices {tuple(sampled_indices.shape)}"
+                )
+            sampled_indices = sampled_indices.masked_fill(~sampled_frame_mask, 0)
 
         fps = visual_data.get("source_fps")
         if fps is None:

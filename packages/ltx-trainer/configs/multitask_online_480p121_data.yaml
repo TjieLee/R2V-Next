@@ -1,0 +1,18 @@
+# Raw annotation sources. This file is read-only input to the deterministic
+# manifest builder; all generated files must be written under litengjie.
+data_root: null
+datasets:
+  - name: "i2i_train"
+    task: "i2i"
+    dataset_type: "I2IDataset"
+    ann_path: "/mnt/workspace/liutao/data_process_one2x/r2i_train_data.jsonl"
+    ratio: 0.3
+    video_sample_n_frames: 1
+    target_fps: 1.0
+  - name: "r2v_opens2v"
+    task: "r2v"
+    dataset_type: "OpenS2VDataset"
+    ann_path: "/mnt/workspace/liutao/data_process_one2x/opens2v_train_data.parquet"
+    ratio: 0.7
+    video_sample_n_frames: 121
+    target_fps: 24.0

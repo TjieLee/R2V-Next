@@ -1,0 +1,131 @@
+# Stage 1 online I2I/R2V training. 30K optimizer steps * global batch 32
+# equals 960,000 sample exposures (288K I2I + 672K R2V).
+model:
+  model_path: "/mnt/workspace/litengjie/LTX-2/models/LTX-2.3/ltx-2.3-22b-dev.safetensors"
+  text_encoder_path: "/mnt/workspace/litengjie/LTX-2/models/gemma-3-12b-it-qat-q4_0-unquantized"
+  training_mode: "lora"
+  load_checkpoint: null
+
+lora:
+  rank: 128
+  alpha: 128
+  dropout: 0.0
+  target_modules:
+    - "attn1.to_k"
+    - "attn1.to_q"
+    - "attn1.to_v"
+    - "attn1.to_out.0"
+    - "attn2.to_k"
+    - "attn2.to_q"
+    - "attn2.to_v"
+    - "attn2.to_out.0"
+    - "ff.net.0.proj"
+    - "ff.net.2"
+
+training_strategy:
+  name: "multi_reference_video"
+  conditions_dir: "vlm_conditions"
+  reference_latents_dir: "multi_reference_latents"
+  gt_visual_tokens_dir: "gt_siglip_tokens"
+  visual_token_key: "visual_tokens"
+  visual_token_mask_key: "visual_token_mask"
+  visual_tokens_per_frame_key: "tokens_per_frame"
+  visual_token_frame_stride: 1
+  visual_token_source_dim: 3840
+  visual_token_target_dim: 4096
+  visual_branch_enabled: true
+  visual_context_mode: "full_tokens_3d_sa"
+  visual_context_expected_tokens: 2048
+  visual_context_max_tokens: 2048
+  visual_full_sa_num_heads: 32
+  visual_full_sa_depth: 1
+  visual_full_sa_ffn_multiplier: 2.0
+  visual_full_sa_dropout: 0.0
+  visual_full_sa_residual_init_gain: 0.1
+  visual_full_sa_use_middle_positions: true
+  visual_connector_enabled: false
+  train_text_connector: false
+  cfg_dropout_enabled: true
+  cfg_full_p: 0.40
+  cfg_drop_text_p: 0.30
+  cfg_drop_siglip_p: 0.15
+  cfg_drop_ref_latents_p: 0.05
+  cfg_drop_all_p: 0.10
+  max_ref_images_per_sample: 4
+  reference_time_stride: 1.0
+  first_frame_conditioning_p: 0.0
+
+optimization:
+  learning_rate: 5.0e-5
+  steps: 30000
+  batch_size: 1
+  gradient_accumulation_steps: 4
+  max_grad_norm: 1.0
+  optimizer_type: "adamw"
+  scheduler_type: "linear"
+  scheduler_params: {}
+  enable_gradient_checkpointing: true
+
+acceleration:
+  mixed_precision_mode: "bf16"
+  quantization: null
+  load_text_encoder_in_8bit: false
+  offload_optimizer_during_validation: false
+
+data:
+  encoding_mode: "online"
+  train_data_config: "/mnt/workspace/litengjie/jd_ltx_multitask_online_480p121/manifests/multitask_480p121.yaml"
+  manifest_path: "/mnt/workspace/litengjie/jd_ltx_multitask_online_480p121/manifests/train_unique.jsonl"
+  num_dataloader_workers: 2
+  online_encoding:
+    width: 832
+    height: 480
+    image_num_frames: 1
+    image_fps: 1.0
+    video_num_frames: 121
+    video_fps: 24.0
+    vlm_video_frame_indices: [0, 17, 34, 51, 69, 86, 103, 120]
+    visual_token_capacity: 2048
+    tokens_per_frame: 256
+    raw_visual_dim: 3840
+    encoder_dtype: "bfloat16"
+    encoder_device_policy: "resident_cuda"
+    pin_memory: true
+    prefetch_factor: 2
+    planner_max_length: 4096
+    max_ref_images: 4
+    image_ratio: 0.3
+    video_ratio: 0.7
+    runtime_max_retries: 8
+    runtime_reject_log_dir: "/mnt/workspace/litengjie/jd_ltx_multitask_online_480p121/logs"
+
+validation:
+  interval: null
+  skip_initial_validation: true
+  generate_audio: false
+  generate_video: true
+
+checkpoints:
+  interval: 2500
+  keep_last_n: 2
+  precision: "bfloat16"
+  no_resume: false
+  save_training_state: "full"
+
+hub:
+  push_to_hub: false
+  hub_model_id: null
+
+flow_matching:
+  timestep_sampling_mode: "shifted_logit_normal"
+  timestep_sampling_params: {}
+
+wandb:
+  enabled: false
+  project: "jd-ltx-multitask-online-480p121"
+  entity: null
+  tags: ["multi-reference", "stage1", "online", "480p", "121f"]
+  log_validation_videos: false
+
+seed: 42
+output_dir: "/mnt/workspace/litengjie/jd_ltx_multitask_online_480p121/stage1"
