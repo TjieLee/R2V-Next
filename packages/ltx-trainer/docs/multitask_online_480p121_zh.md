@@ -32,6 +32,10 @@ I2I 字段不会在代码中猜测。先从报告确认 target、source/referenc
 
 ## 2. 构建并验证确定性 manifest
 
+大规模数据推荐使用可并行、可断点续建的分片流程，完整命令、目录结构和恢复语义见
+[`parallel_manifest_sharded_resume_zh.md`](parallel_manifest_sharded_resume_zh.md)。下面的旧单进程 builder
+仍保持兼容，适合小数据或已有任务继续运行。
+
 ```bash
 cp configs/multitask_online_480p121_data.yaml \
   /mnt/workspace/litengjie/jd_ltx_multitask_online_480p121/manifests/multitask_480p121.yaml

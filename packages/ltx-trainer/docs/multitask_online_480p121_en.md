@@ -17,6 +17,10 @@ path is selected only by `data.encoding_mode: online`.
 
 ## Prepare the deterministic manifest
 
+For large sources, use the parallel, sharded, resumable workflow in
+[`parallel_manifest_sharded_resume_en.md`](parallel_manifest_sharded_resume_en.md). The legacy single-process
+builder below remains compatible and is still appropriate for small datasets or an already-running build.
+
 Run `scripts/inspect_multitask_sources.py` first. I2I column names are deliberately not guessed. Use the
 reported target, source/reference, and instruction/caption names when invoking the builder.
 

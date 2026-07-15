@@ -5,7 +5,10 @@ from __future__ import annotations
 from pathlib import Path
 
 _ALLOWED_WRITE_ROOT = Path("/mnt/workspace/litengjie")
-_FORBIDDEN_WRITE_ROOT = Path("/mnt/workspace/liutao")
+_FORBIDDEN_WRITE_ROOTS = (
+    Path("/mnt/workspace/liutao"),
+    Path("/mnt/workspace/jiangyuxiang2"),
+)
 
 
 def _is_relative_to(path: Path, root: Path) -> bool:
@@ -20,9 +23,9 @@ def assert_write_path_allowed(path: str | Path) -> Path:
     """Resolve and validate a write path without creating it."""
     resolved = Path(path).expanduser().resolve()
     allowed_root = _ALLOWED_WRITE_ROOT.resolve()
-    forbidden_root = _FORBIDDEN_WRITE_ROOT.resolve()
-    if _is_relative_to(resolved, forbidden_root):
-        raise ValueError(f"Writing under {_FORBIDDEN_WRITE_ROOT} is forbidden: {resolved}")
+    for forbidden_root in _FORBIDDEN_WRITE_ROOTS:
+        if _is_relative_to(resolved, forbidden_root.resolve()):
+            raise ValueError(f"Writing under {forbidden_root} is forbidden: {resolved}")
     if not _is_relative_to(resolved, allowed_root):
         raise ValueError(f"Online training writes must stay under {_ALLOWED_WRITE_ROOT}: {resolved}")
     return resolved
