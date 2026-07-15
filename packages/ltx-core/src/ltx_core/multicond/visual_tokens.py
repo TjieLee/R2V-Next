@@ -673,11 +673,48 @@ class Visual3DResampler(nn.Module):
         batch_size, _heads, seq_len, head_dim = value.shape
         return value.transpose(1, 2).reshape(batch_size, seq_len, -1)
 
+
+def module_compute_device_dtype(module: nn.Module) -> tuple[torch.device, torch.dtype] | None:
+    """Return the first floating parameter/buffer device and dtype, including wrapped modules."""
+    candidates: list[nn.Module] = []
+    current = module
+    seen: set[int] = set()
+    while id(current) not in seen:
+        candidates.append(current)
+        seen.add(id(current))
+        wrapped = getattr(current, "module", None)
+        if not isinstance(wrapped, nn.Module):
+            break
+        current = wrapped
+
+    for candidate in candidates:
+        for parameter in candidate.parameters():
+            if parameter.is_floating_point():
+                return parameter.device, parameter.dtype
+        for buffer in candidate.buffers():
+            if buffer.is_floating_point():
+                return buffer.device, buffer.dtype
+    return None
+
+
+def _unwrapped_module_name(module: nn.Module) -> str:
+    current = module
+    seen: set[int] = set()
+    while id(current) not in seen:
+        seen.add(id(current))
+        wrapped = getattr(current, "module", None)
+        if not isinstance(wrapped, nn.Module):
+            break
+        current = wrapped
+    return type(current).__name__
+
+
 def extract_projected_visual_tokens(
     gemma_causal_lm: nn.Module,
     pixel_values: Tensor,
     *,
     image_counts: Tensor | None = None,
+    dtype_diagnostics: dict[str, str] | None = None,
 ) -> VisualTokenBatch:
     """Run frozen Gemma/SigLIP vision tower + projector and return flattened tokens.
 
@@ -696,10 +733,30 @@ def extract_projected_visual_tokens(
     pixel_values, batch_size, images_per_sample = _normalize_pixel_values(pixel_values)
     flat_pixels = pixel_values.reshape(batch_size * images_per_sample, *pixel_values.shape[-3:])
 
+    vision_compute = module_compute_device_dtype(vision_tower)
+    if vision_compute is not None:
+        flat_pixels = flat_pixels.to(device=vision_compute[0], dtype=vision_compute[1])
+    if dtype_diagnostics is not None:
+        dtype_diagnostics["vision_module"] = _unwrapped_module_name(vision_tower)
+        dtype_diagnostics["vision_input_dtype"] = str(flat_pixels.dtype)
+        dtype_diagnostics["vision_input_device"] = str(flat_pixels.device)
     vision_outputs = vision_tower(pixel_values=flat_pixels)
     vision_hidden = _last_hidden_state(vision_outputs)
+    if dtype_diagnostics is not None:
+        dtype_diagnostics["vision_output_dtype"] = str(vision_hidden.dtype)
+        dtype_diagnostics["vision_output_device"] = str(vision_hidden.device)
+    projector_compute = module_compute_device_dtype(projector)
+    if projector_compute is not None:
+        vision_hidden = vision_hidden.to(device=projector_compute[0], dtype=projector_compute[1])
+    if dtype_diagnostics is not None:
+        dtype_diagnostics["projector_module"] = _unwrapped_module_name(projector)
+        dtype_diagnostics["projector_input_dtype"] = str(vision_hidden.dtype)
+        dtype_diagnostics["projector_input_device"] = str(vision_hidden.device)
     projected = _call_projector(projector, vision_hidden)
     projected = _last_hidden_state(projected)
+    if dtype_diagnostics is not None:
+        dtype_diagnostics["projector_output_dtype"] = str(projected.dtype)
+        dtype_diagnostics["projector_output_device"] = str(projected.device)
 
     if projected.ndim != 3:
         raise ValueError(f"Projected visual tokens must be [B*R,T,D], got {tuple(projected.shape)}")

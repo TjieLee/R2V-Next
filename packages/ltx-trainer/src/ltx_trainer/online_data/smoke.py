@@ -369,6 +369,7 @@ def _build_one_step_smoke_report(  # noqa: PLR0915
         "elapsed_seconds": time.perf_counter() - started,
         "training_stats": stats.model_dump(),
         "timings_ms": trainer._last_online_metrics,
+        "dtype_diagnostics": trainer._online_batch_encoder.last_dtype_diagnostics,
         "optimizer_update_audit": optimizer_audit,
         "frozen_parameter_audit": frozen_audit,
         "strategy_loss_audit": loss_audit,
@@ -482,6 +483,7 @@ def run_real_encode_check(
             )
     report = {
         "samples": encoded_reports,
+        "dtype_diagnostics": trainer._online_batch_encoder.last_dtype_diagnostics,
         "peak_vram_gb": (
             torch.cuda.max_memory_allocated() / (1024**3) if torch.cuda.is_available() else 0.0
         ),

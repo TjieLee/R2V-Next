@@ -12,7 +12,11 @@ from PIL import Image
 from torch import Tensor, nn
 from transformers import AutoImageProcessor, AutoTokenizer, Gemma3Processor
 
-from ltx_core.multicond.visual_tokens import extract_projected_visual_tokens, scatter_visual_tokens_into_embeddings
+from ltx_core.multicond.visual_tokens import (
+    extract_projected_visual_tokens,
+    module_compute_device_dtype,
+    scatter_visual_tokens_into_embeddings,
+)
 from ltx_core.text_encoders.gemma.config import GEMMA3_CONFIG_FOR_LTX
 from ltx_core.utils import find_matching_file
 from ltx_trainer.config import OnlineEncodingConfig
@@ -28,6 +32,27 @@ from ltx_trainer.online_data.visual_token_packing import (
     pack_visual_tokens,
     planner_output_mask_from_visual_mask,
 )
+
+
+class OnlineSampleEncodeError(RuntimeError):
+    """A data-specific online encoding failure for which sampling another row is valid."""
+
+
+def _align_floating_hidden_states_to_module(hidden_states: Any, module: nn.Module) -> Any:
+    compute = module_compute_device_dtype(module)
+    if compute is None:
+        return hidden_states
+
+    def align(value: Any) -> Any:
+        if isinstance(value, Tensor) and value.is_floating_point():
+            return value.to(device=compute[0], dtype=compute[1])
+        return value
+
+    if isinstance(hidden_states, tuple):
+        return tuple(align(value) for value in hidden_states)
+    if isinstance(hidden_states, list):
+        return [align(value) for value in hidden_states]
+    return align(hidden_states)
 
 
 def _to_pil(image: Tensor) -> Image.Image:
@@ -95,6 +120,7 @@ class OnlineBatchEncoder:
             "float16": torch.float16,
             "float32": torch.float32,
         }[config.encoder_dtype]
+        self.last_dtype_diagnostics: dict[str, str] = {}
 
         tokenizer_root = str(find_matching_file(text_encoder_path, "tokenizer.model").parent)
         processor_root = str(find_matching_file(text_encoder_path, "preprocessor_config.json").parent)
@@ -130,6 +156,37 @@ class OnlineBatchEncoder:
         self.vae_encoder.requires_grad_(False).eval()
         self._keep_frozen_visual_modules_eval()
 
+    def _frozen_encode_autocast(self) -> Any:
+        if self.device.type == "cuda" and self.dtype in {torch.bfloat16, torch.float16}:
+            return torch.autocast(device_type="cuda", dtype=self.dtype)
+        return nullcontext()
+
+    def _record_feature_extractor_inputs(
+        self,
+        hidden_states: Any,
+        feature_extractor: nn.Module,
+        attention_mask: Tensor,
+    ) -> None:
+        feature_compute = module_compute_device_dtype(feature_extractor)
+        candidates = hidden_states if isinstance(hidden_states, (tuple, list)) else (hidden_states,)
+        first_hidden = next(
+            (hidden for hidden in candidates if isinstance(hidden, Tensor) and hidden.is_floating_point()),
+            None,
+        )
+        feature_module = getattr(feature_extractor, "module", feature_extractor)
+        self.last_dtype_diagnostics["feature_extractor_module"] = type(feature_module).__name__
+        if first_hidden is not None:
+            self.last_dtype_diagnostics["feature_extractor_input_dtype"] = str(first_hidden.dtype)
+            self.last_dtype_diagnostics["feature_extractor_input_device"] = str(first_hidden.device)
+        if feature_compute is not None:
+            self.last_dtype_diagnostics["feature_extractor_weight_dtype"] = str(feature_compute[1])
+            self.last_dtype_diagnostics["feature_extractor_weight_device"] = str(feature_compute[0])
+        self.last_dtype_diagnostics["feature_extractor_attention_mask_dtype"] = str(attention_mask.dtype)
+
+    def _record_feature_extractor_output(self, video_features: Tensor) -> None:
+        self.last_dtype_diagnostics["feature_extractor_output_dtype"] = str(video_features.dtype)
+        self.last_dtype_diagnostics["feature_extractor_output_device"] = str(video_features.device)
+
     def encode_for_strategy(
         self,
         raw_batch: dict[str, Any],
@@ -138,6 +195,7 @@ class OnlineBatchEncoder:
         training_phase: str,
     ) -> dict[str, Any]:
         del training_phase
+        self.last_dtype_diagnostics = {}
         target_pixels = raw_batch["target_pixels"]
         if target_pixels.shape[0] != 1:
             raise ValueError("Online multi-task encoding currently requires local microbatch size 1")
@@ -228,7 +286,7 @@ class OnlineBatchEncoder:
     def _encode_target_latents(self, target_pixels: Tensor, fps: Tensor) -> dict[str, Tensor]:
         video = target_pixels.to(device=self.device, dtype=self.dtype, non_blocking=True)
         video = video.permute(0, 4, 1, 2, 3).div_(127.5).sub_(1.0)
-        with torch.inference_mode():
+        with torch.inference_mode(), self._frozen_encode_autocast():
             encoded = self.vae_encoder(video)
         return {
             "latents": encoded,
@@ -253,7 +311,7 @@ class OnlineBatchEncoder:
             flat.extend(torch.zeros_like(template) for _ in range(max_refs - len(references)))
         pixels = torch.stack(flat, dim=0).to(device=self.device, dtype=self.dtype, non_blocking=True)
         pixels = pixels.permute(0, 3, 1, 2).unsqueeze(2).div_(127.5).sub_(1.0)
-        with torch.inference_mode():
+        with torch.inference_mode(), self._frozen_encode_autocast():
             encoded = self.vae_encoder(pixels)
         encoded = encoded.reshape(batch_size, max_refs, *encoded.shape[1:])
         encoded = encoded * ref_valid_mask[:, :, None, None, None, None].to(dtype=encoded.dtype)
@@ -277,11 +335,12 @@ class OnlineBatchEncoder:
         processed = self.image_processor(images=pil_frames, return_tensors="pt")
         pixel_values = processed["pixel_values"].to(device=self.device, dtype=self.dtype)
         self._keep_frozen_visual_modules_eval()
-        with torch.inference_mode():
+        with torch.inference_mode(), self._frozen_encode_autocast():
             visual = extract_projected_visual_tokens(
                 self._unwrap_text_encoder().model,
                 pixel_values,
                 image_counts=torch.tensor([valid_frames], device=self.device, dtype=torch.long),
+                dtype_diagnostics=self.last_dtype_diagnostics,
             )
         packed, visual_mask = pack_visual_tokens(visual.tokens, valid_frames=valid_frames)
         if packed.shape[-1] != self.config.raw_visual_dim:
@@ -348,13 +407,14 @@ class OnlineBatchEncoder:
         language_model_was_training = language_model.training
         language_model.eval()
         try:
-            with torch.inference_mode(), adapter_context:
+            with torch.inference_mode(), adapter_context, self._frozen_encode_autocast():
                 inputs_embeds = embed_tokens(input_ids)
                 if pixel_values is not None:
                     visual = extract_projected_visual_tokens(
                         self._unwrap_text_encoder().model,
                         pixel_values,
                         image_counts=torch.tensor([len(reference_images)], device=self.device, dtype=torch.long),
+                        dtype_diagnostics=self.last_dtype_diagnostics,
                     )
                     inputs_embeds = scatter_visual_tokens_into_embeddings(
                         inputs_embeds=inputs_embeds,
@@ -369,11 +429,21 @@ class OnlineBatchEncoder:
                     output_hidden_states=True,
                     return_dict=True,
                 )
-                video_features, audio_features = feature_extractor(
+                feature_hidden_states = _align_floating_hidden_states_to_module(
                     outputs.hidden_states,
+                    feature_extractor,
+                )
+                self._record_feature_extractor_inputs(
+                    feature_hidden_states,
+                    feature_extractor,
+                    attention_mask,
+                )
+                video_features, audio_features = feature_extractor(
+                    feature_hidden_states,
                     attention_mask,
                     "right",
                 )
+                self._record_feature_extractor_output(video_features)
         finally:
             language_model.train(language_model_was_training)
         result = {

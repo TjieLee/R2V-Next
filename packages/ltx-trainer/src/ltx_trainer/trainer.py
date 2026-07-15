@@ -1612,6 +1612,7 @@ class LtxvTrainer:
             SampleLoadError,
             collate_online_raw_batch,
         )
+        from ltx_trainer.online_data.online_batch_encoder import OnlineSampleEncodeError  # noqa: PLC0415
 
         if self._online_batch_encoder is None or self._online_sampler is None:
             raise RuntimeError("Online batch encoder/sampler were not initialized")
@@ -1655,10 +1656,25 @@ class LtxvTrainer:
                 )
             except Exception as exc:  # synchronize before any rank enters the trainable graph
                 encode_error = exc
-            if not self._synchronize_online_failure(encode_error is not None):
+            any_encode_failure = self._synchronize_online_failure(encode_error is not None)
+            if not any_encode_failure:
                 if encoded_batch is None:
                     raise RuntimeError("Online encoding returned no batch without reporting an error")
                 return encoded_batch
+
+            local_programming_failure = encode_error is not None and not isinstance(
+                encode_error,
+                OnlineSampleEncodeError,
+            )
+            any_programming_failure = self._synchronize_online_failure(local_programming_failure)
+            if any_programming_failure:
+                if local_programming_failure:
+                    assert encode_error is not None
+                    raise encode_error.with_traceback(encode_error.__traceback__)
+                raise RuntimeError(
+                    "Online encoding failed with a non-retryable error on a peer rank; "
+                    "all ranks are stopping before entering the trainable graph."
+                )
             if encode_error is not None:
                 last_error = encode_error
                 self._log_online_reject(encode_error, attempt=attempt, phase="encode")

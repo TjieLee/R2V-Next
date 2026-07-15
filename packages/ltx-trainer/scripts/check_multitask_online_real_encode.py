@@ -12,9 +12,11 @@ app = typer.Typer(pretty_exceptions_enable=False, no_args_is_help=True)
 @app.command()
 def main(
     stage1_config: str = typer.Option(..., "--stage1-config"),
-    num_image_samples: int = typer.Option(1, "--num-image-samples", min=1),
-    num_video_samples: int = typer.Option(1, "--num-video-samples", min=1),
+    num_image_samples: int = typer.Option(1, "--num-image-samples", min=0),
+    num_video_samples: int = typer.Option(1, "--num-video-samples", min=0),
 ) -> None:
+    if num_image_samples + num_video_samples <= 0:
+        raise typer.BadParameter("At least one image or video sample must be requested")
     run_real_encode_check(
         stage1_config,
         num_image_samples=num_image_samples,
