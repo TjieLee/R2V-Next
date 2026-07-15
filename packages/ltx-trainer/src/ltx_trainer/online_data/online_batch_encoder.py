@@ -23,6 +23,7 @@ from ltx_trainer.config import OnlineEncodingConfig
 from ltx_trainer.online_data.constants import (
     IMAGE_TASK,
     MAX_VLM_FRAMES,
+    TOKENS_PER_FRAME,
     VIDEO_TASK,
     VISUAL_TOKEN_CAPACITY,
     VLM_TARGET_INDICES,
@@ -36,6 +37,17 @@ from ltx_trainer.online_data.visual_token_packing import (
 
 class OnlineSampleEncodeError(RuntimeError):
     """A data-specific online encoding failure for which sampling another row is valid."""
+
+    def __init__(self, message: str, *, reason: str = "online_sample_encode_error") -> None:
+        self.reason = reason
+        super().__init__(f"{reason}: {message}")
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "error_type": type(self).__name__,
+            "reason": self.reason,
+            "message": str(self),
+        }
 
 
 def _align_floating_hidden_states_to_module(hidden_states: Any, module: nn.Module) -> Any:
@@ -369,23 +381,11 @@ class OnlineBatchEncoder:
         reference_images: list[Image.Image],
         task: str,
     ) -> dict[str, Tensor]:
-        text = self.tokenizer.apply_chat_template(
-            _build_messages(
-                self.system_prompts[task],
-                caption,
-                len(reference_images),
-                task=task,
-            ),
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-        processed = self.processor(
-            text=text,
-            images=reference_images or None,
-            return_tensors="pt",
-            padding=False,
-            max_length=self.config.planner_max_length,
-            truncation=True,
+        processed, _ = self._process_multimodal_source(
+            caption=caption,
+            reference_images=reference_images,
+            task=task,
+            source_max_length=self.config.planner_max_length,
         )
         input_ids = processed["input_ids"].to(device=self.device, dtype=torch.long)
         attention_mask = processed["attention_mask"].to(device=self.device, dtype=torch.long)
@@ -465,23 +465,11 @@ class OnlineBatchEncoder:
         source_max_length = self.config.planner_max_length - VISUAL_TOKEN_CAPACITY - 2
         if source_max_length <= 0:
             raise ValueError("planner_max_length must reserve 2048 placeholders and two boundary tokens")
-        text = self.tokenizer.apply_chat_template(
-            _build_messages(
-                self.system_prompts[task],
-                caption,
-                len(reference_images),
-                task=task,
-            ),
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-        processed = self.processor(
-            text=text,
-            images=reference_images or None,
-            return_tensors="pt",
-            padding=False,
-            max_length=source_max_length,
-            truncation=True,
+        processed, source_ref_region_mask = self._process_multimodal_source(
+            caption=caption,
+            reference_images=reference_images,
+            task=task,
+            source_max_length=source_max_length,
         )
         input_ids = processed["input_ids"][0].to(dtype=torch.long)
         attention_mask = processed["attention_mask"][0].to(dtype=torch.long)
@@ -516,15 +504,16 @@ class OnlineBatchEncoder:
         ref_visual_mask = (
             (input_ids == GEMMA3_CONFIG_FOR_LTX.image_token_index) & ~planner_region_mask & active
         )
-        ref_region_mask = (
-            (
-                (input_ids == GEMMA3_CONFIG_FOR_LTX.image_token_index)
-                | (input_ids == GEMMA3_CONFIG_FOR_LTX.boi_token_index)
-                | (input_ids == GEMMA3_CONFIG_FOR_LTX.eoi_token_index)
-            )
-            & ~planner_region_mask
-            & active
-        )
+        ref_region_mask = torch.zeros_like(planner_region_mask)
+        ref_region_mask[:source_len] = source_ref_region_mask
+        if int(placeholder_mask.sum().item()) != VISUAL_TOKEN_CAPACITY:
+            raise RuntimeError("Planner placeholder mask must contain exactly 2048 tokens")
+        if torch.any(ref_region_mask & planner_region_mask):
+            raise RuntimeError("Reference-image and planner token regions must not overlap")
+        if input_ids.numel() != self.config.planner_max_length:
+            raise RuntimeError("Planner input_ids must be padded to planner_max_length")
+        if attention_mask.numel() != self.config.planner_max_length:
+            raise RuntimeError("Planner attention_mask must be padded to planner_max_length")
         text_token_mask = active & ~ref_region_mask & ~planner_region_mask
         ntp_labels = input_ids.clone()
         ntp_labels[~text_token_mask] = -100
@@ -550,6 +539,169 @@ class OnlineBatchEncoder:
         if isinstance(pixel_values, Tensor):
             result["pixel_values"] = pixel_values.unsqueeze(0) if pixel_values.ndim == 4 else pixel_values
         return result
+
+    def _process_multimodal_source(
+        self,
+        *,
+        caption: str,
+        reference_images: list[Image.Image],
+        task: str,
+        source_max_length: int,
+    ) -> tuple[dict[str, Tensor], Tensor]:
+        """Expand all image blocks first, then remove only unprotected text tokens."""
+        text = self.tokenizer.apply_chat_template(
+            _build_messages(
+                self.system_prompts[task],
+                caption,
+                len(reference_images),
+                task=task,
+            ),
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        processed = self.processor(
+            text=text,
+            images=reference_images or None,
+            return_tensors="pt",
+            padding=False,
+            truncation=False,
+        )
+        input_ids = processed["input_ids"][0].to(dtype=torch.long)
+        attention_mask = processed["attention_mask"][0].to(dtype=torch.long)
+        if input_ids.ndim != 1 or attention_mask.shape != input_ids.shape:
+            raise ValueError(
+                "Gemma processor must return one unpadded sequence, got "
+                f"input_ids={tuple(input_ids.shape)}, attention_mask={tuple(attention_mask.shape)}"
+            )
+        if not torch.all(attention_mask == 1):
+            raise ValueError("Gemma multimodal source must be unpadded before deterministic truncation")
+
+        ref_region_mask = self._validate_reference_regions(
+            input_ids,
+            num_reference_images=len(reference_images),
+        )
+        if input_ids.numel() > source_max_length:
+            protected = ref_region_mask.clone()
+            special_ids = set(getattr(self.tokenizer, "all_special_ids", []))
+            special_ids.update(
+                {
+                    GEMMA3_CONFIG_FOR_LTX.boi_token_index,
+                    GEMMA3_CONFIG_FOR_LTX.eoi_token_index,
+                    GEMMA3_CONFIG_FOR_LTX.image_token_index,
+                }
+            )
+            for token_id in special_ids:
+                protected |= input_ids == int(token_id)
+
+            fixed_ids = self._fixed_prompt_scaffold_ids(task)
+            prefix_len = self._common_prefix_length(input_ids, fixed_ids)
+            suffix_len = self._common_suffix_length(input_ids, fixed_ids, prefix_len=prefix_len)
+            protected[:prefix_len] = True
+            if suffix_len:
+                protected[-suffix_len:] = True
+
+            overflow = input_ids.numel() - source_max_length
+            removable = torch.nonzero(~protected, as_tuple=False).flatten()
+            if removable.numel() < overflow:
+                raise OnlineSampleEncodeError(
+                    "fixed system/chat tokens and complete reference-image regions require "
+                    f"{input_ids.numel() - removable.numel()} tokens, but source budget is "
+                    f"{source_max_length}",
+                    reason="planner_source_too_long",
+                )
+            keep = torch.ones(input_ids.shape[0], dtype=torch.bool)
+            keep[removable[-overflow:]] = False
+            input_ids = input_ids[keep]
+            attention_mask = attention_mask[keep]
+            ref_region_mask = ref_region_mask[keep]
+
+        if input_ids.numel() > source_max_length:
+            raise RuntimeError("Deterministic multimodal truncation exceeded source budget")
+        self._validate_reference_regions(
+            input_ids,
+            num_reference_images=len(reference_images),
+        )
+        result = {
+            "input_ids": input_ids.unsqueeze(0),
+            "attention_mask": attention_mask.unsqueeze(0),
+        }
+        pixel_values = processed.get("pixel_values")
+        if isinstance(pixel_values, Tensor):
+            result["pixel_values"] = pixel_values
+        return result, ref_region_mask
+
+    def _fixed_prompt_scaffold_ids(self, task: str) -> Tensor:
+        cache = getattr(self, "_fixed_prompt_scaffold_cache", None)
+        if cache is None:
+            cache = {}
+            self._fixed_prompt_scaffold_cache = cache
+        if task not in cache:
+            scaffold_text = self.tokenizer.apply_chat_template(
+                _build_messages(self.system_prompts[task], "", 0, task=task),
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            scaffold = self.processor(
+                text=scaffold_text,
+                images=None,
+                return_tensors="pt",
+                padding=False,
+                truncation=False,
+            )
+            cache[task] = scaffold["input_ids"][0].to(dtype=torch.long)
+        return cache[task]
+
+    def _validate_reference_regions(self, input_ids: Tensor, *, num_reference_images: int) -> Tensor:
+        image_token = GEMMA3_CONFIG_FOR_LTX.image_token_index
+        boi_token = GEMMA3_CONFIG_FOR_LTX.boi_token_index
+        eoi_token = GEMMA3_CONFIG_FOR_LTX.eoi_token_index
+        expected_per_image = int(
+            getattr(self.processor, "image_seq_length", None) or TOKENS_PER_FRAME
+        )
+        expected_image_tokens = num_reference_images * expected_per_image
+        actual_image_tokens = int((input_ids == image_token).sum().item())
+        if actual_image_tokens != expected_image_tokens:
+            raise ValueError(
+                "Gemma reference image-token count mismatch after full multimodal expansion: "
+                f"expected {expected_image_tokens} ({num_reference_images} x {expected_per_image}), "
+                f"got {actual_image_tokens}"
+            )
+
+        starts = torch.nonzero(input_ids == boi_token, as_tuple=False).flatten().tolist()
+        ends = torch.nonzero(input_ids == eoi_token, as_tuple=False).flatten().tolist()
+        if len(starts) != num_reference_images or len(ends) != num_reference_images:
+            raise ValueError(
+                "Gemma reference boundary count mismatch: "
+                f"expected {num_reference_images}, got BOI={len(starts)}, EOI={len(ends)}"
+            )
+        region_mask = torch.zeros(input_ids.shape[0], dtype=torch.bool)
+        for image_index, (start, end) in enumerate(zip(starts, ends, strict=True)):
+            if end <= start or (image_index and start <= ends[image_index - 1]):
+                raise ValueError("Gemma reference image boundaries are malformed or overlapping")
+            per_image_tokens = int((input_ids[start + 1 : end] == image_token).sum().item())
+            if per_image_tokens != expected_per_image:
+                raise ValueError(
+                    f"Reference image {image_index} has {per_image_tokens} image tokens, "
+                    f"expected {expected_per_image}"
+                )
+            region_mask[start : end + 1] = True
+        return region_mask
+
+    @staticmethod
+    def _common_prefix_length(left: Tensor, right: Tensor) -> int:
+        limit = min(left.numel(), right.numel())
+        index = 0
+        while index < limit and int(left[index]) == int(right[index]):
+            index += 1
+        return index
+
+    @staticmethod
+    def _common_suffix_length(left: Tensor, right: Tensor, *, prefix_len: int) -> int:
+        limit = min(left.numel(), right.numel()) - prefix_len
+        index = 0
+        while index < limit and int(left[-index - 1]) == int(right[-index - 1]):
+            index += 1
+        return index
 
     def _get_language_model(self) -> nn.Module:
         text_encoder = self._unwrap_text_encoder()

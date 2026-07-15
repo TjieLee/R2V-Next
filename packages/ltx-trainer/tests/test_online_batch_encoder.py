@@ -10,9 +10,10 @@ import torch
 import typer
 from torch import Tensor, nn
 
-from ltx_core.multicond.visual_tokens import extract_projected_visual_tokens
+import ltx_trainer.trainer as trainer_module
+from ltx_core.multicond.visual_tokens import Visual3DTokenEncoder, extract_projected_visual_tokens
 from ltx_core.text_encoders.gemma.config import GEMMA3_CONFIG_FOR_LTX
-from ltx_trainer.online_data.constants import IMAGE_TASK
+from ltx_trainer.online_data.constants import IMAGE_TASK, VIDEO_TASK, VISUAL_TOKEN_CAPACITY
 from ltx_trainer.online_data.online_batch_encoder import OnlineBatchEncoder, OnlineSampleEncodeError
 from ltx_trainer.trainer import LtxvTrainer
 from scripts import check_multitask_online_real_encode as real_encode_script
@@ -198,6 +199,7 @@ class _FakeTextEncoder(nn.Module):
 
 class _FakeTokenizer:
     pad_token_id = 0
+    all_special_ids = [100, 101]
 
     @staticmethod
     def apply_chat_template(*_args: Any, **_kwargs: Any) -> str:
@@ -205,10 +207,17 @@ class _FakeTokenizer:
 
 
 class _FakeConditionProcessor:
+    image_seq_length = 256
+
     def __call__(self, *, images: list[Any] | None, **_kwargs: Any) -> dict[str, Tensor]:
         if images:
             input_ids = torch.tensor(
-                [[5] + [GEMMA3_CONFIG_FOR_LTX.image_token_index] * 256],
+                [[
+                    5,
+                    GEMMA3_CONFIG_FOR_LTX.boi_token_index,
+                    *([GEMMA3_CONFIG_FOR_LTX.image_token_index] * 256),
+                    GEMMA3_CONFIG_FOR_LTX.eoi_token_index,
+                ]],
                 dtype=torch.long,
             )
             return {
@@ -247,7 +256,7 @@ def _minimal_online_encoder() -> tuple[
         encoder_dtype="bfloat16",
         encoder_device_policy="resident_cuda",
         max_ref_images=1,
-        planner_max_length=2300,
+        planner_max_length=2310,
         raw_visual_dim=4,
         vlm_reference_preprocess="original",
         video_decoder="pyav",
@@ -328,6 +337,167 @@ def test_frozen_encoder_uses_explicit_cuda_autocast(monkeypatch: pytest.MonkeyPa
     assert calls == [("cuda", torch.bfloat16)]
 
 
+class _PlannerTokenizer:
+    pad_token_id = 0
+    all_special_ids = [100, 101]
+
+    @staticmethod
+    def apply_chat_template(messages: list[dict[str, Any]], **_kwargs: Any) -> list[dict[str, Any]]:
+        return messages
+
+
+class _PlannerProcessor:
+    image_seq_length = 256
+
+    def __init__(self, *, reject_direct_truncation: bool = True) -> None:
+        self.reject_direct_truncation = reject_direct_truncation
+        self.truncation_values: list[bool] = []
+
+    def __call__(
+        self,
+        *,
+        text: list[dict[str, Any]],
+        images: list[Any] | None,
+        truncation: bool,
+        **_kwargs: Any,
+    ) -> dict[str, Tensor]:
+        self.truncation_values.append(truncation)
+        references = images or []
+        user_text = text[1]["content"][0]["text"]
+        caption = user_text.split(": ", 1)[1].removesuffix(".")
+        caption_tokens = [1000 + index for index, _ in enumerate(caption)]
+        ids = [100, 10, *caption_tokens]
+        for image_index in range(len(references)):
+            ids.extend(
+                [
+                    200 + image_index,
+                    GEMMA3_CONFIG_FOR_LTX.boi_token_index,
+                    *([GEMMA3_CONFIG_FOR_LTX.image_token_index] * self.image_seq_length),
+                    GEMMA3_CONFIG_FOR_LTX.eoi_token_index,
+                ]
+            )
+        ids.extend([11, 101])
+        if truncation and self.reject_direct_truncation and len(references) == 4:
+            raise ValueError(
+                "Mismatch in `image` token count between text and `input_ids`. "
+                "Got ids=[985] and text=[1024]."
+            )
+        input_ids = torch.tensor([ids], dtype=torch.long)
+        result = {
+            "input_ids": input_ids,
+            "attention_mask": torch.ones_like(input_ids),
+        }
+        if references:
+            result["pixel_values"] = torch.zeros(len(references), 3, 2, 2)
+        return result
+
+
+def _planner_encoder(*, planner_max_length: int = 4096) -> tuple[OnlineBatchEncoder, _PlannerProcessor]:
+    encoder = object.__new__(OnlineBatchEncoder)
+    encoder.config = SimpleNamespace(planner_max_length=planner_max_length)
+    encoder.tokenizer = _PlannerTokenizer()
+    encoder.processor = _PlannerProcessor()
+    encoder.system_prompts = {
+        IMAGE_TASK: "image system prompt",
+        VIDEO_TASK: "video system prompt",
+    }
+    return encoder, encoder.processor
+
+
+def _planner_output_mask() -> Tensor:
+    return torch.ones(1, VISUAL_TOKEN_CAPACITY, dtype=torch.bool)
+
+
+@pytest.mark.parametrize("num_references", [1, 2, 3, 4])
+@pytest.mark.parametrize("task", [IMAGE_TASK, VIDEO_TASK])
+def test_planner_multimodal_truncation_preserves_complete_reference_regions(
+    num_references: int,
+    task: str,
+) -> None:
+    encoder, processor = _planner_encoder()
+    result = encoder._build_planner_vlm_inputs(
+        caption="x" * 3000,
+        reference_images=[object()] * num_references,
+        planner_output_mask=_planner_output_mask(),
+        task=task,
+    )
+
+    assert processor.truncation_values and set(processor.truncation_values) == {False}
+    assert result["input_ids"].shape == (1, 4096)
+    assert result["attention_mask"].shape == (1, 4096)
+    assert result["planner_placeholder_mask"].sum().item() == VISUAL_TOKEN_CAPACITY
+    assert result["ref_visual_token_mask"].sum().item() == num_references * 256
+    assert result["ref_image_region_mask"].sum().item() == num_references * 258
+    assert not bool((result["planner_region_mask"] & result["ref_image_region_mask"]).any())
+
+
+def test_four_reference_long_caption_avoids_direct_gemma_truncation_mismatch() -> None:
+    encoder, processor = _planner_encoder()
+    with pytest.raises(ValueError, match=r"ids=\[985\].*text=\[1024\]"):
+        processor(
+            text=[
+                {"role": "system", "content": "system"},
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "User Raw Input Prompt: caption."}],
+                },
+            ],
+            images=[object()] * 4,
+            truncation=True,
+        )
+    processor.truncation_values.clear()
+
+    result = encoder._build_planner_vlm_inputs(
+        caption="long caption " * 400,
+        reference_images=[object()] * 4,
+        planner_output_mask=_planner_output_mask(),
+        task=VIDEO_TASK,
+    )
+
+    assert processor.truncation_values and set(processor.truncation_values) == {False}
+    assert result["ref_visual_token_mask"].sum().item() == 1024
+    assert result["planner_placeholder_mask"].sum().item() == 2048
+
+
+def test_planner_source_exact_2046_boundary_requires_no_padding() -> None:
+    encoder, _processor = _planner_encoder()
+    # Prefix/suffix consume four tokens; each reference block consumes 259.
+    caption_length = 2046 - 4 - 4 * 259
+    result = encoder._build_planner_vlm_inputs(
+        caption="x" * caption_length,
+        reference_images=[object()] * 4,
+        planner_output_mask=_planner_output_mask(),
+        task=IMAGE_TASK,
+    )
+
+    assert result["attention_mask"].sum().item() == 4096
+    assert result["input_ids"].shape == (1, 4096)
+
+
+def test_planner_fixed_multimodal_region_too_long_is_retryable_data_error() -> None:
+    encoder, _processor = _planner_encoder(planner_max_length=3000)
+    with pytest.raises(OnlineSampleEncodeError, match="planner_source_too_long") as exc_info:
+        encoder._build_planner_vlm_inputs(
+            caption="",
+            reference_images=[object()] * 4,
+            planner_output_mask=_planner_output_mask(),
+            task=VIDEO_TASK,
+        )
+
+    assert exc_info.value.reason == "planner_source_too_long"
+
+
+def test_visual_3d_encoder_aligns_float_input_to_bf16_rmsnorm() -> None:
+    encoder = Visual3DTokenEncoder(dim=8, num_heads=1, depth=1).to(dtype=torch.bfloat16)
+    tokens = torch.randn(1, 2, 8, dtype=torch.float32)
+    positions = torch.zeros(1, 3, 2, 2, dtype=torch.float32)
+
+    encoded, mask = encoder(tokens=tokens, token_positions=positions, token_mask=None)
+
+    assert encoded.dtype == torch.bfloat16
+    assert mask.tolist() == [[True, True]]
+
+
 def test_real_encode_entry_allows_i2i_only(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[tuple[int, int]] = []
 
@@ -356,6 +526,20 @@ class _FakeAccelerator:
         assert reduction == "max"
         self.reduced_values.append(int(flag.item()))
         return flag
+
+
+class _PeerDataFailureAccelerator(_FakeAccelerator):
+    num_processes = 2
+    process_index = 1
+
+    def __init__(self, reductions: list[int] | None = None) -> None:
+        super().__init__()
+        self.remote_reductions = iter(reductions or [0, 1, 0])
+
+    def reduce(self, flag: Tensor, *, reduction: str) -> Tensor:
+        assert reduction == "max"
+        self.reduced_values.append(int(flag.item()))
+        return torch.tensor([next(self.remote_reductions)], dtype=flag.dtype)
 
 
 class _FakeSampler:
@@ -417,3 +601,51 @@ def test_data_error_still_retries_synchronously() -> None:
     assert result == {"encoded": True}
     assert encoder.calls == 3
     assert trainer._accelerator.reduced_values.count(1) == 2
+
+
+def test_peer_planner_source_error_keeps_reason_during_synchronized_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    encoder = _FailingOnlineEncoder([])
+    trainer = _retry_trainer(encoder, retries=0)
+    trainer._accelerator = _PeerDataFailureAccelerator()
+    monkeypatch.setattr(
+        trainer_module,
+        "gather_object",
+        lambda _payload: [
+            (
+                0,
+                "planner_source_too_long",
+                "planner_source_too_long: fixed multimodal region exceeds source budget",
+            )
+        ],
+    )
+
+    with pytest.raises(RuntimeError, match="planner_source_too_long.*rank 0"):
+        trainer._prepare_online_batch_with_retry({"manifest_index": torch.tensor([0])})
+
+    assert encoder.calls == 1
+
+
+def test_peer_planner_source_error_retries_all_ranks_in_lockstep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    encoder = _FailingOnlineEncoder([])
+    trainer = _retry_trainer(encoder, retries=1)
+    trainer._accelerator = _PeerDataFailureAccelerator([0, 1, 0, 0, 0])
+    monkeypatch.setattr(
+        trainer_module,
+        "gather_object",
+        lambda _payload: [
+            (
+                0,
+                "planner_source_too_long",
+                "planner_source_too_long: fixed multimodal region exceeds source budget",
+            )
+        ],
+    )
+
+    result = trainer._prepare_online_batch_with_retry({"manifest_index": torch.tensor([0])})
+
+    assert result == {"encoded": True}
+    assert encoder.calls == 2

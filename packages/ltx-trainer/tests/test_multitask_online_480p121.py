@@ -138,6 +138,8 @@ def test_task_specific_planner_inputs_keep_fixed_capacity_and_ntp_masks(
             return "serialized"
 
     class _Processor:
+        image_seq_length = 1
+
         def __call__(self, **_kwargs: Any) -> dict[str, torch.Tensor]:
             return {
                 "input_ids": torch.tensor(

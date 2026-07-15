@@ -1676,8 +1676,8 @@ class LtxvTrainer:
                     "all ranks are stopping before entering the trainable graph."
                 )
             if encode_error is not None:
-                last_error = encode_error
                 self._log_online_reject(encode_error, attempt=attempt, phase="encode")
+            last_error = self._synchronize_online_retryable_error(encode_error)
             raw_batch = self._load_online_retry_batch(attempt + 1, collate_online_raw_batch)
 
         raise RuntimeError(
@@ -1697,6 +1697,38 @@ class LtxvTrainer:
         )
         reduced = self._accelerator.reduce(flag, reduction="max")
         return bool(reduced.item())
+
+    def _synchronize_online_retryable_error(self, local_error: Exception | None) -> Exception:
+        from ltx_trainer.online_data.online_batch_encoder import OnlineSampleEncodeError  # noqa: PLC0415
+
+        if getattr(self._accelerator, "num_processes", 1) <= 1:
+            if local_error is None:
+                return OnlineSampleEncodeError(
+                    "retryable online encoding failure was reported without a local exception",
+                    reason="synchronized_peer_data_error",
+                )
+            return local_error
+
+        payload = []
+        if local_error is not None:
+            payload.append(
+                (
+                    int(self._accelerator.process_index),
+                    str(getattr(local_error, "reason", "online_sample_encode_error")),
+                    str(local_error),
+                )
+            )
+        gathered = sorted(gather_object(payload), key=lambda item: item[0])
+        if not gathered:
+            return OnlineSampleEncodeError(
+                "all ranks observed a retryable failure but no rank supplied error details",
+                reason="synchronized_peer_data_error",
+            )
+        rank, reason, message = gathered[0]
+        return OnlineSampleEncodeError(
+            f"rank {rank}: {message}",
+            reason=reason,
+        )
 
     def _log_online_reject(self, error: Any, *, attempt: int, phase: str) -> None:
         from ltx_trainer.online_data.path_safety import assert_write_path_allowed  # noqa: PLC0415

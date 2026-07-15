@@ -461,6 +461,9 @@ class Visual3DTokenEncoder(nn.Module):
             raise ValueError(f"tokens must be [B,N,D], got {tuple(tokens.shape)}")
         if tokens.shape[-1] != self.dim:
             raise ValueError(f"tokens dim {tokens.shape[-1]} != encoder dim {self.dim}")
+        encoder_compute = module_compute_device_dtype(self.input_norm)
+        if encoder_compute is not None:
+            tokens = tokens.to(device=encoder_compute[0], dtype=encoder_compute[1])
         if token_positions.shape != (tokens.shape[0], 3, tokens.shape[1], 2):
             raise ValueError(
                 "token_positions must be [B,3,N,2], got "
