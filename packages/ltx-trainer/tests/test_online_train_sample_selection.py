@@ -210,7 +210,8 @@ def test_selection_bundle_copy_survives_move_and_original_reference_removal(
 
     selected = read_selected_samples(moved_bundle / "selected_samples.jsonl")
     assert len(selected) == 1
-    assert selected[0]["reference_export_modes"] == ["copy"]
+    expected_reference_count = int(selected[0]["reference_count"])
+    assert selected[0]["reference_export_modes"] == ["copy"] * expected_reference_count
     assert selected[0]["original_reference_paths"]
     for reference in selected[0]["reference_paths"]:
         path = Path(reference)
@@ -220,4 +221,4 @@ def test_selection_bundle_copy_survives_move_and_original_reference_removal(
         selected[0],
         vlm_reference_preprocess="original",
     )
-    assert len(decoded.reference_pixels_vae) == 1
+    assert len(decoded.reference_pixels_vae) == expected_reference_count

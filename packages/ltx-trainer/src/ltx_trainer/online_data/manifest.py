@@ -405,7 +405,7 @@ def build_r2v_record(
     if face_cut[1] - face_cut[0] < VIDEO_NUM_FRAMES:
         raise ManifestReject(
             "insufficient_face_cut_span_for_121",
-            f"face_cut={face_cut} contains fewer than {VIDEO_NUM_FRAMES} source frames",
+            f"face_cut={face_cut} does not provide the required {VIDEO_NUM_FRAMES}-frame source span",
         )
     if not target_path_validated and not Path(target_path).is_file():
         raise ManifestReject("missing_target", f"Target video does not exist: {target_path}")
