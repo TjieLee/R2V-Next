@@ -8,13 +8,15 @@ import importlib.util
 import json
 import re
 import sys
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import torch
+from peft import get_peft_model_state_dict
 from safetensors import safe_open
-from torch import nn
+from torch import Tensor, nn
 
 from ltx_trainer.model_loader import (
     load_embeddings_processor,
@@ -30,6 +32,109 @@ from ltx_trainer.training_strategies.multi_reference_planner_stage2 import (
 )
 
 _STEP_PATTERN = re.compile(r"(?:^|_)step_(\d+)(?:\.|$)")
+
+_COMPONENT_PREFIXES = {
+    "dit_lora": "diffusion_model.",
+    "gemma_lora": "text_encoder.model.model.language_model.",
+    "planner": "training_strategy.planner_tokens.",
+    "visual_projection": "training_strategy.visual_token_projection.",
+    "visual_full_encoder": "training_strategy.visual_full_encoder.",
+    "connector": "embeddings_processor.video_connector.",
+}
+
+
+class CheckpointAuditError(RuntimeError):
+    """A Stage 3 checkpoint does not exactly match its owned components."""
+
+    def __init__(self, message: str, audit: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.audit = audit
+
+
+@dataclass(frozen=True)
+class CheckpointComponentSpec:
+    prefix: str
+    expected_state: Mapping[str, Tensor]
+    key_normalizer: Callable[[str], str] | None = None
+
+
+@dataclass(frozen=True)
+class CheckpointSnapshot:
+    size_bytes: int
+    mtime_ns: int
+    sha256: str
+
+
+def _unwrap_module(module: nn.Module) -> nn.Module:
+    return getattr(module, "module", module)
+
+
+def _normalize_peft_adapter_key(key: str) -> str:
+    normalized = key
+    while normalized.startswith("base_model.model."):
+        normalized = normalized.removeprefix("base_model.model.")
+    for adapter_key in ("lora_A", "lora_B", "lora_embedding_A", "lora_embedding_B"):
+        normalized = normalized.replace(f".{adapter_key}.default.", f".{adapter_key}.")
+    return normalized
+
+
+def _module_parameter_state(module: nn.Module) -> dict[str, Tensor]:
+    return {name: parameter for name, parameter in _unwrap_module(module).named_parameters()}
+
+
+def build_expected_checkpoint_components(
+    *,
+    transformer: nn.Module,
+    embeddings_processor: nn.Module,
+    strategy: MultiReferencePlannerStage2Strategy,
+) -> dict[str, CheckpointComponentSpec]:
+    """Build the exact checkpoint-owned key/shape contract from live modules."""
+    strategy_modules = strategy.get_trainable_modules()
+    required_strategy_modules = {
+        "planner": "planner_tokens",
+        "visual_projection": "visual_token_projection",
+        "visual_full_encoder": "visual_full_encoder",
+    }
+    missing_modules = [
+        module_name
+        for module_name in required_strategy_modules.values()
+        if module_name not in strategy_modules
+    ]
+    if missing_modules:
+        raise RuntimeError(f"Stage 3 strategy is missing checkpoint-owned modules: {missing_modules}")
+
+    language_model = strategy._get_language_model()
+    return {
+        "dit_lora": CheckpointComponentSpec(
+            prefix=_COMPONENT_PREFIXES["dit_lora"],
+            expected_state=get_peft_model_state_dict(_unwrap_module(transformer)),
+            key_normalizer=_normalize_peft_adapter_key,
+        ),
+        "gemma_lora": CheckpointComponentSpec(
+            prefix=_COMPONENT_PREFIXES["gemma_lora"],
+            expected_state=get_peft_model_state_dict(_unwrap_module(language_model)),
+            key_normalizer=_normalize_peft_adapter_key,
+        ),
+        "planner": CheckpointComponentSpec(
+            prefix=_COMPONENT_PREFIXES["planner"],
+            expected_state=_unwrap_module(strategy_modules["planner_tokens"]).state_dict(),
+        ),
+        "visual_projection": CheckpointComponentSpec(
+            prefix=_COMPONENT_PREFIXES["visual_projection"],
+            expected_state=_unwrap_module(
+                strategy_modules["visual_token_projection"]
+            ).state_dict(),
+        ),
+        "visual_full_encoder": CheckpointComponentSpec(
+            prefix=_COMPONENT_PREFIXES["visual_full_encoder"],
+            expected_state=_unwrap_module(strategy_modules["visual_full_encoder"]).state_dict(),
+        ),
+        "connector": CheckpointComponentSpec(
+            prefix=_COMPONENT_PREFIXES["connector"],
+            # Stage 3 saves trainable connector parameters, not frozen processor state.
+            expected_state=_module_parameter_state(embeddings_processor.video_connector),
+        ),
+    }
 
 
 def _load_script_module(filename: str, module_name: str) -> Any:
@@ -57,6 +162,24 @@ def _sha256_file(path: Path) -> str:
         while chunk := handle.read(8 * 1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def checkpoint_snapshot(path: Path) -> CheckpointSnapshot:
+    stat_result = path.stat()
+    return CheckpointSnapshot(
+        size_bytes=stat_result.st_size,
+        mtime_ns=stat_result.st_mtime_ns,
+        sha256=_sha256_file(path),
+    )
+
+
+def assert_checkpoint_unchanged(path: Path, snapshot: CheckpointSnapshot) -> None:
+    current = checkpoint_snapshot(path)
+    if current != snapshot:
+        raise RuntimeError(
+            "Checkpoint changed while inference runtime was loading: "
+            f"before={snapshot}, after={current}"
+        )
 
 
 def checkpoint_step(path: Path) -> int:
@@ -114,30 +237,15 @@ def resolve_checkpoint(
     return Path(marker["checkpoint_path"]), marker_path, marker
 
 
-def audit_checkpoint(path: Path) -> dict[str, Any]:
-    component_predicates = {
-        "dit_lora": lambda key: key.startswith("diffusion_model.") and "lora_" in key,
-        "gemma_lora": lambda key: key.startswith("text_encoder.model.model.language_model.")
-        and "lora_" in key,
-        "planner": lambda key: key.startswith("training_strategy.planner_tokens."),
-        "visual_projection": lambda key: key.startswith(
-            "training_strategy.visual_token_projection."
-        ),
-        "visual_full_encoder": lambda key: key.startswith(
-            "training_strategy.visual_full_encoder."
-        ),
-        "connector": lambda key: key.startswith("embeddings_processor.video_connector."),
-    }
+def _checkpoint_structure(path: Path) -> tuple[list[str], dict[str, tuple[int, ...]], dict[str, str]]:
     with safe_open(path, framework="pt", device="cpu") as handle:
         keys = list(handle.keys())
+        shapes = {key: tuple(handle.get_slice(key).get_shape()) for key in keys}
         metadata = dict(handle.metadata() or {})
-    counts = {
-        name: sum(1 for key in keys if predicate(key))
-        for name, predicate in component_predicates.items()
-    }
-    missing = [name for name, count in counts.items() if count == 0]
-    if missing:
-        raise RuntimeError(f"Stage 3 checkpoint is missing required components: {missing}")
+    return keys, shapes, metadata
+
+
+def _validate_checkpoint_metadata(path: Path, metadata: Mapping[str, str]) -> int:
     filename_step = checkpoint_step(path)
     metadata_step = metadata.get("global_step")
     if metadata_step is None:
@@ -149,11 +257,159 @@ def audit_checkpoint(path: Path) -> dict[str, Any]:
         )
     if metadata.get("training_phase") != "stage3":
         raise RuntimeError("Online inference requires checkpoint metadata training_phase=stage3")
-    return {
+    return filename_step
+
+
+def _indexed_shapes(
+    *,
+    keys: list[str],
+    shapes: Mapping[str, tuple[int, ...]],
+    spec: CheckpointComponentSpec,
+) -> tuple[dict[str, tuple[str, tuple[int, ...]]], list[str]]:
+    normalize = spec.key_normalizer or (lambda key: key)
+    indexed: dict[str, tuple[str, tuple[int, ...]]] = {}
+    duplicates: list[str] = []
+    for full_key in keys:
+        if not full_key.startswith(spec.prefix):
+            continue
+        local_key = full_key.removeprefix(spec.prefix)
+        normalized = normalize(local_key)
+        if normalized in indexed:
+            duplicates.extend([indexed[normalized][0], full_key])
+            continue
+        indexed[normalized] = (full_key, shapes[full_key])
+    if duplicates:
+        duplicates = sorted(set(duplicates))
+    return indexed, duplicates
+
+
+def audit_checkpoint(
+    path: Path,
+    *,
+    component_specs: Mapping[str, CheckpointComponentSpec] | None = None,
+) -> dict[str, Any]:
+    """Audit Stage 3 metadata and, when provided, every checkpoint-owned key."""
+    keys, shapes, metadata = _checkpoint_structure(path)
+    filename_step = _validate_checkpoint_metadata(path, metadata)
+    counts = {
+        name: sum(1 for key in keys if key.startswith(prefix))
+        for name, prefix in _COMPONENT_PREFIXES.items()
+    }
+    required_missing_keys: list[str] = []
+    unexpected_checkpoint_keys: list[str] = []
+    shape_mismatches: list[dict[str, Any]] = []
+    expected_counts: dict[str, int] = {}
+    component_complete: dict[str, bool] = {}
+
+    if component_specs is None:
+        required_missing_keys = [
+            f"{_COMPONENT_PREFIXES[name]}*" for name, count in counts.items() if count == 0
+        ]
+        expected_counts = {name: 1 for name in _COMPONENT_PREFIXES}
+        component_complete = {name: counts[name] > 0 for name in _COMPONENT_PREFIXES}
+    else:
+        if set(component_specs) != set(_COMPONENT_PREFIXES):
+            raise ValueError(
+                "component_specs must describe exactly the six Stage 3 components; "
+                f"got {sorted(component_specs)}"
+            )
+        consumed_keys: set[str] = set()
+        for component, spec in component_specs.items():
+            normalize = spec.key_normalizer or (lambda key: key)
+            expected_index: dict[str, tuple[str, tuple[int, ...]]] = {}
+            for local_key, value in spec.expected_state.items():
+                normalized = normalize(local_key)
+                if normalized in expected_index:
+                    raise RuntimeError(
+                        f"Expected {component} state has duplicate normalized key {normalized!r}"
+                    )
+                expected_index[normalized] = (
+                    f"{spec.prefix}{local_key}",
+                    tuple(value.shape),
+                )
+            actual_index, duplicate_keys = _indexed_shapes(
+                keys=keys,
+                shapes=shapes,
+                spec=spec,
+            )
+            consumed_keys.update(full_key for full_key, _shape in actual_index.values())
+            expected_counts[component] = len(expected_index)
+            missing_normalized = sorted(set(expected_index) - set(actual_index))
+            unexpected_normalized = sorted(set(actual_index) - set(expected_index))
+            required_missing_keys.extend(
+                expected_index[normalized][0] for normalized in missing_normalized
+            )
+            unexpected_checkpoint_keys.extend(
+                actual_index[normalized][0] for normalized in unexpected_normalized
+            )
+            unexpected_checkpoint_keys.extend(duplicate_keys)
+            component_shape_mismatch = False
+            for normalized in sorted(set(expected_index) & set(actual_index)):
+                expected_key, expected_shape = expected_index[normalized]
+                actual_key, actual_shape = actual_index[normalized]
+                if expected_shape != actual_shape:
+                    component_shape_mismatch = True
+                    shape_mismatches.append(
+                        {
+                            "component": component,
+                            "checkpoint_key": actual_key,
+                            "expected_key": expected_key,
+                            "checkpoint_shape": list(actual_shape),
+                            "expected_shape": list(expected_shape),
+                        }
+                    )
+            component_complete[component] = not (
+                missing_normalized
+                or unexpected_normalized
+                or duplicate_keys
+                or component_shape_mismatch
+            )
+        unexpected_checkpoint_keys.extend(sorted(set(keys) - consumed_keys))
+
+    required_missing_keys = sorted(set(required_missing_keys))
+    unexpected_checkpoint_keys = sorted(set(unexpected_checkpoint_keys))
+    audit = {
         "checkpoint_step": filename_step,
         "checkpoint_metadata": metadata,
         "component_key_counts": counts,
+        "component_expected_key_counts": expected_counts,
+        "component_complete": component_complete,
+        "required_missing_keys": required_missing_keys,
+        "unexpected_checkpoint_keys": unexpected_checkpoint_keys,
+        "checkpoint_shape_mismatches": shape_mismatches,
+        # Base weights intentionally come from model.model_path/text_encoder_path and
+        # are outside the checkpoint-owned comparison above.
+        "ignored_base_model_missing_keys": [
+            "diffusion_model.<non-LoRA base weights>",
+            "text_encoder.<non-LoRA base weights>",
+            "embeddings_processor.<non-video-connector base weights>",
+        ],
+        "ignored_base_model_policy": (
+            "Base DiT, Gemma, and embeddings-processor weights are loaded from their "
+            "configured base paths and are not required in a Stage 3 adapter checkpoint."
+        ),
         "checkpoint_key_count": len(keys),
+    }
+    if required_missing_keys or unexpected_checkpoint_keys or shape_mismatches:
+        raise CheckpointAuditError(
+            "Stage 3 checkpoint-owned state mismatch: "
+            f"required_missing={required_missing_keys[:20]}, "
+            f"unexpected={unexpected_checkpoint_keys[:20]}, "
+            f"shape_mismatches={shape_mismatches[:20]}",
+            audit,
+        )
+    return audit
+
+
+def _checkpoint_flags_from_audit(audit: Mapping[str, Any]) -> dict[str, bool]:
+    complete = audit["component_complete"]
+    return {
+        "dit_lora_checkpoint_loaded": bool(complete["dit_lora"]),
+        "gemma_lora_checkpoint_loaded": bool(complete["gemma_lora"]),
+        "planner_checkpoint_loaded": bool(complete["planner"]),
+        "visual_token_projection_checkpoint_loaded": bool(complete["visual_projection"]),
+        "visual_full_encoder_checkpoint_loaded": bool(complete["visual_full_encoder"]),
+        "connector_checkpoint_loaded": bool(complete["connector"]),
     }
 
 
@@ -204,9 +460,10 @@ def load_online_inference_runtime(
         guidance_scale=guidance_scale,
     )
 
-    before = checkpoint_path.stat()
-    checkpoint_hash = _sha256_file(checkpoint_path)
-    audit = audit_checkpoint(checkpoint_path)
+    initial_snapshot = checkpoint_snapshot(checkpoint_path)
+    checkpoint_hash = initial_snapshot.sha256
+    # Cheap structural/metadata validation before loading the large base models.
+    audit_checkpoint(checkpoint_path)
     if ready_marker is not None and checkpoint_hash != str(ready_marker["checkpoint_sha256"]):
         raise RuntimeError("Checkpoint SHA256 no longer matches its ready marker")
 
@@ -229,16 +486,21 @@ def load_online_inference_runtime(
         embeddings_processor=embeddings_processor,
         text_encoder=text_encoder,
     )
-    checkpoint_flags = stage2._load_checkpoint_weights(
+    component_specs = build_expected_checkpoint_components(
+        transformer=transformer,
+        embeddings_processor=embeddings_processor,
+        strategy=strategy,
+    )
+    audit = audit_checkpoint(checkpoint_path, component_specs=component_specs)
+    stage2._load_checkpoint_weights(
         checkpoint_path=checkpoint_path,
         transformer=transformer,
         embeddings_processor=embeddings_processor,
         text_encoder=text_encoder,
         strategy=strategy,
     )
-    after = checkpoint_path.stat()
-    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
-        raise RuntimeError("Checkpoint changed while inference runtime was loading")
+    checkpoint_flags = _checkpoint_flags_from_audit(audit)
+    assert_checkpoint_unchanged(checkpoint_path, initial_snapshot)
 
     stage2._disable_gradient_checkpointing(transformer, strategy)
     transformer.requires_grad_(False).eval()
@@ -282,10 +544,8 @@ def load_online_inference_runtime(
     audit.update(
         {
             "checkpoint_sha256": checkpoint_hash,
-            "checkpoint_size_bytes": before.st_size,
+            "checkpoint_size_bytes": initial_snapshot.size_bytes,
             "ready_marker_path": str(ready_marker_path) if ready_marker_path else None,
-            "missing_keys": [],
-            "unexpected_keys": [],
         }
     )
     return OnlineInferenceRuntime(

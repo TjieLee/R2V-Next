@@ -31,6 +31,7 @@ from ltx_trainer.online_inference.output_artifacts import (
 from ltx_trainer.online_inference.path_policy import assert_online_inference_output_path
 from ltx_trainer.online_inference.raw_condition_encoder import RawReferenceLoadError
 from ltx_trainer.online_inference.runner import read_selected_samples, run_online_sample
+from ltx_trainer.online_inference.vae_decode import validate_vae_decode_request
 
 app = typer.Typer(
     pretty_exceptions_enable=False,
@@ -180,6 +181,11 @@ def main(  # noqa: PLR0913, PLR0915
     if dtype not in dtype_map:
         raise typer.BadParameter(f"--dtype must be one of {sorted(dtype_map)}")
     torch_dtype = dtype_map[dtype]
+    if not dry_run:
+        try:
+            validate_vae_decode_request(torch_device, torch_dtype)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
     output = assert_online_inference_output_path(output_root)
     output.mkdir(parents=True, exist_ok=True)
     selected_tasks = None if task == "both" else {task}
@@ -205,8 +211,10 @@ def main(  # noqa: PLR0913, PLR0915
             "base_model_path": runtime.cfg.model.model_path,
             "text_encoder_path": runtime.cfg.model.text_encoder_path,
             "loaded_component_counts": runtime.checkpoint_audit["component_key_counts"],
-            "missing_keys": runtime.checkpoint_audit["missing_keys"],
-            "unexpected_keys": runtime.checkpoint_audit["unexpected_keys"],
+            "required_missing_keys": runtime.checkpoint_audit["required_missing_keys"],
+            "unexpected_checkpoint_keys": runtime.checkpoint_audit[
+                "unexpected_checkpoint_keys"
+            ],
             "task": task,
             "strict_no_gt": strict_no_gt,
         }
@@ -249,7 +257,8 @@ def main(  # noqa: PLR0913, PLR0915
                     f"dry-run {sample['task']} refs={result['reference_count']} "
                     f"planner_tokens={result['planner_token_count']} "
                     f"condition={result['planner_diagnostics'].get('final_condition_shape')} "
-                    f"target_open_count={result['target_open_count']} "
+                    "reference_target_alias_check="
+                    f"{result['strict_no_gt_checks']['reference_target_alias_check']} "
                     f"peak_vram_gb={result['peak_vram_gb']}"
                 )
             if export_ground_truth and not dry_run and result["status"] in {

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +13,7 @@ from PIL import Image
 from ltx_trainer.online_data.constants import VISUAL_TOKEN_CAPACITY
 from ltx_trainer.online_data.online_batch_encoder import OnlineBatchEncoder
 from ltx_trainer.online_inference import raw_condition_encoder, runner
+from ltx_trainer.online_inference.media_identity import TargetReferenceAliasError
 
 
 @pytest.mark.parametrize(
@@ -128,6 +130,11 @@ def test_selected_condition_path_never_passes_or_opens_target(monkeypatch: pytes
     monkeypatch.setattr(raw_condition_encoder, "decode_image_rgb", fake_decode)
     monkeypatch.setattr(
         raw_condition_encoder,
+        "assert_references_do_not_alias_target",
+        lambda references, target: None,
+    )
+    monkeypatch.setattr(
+        raw_condition_encoder,
         "deterministic_resize_center_crop",
         lambda frames, **kwargs: torch.zeros(1, 480, 832, 3, dtype=torch.uint8),
     )
@@ -190,6 +197,18 @@ def test_strict_no_gt_dry_run_succeeds_when_target_open_is_forbidden(
         "visual_position_metadata": {},
         "task_system_prompt_id": torch.tensor([0]),
         "dtype_diagnostics": {},
+        "reference_metadata": {
+            "reference_paths_used": [str(reference)],
+            "original_reference_paths": [str(reference)],
+            "reference_export_modes": [],
+        },
+        "strict_no_gt_checks": {
+            "reference_target_alias_check": "passed",
+            "target_path_passed_to_condition_encoder": False,
+            "target_path_passed_to_denoiser": False,
+            "uses_target_latents": False,
+            "uses_gt_siglip_tokens": False,
+        },
     }
     raw["multi_reference_latents"] = raw["multi_ref_latents"]
     monkeypatch.setattr(runner, "encode_selected_sample_conditions", lambda encoder, sample: raw)
@@ -254,8 +273,49 @@ def test_strict_no_gt_dry_run_succeeds_when_target_open_is_forbidden(
         code_commit="test",
     )
     assert result["status"] == "dry_run_success"
-    assert result["opened_target_during_generation"] is False
     assert result["target_open_count"] == 0
+    assert result["target_open_count_instrumented"] is False
+    assert result["strict_no_gt_checks"]["reference_target_alias_check"] == "passed"
     sample_dir = Path(result["sample_dir"])
     assert (sample_dir / "reference_00.png").is_file()
     assert (sample_dir / "references.png").is_file()
+
+
+@pytest.mark.parametrize("alias_kind", ["direct", "symlink", "hardlink"])
+def test_runtime_rejects_reference_target_alias_before_decode(
+    tmp_path: Path,
+    alias_kind: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "target.png"
+    Image.new("RGB", (16, 16), "red").save(target)
+    reference = tmp_path / f"reference_{alias_kind}.png"
+    if alias_kind == "direct":
+        reference = target
+    elif alias_kind == "symlink":
+        reference.symlink_to(target)
+    else:
+        os.link(target, reference)
+    decode_calls = 0
+
+    def fail_decode(path):
+        nonlocal decode_calls
+        decode_calls += 1
+        raise AssertionError(f"alias reference was decoded: {path}")
+
+    monkeypatch.setattr(raw_condition_encoder, "decode_image_rgb", fail_decode)
+    sample = {
+        "task": "i2i",
+        "reference_paths": [str(reference)],
+        "target_path": str(target),
+        "width": 832,
+        "height": 480,
+        "num_frames": 1,
+        "fps": 1.0,
+    }
+    with pytest.raises(TargetReferenceAliasError, match="reference_aliases_target"):
+        raw_condition_encoder.load_reference_inputs(
+            sample,
+            vlm_reference_preprocess="original",
+        )
+    assert decode_calls == 0

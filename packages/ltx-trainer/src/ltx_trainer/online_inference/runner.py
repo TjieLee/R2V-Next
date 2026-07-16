@@ -28,6 +28,16 @@ from ltx_trainer.online_inference.output_artifacts import (
 from ltx_trainer.online_inference.raw_condition_encoder import (
     encode_selected_sample_conditions,
 )
+from ltx_trainer.online_inference.vae_decode import decode_video_latents
+
+
+def _bundle_reference_path(bundle_root: Path, value: str) -> Path:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = bundle_root / path
+    # Keep the bundle export path visible in metadata instead of resolving a symlink
+    # back to its original source.
+    return path.absolute()
 
 
 def read_selected_samples(
@@ -37,7 +47,9 @@ def read_selected_samples(
     limit: int | None = None,
 ) -> list[dict[str, Any]]:
     selected: list[dict[str, Any]] = []
-    with Path(path).expanduser().resolve().open("r", encoding="utf-8") as handle:
+    selection_path = Path(path).expanduser().resolve()
+    bundle_root = selection_path.parent
+    with selection_path.open("r", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
             if not line.strip():
                 continue
@@ -47,6 +59,21 @@ def read_selected_samples(
                 raise ValueError(f"Selected sample line {line_number} has invalid task {task!r}")
             if tasks is not None and task not in tasks:
                 continue
+            original_reference_paths = list(
+                sample.get("original_reference_paths", sample.get("reference_paths", []))
+            )
+            if "reference_exports" in sample:
+                reference_values = list(sample["reference_exports"])
+            else:
+                reference_values = list(sample.get("reference_paths", []))
+            sample["original_reference_paths"] = original_reference_paths
+            sample["reference_paths"] = [
+                str(_bundle_reference_path(bundle_root, str(value)))
+                for value in reference_values
+            ]
+            sample["reference_export_modes"] = list(
+                sample.get("reference_export_modes", [])
+            )
             selected.append(sample)
             if limit is not None and len(selected) >= limit:
                 break
@@ -165,12 +192,27 @@ def run_online_sample(
         "task": sample["task"],
         "caption": sample["caption"],
         "reference_paths": list(sample["reference_paths"]),
+        "reference_paths_used": list(
+            raw["reference_metadata"].get("reference_paths_used", sample["reference_paths"])
+        ),
+        "original_reference_paths": list(
+            raw["reference_metadata"].get(
+                "original_reference_paths",
+                sample.get("original_reference_paths", sample["reference_paths"]),
+            )
+        ),
+        "reference_export_modes": list(
+            raw["reference_metadata"].get(
+                "reference_export_modes",
+                sample.get("reference_export_modes", []),
+            )
+        ),
         "reference_count": len(sample["reference_paths"]),
         "reference_order": list(range(len(sample["reference_paths"]))),
         "strict_no_gt": True,
-        "opened_target_during_generation": False,
+        "strict_no_gt_checks": dict(raw["strict_no_gt_checks"]),
         "target_open_count": 0,
-        "target_opened_during_generation": False,
+        "target_open_count_instrumented": False,
         "uses_target_latents": False,
         "uses_gt_siglip_tokens": False,
         "uses_precomputed_conditions": False,
@@ -251,11 +293,18 @@ def run_online_sample(
     )
     if runtime.vae_decoder is None:
         raise RuntimeError("Generation requires a loaded VAE decoder; dry-run runtime cannot denoise")
-    decoded = runtime.stage1._decode_video_latents(
+    decoded, decode_diagnostics = decode_video_latents(
         vae_decoder=runtime.vae_decoder,
         latents=generated_latents,
-        device=runtime.device,
         decode_tile=decode_tile,
+    )
+    metadata.update(
+        {
+            "vae_decoder_weight_dtype": decode_diagnostics.decoder_weight_dtype,
+            "vae_decoder_input_dtype": decode_diagnostics.decoder_input_dtype,
+            "vae_decoder_output_dtype": decode_diagnostics.decoder_output_dtype,
+            "vae_decoder_device": decode_diagnostics.decoder_device,
+        }
     )
     expected_frames = int(sample["num_frames"])
     expected_shape = (expected_frames, 3, int(sample["height"]), int(sample["width"]))

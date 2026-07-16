@@ -21,8 +21,14 @@ from ltx_trainer.online_data.manifest_index import (
     read_manifest_index,
 )
 from ltx_trainer.online_data.manifest_schema import validate_manifest_record
+from ltx_trainer.online_inference.media_identity import (
+    RawReferenceLoadError,
+    TargetReferenceAliasError,
+    assert_references_do_not_alias_target,
+)
+from ltx_trainer.online_inference.sample_naming import sample_directory_name
 
-SELECTION_VERSION = 1
+SELECTION_VERSION = 2
 SUPPORTED_TASKS = (IMAGE_TASK, VIDEO_TASK)
 
 
@@ -118,6 +124,7 @@ def _selection_entry(
         "target_modality": str(record["target_modality"]),
         "caption": str(record["caption"]),
         "reference_paths": reference_paths,
+        "original_reference_paths": reference_paths,
         "reference_count": len(reference_paths),
         "target_path": str(_resolve_media_path(str(record["target_path"]), manifest_path)),
         "target_source_frame_indices": record.get("target_source_frame_indices"),
@@ -151,12 +158,22 @@ def _validate_candidate(
     references = list(record["reference_paths"])
     if not 1 <= len(references) <= 4:
         return None, "reference_count_out_of_range"
-    for reference in references:
-        if not _resolve_media_path(str(reference), manifest_path).is_file():
+    resolved_references = [
+        _resolve_media_path(str(reference), manifest_path) for reference in references
+    ]
+    for reference in resolved_references:
+        if not reference.is_file():
             return None, "missing_reference"
     # This checks metadata availability only. The target is never opened or decoded.
-    if not _resolve_media_path(str(record["target_path"]), manifest_path).is_file():
+    target_path = _resolve_media_path(str(record["target_path"]), manifest_path)
+    if not target_path.is_file():
         return None, "missing_target"
+    try:
+        assert_references_do_not_alias_target(resolved_references, target_path)
+    except TargetReferenceAliasError:
+        return None, "reference_aliases_target"
+    except RawReferenceLoadError:
+        return None, "media_identity_error"
     return (
         _selection_entry(
             record,
@@ -469,18 +486,17 @@ def _atomic_write_text(path: Path, text: str) -> None:
 
 
 def _safe_sample_dir_name(sample: dict[str, Any]) -> str:
-    sample_key = str(sample["sample_key"])
-    safe_key = "".join(character if character.isalnum() or character in "-_" else "_" for character in sample_key)
-    if len(safe_key) > 96:
-        suffix = hashlib.sha256(sample_key.encode("utf-8")).hexdigest()[:12]
-        safe_key = f"{safe_key[:80]}_{suffix}"
-    return f"{sample['task']}_{safe_key}"
+    return sample_directory_name(
+        task=str(sample["task"]),
+        sample_key=str(sample["sample_key"]),
+    )
 
 
 def _link_or_copy_reference(source: Path, destination: Path) -> str:
     try:
-        destination.symlink_to(os.path.relpath(source, destination.parent))
-        return "relative_symlink"
+        # Absolute symlinks remain valid when the selection bundle is moved.
+        destination.symlink_to(source.resolve())
+        return "absolute_symlink"
     except OSError:
         shutil.copy2(source, destination)
         return "copy"
@@ -511,15 +527,23 @@ def write_selection_bundle(
             sample_dir.mkdir()
             _atomic_write_text(sample_dir / "prompt.txt", f"{sample['caption']}\n")
             reference_exports: list[str] = []
+            reference_export_modes: list[str] = []
             for index, value in enumerate(sample["reference_paths"]):
                 source = Path(value)
                 suffix = source.suffix.lower() or ".png"
                 destination_ref = sample_dir / f"reference_{index:02d}{suffix}"
-                link_modes[_link_or_copy_reference(source, destination_ref)] += 1
+                export_mode = _link_or_copy_reference(source, destination_ref)
+                link_modes[export_mode] += 1
+                reference_export_modes.append(export_mode)
                 reference_exports.append(str(destination_ref.relative_to(temporary)))
             published = dict(sample)
             published["sample_dir"] = str(sample_dir.relative_to(temporary))
+            published["original_reference_paths"] = list(
+                sample.get("original_reference_paths", sample["reference_paths"])
+            )
             published["reference_exports"] = reference_exports
+            published["reference_export_modes"] = reference_export_modes
+            published["reference_paths"] = reference_exports
             _atomic_write_text(
                 sample_dir / "sample.json",
                 json.dumps(published, ensure_ascii=False, indent=2, sort_keys=True) + "\n",

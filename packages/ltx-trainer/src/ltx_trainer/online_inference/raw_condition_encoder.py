@@ -21,6 +21,11 @@ from ltx_trainer.online_data.constants import (
 from ltx_trainer.online_data.media_decoder import decode_image_rgb
 from ltx_trainer.online_data.online_batch_encoder import OnlineBatchEncoder
 from ltx_trainer.online_data.transforms import deterministic_resize_center_crop
+from ltx_trainer.online_inference.media_identity import (
+    RawReferenceLoadError,
+    TargetReferenceAliasError,
+    assert_references_do_not_alias_target,
+)
 
 
 @dataclass(frozen=True)
@@ -30,10 +35,6 @@ class RawReferenceInputs:
     reference_paths: list[Path]
 
 
-class RawReferenceLoadError(RuntimeError):
-    """A sample-local reference media failure that may be skipped safely."""
-
-
 def validate_selected_geometry(sample: dict[str, Any]) -> None:
     task = str(sample.get("task"))
     if task == IMAGE_TASK:
@@ -41,7 +42,7 @@ def validate_selected_geometry(sample: dict[str, Any]) -> None:
     elif task == VIDEO_TASK:
         expected = (TARGET_WIDTH, TARGET_HEIGHT, VIDEO_NUM_FRAMES, VIDEO_FPS)
     else:
-        raise ValueError(f"Unsupported selected task {task!r}")
+        raise RawReferenceLoadError(f"Unsupported selected task {task!r}")
     actual = (
         int(sample.get("width", -1)),
         int(sample.get("height", -1)),
@@ -49,7 +50,9 @@ def validate_selected_geometry(sample: dict[str, Any]) -> None:
         float(sample.get("fps", -1.0)),
     )
     if actual != expected:
-        raise ValueError(f"Selected {task} geometry must be {expected}, got {actual}")
+        raise RawReferenceLoadError(
+            f"Selected {task} geometry must be {expected}, got {actual}"
+        )
 
 
 def load_reference_inputs(
@@ -60,9 +63,16 @@ def load_reference_inputs(
 ) -> RawReferenceInputs:
     """Decode references only. This function intentionally has no target-path argument."""
     validate_selected_geometry(sample)
-    paths = [Path(value).expanduser().resolve() for value in sample.get("reference_paths", [])]
+    paths = [Path(value).expanduser().absolute() for value in sample.get("reference_paths", [])]
     if not 1 <= len(paths) <= 4:
-        raise ValueError(f"Strict-no-GT inference requires 1..4 references, got {len(paths)}")
+        raise RawReferenceLoadError(
+            f"Strict-no-GT inference requires 1..4 references, got {len(paths)}"
+        )
+    target_path = sample.get("target_path")
+    if not target_path:
+        raise RawReferenceLoadError("Strict-no-GT alias validation requires target_path metadata")
+    # This metadata-only identity check runs before any reference pixels are opened.
+    assert_references_do_not_alias_target(paths, str(target_path))
     originals: list[Tensor] = []
     for path in paths:
         try:
@@ -83,7 +93,7 @@ def load_reference_inputs(
     elif vlm_reference_preprocess == "target_crop":
         vlm_references = vae_references
     else:
-        raise ValueError(
+        raise RawReferenceLoadError(
             "vlm_reference_preprocess must be 'original' or 'target_crop', "
             f"got {vlm_reference_preprocess!r}"
         )
@@ -117,5 +127,27 @@ def encode_selected_sample_conditions(
     conditions["reference_metadata"] = {
         **conditions["reference_metadata"],
         "reference_paths": [str(path) for path in references.reference_paths],
+        "reference_paths_used": [str(path) for path in references.reference_paths],
+        "original_reference_paths": list(
+            sample.get("original_reference_paths", sample.get("reference_paths", []))
+        ),
+        "reference_export_modes": list(sample.get("reference_export_modes", [])),
+    }
+    conditions["strict_no_gt_checks"] = {
+        "reference_target_alias_check": "passed",
+        "target_path_passed_to_condition_encoder": False,
+        "target_path_passed_to_denoiser": False,
+        "uses_target_latents": False,
+        "uses_gt_siglip_tokens": False,
     }
     return conditions
+
+
+__all__ = [
+    "RawReferenceInputs",
+    "RawReferenceLoadError",
+    "TargetReferenceAliasError",
+    "encode_selected_sample_conditions",
+    "load_reference_inputs",
+    "validate_selected_geometry",
+]

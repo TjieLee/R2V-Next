@@ -2,13 +2,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import shutil
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
 from ltx_trainer.online_data.constants import VLM_TARGET_INDICES
 from ltx_trainer.online_data.manifest_index import build_manifest_offset_index
+from ltx_trainer.online_inference.raw_condition_encoder import load_reference_inputs
+from ltx_trainer.online_inference.runner import read_selected_samples
 from ltx_trainer.online_inference.train_sample_selection import (
+    _validate_candidate,
     select_online_train_samples,
     write_selection_bundle,
 )
@@ -24,7 +30,7 @@ def _write_record(
     references = []
     for reference_index in range(reference_count):
         path = root / f"ref_{task}_{index}_{reference_index}.png"
-        path.write_bytes(b"reference")
+        Image.new("RGB", (16, 12), (reference_index * 32, 64, 128)).save(path)
         references.append(str(path))
     target = root / f"target_{task}_{index}.bin"
     target.write_bytes(b"target-must-not-be-opened")
@@ -129,3 +135,89 @@ def test_selection_bundle_is_atomic_and_does_not_export_target(tmp_path: Path) -
         assert not list(sample_dir.glob("target*"))
     with pytest.raises(FileExistsError):
         write_selection_bundle(result, output)
+
+
+@pytest.mark.parametrize("alias_kind", ["direct", "symlink", "hardlink"])
+def test_selection_rejects_reference_target_alias(
+    tmp_path: Path,
+    alias_kind: str,
+) -> None:
+    record = _write_record(root=tmp_path, task="i2i", index=90, reference_count=1)
+    target = Path(record["target_path"])
+    reference = tmp_path / f"alias_{alias_kind}.bin"
+    Path(record["reference_paths"][0]).unlink()
+    if alias_kind == "direct":
+        reference = target
+    elif alias_kind == "symlink":
+        reference.symlink_to(target)
+    else:
+        os.link(target, reference)
+    record["reference_paths"] = [str(reference)]
+    canonical_record = dict(record)
+    canonical_record.pop("sample_plan_sha256")
+    canonical = json.dumps(
+        canonical_record,
+        sort_keys=True,
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    record["sample_plan_sha256"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    candidate, reason = _validate_candidate(
+        record,
+        manifest_path=tmp_path / "train_unique.jsonl",
+        manifest_index=0,
+        max_caption_chars=None,
+    )
+    assert candidate is None
+    assert reason == "reference_aliases_target"
+
+
+def test_selection_accepts_distinct_reference_and_target(tmp_path: Path) -> None:
+    record = _write_record(root=tmp_path, task="i2i", index=91, reference_count=1)
+    candidate, reason = _validate_candidate(
+        record,
+        manifest_path=tmp_path / "train_unique.jsonl",
+        manifest_index=0,
+        max_caption_chars=None,
+    )
+    assert reason is None
+    assert candidate is not None
+
+
+def test_selection_bundle_copy_survives_move_and_original_reference_removal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest, records = _manifest(tmp_path)
+    result = select_online_train_samples(
+        manifest,
+        tasks=("i2i",),
+        samples_per_task=1,
+    )
+
+    def fail_symlink(*args, **kwargs):
+        raise OSError("copy fallback requested")
+
+    monkeypatch.setattr(Path, "symlink_to", fail_symlink)
+    original_bundle = write_selection_bundle(result, tmp_path / "selection")
+    moved_bundle = tmp_path / "moved" / "selection"
+    moved_bundle.parent.mkdir()
+    shutil.move(str(original_bundle), moved_bundle)
+    for record in records:
+        for reference in record["reference_paths"]:
+            Path(reference).unlink(missing_ok=True)
+
+    selected = read_selected_samples(moved_bundle / "selected_samples.jsonl")
+    assert len(selected) == 1
+    assert selected[0]["reference_export_modes"] == ["copy"]
+    assert selected[0]["original_reference_paths"]
+    for reference in selected[0]["reference_paths"]:
+        path = Path(reference)
+        assert path.is_file()
+        assert moved_bundle in path.parents
+    decoded = load_reference_inputs(
+        selected[0],
+        vlm_reference_preprocess="original",
+    )
+    assert len(decoded.reference_pixels_vae) == 1

@@ -12,6 +12,9 @@ from PIL import Image, ImageDraw
 from torch import Tensor
 
 from ltx_trainer.online_data.constants import TARGET_HEIGHT, TARGET_WIDTH
+from ltx_trainer.online_inference.sample_naming import sample_directory_name
+
+
 def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}")
@@ -139,9 +142,11 @@ def save_contact_sheet(
 
 
 def sample_output_dir(output_root: Path, sample: dict[str, Any]) -> Path:
-    key = str(sample["sample_key"])
-    safe = "".join(character if character.isalnum() or character in "-_" else "_" for character in key)
-    return output_root / str(sample["task"]) / safe[:112]
+    task = str(sample["task"])
+    return output_root / task / sample_directory_name(
+        task=task,
+        sample_key=str(sample["sample_key"]),
+    )
 
 
 def output_is_complete(sample_dir: Path) -> bool:
