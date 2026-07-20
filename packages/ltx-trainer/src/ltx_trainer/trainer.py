@@ -1655,6 +1655,8 @@ class LtxvTrainer:
                     training_phase=getattr(self._training_strategy.config, "training_phase", "stage1"),
                 )
             except Exception as exc:  # synchronize before any rank enters the trainable graph
+                if isinstance(exc, OnlineSampleEncodeError):
+                    exc.attach_sample_context(raw_batch)
                 encode_error = exc
             any_encode_failure = self._synchronize_online_failure(encode_error is not None)
             if not any_encode_failure:
@@ -1749,7 +1751,14 @@ class LtxvTrainer:
             payload = error.to_dict()
         else:
             payload = {"error_type": type(error).__name__, "message": str(error)}
-        payload.update({"attempt": attempt, "phase": phase, "global_step": self._global_step})
+        payload.update(
+            {
+                "attempt": attempt,
+                "phase": phase,
+                "global_step": self._global_step,
+                "rank": int(self._accelerator.process_index),
+            }
+        )
         with log_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
 

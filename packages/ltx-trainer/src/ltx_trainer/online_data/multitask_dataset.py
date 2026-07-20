@@ -40,9 +40,66 @@ class SampleLoadError:
     error_type: str
     message: str
     manifest_index: int
+    reason: str = "sample_load_error"
+    reference_index: int | None = None
+    reference_path: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+class VLMReferenceValidationError(ValueError):
+    """A decoded reference cannot carry meaningful VLM image information."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: str,
+        reference_index: int,
+        reference_path: str,
+    ) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.reference_index = reference_index
+        self.reference_path = reference_path
+
+
+def validate_vlm_reference_tensor(
+    image: Tensor,
+    *,
+    path: str | Path,
+    reference_index: int,
+    manifest_index: int,
+    sample_key: str,
+    task: str,
+) -> None:
+    """Reject malformed or one-pixel-edge VLM references before any resize."""
+    shape = tuple(image.shape)
+    dtype = image.dtype
+    context = (
+        f"manifest_index={manifest_index}, sample_key={sample_key}, task={task}, "
+        f"reference_index={reference_index}, reference_path={path}, "
+        f"shape={shape}, dtype={dtype}"
+    )
+    if dtype != torch.uint8 or image.ndim != 3 or image.shape[-1] != 3:
+        reason = "invalid_vlm_reference_tensor"
+        raise VLMReferenceValidationError(
+            f"{reason}: {context}",
+            reason=reason,
+            reference_index=reference_index,
+            reference_path=str(path),
+        )
+
+    height, width = int(image.shape[0]), int(image.shape[1])
+    if height <= 1 or width <= 1:
+        reason = "degenerate_vlm_reference_geometry"
+        raise VLMReferenceValidationError(
+            f"{reason}: {context}, width={width}, height={height}",
+            reason=reason,
+            reference_index=reference_index,
+            reference_path=str(path),
+        )
 
 
 class OnlineMultiTaskDataset(Dataset[dict[str, Any] | SampleLoadError]):
@@ -132,6 +189,17 @@ class OnlineMultiTaskDataset(Dataset[dict[str, Any] | SampleLoadError]):
             if self.max_ref_images is not None:
                 reference_paths = reference_paths[: self.max_ref_images]
             original_references = [decode_image_rgb(path) for path in reference_paths]
+            for reference_index, (reference_path, reference) in enumerate(
+                zip(reference_paths, original_references, strict=True)
+            ):
+                validate_vlm_reference_tensor(
+                    reference,
+                    path=reference_path,
+                    reference_index=reference_index,
+                    manifest_index=index,
+                    sample_key=str(record["sample_key"]),
+                    task=str(record["task"]),
+                )
             references_vae = [
                 deterministic_resize_center_crop(
                     reference.unsqueeze(0),
@@ -178,6 +246,9 @@ class OnlineMultiTaskDataset(Dataset[dict[str, Any] | SampleLoadError]):
                 error_type=type(exc).__name__,
                 message=str(exc),
                 manifest_index=int(index),
+                reason=str(getattr(exc, "reason", "sample_load_error")),
+                reference_index=getattr(exc, "reference_index", None),
+                reference_path=getattr(exc, "reference_path", None),
             )
 
     def _load_target(self, record: dict[str, Any]) -> Tensor:

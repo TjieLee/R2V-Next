@@ -40,14 +40,50 @@ class OnlineSampleEncodeError(RuntimeError):
 
     def __init__(self, message: str, *, reason: str = "online_sample_encode_error") -> None:
         self.reason = reason
+        self.manifest_index: int | None = None
+        self.sample_key: str | None = None
+        self.task: str | None = None
+        self.reference_path: str | None = None
+        self.reference_paths: list[str] | None = None
         super().__init__(f"{reason}: {message}")
 
-    def to_dict(self) -> dict[str, str]:
-        return {
+    def attach_sample_context(self, raw_batch: dict[str, Any]) -> None:
+        def first(value: Any) -> Any:
+            if isinstance(value, Tensor):
+                return value.flatten()[0].item() if value.numel() else None
+            if isinstance(value, (list, tuple)):
+                return value[0] if value else None
+            return value
+
+        manifest_index = first(raw_batch.get("manifest_index"))
+        self.manifest_index = int(manifest_index) if manifest_index is not None else None
+        sample_key = first(raw_batch.get("sample_key"))
+        self.sample_key = str(sample_key) if sample_key is not None else None
+        task = first(raw_batch.get("task"))
+        self.task = str(task) if task is not None else None
+        reference_paths = first(raw_batch.get("reference_paths"))
+        if isinstance(reference_paths, (list, tuple)):
+            self.reference_paths = [str(path) for path in reference_paths]
+            if len(self.reference_paths) == 1:
+                self.reference_path = self.reference_paths[0]
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
             "error_type": type(self).__name__,
             "reason": self.reason,
             "message": str(self),
         }
+        for key in (
+            "manifest_index",
+            "sample_key",
+            "task",
+            "reference_path",
+            "reference_paths",
+        ):
+            value = getattr(self, key)
+            if value is not None:
+                payload[key] = value
+        return payload
 
 
 def _align_floating_hidden_states_to_module(hidden_states: Any, module: nn.Module) -> Any:
@@ -672,13 +708,29 @@ class OnlineBatchEncoder:
             tokenize=False,
             add_generation_prompt=True,
         )
-        processed = self.processor(
-            text=text,
-            images=reference_images or None,
-            return_tensors="pt",
-            padding=False,
-            truncation=False,
-        )
+        processor_kwargs: dict[str, Any] = {}
+        if reference_images:
+            processor_kwargs["input_data_format"] = "channels_last"
+        try:
+            processed = self.processor(
+                text=text,
+                images=reference_images or None,
+                return_tensors="pt",
+                padding=False,
+                truncation=False,
+                **processor_kwargs,
+            )
+        except (ValueError, TypeError) as exc:
+            if not reference_images:
+                raise
+            sizes = [tuple(image.size) for image in reference_images]
+            modes = [str(image.mode) for image in reference_images]
+            raise OnlineSampleEncodeError(
+                "Gemma reference processor failed: "
+                f"image_count={len(reference_images)}, sizes={sizes}, modes={modes}, "
+                f"original_error={type(exc).__name__}: {exc}",
+                reason="gemma_reference_processor_failure",
+            ) from exc
         input_ids = processed["input_ids"][0].to(dtype=torch.long)
         attention_mask = processed["attention_mask"][0].to(dtype=torch.long)
         if input_ids.ndim != 1 or attention_mask.shape != input_ids.shape:
