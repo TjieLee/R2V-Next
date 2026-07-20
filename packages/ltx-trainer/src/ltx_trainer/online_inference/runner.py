@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import shutil
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -139,9 +140,13 @@ def run_online_sample(
     stg_blocks: list[int] | None,
     decode_tile: bool,
     code_commit: str | None,
+    condition_encoder: Callable[[Any, dict[str, Any]], dict[str, Any]] | None = None,
+    sample_dir_override: Path | None = None,
+    metadata_overrides: dict[str, Any] | None = None,
+    save_mid_frame: bool = False,
 ) -> dict[str, Any]:  # noqa: PLR0913, PLR0915
     started = time.perf_counter()
-    sample_dir = sample_output_dir(output_root, sample)
+    sample_dir = sample_dir_override or sample_output_dir(output_root, sample)
     if sample_dir.exists():
         if output_is_complete(sample_dir) and not overwrite:
             return {"status": "skipped_existing", "sample_dir": str(sample_dir)}
@@ -154,7 +159,8 @@ def run_online_sample(
     if runtime.device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(runtime.device)
 
-    raw = encode_selected_sample_conditions(runtime.online_encoder, sample)
+    encode_conditions = condition_encoder or encode_selected_sample_conditions
+    raw = encode_conditions(runtime.online_encoder, sample)
     latents_metadata = build_noise_shape_metadata(
         sample,
         device=runtime.device,
@@ -255,6 +261,8 @@ def run_online_sample(
         "dry_run": dry_run,
         "output_path": str(sample_dir / output_name),
     }
+    if metadata_overrides:
+        metadata.update(metadata_overrides)
     atomic_write_text(sample_dir / "prompt.txt", f"{sample['caption']}\n")
     save_reference_montage(list(sample["reference_paths"]), sample_dir / "references.png")
     reference_outputs = save_reference_images(list(sample["reference_paths"]), sample_dir)
@@ -324,6 +332,11 @@ def run_online_sample(
         )
         atomic_save_png(tensor_frame_to_pil(decoded[0]), sample_dir / "generated_first.png")
         atomic_save_png(tensor_frame_to_pil(decoded[-1]), sample_dir / "generated_last.png")
+        if save_mid_frame:
+            atomic_save_png(
+                tensor_frame_to_pil(decoded[int(decoded.shape[0]) // 2]),
+                sample_dir / "generated_mid.png",
+            )
         save_contact_sheet(decoded, sample_dir / "generated_contact_sheet.png", frame_count=8)
         artifacts.extend(
             [
@@ -333,6 +346,8 @@ def run_online_sample(
                 "generated_contact_sheet.png",
             ]
         )
+        if save_mid_frame:
+            artifacts.append("generated_mid.png")
     metadata["elapsed_seconds"] = time.perf_counter() - started
     metadata["peak_vram_gb"] = _peak_memory_gib(runtime.device)
     metadata["peak_vram_gib"] = metadata["peak_vram_gb"]

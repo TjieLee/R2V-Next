@@ -78,7 +78,9 @@ def load_reference_inputs(
         try:
             originals.append(decode_image_rgb(path))
         except (OSError, ValueError, RuntimeError) as exc:
-            raise RawReferenceLoadError(f"Could not decode reference image {path}: {exc}") from exc
+            raise RawReferenceLoadError(
+                f"Could not decode reference image {path}: {exc}"
+            ) from exc
     vae_references = [
         deterministic_resize_center_crop(
             image.unsqueeze(0),
@@ -143,10 +145,80 @@ def encode_selected_sample_conditions(
     return conditions
 
 
+def encode_external_reference_only_conditions(
+    encoder: OnlineBatchEncoder,
+    sample: dict[str, Any],
+) -> dict[str, Any]:
+    """Encode an external benchmark sample that has references and no target by design."""
+    validate_selected_geometry(sample)
+    paths = [
+        Path(value).expanduser().resolve()
+        for value in sample.get("reference_paths", [])
+    ]
+    if not 1 <= len(paths) <= 4:
+        raise RawReferenceLoadError(
+            f"External reference-only inference requires 1..4 references, got {len(paths)}"
+        )
+    originals: list[Tensor] = []
+    for path in paths:
+        try:
+            originals.append(decode_image_rgb(path))
+        except (OSError, ValueError, RuntimeError) as exc:
+            raise RawReferenceLoadError(f"Could not decode reference image {path}: {exc}") from exc
+    vae_references = [
+        deterministic_resize_center_crop(
+            image.unsqueeze(0),
+            target_height=TARGET_HEIGHT,
+            target_width=TARGET_WIDTH,
+            chunk_frames=encoder.config.cpu_transform_chunk_frames,
+        )[0]
+        for image in originals
+    ]
+    if encoder.config.vlm_reference_preprocess == "original":
+        vlm_references = originals
+    elif encoder.config.vlm_reference_preprocess == "target_crop":
+        vlm_references = vae_references
+    else:
+        raise RawReferenceLoadError(
+            "vlm_reference_preprocess must be 'original' or 'target_crop', "
+            f"got {encoder.config.vlm_reference_preprocess!r}"
+        )
+    conditions = encoder.encode_inference_conditions_from_references(
+        task=str(sample["task"]),
+        caption=str(sample["caption"]),
+        reference_pixels_vae=vae_references,
+        reference_images_vlm=vlm_references,
+        width=int(sample["width"]),
+        height=int(sample["height"]),
+        num_frames=int(sample["num_frames"]),
+        fps=float(sample["fps"]),
+    )
+    conditions["reference_metadata"] = {
+        **conditions["reference_metadata"],
+        "reference_paths": [str(path) for path in paths],
+        "reference_paths_used": [str(path) for path in paths],
+        "original_reference_paths": list(
+            sample.get("original_reference_paths", sample.get("reference_paths", []))
+        ),
+    }
+    conditions["strict_no_gt_checks"] = {
+        "strict_no_gt": True,
+        "has_target": False,
+        "reference_target_alias_check": "not_applicable_no_target",
+        "target_open_count": 0,
+        "target_path_passed_to_condition_encoder": False,
+        "target_path_passed_to_denoiser": False,
+        "uses_target_latents": False,
+        "uses_gt_siglip_tokens": False,
+    }
+    return conditions
+
+
 __all__ = [
     "RawReferenceInputs",
     "RawReferenceLoadError",
     "TargetReferenceAliasError",
+    "encode_external_reference_only_conditions",
     "encode_selected_sample_conditions",
     "load_reference_inputs",
     "validate_selected_geometry",
