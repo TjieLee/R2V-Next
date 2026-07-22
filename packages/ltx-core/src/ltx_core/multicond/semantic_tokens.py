@@ -165,6 +165,7 @@ def build_semantic_teacher_attention_mask(
     prefix_attention_mask: Tensor,
     *,
     frame_count: int,
+    image_token_mask: Tensor | None = None,
     reference_region_mask: Tensor | None = None,
 ) -> Tensor:
     """Build the exact prefix/evidence/local-query teacher visibility mask."""
@@ -179,6 +180,7 @@ def build_semantic_teacher_attention_mask(
     allowed = torch.zeros(batch_size, total_length, total_length, dtype=torch.bool, device=prefix_valid.device)
     allowed[:, :prefix_length, :prefix_length] = build_multimodal_prefix_attention_mask(
         prefix_attention_mask,
+        image_token_mask=image_token_mask,
         reference_region_mask=reference_region_mask,
     )
 
@@ -210,9 +212,10 @@ def build_semantic_teacher_attention_mask(
 def build_multimodal_prefix_attention_mask(
     prefix_attention_mask: Tensor,
     *,
+    image_token_mask: Tensor | None = None,
     reference_region_mask: Tensor | None = None,
 ) -> Tensor:
-    """Return [B,P,P] visibility for causal text plus bidirectional reference-image regions."""
+    """Return [B,P,P] visibility for causal text plus bidirectional image placeholder regions."""
     if prefix_attention_mask.ndim != 2:
         raise ValueError("prefix_attention_mask must be [B,P]")
     prefix_valid = prefix_attention_mask.to(dtype=torch.bool)
@@ -220,13 +223,15 @@ def build_multimodal_prefix_attention_mask(
     causal = torch.ones(prefix_length, prefix_length, dtype=torch.bool, device=prefix_valid.device).tril()
     allowed = causal[None] & prefix_valid[:, :, None] & prefix_valid[:, None, :]
 
-    if reference_region_mask is None:
+    if image_token_mask is None:
+        image_token_mask = reference_region_mask
+    if image_token_mask is None:
         return allowed
-    if reference_region_mask.shape != prefix_valid.shape:
-        raise ValueError("reference_region_mask must match prefix_attention_mask")
-    reference_region_mask = reference_region_mask.to(device=allowed.device, dtype=torch.bool) & prefix_valid
+    if image_token_mask.shape != prefix_valid.shape:
+        raise ValueError("image_token_mask must match prefix_attention_mask")
+    image_token_mask = image_token_mask.to(device=allowed.device, dtype=torch.bool) & prefix_valid
     for batch_index in range(batch_size):
-        indices = torch.nonzero(reference_region_mask[batch_index], as_tuple=False).flatten().tolist()
+        indices = torch.nonzero(image_token_mask[batch_index], as_tuple=False).flatten().tolist()
         if not indices:
             continue
         run_start = indices[0]

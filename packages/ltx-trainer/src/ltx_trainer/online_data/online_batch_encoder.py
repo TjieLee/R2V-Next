@@ -12,6 +12,7 @@ from PIL import Image
 from torch import Tensor, nn
 from transformers import AutoImageProcessor, AutoTokenizer, Gemma3Processor
 
+from ltx_core.multicond.gemma3_attention import build_gemma3_attention_masks, resolve_gemma3_sliding_window
 from ltx_core.multicond.semantic_tokens import (
     EVIDENCE_TOKENS_PER_FRAME,
     build_multimodal_prefix_attention_mask,
@@ -380,7 +381,7 @@ class OnlineBatchEncoder:
         task: str,
         sample_key: str,
     ) -> tuple[dict[str, Tensor], dict[str, Tensor]]:
-        processed, reference_region_mask = self._process_multimodal_prefix(
+        processed, reference_segment_mask, image_token_mask = self._process_multimodal_prefix(
             caption=caption,
             reference_images=reference_images,
             task=task,
@@ -413,21 +414,25 @@ class OnlineBatchEncoder:
             raise RuntimeError("Online prefix encoding requires embeddings_processor.feature_extractor")
         feature_extractor.requires_grad_(False).eval()
         language_model.eval()
-        prefix_reference_mask = reference_region_mask.to(device=self.device).unsqueeze(0)
+        prefix_reference_segment_mask = reference_segment_mask.to(device=self.device).unsqueeze(0)
+        prefix_image_token_mask = image_token_mask.to(device=self.device).unsqueeze(0)
         prefix_visibility = build_multimodal_prefix_attention_mask(
             attention_mask,
-            reference_region_mask=prefix_reference_mask,
+            image_token_mask=prefix_image_token_mask,
         )
-        finfo = torch.finfo(inputs_embeds.dtype)
-        attention_bias = torch.zeros_like(prefix_visibility, dtype=inputs_embeds.dtype)
-        attention_bias.masked_fill_(~prefix_visibility, finfo.min)
-        attention_bias = attention_bias.unsqueeze(1)
+        gemma_masks = build_gemma3_attention_masks(
+            valid_token_mask=attention_mask,
+            image_token_mask=prefix_image_token_mask,
+            custom_visibility=prefix_visibility,
+            sliding_window=resolve_gemma3_sliding_window(language_model),
+            dtype=inputs_embeds.dtype,
+        )
         position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device, dtype=torch.long)
         position_ids = position_ids.unsqueeze(0).expand(input_ids.shape[0], -1)
         with torch.inference_mode(), self._frozen_encode_autocast():
             outputs = language_model(
                 inputs_embeds=inputs_embeds,
-                attention_mask=attention_bias,
+                attention_mask=gemma_masks.as_mapping(),
                 position_ids=position_ids,
                 output_hidden_states=True,
                 return_dict=True,
@@ -444,7 +449,8 @@ class OnlineBatchEncoder:
         teacher_prefix = {
             "prefix_inputs_embeds": inputs_embeds.detach(),
             "prefix_attention_mask": attention_mask,
-            "prefix_reference_region_mask": prefix_reference_mask,
+            "prefix_reference_segment_mask": prefix_reference_segment_mask,
+            "prefix_image_token_mask": prefix_image_token_mask,
         }
         return conditions, teacher_prefix
 
@@ -484,7 +490,7 @@ class OnlineBatchEncoder:
         reference_images: list[Image.Image],
         task: str,
         sample_key: str,
-    ) -> tuple[dict[str, Tensor], Tensor]:
+    ) -> tuple[dict[str, Tensor], Tensor, Tensor]:
         text = self.tokenizer.apply_chat_template(
             _build_messages(self.system_prompts[task], caption, len(reference_images), task=task),
             tokenize=False,
@@ -507,14 +513,15 @@ class OnlineBatchEncoder:
             ) from exc
         input_ids = processed["input_ids"][0].to(dtype=torch.long)
         attention_mask = processed["attention_mask"][0].to(dtype=torch.long)
-        reference_region_mask = self._validate_reference_regions(
+        reference_segment_mask, image_token_mask = self._validate_reference_regions(
             input_ids,
             num_reference_images=len(reference_images),
         )
-        input_ids, attention_mask, reference_region_mask = self._truncate_prefix(
+        input_ids, attention_mask, reference_segment_mask, image_token_mask = self._truncate_prefix(
             input_ids,
             attention_mask,
-            reference_region_mask,
+            reference_segment_mask,
+            image_token_mask,
             sample_key=sample_key,
         )
         padded_length = round_up_prefix_length(
@@ -526,29 +533,29 @@ class OnlineBatchEncoder:
             pad_id = int(self.tokenizer.pad_token_id or 0)
             input_ids = torch.cat([input_ids, torch.full((pad_length,), pad_id, dtype=torch.long)])
             attention_mask = torch.cat([attention_mask, torch.zeros(pad_length, dtype=torch.long)])
-            reference_region_mask = torch.cat(
-                [reference_region_mask, torch.zeros(pad_length, dtype=torch.bool)]
-            )
+            reference_segment_mask = torch.cat([reference_segment_mask, torch.zeros(pad_length, dtype=torch.bool)])
+            image_token_mask = torch.cat([image_token_mask, torch.zeros(pad_length, dtype=torch.bool)])
         result = {
             "input_ids": input_ids.unsqueeze(0),
             "attention_mask": attention_mask.unsqueeze(0),
         }
         if isinstance(processed.get("pixel_values"), Tensor):
             result["pixel_values"] = processed["pixel_values"]
-        return result, reference_region_mask
+        return result, reference_segment_mask, image_token_mask
 
     def _truncate_prefix(
         self,
         input_ids: Tensor,
         attention_mask: Tensor,
-        reference_region_mask: Tensor,
+        reference_segment_mask: Tensor,
+        image_token_mask: Tensor,
         *,
         sample_key: str,
-    ) -> tuple[Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         maximum = self.config.vlm_prefix_max_length
         if input_ids.numel() <= maximum:
-            return input_ids, attention_mask, reference_region_mask
-        protected = reference_region_mask.clone()
+            return input_ids, attention_mask, reference_segment_mask, image_token_mask
+        protected = reference_segment_mask.clone()
         for token_id in set(getattr(self.tokenizer, "all_special_ids", [])) | {
             GEMMA3_CONFIG_FOR_LTX.boi_token_index,
             GEMMA3_CONFIG_FOR_LTX.eoi_token_index,
@@ -564,8 +571,8 @@ class OnlineBatchEncoder:
                 reason="vlm_prefix_too_long",
             )
         first_reference = (
-            int(torch.nonzero(reference_region_mask, as_tuple=False).flatten()[0])
-            if reference_region_mask.any()
+            int(torch.nonzero(reference_segment_mask, as_tuple=False).flatten()[0])
+            if reference_segment_mask.any()
             else input_ids.numel()
         )
         system_candidates = removable[removable < first_reference]
@@ -576,14 +583,15 @@ class OnlineBatchEncoder:
         keep[remove] = False
         truncated_ids = input_ids[keep]
         truncated_attention = attention_mask[keep]
-        truncated_reference = reference_region_mask[keep]
+        truncated_reference_segment = reference_segment_mask[keep]
+        truncated_image_token = image_token_mask[keep]
         self._validate_reference_regions(
             truncated_ids,
-            num_reference_images=self._reference_count(reference_region_mask),
+            num_reference_images=self._reference_count(reference_segment_mask),
         )
-        return truncated_ids, truncated_attention, truncated_reference
+        return truncated_ids, truncated_attention, truncated_reference_segment, truncated_image_token
 
-    def _validate_reference_regions(self, input_ids: Tensor, *, num_reference_images: int) -> Tensor:
+    def _validate_reference_regions(self, input_ids: Tensor, *, num_reference_images: int) -> tuple[Tensor, Tensor]:
         image_token = GEMMA3_CONFIG_FOR_LTX.image_token_index
         boi_token = GEMMA3_CONFIG_FOR_LTX.boi_token_index
         eoi_token = GEMMA3_CONFIG_FOR_LTX.eoi_token_index
@@ -594,14 +602,16 @@ class OnlineBatchEncoder:
         ends = torch.nonzero(input_ids == eoi_token, as_tuple=False).flatten().tolist()
         if len(starts) != num_reference_images or len(ends) != num_reference_images:
             raise ValueError("Gemma reference boundary count mismatch")
-        region_mask = torch.zeros(input_ids.numel(), dtype=torch.bool)
+        segment_mask = torch.zeros(input_ids.numel(), dtype=torch.bool)
+        image_token_mask = torch.zeros(input_ids.numel(), dtype=torch.bool)
         for start, end in zip(starts, ends, strict=True):
             if end <= start:
                 raise ValueError("Gemma reference boundaries are malformed")
             if int((input_ids[start + 1 : end] == image_token).sum().item()) != expected_per_image:
                 raise ValueError("Gemma reference image region was truncated")
-            region_mask[start : end + 1] = True
-        return region_mask
+            segment_mask[start : end + 1] = True
+            image_token_mask[start + 1 : end] = input_ids[start + 1 : end] == image_token
+        return segment_mask, image_token_mask
 
     @staticmethod
     def _reference_count(reference_region_mask: Tensor) -> int:

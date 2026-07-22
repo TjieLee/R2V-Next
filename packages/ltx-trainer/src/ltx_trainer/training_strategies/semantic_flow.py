@@ -9,6 +9,7 @@ import torch
 from pydantic import Field, model_validator
 from torch import Tensor, nn
 
+from ltx_core.multicond.gemma3_attention import build_gemma3_attention_masks, resolve_gemma3_sliding_window
 from ltx_core.model.transformer.modality import Modality
 from ltx_core.multicond.semantic_tokens import (
     EVIDENCE_TOKENS_PER_FRAME,
@@ -193,7 +194,10 @@ class SemanticFlowStrategy(TrainingStrategy):
         query_initializer, semantic_encoder, reconstruction_decoder = self._require_semantic_modules()
         prefix_embeddings = teacher_inputs["prefix_inputs_embeds"]
         prefix_attention_mask = teacher_inputs["prefix_attention_mask"].to(dtype=torch.bool)
-        reference_region_mask = teacher_inputs.get("prefix_reference_region_mask")
+        prefix_image_token_mask = teacher_inputs.get(
+            "prefix_image_token_mask",
+            teacher_inputs.get("prefix_reference_region_mask"),
+        )
         evidence = teacher_inputs["evidence_tokens"].detach()
         normalized_timestamps = teacher_inputs["normalized_timestamps"]
         if evidence.shape[-2] != EVIDENCE_TOKENS_PER_FRAME:
@@ -215,20 +219,29 @@ class SemanticFlowStrategy(TrainingStrategy):
         allowed = build_semantic_teacher_attention_mask(
             prefix_attention_mask,
             frame_count=frame_count,
-            reference_region_mask=reference_region_mask,
+            image_token_mask=prefix_image_token_mask,
         )
-        finfo = torch.finfo(inputs_embeds.dtype)
-        attention_bias = torch.zeros_like(allowed, dtype=inputs_embeds.dtype)
-        attention_bias.masked_fill_(~allowed, finfo.min)
-        attention_bias = attention_bias.unsqueeze(1)
+        suffix_valid = torch.ones(batch_size, suffix.shape[1], device=prefix_attention_mask.device, dtype=torch.bool)
+        valid_token_mask = torch.cat([prefix_attention_mask, suffix_valid], dim=1)
+        if prefix_image_token_mask is None:
+            prefix_image_token_mask = torch.zeros_like(prefix_attention_mask)
+        prefix_image_token_mask = prefix_image_token_mask.to(device=prefix_attention_mask.device, dtype=torch.bool)
+        image_token_mask = torch.cat([prefix_image_token_mask, torch.zeros_like(suffix_valid)], dim=1)
         position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device, dtype=torch.long)
         position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
 
         language_model = self._get_language_model()
         language_model.eval()
+        gemma_masks = build_gemma3_attention_masks(
+            valid_token_mask=valid_token_mask,
+            image_token_mask=image_token_mask,
+            custom_visibility=allowed,
+            sliding_window=resolve_gemma3_sliding_window(language_model),
+            dtype=inputs_embeds.dtype,
+        )
         outputs = language_model(
             inputs_embeds=inputs_embeds,
-            attention_mask=attention_bias,
+            attention_mask=gemma_masks.as_mapping(),
             position_ids=position_ids,
             output_hidden_states=True,
             return_dict=True,

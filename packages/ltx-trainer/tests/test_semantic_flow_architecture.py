@@ -105,13 +105,13 @@ def test_prefix_only_hidden_matches_teacher_prefix_hidden_with_reference_regions
         generator=generator,
     )
     prefix_attention = torch.tensor([[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0]], dtype=torch.bool)
-    reference_regions = torch.zeros_like(prefix_attention)
-    reference_regions[:, 2:5] = True
-    reference_regions[:, 6:9] = True
+    image_regions = torch.zeros_like(prefix_attention)
+    image_regions[:, 2:5] = True
+    image_regions[:, 6:9] = True
 
     prefix_visible = build_multimodal_prefix_attention_mask(
         prefix_attention,
-        reference_region_mask=reference_regions,
+        image_token_mask=image_regions,
     )
     assert prefix_visible[0, 2, 4]
     assert prefix_visible[0, 4, 2]
@@ -125,7 +125,7 @@ def test_prefix_only_hidden_matches_teacher_prefix_hidden_with_reference_regions
     teacher_visible = build_semantic_teacher_attention_mask(
         prefix_attention,
         frame_count=1,
-        reference_region_mask=reference_regions,
+        image_token_mask=image_regions,
     )
     assert torch.equal(teacher_visible[:, : prefix_embeddings.shape[1], : prefix_embeddings.shape[1]], prefix_visible)
     assert not teacher_visible[:, : prefix_embeddings.shape[1], prefix_embeddings.shape[1] :].any()
