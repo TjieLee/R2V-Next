@@ -450,6 +450,57 @@ def _first_non_increasing_source_pair(indices: list[int]) -> tuple[int, int, int
     return None
 
 
+@dataclass(frozen=True)
+class SourcePlanEvaluation:
+    sample_start: int
+    indices: tuple[int, ...]
+    valid: bool
+    failure_reason: str | None
+    first_non_increasing: tuple[int, int, int] | None
+    first_out_of_clip: tuple[int, int] | None
+
+
+def evaluate_source_plan(
+    *,
+    sample_start: int,
+    clip_start: int,
+    clip_end: int,
+    source_fps: float,
+    target_fps: float,
+    target_frame_count: int,
+) -> SourcePlanEvaluation:
+    indices = _source_indices_for_start(
+        sample_start=sample_start,
+        source_fps=source_fps,
+        target_fps=target_fps,
+        target_frame_count=target_frame_count,
+    )
+    first_non_increasing = _first_non_increasing_source_pair(indices)
+    first_out_of_clip = next(
+        (
+            (target_index, source_index)
+            for target_index, source_index in enumerate(indices)
+            if source_index < clip_start or source_index >= clip_end
+        ),
+        None,
+    )
+    failure_reason: str | None = None
+    if len(indices) != target_frame_count:
+        failure_reason = "incorrect_length"
+    elif first_non_increasing is not None:
+        failure_reason = "non_increasing"
+    elif first_out_of_clip is not None:
+        failure_reason = "out_of_clip"
+    return SourcePlanEvaluation(
+        sample_start=sample_start,
+        indices=tuple(indices),
+        valid=failure_reason is None,
+        failure_reason=failure_reason,
+        first_non_increasing=first_non_increasing,
+        first_out_of_clip=first_out_of_clip,
+    )
+
+
 def select_strict_source_plan(
     *,
     clip_start: int,
@@ -458,46 +509,60 @@ def select_strict_source_plan(
     source_fps: float,
     target_fps: float,
     target_frame_count: int,
+    clip_end: int | None = None,
 ) -> tuple[int, list[int]]:
+    span = (target_frame_count - 1) * source_fps / target_fps
+    if clip_end is None:
+        clip_end = max_start + math.floor(span) + 1
     candidates: list[int] = []
-    for candidate in (
-        preferred_start,
-        clip_start,
-        clip_start + 1,
-        max_start,
-        max_start - 1,
-    ):
-        if clip_start <= candidate <= max_start and candidate not in candidates:
-            candidates.append(candidate)
+    for base in (preferred_start, clip_start, max_start):
+        for offset in (0, -1, 1, -2, 2):
+            candidate = base + offset
+            if clip_start <= candidate < clip_end and candidate not in candidates:
+                candidates.append(candidate)
 
-    first_duplicate: tuple[int, int, int, int] | None = None
+    evaluations: list[SourcePlanEvaluation] = []
     for candidate in candidates:
-        indices = _source_indices_for_start(
+        evaluation = evaluate_source_plan(
             sample_start=candidate,
+            clip_start=clip_start,
+            clip_end=clip_end,
             source_fps=source_fps,
             target_fps=target_fps,
             target_frame_count=target_frame_count,
         )
-        duplicate = _first_non_increasing_source_pair(indices)
-        if duplicate is None:
-            return candidate, indices
-        if first_duplicate is None:
-            target_index, left, right = duplicate
-            first_duplicate = (candidate, target_index, left, right)
+        evaluations.append(evaluation)
+        if evaluation.valid:
+            return candidate, list(evaluation.indices)
 
-    duplicate_message = "none"
-    if first_duplicate is not None:
-        duplicate_start, target_index, left, right = first_duplicate
-        duplicate_message = (
-            f"start={duplicate_start} target_indices={target_index}/{target_index + 1} "
-            f"source_frames={left}/{right}"
+    theoretical_span_fits = clip_end - clip_start >= math.floor(span) + 1
+    duplicate_evaluation = next(
+        (evaluation for evaluation in evaluations if evaluation.first_non_increasing is not None),
+        None,
+    )
+    if theoretical_span_fits and duplicate_evaluation is not None:
+        target_index, left, right = duplicate_evaluation.first_non_increasing
+        raise ManifestReject(
+            "source_fps_too_low_for_unique_24fps_sampling",
+            f"Source FPS {source_fps} cannot produce {target_frame_count} unique source frames "
+            f"at target FPS {target_fps}: source_fps={source_fps}, target_fps={target_fps}, "
+            f"target_frame_count={target_frame_count}, clip_start={clip_start}, clip_end={clip_end}, "
+            f"preferred_start={preferred_start}, tried_starts={candidates}, "
+            f"first_duplicate_target_indices={target_index}/{target_index + 1}, "
+            f"first_duplicate_source_frames={left}/{right}",
         )
+
+    last_generated_index = "none"
+    if evaluations and evaluations[0].indices:
+        last_generated_index = str(evaluations[0].indices[-1])
     raise ManifestReject(
-        "source_fps_too_low_for_unique_24fps_sampling",
-        f"Source FPS {source_fps} cannot produce {target_frame_count} unique source frames "
-        f"at target FPS {target_fps}: preferred_start={preferred_start}, "
-        f"tried_starts={candidates}, valid_start_range=[{clip_start},{max_start}], "
-        f"source_fps={source_fps}, target_fps={target_fps}, first_duplicate={duplicate_message}",
+        "insufficient_frames_for_121_at_24fps",
+        f"No exact {target_frame_count}-frame/{target_fps:g}-fps clip fits "
+        f"[{clip_start},{clip_end}) at fps={source_fps}: source_fps={source_fps}, "
+        f"target_fps={target_fps}, target_frame_count={target_frame_count}, "
+        f"optimistic_max_start={max_start}, preferred_start={preferred_start}, "
+        f"tried_starts={candidates}, last_generated_index={last_generated_index}, "
+        f"required_exclusive_clip_end={clip_end}",
     )
 
 
@@ -542,14 +607,14 @@ def prepare_canonical_r2v_record(
         "clip_end_frame": clip_end,
     }
     sample_key = stable_sample_key(identity)
-    max_start = clip_end - 1 - round((VIDEO_NUM_FRAMES - 1) * original_fps / VIDEO_FPS)
-    if max_start < clip_start:
-        raise ManifestReject(
-            "insufficient_frames_for_121_at_24fps",
-            f"No exact 121-frame/24-fps clip fits [{clip_start},{clip_end}) at fps={original_fps}",
-        )
+    span = (VIDEO_NUM_FRAMES - 1) * original_fps / VIDEO_FPS
+    max_start = clip_end - 1 - math.floor(span)
     rng_seed = int(stable_sample_key({"sample_key": sample_key, "manifest_seed": manifest_seed})[:16], 16)
-    preferred_start = random.Random(rng_seed).randint(clip_start, max_start)
+    preferred_start = (
+        random.Random(rng_seed).randint(clip_start, max_start)
+        if max_start >= clip_start
+        else clip_start
+    )
     try:
         _sample_start, source_indices = select_strict_source_plan(
             clip_start=clip_start,
@@ -558,9 +623,10 @@ def prepare_canonical_r2v_record(
             source_fps=original_fps,
             target_fps=VIDEO_FPS,
             target_frame_count=VIDEO_NUM_FRAMES,
+            clip_end=clip_end,
         )
     except ManifestReject as exc:
-        raise ManifestReject(exc.reason, f"{exc}; clip=[{clip_start},{clip_end})") from exc
+        raise ManifestReject(exc.reason, str(exc)) from exc
     if (
         len(source_indices) != VIDEO_NUM_FRAMES
         or source_indices[0] < clip_start

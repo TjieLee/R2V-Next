@@ -68,11 +68,12 @@ def test_23976_fps_source_builds_for_clip_start_parity(clip_start: int) -> None:
 def test_239_fps_source_recovers_opposite_parity_start_plan() -> None:
     selected_start, indices = select_strict_source_plan(
         clip_start=0,
-        max_start=1,
+        max_start=2,
         preferred_start=1,
         source_fps=23.9,
         target_fps=24.0,
         target_frame_count=121,
+        clip_end=122,
     )
     assert selected_start == 0
     assert len(indices) == 121
@@ -91,8 +92,10 @@ def test_23899_fps_source_rejects_when_bounded_parities_all_duplicate() -> None:
     message = str(exc_info.value)
     assert "preferred_start=" in message
     assert "tried_starts=" in message
-    assert "first_duplicate=" in message
-    assert "clip=[0,122)" in message
+    assert "first_duplicate_target_indices=" in message
+    assert "first_duplicate_source_frames=" in message
+    assert "clip_start=0" in message
+    assert "clip_end=122" in message
 
 
 def test_23_fps_source_rejects_duplicate_source_indices() -> None:
@@ -104,9 +107,32 @@ def test_23_fps_source_rejects_duplicate_source_indices() -> None:
     assert "Source FPS 23.0" in message
     assert "target FPS 24.0" in message
     assert "121 unique source frames" in message
-    assert "first_duplicate=" in message
-    assert "target_indices=" in message
-    assert "clip=[30,146)" in message
+    assert "first_duplicate_target_indices=" in message
+    assert "first_duplicate_source_frames=" in message
+    assert "clip_start=30" in message
+    assert "clip_end=146" in message
+
+
+def test_243_fps_half_integer_span_is_not_rejected() -> None:
+    record = _build_record(source_fps=24.3, clip_start=1, clip_end=123)
+
+    indices = record["target_source_frame_indices"]
+    assert len(indices) == 121
+    assert indices[0] >= 1
+    assert indices[-1] < 123
+    assert all(left < right for left, right in zip(indices, indices[1:]))
+
+
+def test_243_fps_short_clip_remains_insufficient() -> None:
+    with pytest.raises(ManifestReject) as exc_info:
+        _build_record(source_fps=24.3, clip_start=0, clip_end=121)
+
+    assert exc_info.value.reason == "insufficient_frames_for_121_at_24fps"
+    message = str(exc_info.value)
+    assert "optimistic_max_start=" in message
+    assert "tried_starts=" in message
+    assert "last_generated_index=" in message
+    assert "required_exclusive_clip_end=121" in message
 
 
 @pytest.mark.parametrize(
