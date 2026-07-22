@@ -47,6 +47,11 @@ from ltx_trainer.model_loader import (
     load_transformer,
     load_video_vae_encoder,
 )
+from ltx_trainer.online_inference.checkpoint_runtime import (
+    checkpoint_contains_semantic_flow_modules,
+    read_checkpoint_metadata,
+    validate_reference_rope_checkpoint_metadata,
+)
 from ltx_trainer.online_inference.startup_memory import host_memory_snapshot
 from ltx_trainer.progress import TrainingProgress
 from ltx_trainer.quantization import quantize_model
@@ -874,6 +879,7 @@ class LtxvTrainer:
 
     def _load_full_checkpoint(self, checkpoint_path: Path) -> None:
         """Load full model checkpoint."""
+        self._validate_full_checkpoint_metadata(checkpoint_path)
         state_dict = load_file(checkpoint_path)
         self._load_auxiliary_checkpoint_state(state_dict)
 
@@ -884,6 +890,18 @@ class LtxvTrainer:
             logger.info("No full transformer weights found in checkpoint; loaded auxiliary weights only")
 
         logger.info("✅ Full model checkpoint loaded successfully")
+
+    def _validate_full_checkpoint_metadata(self, checkpoint_path: Path) -> None:
+        if self._config.training_strategy.name != "semantic_flow":
+            return
+        if not checkpoint_contains_semantic_flow_modules(checkpoint_path):
+            return
+        metadata = read_checkpoint_metadata(checkpoint_path)
+        validate_reference_rope_checkpoint_metadata(
+            metadata,
+            expected_mode=self._training_strategy.config.reference_rope_mode,
+            allow_legacy=False,
+        )
 
     @staticmethod
     def _index_peft_adapter_state(

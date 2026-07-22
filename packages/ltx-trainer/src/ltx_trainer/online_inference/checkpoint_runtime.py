@@ -158,6 +158,27 @@ def audit_checkpoint(path: Path) -> dict[str, Any]:
     }
 
 
+def read_checkpoint_metadata(path: Path) -> dict[str, str]:
+    """Read safetensors metadata without materializing checkpoint tensors."""
+    resolved = path.expanduser().resolve()
+    try:
+        with safe_open(resolved, framework="pt", device="cpu") as handle:
+            return dict(handle.metadata() or {})
+    except Exception as exc:
+        raise CheckpointAuditError(f"Invalid safetensors checkpoint {resolved}: {exc}") from exc
+
+
+def checkpoint_contains_semantic_flow_modules(path: Path) -> bool:
+    """Return whether a checkpoint header contains any semantic-flow module."""
+    resolved = path.expanduser().resolve()
+    prefixes = SEMANTIC_STRATEGY_CHECKPOINT_PREFIXES + SEMANTIC_TRANSFORMER_CHECKPOINT_PREFIXES
+    try:
+        with safe_open(resolved, framework="pt", device="cpu") as handle:
+            return any(key.startswith(prefixes) for key in handle.keys())
+    except Exception as exc:
+        raise CheckpointAuditError(f"Invalid safetensors checkpoint {resolved}: {exc}") from exc
+
+
 def validate_reference_rope_checkpoint_metadata(
     metadata: dict[str, str],
     *,
@@ -401,9 +422,11 @@ __all__ = [
     "OnlineInferenceRuntime",
     "assert_checkpoint_unchanged",
     "audit_checkpoint",
+    "checkpoint_contains_semantic_flow_modules",
     "checkpoint_snapshot",
     "checkpoint_step",
     "load_online_inference_runtime",
+    "read_checkpoint_metadata",
     "resolve_checkpoint",
     "validate_reference_rope_checkpoint_metadata",
 ]

@@ -38,6 +38,8 @@ from ltx_trainer.config import LtxTrainerConfig
 from ltx_trainer.online_inference.checkpoint_runtime import (
     CheckpointAuditError,
     audit_checkpoint,
+    checkpoint_contains_semantic_flow_modules,
+    read_checkpoint_metadata,
     resolve_checkpoint,
     validate_reference_rope_checkpoint_metadata,
 )
@@ -59,7 +61,7 @@ from ltx_trainer.online_inference.startup_memory import (
     model_parameter_count,
 )
 from ltx_trainer.training_strategies.semantic_flow import SemanticFlowConfig, SemanticFlowStrategy
-from ltx_trainer.trainer import _enforce_semantic_flow_fsdp_runtime_safety
+from ltx_trainer.trainer import LtxvTrainer, _enforce_semantic_flow_fsdp_runtime_safety
 
 
 def test_local_queries_and_reconstruction_targets_preserve_spatial_neighborhoods() -> None:
@@ -683,6 +685,54 @@ def test_checkpoint_audit_and_ready_resolution_require_semantic_modules(tmp_path
     save_file(tensors, missing_transformer, metadata={"architecture": "semantic_flow_v1"})
     with pytest.raises(CheckpointAuditError, match="semantic_proj_out"):
         audit_checkpoint(missing_transformer)
+
+
+def test_trainer_validates_reference_rope_metadata_before_loading_tensors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint = tmp_path / "semantic.safetensors"
+    native_metadata = SemanticFlowStrategy(
+        SemanticFlowConfig(reference_rope_mode="native_overlap")
+    ).get_checkpoint_metadata()
+    save_file(
+        {"training_strategy.semantic_query.weight": torch.ones(1)},
+        checkpoint,
+        metadata={key: str(value) for key, value in native_metadata.items()},
+    )
+    assert checkpoint_contains_semantic_flow_modules(checkpoint)
+    assert read_checkpoint_metadata(checkpoint)["reference_rope_mode"] == "native_overlap"
+
+    trainer = object.__new__(LtxvTrainer)
+    trainer._config = SimpleNamespace(training_strategy=SimpleNamespace(name="semantic_flow"))
+    trainer._training_strategy = SemanticFlowStrategy(SemanticFlowConfig())
+    monkeypatch.setattr(
+        "ltx_trainer.trainer.load_file",
+        lambda _path: pytest.fail("checkpoint tensors loaded before metadata validation"),
+    )
+    with pytest.raises(CheckpointAuditError, match="metadata mismatch"):
+        trainer._load_full_checkpoint(checkpoint)
+
+
+def test_base_checkpoint_header_is_not_treated_as_reference_rope_metadata(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "base.safetensors"
+    save_file({"transformer_blocks.0.weight": torch.ones(1)}, checkpoint)
+    assert not checkpoint_contains_semantic_flow_modules(checkpoint)
+    assert read_checkpoint_metadata(checkpoint) == {}
+
+    trainer = object.__new__(LtxvTrainer)
+    trainer._config = SimpleNamespace(training_strategy=SimpleNamespace(name="semantic_flow"))
+    strategy = SemanticFlowStrategy(SemanticFlowConfig())
+    trainer._training_strategy = strategy
+    trainer._validate_full_checkpoint_metadata(checkpoint)
+
+    strategy._query_initializer = SemanticQueryInitializer(4)
+    strategy._semantic_encoder = SemanticEncoder(4, 4)
+    strategy._reconstruction_decoder = SemanticReconstructionDecoder(4, 4)
+    with pytest.raises(RuntimeError, match="semantic_flow checkpoint is incomplete"):
+        trainer._load_full_checkpoint(checkpoint)
 
 
 def test_reference_rope_checkpoint_metadata_is_complete_and_fail_closed() -> None:
