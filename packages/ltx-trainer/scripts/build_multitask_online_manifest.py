@@ -1056,17 +1056,21 @@ def main(  # noqa: PLR0913, PLR0915
                         progress.maybe_emit()
                         row_index += 1
                 progress.maybe_emit(force=True, event="dataset_complete")
-            progress.maybe_emit(force=True, event="manifest_complete")
             connection.commit()
             _flush_and_sync(accepted_handle)
             _flush_and_sync(reject_handle)
+            progress.maybe_emit(force=True, event="rows_complete")
 
         if any(task_counts[task] == 0 for task in (IMAGE_TASK, VIDEO_TASK)):
             raise RuntimeError(f"Built manifest does not contain both tasks: {dict(task_counts)}")
+        progress.maybe_emit(force=True, event="index_start")
         build_manifest_offset_index(output_temporary, index_temporary)
+        progress.maybe_emit(force=True, event="index_complete")
+        progress.maybe_emit(force=True, event="publish_start")
         output_temporary.replace(output_path)
         reject_temporary.replace(reject_path)
         index_temporary.replace(index_path)
+        progress.maybe_emit(force=True, event="publish_complete")
         summary = {
             "raw_rows": raw_rows,
             "accepted_rows": accepted_rows,
@@ -1103,7 +1107,15 @@ def main(  # noqa: PLR0913, PLR0915
             ),
         }
         _atomic_write_json(summary_path, summary)
+        missing_artifacts = [
+            str(path)
+            for path in (output_path, reject_path, index_path, summary_path)
+            if not path.is_file()
+        ]
+        if missing_artifacts:
+            raise RuntimeError(f"Manifest publish did not create required artifacts: {missing_artifacts}")
         typer.echo(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
+        progress.maybe_emit(force=True, event="manifest_complete")
     finally:
         if connection is not None:
             connection.close()

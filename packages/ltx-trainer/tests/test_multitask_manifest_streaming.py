@@ -350,6 +350,7 @@ def test_manifest_builder_streams_100k_rows_with_bounded_memory(
 def test_manifest_builder_failure_preserves_existing_outputs_and_cleans_temps(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     _patch_synthetic_builder(monkeypatch, rows_per_task=2)
     output = tmp_path / "train_unique.jsonl"
@@ -362,5 +363,85 @@ def test_manifest_builder_failure_preserves_existing_outputs_and_cleans_temps(
     with pytest.raises(RuntimeError, match="forced index failure"):
         _run_synthetic_builder(tmp_path)
     assert output.read_text(encoding="utf-8") == "existing-manifest\n"
+    assert not (tmp_path / "rejected.jsonl").exists()
+    assert not Path(f"{output}.idx").exists()
+    assert not (tmp_path / "summary.json").exists()
     assert not list(tmp_path.glob("*.tmp.*"))
     assert not list(tmp_path.glob("*.sqlite"))
+    events = capsys.readouterr().err
+    assert "event=rows_complete" in events
+    assert "event=index_start" in events
+    assert "event=index_complete" not in events
+    assert "event=manifest_complete" not in events
+
+
+def test_manifest_completion_event_follows_all_published_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_synthetic_builder(monkeypatch, rows_per_task=2)
+    output = tmp_path / "train_unique.jsonl"
+    rejects = tmp_path / "rejected.jsonl"
+    summary = tmp_path / "summary.json"
+    index = Path(f"{output}.idx")
+    events: list[str] = []
+    original_maybe_emit = manifest_builder._ManifestProgress.maybe_emit
+
+    def recording_maybe_emit(
+        self: Any,
+        *,
+        force: bool = False,
+        event: str = "progress",
+    ) -> None:
+        original_maybe_emit(self, force=force, event=event)
+        if force:
+            events.append(event)
+        if event == "manifest_complete":
+            assert output.is_file()
+            assert rejects.is_file()
+            assert index.is_file()
+            assert summary.is_file()
+
+    monkeypatch.setattr(manifest_builder._ManifestProgress, "maybe_emit", recording_maybe_emit)
+    _run_synthetic_builder(tmp_path)
+
+    required_events = [
+        "dataset_complete",
+        "rows_complete",
+        "index_start",
+        "index_complete",
+        "publish_complete",
+        "manifest_complete",
+    ]
+    positions = [
+        max(position for position, recorded_event in enumerate(events) if recorded_event == name)
+        for name in required_events
+    ]
+    assert positions == sorted(positions)
+
+
+def test_summary_write_failure_never_emits_manifest_complete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _patch_synthetic_builder(monkeypatch, rows_per_task=2)
+    output = tmp_path / "train_unique.jsonl"
+    rejects = tmp_path / "rejected.jsonl"
+    summary = tmp_path / "summary.json"
+
+    def fail_summary_write(*_args, **_kwargs) -> None:
+        raise RuntimeError("forced summary failure")
+
+    monkeypatch.setattr(manifest_builder, "_atomic_write_json", fail_summary_write)
+    with pytest.raises(RuntimeError, match="forced summary failure"):
+        _run_synthetic_builder(tmp_path)
+
+    assert output.is_file()
+    assert rejects.is_file()
+    assert Path(f"{output}.idx").is_file()
+    assert not summary.exists()
+    assert not list(tmp_path.glob("*.tmp.*"))
+    events = capsys.readouterr().err
+    assert "event=publish_complete" in events
+    assert "event=manifest_complete" not in events
