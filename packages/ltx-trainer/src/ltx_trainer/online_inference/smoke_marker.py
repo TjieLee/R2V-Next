@@ -109,6 +109,7 @@ def write_semantic_flow_smoke_marker(
     i2i_checkpoint_path: str | Path,
     r2v_checkpoint_path: str | Path,
     runtime_audit_path: str | Path,
+    runtime_lock_path: str | Path,
     inference_summary_path: str | Path,
 ) -> dict[str, Any]:
     training_config = _require_file("training config", training_config_path)
@@ -116,8 +117,13 @@ def write_semantic_flow_smoke_marker(
     i2i_checkpoint = _require_file("I2I checkpoint", i2i_checkpoint_path)
     r2v_checkpoint = _require_file("R2V checkpoint", r2v_checkpoint_path)
     runtime_audit = _require_file("runtime audit", runtime_audit_path)
+    runtime_lock = _require_file("runtime lock", runtime_lock_path)
     inference_summary = _require_file("non-dry-run inference summary", inference_summary_path)
     inference_result = validate_non_dry_run_i2i_summary(inference_summary)
+    inference_sample_dir = Path(str(inference_result["sample_dir"])).expanduser().resolve()
+    generated_png = _require_file("generated I2I PNG", inference_sample_dir / "generated.png")
+    inference_success_json = _require_file("I2I success.json", inference_sample_dir / "success.json")
+    inference_metadata_json = _require_file("I2I metadata.json", inference_sample_dir / "metadata.json")
     i2i_checkpoint_sha256 = sha256_file(i2i_checkpoint)
     if inference_result.get("code_commit") != code_commit:
         raise SemanticFlowSmokeMarkerError("Non-dry-run inference was produced by a different code commit")
@@ -140,7 +146,16 @@ def write_semantic_flow_smoke_marker(
         "r2v_checkpoint_sha256": sha256_file(r2v_checkpoint),
         "runtime_audit": str(runtime_audit),
         "runtime_audit_sha256": sha256_file(runtime_audit),
+        "runtime_lock": str(runtime_lock),
+        "runtime_lock_sha256": sha256_file(runtime_lock),
         "non_dry_run_inference_summary": str(inference_summary),
+        "non_dry_run_inference_summary_sha256": sha256_file(inference_summary),
+        "generated_png": str(generated_png),
+        "generated_png_sha256": sha256_file(generated_png),
+        "inference_success_json": str(inference_success_json),
+        "inference_success_json_sha256": sha256_file(inference_success_json),
+        "inference_metadata_json": str(inference_metadata_json),
+        "inference_metadata_json_sha256": sha256_file(inference_metadata_json),
         "non_dry_run_inference_passed": True,
     }
     atomic_write_json(Path(marker_path).expanduser().resolve(), payload)

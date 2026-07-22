@@ -24,6 +24,7 @@ def write(
     i2i_checkpoint: str = typer.Option(..., "--i2i-checkpoint"),
     r2v_checkpoint: str = typer.Option(..., "--r2v-checkpoint"),
     runtime_audit: str = typer.Option(..., "--runtime-audit"),
+    runtime_lock: str = typer.Option(..., "--runtime-lock"),
     inference_summary: str = typer.Option(..., "--inference-summary"),
 ) -> None:
     payload = write_semantic_flow_smoke_marker(
@@ -34,6 +35,7 @@ def write(
         i2i_checkpoint_path=i2i_checkpoint,
         r2v_checkpoint_path=r2v_checkpoint,
         runtime_audit_path=runtime_audit,
+        runtime_lock_path=runtime_lock,
         inference_summary_path=inference_summary,
     )
     typer.echo(json.dumps(payload, indent=2, sort_keys=True))

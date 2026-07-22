@@ -256,6 +256,7 @@ case "${1:-}" in
       --i2i-checkpoint "$I2I_CHECKPOINT" \
       --r2v-checkpoint "$R2V_CHECKPOINT" \
       --runtime-audit "$RUNTIME_AUDIT" \
+      --runtime-lock "$RUNTIME_LOCK" \
       --inference-summary "$INFERENCE_SMOKE_ROOT/run/i2i/run_summary.json"
     ;;
   train)

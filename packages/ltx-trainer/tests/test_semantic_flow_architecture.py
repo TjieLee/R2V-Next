@@ -4,6 +4,8 @@ import copy
 import hashlib
 import json
 import math
+import runpy
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -719,12 +721,14 @@ def test_semantic_flow_smoke_marker_binds_code_configs_checkpoints_and_real_infe
     i2i_checkpoint = tmp_path / "i2i.safetensors"
     r2v_checkpoint = tmp_path / "r2v.safetensors"
     runtime_audit = tmp_path / "runtime_audit.json"
+    runtime_lock = tmp_path / "runtime_lock.json"
     for path, content in (
         (training_config, "training: true\n"),
         (accelerate_config, "num_processes: 8\n"),
         (i2i_checkpoint, "i2i checkpoint\n"),
         (r2v_checkpoint, "r2v checkpoint\n"),
         (runtime_audit, "{}\n"),
+        (runtime_lock, "{}\n"),
     ):
         path.write_text(content, encoding="utf-8")
 
@@ -773,9 +777,15 @@ def test_semantic_flow_smoke_marker_binds_code_configs_checkpoints_and_real_infe
         i2i_checkpoint_path=i2i_checkpoint,
         r2v_checkpoint_path=r2v_checkpoint,
         runtime_audit_path=runtime_audit,
+        runtime_lock_path=runtime_lock,
         inference_summary_path=inference_summary,
     )
     assert marker["non_dry_run_inference_passed"] is True
+    assert marker["runtime_lock_sha256"] == hashlib.sha256(runtime_lock.read_bytes()).hexdigest()
+    assert marker["non_dry_run_inference_summary_sha256"] == hashlib.sha256(
+        inference_summary.read_bytes()
+    ).hexdigest()
+    assert marker["generated_png_sha256"] == hashlib.sha256((sample_dir / "generated.png").read_bytes()).hexdigest()
     assert validate_semantic_flow_smoke_marker(
         marker_path,
         code_commit=code_commit,
@@ -791,6 +801,24 @@ def test_semantic_flow_smoke_marker_binds_code_configs_checkpoints_and_real_infe
             training_config_path=training_config,
             accelerate_config_path=accelerate_config,
         )
+
+
+def test_inference_git_commit_is_resolved_from_repository_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    script = repo_root / "packages" / "ltx-trainer" / "scripts" / "infer_multitask_online_train_samples.py"
+    git_commit = runpy.run_path(str(script))["_git_commit"]
+    expected = subprocess.check_output(
+        ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+        text=True,
+    ).strip()
+
+    monkeypatch.chdir(repo_root)
+    assert git_commit() == expected
+    monkeypatch.chdir(tmp_path)
+    assert git_commit() == expected
 
 
 def test_semantic_flow_runtime_lock_requires_exact_environment_and_fsdp_roundtrip(tmp_path: Path) -> None:

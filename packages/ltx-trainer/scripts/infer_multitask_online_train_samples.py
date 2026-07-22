@@ -27,15 +27,16 @@ app = typer.Typer(pretty_exceptions_enable=False, no_args_is_help=True)
 console = Console()
 
 
-def _git_commit() -> str | None:
+def _git_commit() -> str:
+    repo_root = Path(__file__).resolve().parents[3]
     try:
         return subprocess.check_output(
-            ["git", "rev-parse", "HEAD"],
+            ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
             text=True,
             stderr=subprocess.DEVNULL,
         ).strip()
-    except (OSError, subprocess.CalledProcessError):
-        return None
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError(f"Unable to resolve R2V-Next git commit from {repo_root}") from exc
 
 
 def _dtype(value: str) -> torch.dtype:
