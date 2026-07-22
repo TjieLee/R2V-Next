@@ -9,11 +9,15 @@ from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Callable
 
 import pytest
 
-from ltx_trainer.online_data.manifest import iter_annotation_rows, read_annotation_rows
+from ltx_trainer.online_data.manifest import (
+    ManifestReject,
+    iter_annotation_rows,
+    read_annotation_rows,
+)
 from ltx_trainer.online_data.manifest_index import (
     INDEX_ENTRY,
     INDEX_HEADER,
@@ -106,8 +110,7 @@ def test_manifest_index_rejects_manifest_size_or_offset_change(tmp_path: Path) -
     )
     index_path = build_manifest_offset_index(manifest)
     manifest.write_text(
-        '{"task":"i2i","dataset_name":"unit","longer":true}\n'
-        '{"task":"r2v","dataset_name":"unit"}\n',
+        '{"task":"i2i","dataset_name":"unit","longer":true}\n{"task":"r2v","dataset_name":"unit"}\n',
         encoding="utf-8",
     )
 
@@ -249,7 +252,12 @@ def _patch_synthetic_builder(
         lambda _path: {
             "datasets": [
                 {"name": "images", "task": "i2i", "ann_path": "images.jsonl"},
-                {"name": "videos", "task": "r2v", "ann_path": "videos.jsonl"},
+                {
+                    "name": "videos",
+                    "task": "r2v",
+                    "dataset_type": "OpenS2VDataset",
+                    "ann_path": "videos.jsonl",
+                },
             ]
         },
     )
@@ -258,7 +266,22 @@ def _patch_synthetic_builder(
         del batch_size
         task = "i2i" if "images" in str(path) else "r2v"
         for index in range(rows_per_task):
-            yield str(index), {"index": index, "task": task}
+            row: dict[str, Any] = {"index": index, "task": task}
+            if task == "i2i":
+                row.update(
+                    target="target.png",
+                    sources=["reference.png"],
+                    caption=f"caption-{index}",
+                )
+            else:
+                row.update(
+                    video_path="target.mp4",
+                    text=f"caption-{index}",
+                    crop=[0, 64, 0, 48],
+                    face_cut=[0, 121],
+                    ref_images=["reference.png"],
+                )
+            yield str(index), row
 
     def _record(row: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
         task = str(row["task"])
@@ -444,4 +467,253 @@ def test_summary_write_failure_never_emits_manifest_complete(
     assert not list(tmp_path.glob("*.tmp.*"))
     events = capsys.readouterr().err
     assert "event=publish_complete" in events
+    assert "event=manifest_complete" not in events
+
+
+def _run_schema_fixture_builder(tmp_path: Path) -> tuple[Path, Path, Path]:
+    output = tmp_path / "schema_train.jsonl"
+    rejects = tmp_path / "schema_rejected.jsonl"
+    summary = tmp_path / "schema_summary.json"
+    manifest_builder.main(
+        train_data_config="schema_fixture.yaml",
+        output=str(output),
+        reject_output=str(rejects),
+        summary_output=str(summary),
+        manifest_seed=42,
+        annotation_batch_size=128,
+        media_workers=2,
+        media_batch_size=128,
+        progress_interval_seconds=10.0,
+        progress_every_rows=10_000,
+        count_total_rows=False,
+        i2i_target_field="image",
+        i2i_reference_field="edit_image",
+        i2i_caption_field="prompt",
+        i2i_crop_field=None,
+    )
+    return output, rejects, summary
+
+
+def _patch_two_dataset_schema_fixture(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    i2i_rows: list[dict[str, Any]],
+    i2i_builder: Callable[..., dict[str, Any]],
+) -> list[str]:
+    started_datasets: list[str] = []
+    monkeypatch.setattr(
+        manifest_builder,
+        "load_multitask_data_config",
+        lambda _path: {
+            "datasets": [
+                {"name": "i2i_first", "task": "i2i", "ann_path": "i2i.jsonl"},
+                {
+                    "name": "r2v_second",
+                    "task": "r2v",
+                    "dataset_type": "OpenS2VDataset",
+                    "ann_path": "r2v.jsonl",
+                },
+            ]
+        },
+    )
+
+    def rows(path: str, *, batch_size: int) -> Iterator[tuple[str, dict[str, Any]]]:
+        del batch_size
+        dataset = "i2i_first" if path == "i2i.jsonl" else "r2v_second"
+        started_datasets.append(dataset)
+        if dataset == "i2i_first":
+            for index, row in enumerate(i2i_rows):
+                yield str(index), row
+            return
+        yield (
+            "r2v-0",
+            {
+                "video_path": "target.mp4",
+                "text": "video instruction",
+                "crop": [0, 64, 0, 48],
+                "face_cut": [0, 121],
+                "ref_images": ["reference.png"],
+            },
+        )
+
+    def record(task: str, dataset_name: str, source_id: str) -> dict[str, str]:
+        return {
+            "sample_key": f"{task}-{source_id}",
+            "sample_plan_sha256": f"plan-{task}-{source_id}",
+            "task": task,
+            "dataset_name": dataset_name,
+            "source_record_id": source_id,
+        }
+
+    monkeypatch.setattr(manifest_builder, "iter_annotation_items", rows)
+    monkeypatch.setattr(manifest_builder, "build_i2i_record", i2i_builder)
+    monkeypatch.setattr(
+        manifest_builder,
+        "normalize_r2v_source",
+        lambda row, **kwargs: SimpleNamespace(
+            video_path=str(row["video_path"]),
+            dataset_name=kwargs["dataset_name"],
+            reference_paths=[],
+            row=row,
+        ),
+    )
+    monkeypatch.setattr(
+        manifest_builder,
+        "prepare_canonical_r2v_record",
+        lambda source, **_kwargs: SimpleNamespace(
+            record=record("r2v", source.dataset_name, "r2v-0"),
+            reference_paths=(),
+        ),
+    )
+    monkeypatch.setattr(
+        manifest_builder,
+        "finalize_prepared_canonical_r2v_record",
+        lambda prepared, **_kwargs: prepared.record,
+    )
+    monkeypatch.setattr(
+        manifest_builder,
+        "_probe_resolved_image",
+        lambda _path: manifest_builder._ValidationResult({"width": 64, "height": 48}),
+    )
+    monkeypatch.setattr(
+        manifest_builder,
+        "_probe_resolved_video",
+        lambda _path: manifest_builder._ValidationResult({"fps": 24.0, "frame_count": 300, "width": 64, "height": 48}),
+    )
+    monkeypatch.setattr(manifest_builder, "assert_write_path_allowed", lambda path: Path(path).resolve())
+    return started_datasets
+
+
+def test_i2i_schema_preflight_accepts_real_fields_and_preserves_first_sample(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = {
+        "image": "target",
+        "edit_image": ["ref"],
+        "prompt": "edit",
+    }
+    seen_rows: list[dict[str, Any]] = []
+
+    def build_i2i(row: dict[str, Any], **kwargs: object) -> dict[str, str]:
+        seen_rows.append(row)
+        return {
+            "sample_key": "i2i-first",
+            "sample_plan_sha256": "plan-i2i-first",
+            "task": "i2i",
+            "dataset_name": str(kwargs["dataset_name"]),
+            "source_record_id": "i2i-0",
+        }
+
+    started = _patch_two_dataset_schema_fixture(
+        monkeypatch,
+        i2i_rows=[source],
+        i2i_builder=build_i2i,
+    )
+    output, rejects, summary_path = _run_schema_fixture_builder(tmp_path)
+
+    assert seen_rows == [source]
+    assert started == ["i2i_first", "r2v_second"]
+    records = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    assert [record["source_record_id"] for record in records] == ["i2i-0", "r2v-0"]
+    assert rejects.read_text(encoding="utf-8") == ""
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["task_counts"] == {"i2i": 1, "r2v": 1}
+    assert "event=schema_preflight_pass dataset_name=i2i_first" in capsys.readouterr().err
+
+
+def test_i2i_schema_preflight_rejects_wrong_fields_before_any_media_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    wrong_rows = [
+        {
+            "video": f"target-{index}",
+            "reference_images": [f"ref-{index}"],
+            "caption": f"edit-{index}",
+        }
+        for index in range(100)
+    ]
+    started = _patch_two_dataset_schema_fixture(
+        monkeypatch,
+        i2i_rows=wrong_rows,
+        i2i_builder=lambda _row, **_kwargs: pytest.fail("row build must not start"),
+    )
+    probe_calls = 0
+
+    def forbid_probe(_path: str) -> object:
+        nonlocal probe_calls
+        probe_calls += 1
+        raise AssertionError("schema preflight must fail before media probes")
+
+    monkeypatch.setattr(manifest_builder, "_probe_resolved_image", forbid_probe)
+    monkeypatch.setattr(manifest_builder, "_probe_resolved_video", forbid_probe)
+    output = tmp_path / "schema_train.jsonl"
+    with pytest.raises(RuntimeError, match="Dataset schema preflight failed") as exc_info:
+        _run_schema_fixture_builder(tmp_path)
+
+    message = str(exc_info.value)
+    for field in (
+        "dataset_name",
+        "annotation_path",
+        "required_fields",
+        "available_fields",
+        "missing_fields",
+    ):
+        assert field in message
+    assert '"dataset_name": "i2i_first"' in message
+    assert '"required_fields": ["image", "edit_image", "prompt"]' in message
+    assert '"missing_fields": ["image", "edit_image", "prompt"]' in message
+    assert probe_calls == 0
+    assert started == ["i2i_first"]
+    assert not output.exists()
+    assert not Path(f"{output}.idx").exists()
+    events = capsys.readouterr().err
+    assert "event=dataset_failed dataset_name=i2i_first task=i2i processed=0" in events
+    assert "top_reject_reasons=none" in events
+    assert "dataset_name=r2v_second" not in events
+    assert "event=index_start" not in events
+    assert "event=manifest_complete" not in events
+
+
+def test_dataset_fail_fast_stops_before_next_dataset_and_index(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    valid_rows = [
+        {
+            "image": f"target-{index}",
+            "edit_image": [f"ref-{index}"],
+            "prompt": f"edit-{index}",
+        }
+        for index in range(100)
+    ]
+
+    def reject_i2i(_row: dict[str, Any], **_kwargs: object) -> dict[str, Any]:
+        raise ManifestReject("empty_caption", "synthetic rejection")
+
+    started = _patch_two_dataset_schema_fixture(
+        monkeypatch,
+        i2i_rows=valid_rows,
+        i2i_builder=reject_i2i,
+    )
+    output = tmp_path / "schema_train.jsonl"
+    with pytest.raises(RuntimeError, match="Dataset produced no accepted or duplicate records"):
+        _run_schema_fixture_builder(tmp_path)
+
+    assert started == ["i2i_first"]
+    assert not output.exists()
+    assert not Path(f"{output}.idx").exists()
+    assert not (tmp_path / "schema_summary.json").exists()
+    events = capsys.readouterr().err
+    assert "event=dataset_failed dataset_name=i2i_first task=i2i processed=100" in events
+    assert "accepted=0" in events
+    assert "rejected=100" in events
+    assert "duplicates=0" in events
+    assert "top_reject_reasons=empty_caption:100" in events
+    assert "dataset_name=r2v_second" not in events
+    assert "event=index_start" not in events
     assert "event=manifest_complete" not in events
