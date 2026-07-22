@@ -7,6 +7,7 @@ from ltx_trainer.online_data.manifest import (
     ManifestReject,
     build_canonical_r2v_record,
     build_strict_source_indices,
+    select_strict_source_plan,
 )
 
 
@@ -49,6 +50,49 @@ def test_23976_fps_source_builds_strict_121_frame_plan() -> None:
     assert record["target_num_frames"] == 121
     assert len(indices) == 121
     assert all(left < right for left, right in zip(indices, indices[1:]))
+
+
+@pytest.mark.parametrize("clip_start", [0, 1, 30, 31])
+def test_23976_fps_source_builds_for_clip_start_parity(clip_start: int) -> None:
+    record = _build_record(
+        source_fps=23.976023976,
+        clip_start=clip_start,
+        clip_end=clip_start + 121,
+    )
+
+    indices = record["target_source_frame_indices"]
+    assert len(indices) == 121
+    assert all(left < right for left, right in zip(indices, indices[1:]))
+
+
+def test_239_fps_source_recovers_opposite_parity_start_plan() -> None:
+    selected_start, indices = select_strict_source_plan(
+        clip_start=0,
+        max_start=1,
+        preferred_start=1,
+        source_fps=23.9,
+        target_fps=24.0,
+        target_frame_count=121,
+    )
+    assert selected_start == 0
+    assert len(indices) == 121
+    assert all(left < right for left, right in zip(indices, indices[1:]))
+
+    record = _build_record(source_fps=23.9, clip_start=0, clip_end=122)
+    record_indices = record["target_source_frame_indices"]
+    assert record_indices == indices
+
+
+def test_23899_fps_source_rejects_when_bounded_parities_all_duplicate() -> None:
+    with pytest.raises(ManifestReject) as exc_info:
+        _build_record(source_fps=23.899, clip_start=0, clip_end=122)
+
+    assert exc_info.value.reason == "source_fps_too_low_for_unique_24fps_sampling"
+    message = str(exc_info.value)
+    assert "preferred_start=" in message
+    assert "tried_starts=" in message
+    assert "first_duplicate=" in message
+    assert "clip=[0,122)" in message
 
 
 def test_23_fps_source_rejects_duplicate_source_indices() -> None:

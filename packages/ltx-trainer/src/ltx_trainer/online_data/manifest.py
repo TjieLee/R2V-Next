@@ -409,13 +409,15 @@ def build_strict_source_indices(
     clip_end: int | None = None,
 ) -> list[int]:
     """Build a source-frame plan and reject frame-rate-induced duplicates."""
-    indices = [
-        round(sample_start + index * source_fps / target_fps)
-        for index in range(target_frame_count)
-    ]
-    for target_index, (left, right) in enumerate(zip(indices, indices[1:])):
-        if left < right:
-            continue
+    indices = _source_indices_for_start(
+        sample_start=sample_start,
+        source_fps=source_fps,
+        target_fps=target_fps,
+        target_frame_count=target_frame_count,
+    )
+    duplicate = _first_non_increasing_source_pair(indices)
+    if duplicate is not None:
+        target_index, left, right = duplicate
         diagnostic_clip_start = sample_start if clip_start is None else clip_start
         diagnostic_clip_end = "unknown" if clip_end is None else str(clip_end)
         raise ManifestReject(
@@ -426,6 +428,77 @@ def build_strict_source_indices(
             f"clip=[{diagnostic_clip_start},{diagnostic_clip_end})",
         )
     return indices
+
+
+def _source_indices_for_start(
+    *,
+    sample_start: int,
+    source_fps: float,
+    target_fps: float,
+    target_frame_count: int,
+) -> list[int]:
+    return [
+        round(sample_start + index * source_fps / target_fps)
+        for index in range(target_frame_count)
+    ]
+
+
+def _first_non_increasing_source_pair(indices: list[int]) -> tuple[int, int, int] | None:
+    for target_index, (left, right) in enumerate(zip(indices, indices[1:])):
+        if left >= right:
+            return target_index, left, right
+    return None
+
+
+def select_strict_source_plan(
+    *,
+    clip_start: int,
+    max_start: int,
+    preferred_start: int,
+    source_fps: float,
+    target_fps: float,
+    target_frame_count: int,
+) -> tuple[int, list[int]]:
+    candidates: list[int] = []
+    for candidate in (
+        preferred_start,
+        clip_start,
+        clip_start + 1,
+        max_start,
+        max_start - 1,
+    ):
+        if clip_start <= candidate <= max_start and candidate not in candidates:
+            candidates.append(candidate)
+
+    first_duplicate: tuple[int, int, int, int] | None = None
+    for candidate in candidates:
+        indices = _source_indices_for_start(
+            sample_start=candidate,
+            source_fps=source_fps,
+            target_fps=target_fps,
+            target_frame_count=target_frame_count,
+        )
+        duplicate = _first_non_increasing_source_pair(indices)
+        if duplicate is None:
+            return candidate, indices
+        if first_duplicate is None:
+            target_index, left, right = duplicate
+            first_duplicate = (candidate, target_index, left, right)
+
+    duplicate_message = "none"
+    if first_duplicate is not None:
+        duplicate_start, target_index, left, right = first_duplicate
+        duplicate_message = (
+            f"start={duplicate_start} target_indices={target_index}/{target_index + 1} "
+            f"source_frames={left}/{right}"
+        )
+    raise ManifestReject(
+        "source_fps_too_low_for_unique_24fps_sampling",
+        f"Source FPS {source_fps} cannot produce {target_frame_count} unique source frames "
+        f"at target FPS {target_fps}: preferred_start={preferred_start}, "
+        f"tried_starts={candidates}, valid_start_range=[{clip_start},{max_start}], "
+        f"source_fps={source_fps}, target_fps={target_fps}, first_duplicate={duplicate_message}",
+    )
 
 
 def prepare_canonical_r2v_record(
@@ -476,15 +549,18 @@ def prepare_canonical_r2v_record(
             f"No exact 121-frame/24-fps clip fits [{clip_start},{clip_end}) at fps={original_fps}",
         )
     rng_seed = int(stable_sample_key({"sample_key": sample_key, "manifest_seed": manifest_seed})[:16], 16)
-    sample_start = random.Random(rng_seed).randint(clip_start, max_start)
-    source_indices = build_strict_source_indices(
-        sample_start=sample_start,
-        source_fps=original_fps,
-        target_fps=VIDEO_FPS,
-        target_frame_count=VIDEO_NUM_FRAMES,
-        clip_start=clip_start,
-        clip_end=clip_end,
-    )
+    preferred_start = random.Random(rng_seed).randint(clip_start, max_start)
+    try:
+        _sample_start, source_indices = select_strict_source_plan(
+            clip_start=clip_start,
+            max_start=max_start,
+            preferred_start=preferred_start,
+            source_fps=original_fps,
+            target_fps=VIDEO_FPS,
+            target_frame_count=VIDEO_NUM_FRAMES,
+        )
+    except ManifestReject as exc:
+        raise ManifestReject(exc.reason, f"{exc}; clip=[{clip_start},{clip_end})") from exc
     if (
         len(source_indices) != VIDEO_NUM_FRAMES
         or source_indices[0] < clip_start
