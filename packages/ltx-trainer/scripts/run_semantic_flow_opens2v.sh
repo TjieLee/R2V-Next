@@ -34,6 +34,128 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 DATA_CONFIG="$R2V_ROOT/manifests/multitask_online_480p121_opens2v.yaml"
 TRAIN_CONFIG="$REPO_ROOT/packages/ltx-trainer/configs/semantic_flow_multitask_480p121.yaml"
+ACCELERATE_CONFIG="${ACCELERATE_CONFIG:-$REPO_ROOT/packages/ltx-trainer/configs/accelerate_semantic_flow_fsdp_full_shard.yaml}"
+
+semantic_flow_train_preflight() {
+  python3 - "$TRAIN_CONFIG" "$ACCELERATE_CONFIG" "$R2V_ROOT" <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+import yaml
+
+train_config_path = Path(sys.argv[1]).expanduser().resolve()
+accelerate_config_path = Path(sys.argv[2]).expanduser().resolve()
+r2v_root = Path(sys.argv[3]).expanduser()
+litengjie_root = Path("/mnt/workspace/litengjie")
+errors = []
+
+
+def path_value(raw):
+    return Path(str(raw)).expanduser()
+
+
+def require_file(label, raw):
+    path = path_value(raw)
+    if not path.is_file():
+        errors.append(f"{label} is not a file: {path}")
+    return path
+
+
+def require_dir(label, raw):
+    path = path_value(raw)
+    if not path.is_dir():
+        errors.append(f"{label} is not a directory: {path}")
+    return path
+
+
+def require_under_litengjie(label, raw):
+    path = path_value(raw)
+    try:
+        resolved = path.resolve(strict=False)
+        resolved.relative_to(litengjie_root)
+    except ValueError:
+        errors.append(f"{label} must stay under {litengjie_root}: {path}")
+
+
+if not train_config_path.is_file():
+    errors.append(f"training config is missing: {train_config_path}")
+if not accelerate_config_path.is_file():
+    errors.append(f"accelerate config is missing: {accelerate_config_path}")
+if errors:
+    print(json.dumps({"ready": False, "errors": errors}, indent=2, sort_keys=True))
+    sys.exit(1)
+
+train_config = yaml.safe_load(train_config_path.read_text(encoding="utf-8")) or {}
+accelerate_config = yaml.safe_load(accelerate_config_path.read_text(encoding="utf-8")) or {}
+model_config = train_config.get("model") or {}
+data_config = train_config.get("data") or {}
+online_config = data_config.get("online_encoding") or {}
+
+require_file("model.model_path", model_config.get("model_path"))
+require_dir("model.text_encoder_path", model_config.get("text_encoder_path"))
+require_file("data.train_data_config", data_config.get("train_data_config"))
+manifest_path = require_file("data.manifest_path", data_config.get("manifest_path"))
+require_file("data.manifest_path index", f"{manifest_path}.idx")
+
+for label, raw in (
+    ("R2V_ROOT", r2v_root),
+    ("output_dir", train_config.get("output_dir")),
+    ("runtime_reject_log_dir", online_config.get("runtime_reject_log_dir")),
+):
+    if raw is not None:
+        require_under_litengjie(label, raw)
+
+for env_name in (
+    "TMPDIR",
+    "XDG_CACHE_HOME",
+    "HF_HOME",
+    "TRANSFORMERS_CACHE",
+    "TORCH_HOME",
+    "TRITON_CACHE_DIR",
+    "CUDA_CACHE_PATH",
+    "UV_CACHE_DIR",
+    "WANDB_DIR",
+    "PYTHONPYCACHEPREFIX",
+):
+    require_under_litengjie(env_name, os.environ[env_name])
+
+fsdp_config = accelerate_config.get("fsdp_config") or {}
+if accelerate_config.get("compute_environment") != "LOCAL_MACHINE":
+    errors.append("Accelerate compute_environment must be LOCAL_MACHINE")
+if accelerate_config.get("distributed_type") != "FSDP":
+    errors.append("Accelerate distributed_type must be FSDP")
+if accelerate_config.get("mixed_precision") != "bf16":
+    errors.append("Accelerate mixed_precision must be bf16")
+if fsdp_config.get("fsdp_version") != 1:
+    errors.append("Accelerate fsdp_version must be 1")
+if fsdp_config.get("fsdp_sharding_strategy") != "FULL_SHARD":
+    errors.append("Accelerate fsdp_sharding_strategy must be FULL_SHARD")
+if fsdp_config.get("fsdp_state_dict_type") != "FULL_STATE_DICT":
+    errors.append("Accelerate fsdp_state_dict_type must be FULL_STATE_DICT")
+if fsdp_config.get("fsdp_auto_wrap_policy") != "TRANSFORMER_BASED_WRAP":
+    errors.append("Accelerate fsdp_auto_wrap_policy must be TRANSFORMER_BASED_WRAP")
+if fsdp_config.get("fsdp_transformer_layer_cls_to_wrap") != "BasicAVTransformerBlock":
+    errors.append("Accelerate must wrap BasicAVTransformerBlock")
+if fsdp_config.get("fsdp_use_orig_params") is not True:
+    errors.append("Accelerate fsdp_use_orig_params must be true")
+if fsdp_config.get("fsdp_sync_module_states") is not True:
+    errors.append("Accelerate fsdp_sync_module_states must be true")
+if fsdp_config.get("fsdp_cpu_ram_efficient_loading") is not False:
+    errors.append("Accelerate fsdp_cpu_ram_efficient_loading must be false")
+
+report = {
+    "ready": not errors,
+    "accelerate_config": str(accelerate_config_path),
+    "training_config": str(train_config_path),
+    "errors": errors,
+}
+print(json.dumps(report, indent=2, sort_keys=True))
+if errors:
+    sys.exit(1)
+PY
+}
 
 case "${1:-}" in
   build-manifest)
@@ -50,7 +172,7 @@ case "${1:-}" in
       --probe-batch-size 512
     ;;
   train)
-    : "${ACCELERATE_CONFIG:?Set ACCELERATE_CONFIG to an Accelerate FSDP FULL_SHARD config file.}"
+    semantic_flow_train_preflight
     accelerate launch --config_file "$ACCELERATE_CONFIG" \
       "$REPO_ROOT/packages/ltx-trainer/scripts/train.py" \
       "$TRAIN_CONFIG"

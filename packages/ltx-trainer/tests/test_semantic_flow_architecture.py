@@ -307,9 +307,17 @@ def _fake_trainer_config(*, strategy_name: str = "semantic_flow", training_mode:
     )
 
 
-def _fake_accelerator(distributed_type: DistributedType, *, sharding_strategy: str | None = None) -> SimpleNamespace:
+def _fake_accelerator(
+    distributed_type: DistributedType,
+    *,
+    fsdp_version: int | str | None = 1,
+    sharding_strategy: str | None = "FULL_SHARD",
+    state_dict_type: str | None = "FULL_STATE_DICT",
+) -> SimpleNamespace:
     fsdp_plugin = SimpleNamespace(
-        sharding_strategy=None if sharding_strategy is None else SimpleNamespace(name=sharding_strategy)
+        fsdp_version=fsdp_version,
+        sharding_strategy=None if sharding_strategy is None else SimpleNamespace(name=sharding_strategy),
+        state_dict_type=None if state_dict_type is None else SimpleNamespace(name=state_dict_type),
     )
     return SimpleNamespace(distributed_type=distributed_type, state=SimpleNamespace(fsdp_plugin=fsdp_plugin))
 
@@ -330,11 +338,47 @@ def test_semantic_flow_full_training_requires_fsdp_full_shard() -> None:
             config,
             _fake_accelerator(DistributedType.FSDP, sharding_strategy="SHARD_GRAD_OP"),
         )
+    with pytest.raises(RuntimeError, match="currently supports only FSDP1"):
+        _enforce_semantic_flow_fsdp_runtime_safety(
+            config,
+            _fake_accelerator(DistributedType.FSDP, fsdp_version=2),
+        )
+    with pytest.raises(RuntimeError, match="Unable to identify FSDP sharding strategy"):
+        _enforce_semantic_flow_fsdp_runtime_safety(
+            config,
+            _fake_accelerator(DistributedType.FSDP, sharding_strategy=None),
+        )
+    with pytest.raises(RuntimeError, match="requires FSDP FULL_STATE_DICT"):
+        _enforce_semantic_flow_fsdp_runtime_safety(
+            config,
+            _fake_accelerator(DistributedType.FSDP, state_dict_type="SHARDED_STATE_DICT"),
+        )
 
     _enforce_semantic_flow_fsdp_runtime_safety(
         _fake_trainer_config(strategy_name="text_to_video", training_mode="lora"),
         _fake_accelerator(DistributedType.NO),
     )
+
+
+def test_semantic_flow_fsdp_accelerate_config_is_full_shard() -> None:
+    config_path = (
+        Path(__file__).resolve().parents[1]
+        / "configs"
+        / "accelerate_semantic_flow_fsdp_full_shard.yaml"
+    )
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    fsdp_config = config["fsdp_config"]
+    assert config["compute_environment"] == "LOCAL_MACHINE"
+    assert config["distributed_type"] == "FSDP"
+    assert config["mixed_precision"] == "bf16"
+    assert fsdp_config["fsdp_version"] == 1
+    assert fsdp_config["fsdp_sharding_strategy"] == "FULL_SHARD"
+    assert fsdp_config["fsdp_state_dict_type"] == "FULL_STATE_DICT"
+    assert fsdp_config["fsdp_auto_wrap_policy"] == "TRANSFORMER_BASED_WRAP"
+    assert fsdp_config["fsdp_transformer_layer_cls_to_wrap"] == "BasicAVTransformerBlock"
+    assert fsdp_config["fsdp_use_orig_params"] is True
+    assert fsdp_config["fsdp_sync_module_states"] is True
+    assert fsdp_config["fsdp_cpu_ram_efficient_loading"] is False
 
 
 class _VelocityRecorder(nn.Module):

@@ -75,14 +75,50 @@ StepCallback = Callable[[int, int, list[Path]], None]  # (step, total, list[samp
 MEMORY_CHECK_INTERVAL = 200
 
 
-def _read_fsdp_sharding_strategy_name(accelerator: Accelerator) -> str | None:
+def _normalize_fsdp_config_value(value: Any) -> str | None:
+    if value is None or isinstance(value, bool):
+        return None
+    name = getattr(value, "name", None)
+    if name is not None:
+        value = name
+    return str(value).split(".")[-1].upper()
+
+
+def _read_fsdp_plugin(accelerator: Accelerator) -> Any | None:
     plugin = getattr(getattr(accelerator, "state", None), "fsdp_plugin", None)
+    return plugin
+
+
+def _read_fsdp_version_name(accelerator: Accelerator) -> str | None:
+    plugin = _read_fsdp_plugin(accelerator)
+    if plugin is None:
+        return None
+    for attribute in ("fsdp_version", "version"):
+        version = _normalize_fsdp_config_value(getattr(plugin, attribute, None))
+        if version is not None:
+            return version
+    return None
+
+
+def _read_fsdp_sharding_strategy_name(accelerator: Accelerator) -> str | None:
+    plugin = _read_fsdp_plugin(accelerator)
+    if plugin is None:
+        return None
     for attribute in ("sharding_strategy", "reshard_after_forward"):
-        strategy = getattr(plugin, attribute, None)
-        if strategy is None or isinstance(strategy, bool):
-            continue
-        name = getattr(strategy, "name", None) or str(strategy)
-        return str(name).split(".")[-1].upper()
+        strategy = _normalize_fsdp_config_value(getattr(plugin, attribute, None))
+        if strategy is not None:
+            return strategy
+    return None
+
+
+def _read_fsdp_state_dict_type_name(accelerator: Accelerator) -> str | None:
+    plugin = _read_fsdp_plugin(accelerator)
+    if plugin is None:
+        return None
+    for attribute in ("state_dict_type", "fsdp_state_dict_type"):
+        state_dict_type = _normalize_fsdp_config_value(getattr(plugin, attribute, None))
+        if state_dict_type is not None:
+            return state_dict_type
     return None
 
 
@@ -94,11 +130,27 @@ def _enforce_semantic_flow_fsdp_runtime_safety(config: LtxTrainerConfig, acceler
             "Full-DiT semantic-flow training requires Accelerate FSDP FULL_SHARD. "
             "Plain DDP and single-process full training are disabled to prevent OOM."
         )
+    fsdp_version = _read_fsdp_version_name(accelerator)
+    if fsdp_version not in {"1", "FSDP1"}:
+        raise RuntimeError(
+            "Full-DiT semantic-flow training currently supports only FSDP1. "
+            f"Configured FSDP version is {fsdp_version!r}."
+        )
     sharding_strategy = _read_fsdp_sharding_strategy_name(accelerator)
-    if sharding_strategy is not None and sharding_strategy != "FULL_SHARD":
+    if sharding_strategy is None:
+        raise RuntimeError("Unable to identify FSDP sharding strategy; refusing to load semantic-flow models.")
+    if sharding_strategy != "FULL_SHARD":
         raise RuntimeError(
             "Full-DiT semantic-flow training requires Accelerate FSDP FULL_SHARD. "
             f"Configured FSDP sharding strategy is {sharding_strategy!r}."
+        )
+    state_dict_type = _read_fsdp_state_dict_type_name(accelerator)
+    if state_dict_type is None:
+        raise RuntimeError("Unable to identify FSDP state-dict type; refusing to load semantic-flow models.")
+    if state_dict_type != "FULL_STATE_DICT":
+        raise RuntimeError(
+            "Full-DiT semantic-flow training requires FSDP FULL_STATE_DICT checkpoint collection. "
+            f"Configured FSDP state-dict type is {state_dict_type!r}."
         )
 
 
@@ -147,6 +199,7 @@ class LtxvTrainer:
         if IS_MAIN_PROCESS:
             print_config(trainer_config)
         self._training_strategy = get_training_strategy(self._config.training_strategy)
+        self._setup_accelerator()
 
         # ValidationRunner loads its own models (text encoder, VAE encoder/decoder, etc.),
         # caches prompt embeddings and conditioning media, then unloads encoders.
@@ -158,7 +211,6 @@ class LtxvTrainer:
         )
 
         self._load_models()
-        self._setup_accelerator()
         self._setup_trainable_model_wrappers()
         self._loaded_checkpoint_path: Path | None = None
         self._load_checkpoint()
@@ -572,10 +624,9 @@ class LtxvTrainer:
             dtype=torch.bfloat16,
         )
 
-        # DDP-safe: LOCAL_RANK is set by accelerate before trainer init. Loading on bare
-        # "cuda" would resolve to cuda:0 on every rank and crash with a device mismatch.
-        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-        init_device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+        # Accelerator is initialized before model loading, so every rank resolves to its
+        # assigned device before Gemma, VAE, and connector weights are materialized.
+        init_device = self._accelerator.device if torch.cuda.is_available() else torch.device("cpu")
 
         logger.debug("Loading embeddings processor...")
         self._embeddings_processor = load_embeddings_processor(
