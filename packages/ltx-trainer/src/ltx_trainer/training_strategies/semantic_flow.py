@@ -8,6 +8,7 @@ from typing import Any, Literal
 import torch
 from pydantic import Field, model_validator
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
 
 from ltx_core.multicond.gemma3_attention import build_gemma3_attention_masks, resolve_gemma3_sliding_window
 from ltx_core.model.transformer.modality import Modality
@@ -142,6 +143,7 @@ class SemanticFlowStrategy(TrainingStrategy):
         self._text_encoder.requires_grad_(False).eval()
 
         language_model = self._get_language_model()
+        self._enable_frozen_teacher_gradient_checkpointing(language_model)
         input_embeddings = self._get_input_embeddings(language_model)
         self._gemma_dim = int(input_embeddings.weight.shape[-1])
         patchify_projection = getattr(transformer, "patchify_proj", None)
@@ -245,7 +247,7 @@ class SemanticFlowStrategy(TrainingStrategy):
     def build_semantic_teacher_outputs(self, teacher_inputs: dict[str, Tensor]) -> dict[str, Tensor]:
         """Run frozen Gemma with the prefix plus native evidence/local-query suffix."""
         query_initializer, semantic_encoder, reconstruction_decoder = self._require_semantic_modules()
-        prefix_embeddings = teacher_inputs["prefix_inputs_embeds"]
+        prefix_embeddings = teacher_inputs["prefix_inputs_embeds"].detach()
         prefix_attention_mask = teacher_inputs["prefix_attention_mask"].to(dtype=torch.bool)
         prefix_image_token_mask = teacher_inputs.get(
             "prefix_image_token_mask",
@@ -734,6 +736,58 @@ class SemanticFlowStrategy(TrainingStrategy):
         if language_model is None:
             raise RuntimeError("Gemma text encoder does not expose model.model.language_model")
         return language_model
+
+    def _enable_frozen_teacher_gradient_checkpointing(self, language_model: nn.Module) -> str:
+        """Enable non-reentrant checkpointing while keeping the Gemma teacher frozen."""
+        core = getattr(language_model, "module", language_model)
+        config = getattr(core, "config", None)
+        if config is not None and hasattr(config, "use_cache"):
+            config.use_cache = False
+
+        enable_checkpointing = getattr(core, "gradient_checkpointing_enable", None)
+        if callable(enable_checkpointing):
+            try:
+                enable_checkpointing(gradient_checkpointing_kwargs={"use_reentrant": False})
+                return "native_non_reentrant"
+            except TypeError:
+                pass
+
+        wrapped_layers = self._install_non_reentrant_decoder_checkpointing(core)
+        if wrapped_layers > 0:
+            return "manual_non_reentrant"
+        raise RuntimeError(
+            "Gemma language model does not support non-reentrant gradient checkpointing "
+            "and no decoder layers were found for the manual fallback"
+        )
+
+    @staticmethod
+    def _install_non_reentrant_decoder_checkpointing(language_model: nn.Module) -> int:
+        layers = None
+        for path in ("model.layers", "layers", "decoder.layers"):
+            candidate: Any = language_model
+            for part in path.split("."):
+                candidate = getattr(candidate, part, None)
+                if candidate is None:
+                    break
+            if isinstance(candidate, (nn.ModuleList, list, tuple)):
+                layers = candidate
+                break
+        if layers is None:
+            return 0
+
+        wrapped = 0
+        for layer in layers:
+            if getattr(layer, "_semantic_flow_non_reentrant_checkpoint", False):
+                continue
+            original_forward = layer.forward
+
+            def checkpointed_forward(*args: Any, _original_forward=original_forward, **kwargs: Any) -> Any:
+                return checkpoint(_original_forward, *args, use_reentrant=False, **kwargs)
+
+            layer.forward = checkpointed_forward  # type: ignore[method-assign]
+            layer._semantic_flow_non_reentrant_checkpoint = True  # type: ignore[attr-defined]
+            wrapped += 1
+        return wrapped
 
     @staticmethod
     def _get_input_embeddings(language_model: nn.Module) -> nn.Module:

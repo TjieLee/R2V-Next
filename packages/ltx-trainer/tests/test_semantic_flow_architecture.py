@@ -68,19 +68,30 @@ def test_teacher_mask_blocks_prefix_from_gt_and_queries_from_nonlocal_evidence()
 
 
 class _TinyMaskedAttentionLanguageModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.scale = nn.Parameter(torch.tensor(1.0))
+        self.config = SimpleNamespace(use_cache=True)
+        self.gradient_checkpointing_kwargs = None
+
+    def gradient_checkpointing_enable(self, *, gradient_checkpointing_kwargs=None) -> None:
+        self.gradient_checkpointing_kwargs = gradient_checkpointing_kwargs
+
     def forward(
         self,
         *,
         inputs_embeds: torch.Tensor,
-        attention_mask: torch.Tensor,
+        attention_mask: torch.Tensor | dict[str, torch.Tensor],
         position_ids: torch.Tensor,
         output_hidden_states: bool,
         return_dict: bool,
         use_cache: bool,
     ):
         assert output_hidden_states and return_dict and not use_cache
+        if isinstance(attention_mask, dict):
+            attention_mask = attention_mask["full_attention"]
         visible = attention_mask[:, 0] == 0
-        source = inputs_embeds + position_ids.to(dtype=inputs_embeds.dtype).unsqueeze(-1) * 0.01
+        source = inputs_embeds * self.scale + position_ids.to(dtype=inputs_embeds.dtype).unsqueeze(-1) * 0.01
         scores = torch.matmul(source, source.transpose(-1, -2)) / math.sqrt(source.shape[-1])
         scores = scores.masked_fill(~visible, -1.0e9)
         weights = torch.softmax(scores, dim=-1)
@@ -154,6 +165,70 @@ def test_prefix_only_hidden_matches_teacher_prefix_hidden_with_reference_regions
     teacher_prefix_hidden = teacher_hidden[:, : prefix_embeddings.shape[1]]
 
     torch.testing.assert_close(prefix_only_hidden, teacher_prefix_hidden, rtol=0.0, atol=0.0)
+
+
+def _has_nonzero_grad(module: nn.Module) -> bool:
+    return any(
+        parameter.grad is not None and torch.count_nonzero(parameter.grad).item() > 0
+        for parameter in module.parameters()
+    )
+
+
+def test_frozen_gemma_teacher_backpropagates_only_to_semantic_modules() -> None:
+    language_model = _TinyMaskedAttentionLanguageModel()
+    language_model.requires_grad_(False)
+    strategy = SemanticFlowStrategy(SemanticFlowConfig())
+    strategy._text_encoder = SimpleNamespace(
+        model=SimpleNamespace(model=SimpleNamespace(language_model=language_model))
+    )
+    strategy._query_initializer = SemanticQueryInitializer(gemma_dim=8)
+    strategy._semantic_encoder = SemanticEncoder(gemma_dim=8, semantic_dim=4, hidden_dim=8)
+    strategy._reconstruction_decoder = SemanticReconstructionDecoder(semantic_dim=4, gemma_dim=8, hidden_dim=8)
+
+    mode = strategy._enable_frozen_teacher_gradient_checkpointing(language_model)
+    assert mode == "native_non_reentrant"
+    assert language_model.gradient_checkpointing_kwargs == {"use_reentrant": False}
+    assert language_model.config.use_cache is False
+
+    prefix_embeddings = torch.randn(1, 6, 8, requires_grad=True)
+    evidence = torch.randn(1, 1, EVIDENCE_TOKENS_PER_FRAME, 8, requires_grad=True)
+    teacher = strategy.build_semantic_teacher_outputs(
+        {
+            "prefix_inputs_embeds": prefix_embeddings,
+            "prefix_attention_mask": torch.ones(1, 6, dtype=torch.bool),
+            "prefix_image_token_mask": torch.zeros(1, 6, dtype=torch.bool),
+            "evidence_tokens": evidence,
+            "normalized_timestamps": torch.tensor([[0.25]]),
+        }
+    )
+    loss = teacher["semantic_clean"].pow(2).mean() + teacher["reconstruction_prediction"].pow(2).mean()
+    loss.backward()
+
+    assert _has_nonzero_grad(strategy._query_initializer)
+    assert _has_nonzero_grad(strategy._semantic_encoder)
+    assert all(parameter.grad is None for parameter in language_model.parameters())
+    assert prefix_embeddings.grad is None
+    assert evidence.grad is None
+    assert teacher["reconstruction_target"].requires_grad is False
+
+
+def test_frozen_gemma_checkpointing_falls_back_to_manual_layers() -> None:
+    class _ManualCheckpointLanguageModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.config = SimpleNamespace(use_cache=True)
+            self.layers = nn.ModuleList([nn.Linear(2, 2)])
+
+        def gradient_checkpointing_enable(self) -> None:
+            raise AssertionError("non-reentrant kwargs should choose the manual fallback")
+
+    model = _ManualCheckpointLanguageModel()
+    strategy = SemanticFlowStrategy(SemanticFlowConfig())
+    mode = strategy._enable_frozen_teacher_gradient_checkpointing(model)
+
+    assert mode == "manual_non_reentrant"
+    assert model.config.use_cache is False
+    assert getattr(model.layers[0], "_semantic_flow_non_reentrant_checkpoint")
 
 
 def test_semantic_dropout_uses_exact_counts_between_48_and_64_tokens_per_frame() -> None:
