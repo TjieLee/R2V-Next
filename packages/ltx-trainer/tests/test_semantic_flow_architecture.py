@@ -6,9 +6,12 @@ import json
 import math
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
+import torch.utils.checkpoint
+import transformers
 import yaml
 from accelerate import DistributedType
 from safetensors.torch import save_file
@@ -73,10 +76,7 @@ class _TinyMaskedAttentionLanguageModel(nn.Module):
         super().__init__()
         self.scale = nn.Parameter(torch.tensor(1.0))
         self.config = SimpleNamespace(use_cache=True)
-        self.gradient_checkpointing_kwargs = None
-
-    def gradient_checkpointing_enable(self, *, gradient_checkpointing_kwargs=None) -> None:
-        self.gradient_checkpointing_kwargs = gradient_checkpointing_kwargs
+        self.layers = nn.ModuleList([nn.Identity()])
 
     def forward(
         self,
@@ -93,6 +93,7 @@ class _TinyMaskedAttentionLanguageModel(nn.Module):
             attention_mask = attention_mask["full_attention"]
         visible = attention_mask[:, 0] == 0
         source = inputs_embeds * self.scale + position_ids.to(dtype=inputs_embeds.dtype).unsqueeze(-1) * 0.01
+        source = self.layers[0](source)
         scores = torch.matmul(source, source.transpose(-1, -2)) / math.sqrt(source.shape[-1])
         scores = scores.masked_fill(~visible, -1.0e9)
         weights = torch.softmax(scores, dim=-1)
@@ -187,9 +188,9 @@ def test_frozen_gemma_teacher_backpropagates_only_to_semantic_modules() -> None:
     strategy._reconstruction_decoder = SemanticReconstructionDecoder(semantic_dim=4, gemma_dim=8, hidden_dim=8)
 
     mode = strategy._enable_frozen_teacher_gradient_checkpointing(language_model)
-    assert mode == "native_non_reentrant"
-    assert language_model.gradient_checkpointing_kwargs == {"use_reentrant": False}
+    assert mode == "manual_non_reentrant"
     assert language_model.config.use_cache is False
+    assert strategy.teacher_checkpointed_layer_count == 1
 
     prefix_embeddings = torch.randn(1, 6, 8, requires_grad=True)
     evidence = torch.randn(1, 1, EVIDENCE_TOKENS_PER_FRAME, 8, requires_grad=True)
@@ -207,6 +208,9 @@ def test_frozen_gemma_teacher_backpropagates_only_to_semantic_modules() -> None:
 
     assert _has_nonzero_grad(strategy._query_initializer)
     assert _has_nonzero_grad(strategy._semantic_encoder)
+    assert _has_nonzero_grad(strategy._reconstruction_decoder)
+    assert strategy.teacher_checkpoint_forward_calls > 0
+    assert language_model.training is False
     assert all(parameter.grad is None for parameter in language_model.parameters())
     assert prefix_embeddings.grad is None
     assert evidence.grad is None
@@ -220,9 +224,6 @@ def test_frozen_gemma_checkpointing_falls_back_to_manual_layers() -> None:
             self.config = SimpleNamespace(use_cache=True)
             self.layers = nn.ModuleList([nn.Linear(2, 2)])
 
-        def gradient_checkpointing_enable(self) -> None:
-            raise AssertionError("non-reentrant kwargs should choose the manual fallback")
-
     model = _ManualCheckpointLanguageModel()
     strategy = SemanticFlowStrategy(SemanticFlowConfig())
     mode = strategy._enable_frozen_teacher_gradient_checkpointing(model)
@@ -230,6 +231,75 @@ def test_frozen_gemma_checkpointing_falls_back_to_manual_layers() -> None:
     assert mode == "manual_non_reentrant"
     assert model.config.use_cache is False
     assert getattr(model.layers[0], "_semantic_flow_non_reentrant_checkpoint")
+    assert getattr(model.layers[0], "_semantic_flow_original_forward") is not None
+    assert strategy._enable_frozen_teacher_gradient_checkpointing(model) == "manual_non_reentrant"
+    assert strategy.teacher_checkpointed_layer_count == 1
+
+
+def test_eval_tiny_gemma_teacher_executes_manual_checkpointing_and_backpropagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = transformers.Gemma3TextConfig(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        head_dim=4,
+        sliding_window=1024,
+        layer_types=["full_attention", "sliding_attention"],
+        use_cache=False,
+    )
+    language_model = transformers.Gemma3TextModel(config).eval().requires_grad_(False)
+    strategy = SemanticFlowStrategy(SemanticFlowConfig())
+    strategy._text_encoder = SimpleNamespace(
+        model=SimpleNamespace(model=SimpleNamespace(language_model=language_model))
+    )
+    strategy._query_initializer = SemanticQueryInitializer(gemma_dim=config.hidden_size)
+    strategy._semantic_encoder = SemanticEncoder(
+        gemma_dim=config.hidden_size,
+        semantic_dim=8,
+        hidden_dim=16,
+    )
+    strategy._reconstruction_decoder = SemanticReconstructionDecoder(
+        semantic_dim=8,
+        gemma_dim=config.hidden_size,
+        hidden_dim=16,
+    )
+
+    checkpoint_calls = 0
+    real_checkpoint = torch.utils.checkpoint.checkpoint
+
+    def counted_checkpoint(*args, **kwargs) -> Any:
+        nonlocal checkpoint_calls
+        checkpoint_calls += 1
+        return real_checkpoint(*args, **kwargs)
+
+    monkeypatch.setattr(torch.utils.checkpoint, "checkpoint", counted_checkpoint)
+    assert strategy._enable_frozen_teacher_gradient_checkpointing(language_model) == "manual_non_reentrant"
+
+    teacher = strategy.build_semantic_teacher_outputs(
+        {
+            "prefix_inputs_embeds": torch.randn(1, 6, config.hidden_size),
+            "prefix_attention_mask": torch.ones(1, 6, dtype=torch.bool),
+            "prefix_image_token_mask": torch.zeros(1, 6, dtype=torch.bool),
+            "evidence_tokens": torch.randn(1, 1, EVIDENCE_TOKENS_PER_FRAME, config.hidden_size),
+            "normalized_timestamps": torch.tensor([[0.25]]),
+        }
+    )
+    loss = teacher["semantic_clean"].pow(2).mean() + teacher["reconstruction_prediction"].pow(2).mean()
+    loss.backward()
+
+    assert checkpoint_calls > 0
+    assert strategy.teacher_checkpoint_forward_calls == checkpoint_calls
+    assert strategy.teacher_checkpointed_layer_count == 2
+    assert language_model.training is False
+    assert all(not parameter.requires_grad for parameter in language_model.parameters())
+    assert all(parameter.grad is None for parameter in language_model.parameters())
+    assert _has_nonzero_grad(strategy._query_initializer)
+    assert _has_nonzero_grad(strategy._semantic_encoder)
+    assert _has_nonzero_grad(strategy._reconstruction_decoder)
 
 
 def test_semantic_dropout_uses_exact_counts_between_48_and_64_tokens_per_frame() -> None:
