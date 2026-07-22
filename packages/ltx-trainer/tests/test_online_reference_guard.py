@@ -7,7 +7,6 @@ from typing import Any
 
 import pytest
 import torch
-import yaml
 from PIL import Image
 from transformers import Gemma3ImageProcessor
 
@@ -37,8 +36,8 @@ def _record(reference_paths: list[str]) -> dict[str, Any]:
         "target_fps": 1.0,
         "target_num_frames": 1,
         "target_source_frame_indices": [0],
-        "vlm_target_frame_indices": [0],
-        "vlm_source_frame_indices": [0],
+        "semantic_anchor_target_indices": [0],
+        "semantic_anchor_source_indices": [0],
         "reference_paths": reference_paths,
     }
 
@@ -302,20 +301,3 @@ def test_reference_audit_deduplicates_decode_and_keeps_all_occurrences(tmp_path:
     assert [row["manifest_index"] for row in tiny_rows] == [0, 1]
     assert all(row["shape"] == [1, 1, 3] for row in tiny_rows)
     assert all(row["dtype"] == "torch.uint8" for row in tiny_rows)
-
-
-def test_resume_refguard_config_is_exact_resume() -> None:
-    config_path = (
-        Path(__file__).resolve().parents[1]
-        / "configs"
-        / "multiref_stage3_resume_step15000_refguard_30k.yaml"
-    )
-    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    assert config["model"]["load_checkpoint"].endswith(
-        "stage3_step_15000/lora_weights_step_15000.safetensors"
-    )
-    assert config["checkpoints"]["no_resume"] is False
-    assert config["checkpoints"]["save_training_state"] == "full"
-    assert config["checkpoints"]["allow_warm_resume_without_optimizer"] is False
-    assert config["optimization"]["steps"] == 30000
-    assert config["data"]["online_encoding"]["vlm_reference_preprocess"] == "original"

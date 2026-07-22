@@ -9,7 +9,7 @@ import json
 import re
 import statistics
 from collections import Counter
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Iterable
 
 from PIL import Image
@@ -19,14 +19,12 @@ from ltx_trainer.online_data.constants import (
     TARGET_WIDTH,
     VIDEO_FPS,
     VIDEO_NUM_FRAMES,
-    VISUAL_TOKEN_CAPACITY,
 )
 from ltx_trainer.online_inference.read_only_sources import ReadOnlySourcePolicy
 
 SCHEMA_VERSION = 1
 TARGET_FRAMES = VIDEO_NUM_FRAMES
 TARGET_FPS = VIDEO_FPS
-PLANNER_TOKEN_COUNT = VISUAL_TOKEN_CAPACITY
 DATASET_SCHEMAS = {"videoxfun_test", "opens2v_open_domain", "custom64"}
 
 _CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f]")
@@ -69,6 +67,10 @@ def _required_text(record: dict[str, Any], key: str, *, record_id: str) -> str:
     return value
 
 
+def _is_absolute_path(value: str) -> bool:
+    return Path(value).is_absolute() or PurePosixPath(value).is_absolute() or PureWindowsPath(value).is_absolute()
+
+
 def _reference_paths(
     values: Any,
     *,
@@ -85,12 +87,13 @@ def _reference_paths(
     for value in original:
         if not value.strip():
             raise ExternalEvalSchemaError(f"{record_id}: reference path must not be empty")
+        is_absolute = _is_absolute_path(value)
         path = Path(value).expanduser()
-        if require_absolute and not path.is_absolute():
+        if require_absolute and not is_absolute:
             raise ExternalEvalSchemaError(f"{record_id}: reference path must be absolute: {value}")
-        if not path.is_absolute():
+        if not is_absolute:
             path = input_parent / path
-        resolved.append(str(path.resolve()))
+        resolved.append(value if is_absolute and not path.is_absolute() else str(path.resolve()))
     return original, resolved
 
 
@@ -277,7 +280,7 @@ def validate_normalized_record(record: dict[str, Any]) -> dict[str, Any]:
     references = list(record["reference_paths"])
     if not caption or not 1 <= len(references) <= 4:
         raise ExternalEvalSchemaError("normalized record requires a caption and 1..4 references")
-    if any(not Path(str(reference)).is_absolute() for reference in references):
+    if any(not _is_absolute_path(str(reference)) for reference in references):
         raise ExternalEvalSchemaError("normalized reference_paths must all be absolute")
     if len(record["original_reference_paths"]) != len(references):
         raise ExternalEvalSchemaError("original and resolved reference path counts differ")
@@ -512,13 +515,12 @@ def crop_rows_csv(rows: list[dict[str, Any]]) -> str:
 
 __all__ = [
     "DATASET_SCHEMAS",
-    "ExternalEvalSchemaError",
-    "PLANNER_TOKEN_COUNT",
     "SCHEMA_VERSION",
     "TARGET_FPS",
     "TARGET_FRAMES",
     "TARGET_HEIGHT",
     "TARGET_WIDTH",
+    "ExternalEvalSchemaError",
     "build_preflight_report",
     "center_crop_risk",
     "crop_rows_csv",

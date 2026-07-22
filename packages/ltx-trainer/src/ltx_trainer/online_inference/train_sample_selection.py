@@ -70,7 +70,7 @@ def _scan_compact_index(manifest_path: Path) -> tuple[array, dict[str, array]]:
 def _load_compact_index(manifest_path: Path) -> tuple[array, dict[str, array], Path | None]:
     index_path = default_manifest_index_path(manifest_path)
     if index_path.is_file():
-        offsets, task_indices = read_manifest_index(
+        offsets, task_indices, _dataset_indices = read_manifest_index(
             index_path,
             manifest_path=manifest_path,
         )
@@ -128,8 +128,8 @@ def _selection_entry(
         "reference_count": len(reference_paths),
         "target_path": str(_resolve_media_path(str(record["target_path"]), manifest_path)),
         "target_source_frame_indices": record.get("target_source_frame_indices"),
-        "vlm_target_frame_indices": record.get("vlm_target_frame_indices"),
-        "vlm_source_frame_indices": record.get("vlm_source_frame_indices"),
+        "semantic_anchor_target_indices": record.get("semantic_anchor_target_indices"),
+        "semantic_anchor_source_indices": record.get("semantic_anchor_source_indices"),
         "crop_xyxy": record.get("crop_xyxy"),
         "face_cut": record.get("face_cut"),
         "width": int(record["target_width"]),

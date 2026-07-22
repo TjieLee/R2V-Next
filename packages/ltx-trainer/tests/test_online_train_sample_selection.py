@@ -9,7 +9,6 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
-from ltx_trainer.online_data.constants import VLM_TARGET_INDICES
 from ltx_trainer.online_data.manifest_index import build_manifest_offset_index
 from ltx_trainer.online_inference.raw_condition_encoder import load_reference_inputs
 from ltx_trainer.online_inference.runner import read_selected_samples
@@ -36,10 +35,12 @@ def _write_record(
     target.write_bytes(b"target-must-not-be-opened")
     is_image = task == "i2i"
     target_indices = [0] if is_image else list(range(121))
-    vlm_indices = [0] if is_image else list(VLM_TARGET_INDICES)
+    semantic_indices = [0] if is_image else [round(index * 120 / 11) for index in range(12)]
     record = {
         "sample_key": f"{task}-{index}",
         "dataset_name": "unit-test",
+        "adapter_name": "unit-test",
+        "source_record_id": f"record-{task}-{index}",
         "task": task,
         "target_modality": "image" if is_image else "video",
         "target_path": str(target),
@@ -47,13 +48,16 @@ def _write_record(
         "caption": f"caption {task} {index}",
         "crop_xyxy": None,
         "face_cut": None,
+        "clip_start_frame": 0,
+        "clip_end_frame": 0 if is_image else 120,
+        "original_fps": 1.0 if is_image else 24.0,
         "target_fps": 1.0 if is_image else 24.0,
         "target_num_frames": 1 if is_image else 121,
         "target_width": 832,
         "target_height": 480,
         "target_source_frame_indices": target_indices,
-        "vlm_target_frame_indices": vlm_indices,
-        "vlm_source_frame_indices": vlm_indices,
+        "semantic_anchor_target_indices": semantic_indices,
+        "semantic_anchor_source_indices": semantic_indices,
     }
     canonical = json.dumps(record, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
     record["sample_plan_sha256"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -149,7 +153,10 @@ def test_selection_rejects_reference_target_alias(
     if alias_kind == "direct":
         reference = target
     elif alias_kind == "symlink":
-        reference.symlink_to(target)
+        try:
+            reference.symlink_to(target)
+        except OSError as exc:
+            pytest.skip(f"symlinks are unavailable in this environment: {exc}")
     else:
         os.link(target, reference)
     record["reference_paths"] = [str(reference)]
