@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import hashlib
+import importlib.util
 import json
+import sqlite3
+import sys
 import threading
 import time
 import tracemalloc
@@ -11,6 +15,7 @@ import pytest
 from PIL import Image
 
 from ltx_trainer.online_data import parallel_manifest
+from ltx_trainer.online_data.manifest import build_canonical_r2v_record
 from ltx_trainer.online_data.parallel_manifest import (
     AnnotationSource,
     BuildOptions,
@@ -24,6 +29,17 @@ from ltx_trainer.online_data.parallel_manifest import (
     validate_done_marker,
 )
 from ltx_trainer.online_data.path_safety import assert_write_path_allowed
+
+
+def _load_online_manifest_builder_module():
+    path = Path(__file__).resolve().parents[1] / "scripts" / "build_multitask_online_manifest.py"
+    name = "_test_build_multitask_online_manifest"
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def _write_image(path: Path, color: tuple[int, int, int]) -> None:
@@ -153,6 +169,127 @@ def test_parallel_r2v_builder_deduplicates_inflight_probe_and_builds_121_frame_p
             record["target_source_frame_indices"][1:],
         )
     )
+
+
+def _canonical_probe_rows(tmp_path: Path) -> list[tuple[str, dict[str, object]]]:
+    reference = tmp_path / "reference.png"
+    _write_image(reference, (11, 22, 33))
+    videos = []
+    for index in range(4):
+        video = tmp_path / f"video_{index}.mp4"
+        video.write_bytes(f"video-{index}".encode())
+        videos.append(video)
+    paths = [videos[0], videos[0], videos[1], videos[2], videos[3]]
+    return [
+        (
+            f"row-{index}",
+            {
+                "video_path": str(path),
+                "text": f"video request {index}",
+                "crop": [0, 64, 0, 48],
+                "face_cut": [0, 300],
+                "ref_images": [str(reference)],
+            },
+        )
+        for index, path in enumerate(paths)
+    ]
+
+
+def test_canonical_manifest_probe_is_parallel_cached_ordered_and_rejects_probe_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_online_manifest_builder_module()
+    rows = _canonical_probe_rows(tmp_path)
+    call_paths: list[str] = []
+    thread_names: set[str] = set()
+
+    def fake_probe(path: str) -> dict[str, object]:
+        call_paths.append(path)
+        thread_names.add(threading.current_thread().name)
+        time.sleep(0.02)
+        if path.endswith("video_2.mp4"):
+            raise RuntimeError("synthetic probe failure")
+        return {"fps": 24.0, "frame_count": 300, "width": 64, "height": 48}
+
+    monkeypatch.setattr(builder, "probe_video", fake_probe)
+    connection = sqlite3.connect(":memory:")
+    cache = builder._MediaValidationCache(connection)
+
+    results = list(
+        builder._iter_canonical_rows_with_bounded_probes(
+            rows,
+            dataset_name="r2v_fixture",
+            dataset_type="OpenS2VDataset",
+            data_root=None,
+            adapter_config=None,
+            manifest_seed=42,
+            workers=4,
+            batch_size=8,
+            validation_cache=cache,
+        )
+    )
+
+    assert [source_record_id for source_record_id, *_ in results] == [row_id for row_id, _ in rows]
+    assert len(thread_names) > 1
+    assert call_paths.count(str(tmp_path / "video_0.mp4")) == 1
+    assert len(call_paths) == 4
+    assert results[3][3] is not None
+    assert results[3][3].reason == "invalid_video_header"
+    assert [result[1].source_record_id for result in results if result[3] is None] == [
+        "row-0",
+        "row-1",
+        "row-2",
+        "row-4",
+    ]
+
+
+def test_canonical_manifest_probe_worker_count_does_not_change_records_or_sha(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_online_manifest_builder_module()
+    rows = _canonical_probe_rows(tmp_path)[:3]
+    monkeypatch.setattr(
+        builder,
+        "probe_video",
+        lambda _path: {"fps": 24.0, "frame_count": 300, "width": 64, "height": 48},
+    )
+
+    def build_payload(workers: int) -> tuple[str, str]:
+        connection = sqlite3.connect(":memory:")
+        cache = builder._MediaValidationCache(connection)
+        records = []
+        for _row_id, canonical, header, error in builder._iter_canonical_rows_with_bounded_probes(
+            rows,
+            dataset_name="r2v_fixture",
+            dataset_type="OpenS2VDataset",
+            data_root=None,
+            adapter_config=None,
+            manifest_seed=42,
+            workers=workers,
+            batch_size=2,
+            validation_cache=cache,
+        ):
+            assert error is None
+            assert canonical is not None and header is not None
+            records.append(
+                build_canonical_r2v_record(
+                    canonical,
+                    manifest_seed=42,
+                    video_header=header,
+                    image_validator=lambda _path: (64, 48),
+                    target_path_validated=True,
+                )
+            )
+        payload = "".join(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n" for record in records)
+        return payload, hashlib.sha256(payload.encode()).hexdigest()
+
+    serial_payload, serial_sha = build_payload(workers=1)
+    parallel_payload, parallel_sha = build_payload(workers=4)
+
+    assert serial_payload == parallel_payload
+    assert serial_sha == parallel_sha
 
 
 def test_media_cache_runtime_writes_use_dedicated_writer_thread(tmp_path: Path) -> None:

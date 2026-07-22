@@ -27,6 +27,7 @@ from PIL import Image, ImageOps
 
 from ltx_trainer.online_data.constants import IMAGE_TASK, VIDEO_TASK
 from ltx_trainer.online_data.manifest import (
+    CanonicalR2VSource,
     ManifestReject,
     build_canonical_r2v_record,
     build_i2i_record,
@@ -275,6 +276,71 @@ def _iter_rows_with_bounded_probes(
                 yield row, header, error
 
 
+def _iter_canonical_rows_with_bounded_probes(
+    rows: Iterable[tuple[str, dict[str, Any]]],
+    *,
+    dataset_name: str,
+    dataset_type: str,
+    data_root: str | Path | None,
+    adapter_config: Mapping[str, Any] | None,
+    manifest_seed: int,
+    workers: int,
+    batch_size: int,
+    validation_cache: _MediaValidationCache,
+) -> Iterator[tuple[str, CanonicalR2VSource | None, dict[str, Any] | None, ManifestReject | None]]:
+    """Normalize R2V rows, probe canonical paths in bounded parallel batches, and preserve order."""
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        for row_batch in _batched(rows, batch_size):
+            canonicals: list[CanonicalR2VSource | None] = []
+            requests: list[_MediaSignature | _ValidationResult] = []
+            results_by_signature: dict[_MediaSignature, _ValidationResult] = {}
+            misses: dict[_MediaSignature, str] = {}
+
+            for source_record_id, row in row_batch:
+                try:
+                    canonical = normalize_r2v_source(
+                        row,
+                        row_id=source_record_id,
+                        dataset_name=dataset_name,
+                        dataset_type=dataset_type,
+                        data_root=data_root,
+                        adapter_config=adapter_config,
+                        manifest_seed=manifest_seed,
+                    )
+                except ManifestReject as exc:
+                    canonicals.append(None)
+                    requests.append(_ValidationResult(None, exc.reason, str(exc)))
+                    continue
+
+                canonicals.append(canonical)
+                signature = validation_cache.signature(canonical.video_path)
+                requests.append(signature)
+                cached = validation_cache.get("video", signature)
+                if cached is not None:
+                    results_by_signature[signature] = cached
+                elif signature.size < 0:
+                    result = _ValidationResult(
+                        None,
+                        "missing_target",
+                        f"Target video does not exist: {signature.path}",
+                    )
+                    validation_cache.put("video", signature, result)
+                    results_by_signature[signature] = result
+                else:
+                    misses.setdefault(signature, signature.path)
+
+            missing_signatures = list(misses)
+            probed = executor.map(_probe_resolved_video, [misses[item] for item in missing_signatures])
+            for signature, result in zip(missing_signatures, probed, strict=True):
+                validation_cache.put("video", signature, result)
+                results_by_signature[signature] = result
+
+            for (source_record_id, _row), canonical, request in zip(row_batch, canonicals, requests, strict=True):
+                result = request if isinstance(request, _ValidationResult) else results_by_signature[request]
+                header, error = result.as_probe_result()
+                yield source_record_id, canonical, header, error
+
+
 def _peak_rss_gb() -> float:
     if resource is None:
         return 0.0
@@ -340,6 +406,54 @@ def main(  # noqa: PLR0913, PLR0915
         with output_temporary.open("w", encoding="utf-8") as accepted_handle, reject_temporary.open(
             "w", encoding="utf-8"
         ) as reject_handle:
+            def accept_record(record: dict[str, Any]) -> None:
+                nonlocal accepted_rows, duplicate_rows
+                sample_key = str(record["sample_key"])
+                plan_sha = str(record["sample_plan_sha256"])
+                existing = connection.execute(
+                    "SELECT sample_plan_sha256 FROM dedup WHERE sample_key = ?",
+                    (sample_key,),
+                ).fetchone()
+                if existing is not None:
+                    if str(existing[0]) != plan_sha:
+                        raise _ManifestCollisionError(f"sample_key collision with different plans: {sample_key}")
+                    duplicate_rows += 1
+                    return
+                connection.execute("INSERT INTO dedup VALUES (?, ?)", (sample_key, plan_sha))
+                accepted_handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+                accepted_rows += 1
+                task_counts[str(record["task"])] += 1
+                if accepted_rows % 10_000 == 0:
+                    connection.commit()
+
+            def reject_record(
+                *,
+                dataset_name: str,
+                row_index: int,
+                task: str,
+                source_record_id: str,
+                exc: Exception,
+            ) -> None:
+                nonlocal rejected_rows
+                reason = exc.reason if isinstance(exc, ManifestReject) else type(exc).__name__
+                reject_handle.write(
+                    json.dumps(
+                        {
+                            "dataset_name": dataset_name,
+                            "row_index": row_index,
+                            "task": task,
+                            "reason": reason,
+                            "source_record_id": source_record_id,
+                            "message": str(exc),
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
+                rejected_rows += 1
+                reject_reason_counts[reason] += 1
+
             for dataset in config["datasets"]:
                 if not isinstance(dataset, dict):
                     raise ValueError("Each datasets entry must be a mapping")
@@ -359,6 +473,46 @@ def main(  # noqa: PLR0913, PLR0915
                 dataset_type = str(dataset.get("dataset_type", ""))
                 adapter_config = dataset.get("adapter")
 
+                if task == VIDEO_TASK:
+                    probed_rows = _iter_canonical_rows_with_bounded_probes(
+                        rows,
+                        dataset_name=dataset_name,
+                        dataset_type=dataset_type,
+                        data_root=data_root,
+                        adapter_config=adapter_config,
+                        manifest_seed=manifest_seed,
+                        workers=probe_workers,
+                        batch_size=probe_batch_size,
+                        validation_cache=validation_cache,
+                    )
+                    for row_index, (source_record_id, canonical, video_header, probe_error) in enumerate(probed_rows):
+                        raw_rows += 1
+                        try:
+                            if probe_error is not None:
+                                raise probe_error
+                            if canonical is None or video_header is None:
+                                raise RuntimeError("R2V canonical row was not probed")
+                            record = build_canonical_r2v_record(
+                                canonical,
+                                manifest_seed=manifest_seed,
+                                anchor_frame_ratio=float(dataset.get("anchor_frame_ratio", 0.10)),
+                                video_header=video_header,
+                                image_validator=validation_cache.validate_image,
+                                target_path_validated=True,
+                            )
+                            accept_record(record)
+                        except Exception as exc:
+                            if isinstance(exc, _ManifestCollisionError):
+                                raise
+                            reject_record(
+                                dataset_name=dataset_name,
+                                row_index=row_index,
+                                task=task,
+                                source_record_id=source_record_id,
+                                exc=exc,
+                            )
+                    continue
+
                 for row_index, (source_record_id, row) in enumerate(rows):
                     raw_rows += 1
                     try:
@@ -373,67 +527,20 @@ def main(  # noqa: PLR0913, PLR0915
                                 crop_field=i2i_crop_field,
                                 image_validator=validation_cache.validate_image,
                             )
-                        elif task == VIDEO_TASK:
-                            canonical = normalize_r2v_source(
-                                row,
-                                row_id=source_record_id,
-                                dataset_name=dataset_name,
-                                dataset_type=dataset_type,
-                                data_root=data_root,
-                                adapter_config=adapter_config,
-                                manifest_seed=manifest_seed,
-                            )
-                            record = build_canonical_r2v_record(
-                                canonical,
-                                manifest_seed=manifest_seed,
-                                anchor_frame_ratio=float(dataset.get("anchor_frame_ratio", 0.10)),
-                                video_header=probe_video(canonical.video_path),
-                                image_validator=validation_cache.validate_image,
-                                target_path_validated=False,
-                            )
                         else:
                             raise ValueError(f"Unsupported task {task!r} in dataset {dataset_name!r}")
 
-                        sample_key = str(record["sample_key"])
-                        plan_sha = str(record["sample_plan_sha256"])
-                        existing = connection.execute(
-                            "SELECT sample_plan_sha256 FROM dedup WHERE sample_key = ?",
-                            (sample_key,),
-                        ).fetchone()
-                        if existing is not None:
-                            if str(existing[0]) != plan_sha:
-                                raise _ManifestCollisionError(
-                                    f"sample_key collision with different plans: {sample_key}"
-                                )
-                            duplicate_rows += 1
-                            continue
-                        connection.execute("INSERT INTO dedup VALUES (?, ?)", (sample_key, plan_sha))
-                        accepted_handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
-                        accepted_rows += 1
-                        task_counts[task] += 1
-                        if accepted_rows % 10_000 == 0:
-                            connection.commit()
+                        accept_record(record)
                     except Exception as exc:
                         if isinstance(exc, _ManifestCollisionError):
                             raise
-                        reason = exc.reason if isinstance(exc, ManifestReject) else type(exc).__name__
-                        reject_handle.write(
-                            json.dumps(
-                                {
-                                    "dataset_name": dataset_name,
-                                    "row_index": row_index,
-                                    "task": task,
-                                    "reason": reason,
-                                    "source_record_id": source_record_id,
-                                    "message": str(exc),
-                                },
-                                ensure_ascii=False,
-                                sort_keys=True,
-                            )
-                            + "\n"
+                        reject_record(
+                            dataset_name=dataset_name,
+                            row_index=row_index,
+                            task=task,
+                            source_record_id=source_record_id,
+                            exc=exc,
                         )
-                        rejected_rows += 1
-                        reject_reason_counts[reason] += 1
             connection.commit()
             _flush_and_sync(accepted_handle)
             _flush_and_sync(reject_handle)
