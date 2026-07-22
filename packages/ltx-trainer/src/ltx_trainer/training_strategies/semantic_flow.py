@@ -739,11 +739,17 @@ class SemanticFlowStrategy(TrainingStrategy):
         return semantic, self._video_patchifier.unpatchify(target, state.target_shape)
 
     def get_checkpoint_metadata(self) -> dict[str, Any]:
+        appended = self.config.reference_rope_mode == "appended_time_shifted_width"
         return {
             "architecture": "semantic_flow_v1",
             "semantic_dim": self._semantic_dim,
             "gemma_dim": self._gemma_dim,
             "token_sequence": ["reference", "semantic", "target"],
+            "reference_rope_layout_version": 2,
+            "reference_rope_mode": self.config.reference_rope_mode,
+            "reference_rope_temporal_slots": "fixed_after_target" if appended else "native_overlap",
+            "reference_rope_spatial_shift": "width_adjacent" if appended else "native_overlap",
+            "semantic_rope_mode": "target_interpolated_8x8",
         }
 
     def _require_semantic_modules(

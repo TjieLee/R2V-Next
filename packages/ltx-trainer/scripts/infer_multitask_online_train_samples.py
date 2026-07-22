@@ -68,6 +68,7 @@ def main(
     decode_tile: bool = typer.Option(True, "--decode-tile/--no-decode-tile"),
     dry_run: bool = typer.Option(False, "--dry-run/--no-dry-run"),
     overwrite: bool = typer.Option(False, "--overwrite/--no-overwrite"),
+    allow_legacy_reference_rope: bool = typer.Option(False, "--allow-legacy-reference-rope"),
 ) -> None:
     if limit is not None and limit < 1:
         raise typer.BadParameter("--limit must be >= 1")
@@ -99,6 +100,7 @@ def main(
         device=torch_device,
         dtype=torch_dtype,
         load_vae_decoder=not dry_run,
+        allow_legacy_reference_rope=allow_legacy_reference_rope,
     )
 
     started = time.perf_counter()

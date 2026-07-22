@@ -37,6 +37,7 @@ from ltx_trainer.online_inference.checkpoint_runtime import (
     CheckpointAuditError,
     audit_checkpoint,
     resolve_checkpoint,
+    validate_reference_rope_checkpoint_metadata,
 )
 from ltx_trainer.online_inference.runtime_lock import (
     SemanticFlowRuntimeLockError,
@@ -672,6 +673,43 @@ def test_checkpoint_audit_and_ready_resolution_require_semantic_modules(tmp_path
     save_file(tensors, missing_transformer, metadata={"architecture": "semantic_flow_v1"})
     with pytest.raises(CheckpointAuditError, match="semantic_proj_out"):
         audit_checkpoint(missing_transformer)
+
+
+def test_reference_rope_checkpoint_metadata_is_complete_and_fail_closed() -> None:
+    metadata = SemanticFlowStrategy(SemanticFlowConfig()).get_checkpoint_metadata()
+    assert metadata == {
+        "architecture": "semantic_flow_v1",
+        "semantic_dim": None,
+        "gemma_dim": None,
+        "token_sequence": ["reference", "semantic", "target"],
+        "reference_rope_layout_version": 2,
+        "reference_rope_mode": "appended_time_shifted_width",
+        "reference_rope_temporal_slots": "fixed_after_target",
+        "reference_rope_spatial_shift": "width_adjacent",
+        "semantic_rope_mode": "target_interpolated_8x8",
+    }
+    serialized = {key: str(value) for key, value in metadata.items()}
+    validate_reference_rope_checkpoint_metadata(
+        serialized,
+        expected_mode="appended_time_shifted_width",
+    )
+
+    with pytest.raises(CheckpointAuditError, match="missing Reference RoPE metadata"):
+        validate_reference_rope_checkpoint_metadata({}, expected_mode="appended_time_shifted_width")
+    validate_reference_rope_checkpoint_metadata(
+        {},
+        expected_mode="appended_time_shifted_width",
+        allow_legacy=True,
+    )
+
+    mismatched = dict(serialized)
+    mismatched["reference_rope_mode"] = "native_overlap"
+    with pytest.raises(CheckpointAuditError, match="metadata mismatch"):
+        validate_reference_rope_checkpoint_metadata(
+            mismatched,
+            expected_mode="appended_time_shifted_width",
+            allow_legacy=True,
+        )
 
 
 def test_semantic_flow_smoke_marker_binds_code_configs_checkpoints_and_real_inference(tmp_path: Path) -> None:

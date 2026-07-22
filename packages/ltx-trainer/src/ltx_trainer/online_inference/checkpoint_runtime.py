@@ -158,6 +158,41 @@ def audit_checkpoint(path: Path) -> dict[str, Any]:
     }
 
 
+def validate_reference_rope_checkpoint_metadata(
+    metadata: dict[str, str],
+    *,
+    expected_mode: str,
+    allow_legacy: bool = False,
+) -> None:
+    required = {
+        "reference_rope_layout_version": "2",
+        "reference_rope_mode": expected_mode,
+        "reference_rope_temporal_slots": (
+            "fixed_after_target" if expected_mode == "appended_time_shifted_width" else "native_overlap"
+        ),
+        "reference_rope_spatial_shift": (
+            "width_adjacent" if expected_mode == "appended_time_shifted_width" else "native_overlap"
+        ),
+        "semantic_rope_mode": "target_interpolated_8x8",
+    }
+    present = set(required) & set(metadata)
+    if not present and allow_legacy:
+        return
+    missing = sorted(set(required) - set(metadata))
+    if missing:
+        raise CheckpointAuditError(
+            "Semantic-flow checkpoint is missing Reference RoPE metadata: "
+            f"{missing}. Use --allow-legacy-reference-rope only for an explicit legacy migration test."
+        )
+    mismatches = {
+        key: {"expected": expected, "actual": metadata.get(key)}
+        for key, expected in required.items()
+        if metadata.get(key) != expected
+    }
+    if mismatches:
+        raise CheckpointAuditError(f"Semantic-flow Reference RoPE metadata mismatch: {mismatches}")
+
+
 @dataclass
 class OnlineInferenceRuntime:
     cfg: LtxTrainerConfig
@@ -259,6 +294,7 @@ def load_online_inference_runtime(
     device: torch.device,
     dtype: torch.dtype,
     load_vae_decoder: bool = True,
+    allow_legacy_reference_rope: bool = False,
 ) -> OnlineInferenceRuntime:
     """Load a complete full-DiT semantic checkpoint and frozen encoders once."""
     config = Path(config_path).expanduser().resolve()
@@ -273,6 +309,11 @@ def load_online_inference_runtime(
 
     snapshot = checkpoint_snapshot(checkpoint_path)
     audit = audit_checkpoint(checkpoint_path)
+    validate_reference_rope_checkpoint_metadata(
+        audit["metadata"],
+        expected_mode=strategy.config.reference_rope_mode,
+        allow_legacy=allow_legacy_reference_rope,
+    )
     if ready_marker is not None:
         expected_sha = ready_marker.get("checkpoint_sha256")
         if expected_sha and snapshot.sha256 != str(expected_sha):
@@ -363,4 +404,5 @@ __all__ = [
     "checkpoint_step",
     "load_online_inference_runtime",
     "resolve_checkpoint",
+    "validate_reference_rope_checkpoint_metadata",
 ]
