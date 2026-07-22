@@ -1,6 +1,7 @@
 name: Semantic Flow CPU Unit Tests
 
 on:
+  workflow_dispatch:
   pull_request:
     paths:
       - ".github/workflows/semantic-flow-unit-tests.yml"
@@ -35,9 +36,19 @@ jobs:
           pytest -q \
             packages/ltx-trainer/tests/test_gemma3_attention_masks.py::test_small_transformers_gemma3_forward_accepts_full_sliding_mask_mapping
 
+      - name: Require semantic-flow production guards
+        run: |
+          pytest -q \
+            packages/ltx-trainer/tests/test_gemma3_attention_masks.py::test_teacher_masks_keep_evidence_bidirectional_and_queries_local \
+            packages/ltx-trainer/tests/test_semantic_flow_architecture.py::test_eval_tiny_gemma_teacher_executes_manual_checkpointing_and_backpropagates \
+            packages/ltx-trainer/tests/test_reference_rope_layout.py \
+            packages/ltx-trainer/tests/test_semantic_flow_architecture.py::test_semantic_flow_smoke_marker_binds_code_configs_checkpoints_and_real_inference \
+            packages/ltx-trainer/tests/test_semantic_flow_architecture.py::test_semantic_flow_runtime_lock_requires_exact_environment_and_fsdp_roundtrip
+
       - name: Run semantic-flow CPU tests
         run: |
           pytest -q \
             packages/ltx-trainer/tests/test_semantic_flow_architecture.py \
             packages/ltx-trainer/tests/test_parallel_manifest_builder.py \
-            packages/ltx-trainer/tests/test_gemma3_attention_masks.py
+            packages/ltx-trainer/tests/test_gemma3_attention_masks.py \
+            packages/ltx-trainer/tests/test_reference_rope_layout.py

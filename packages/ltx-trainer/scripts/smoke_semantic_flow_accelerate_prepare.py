@@ -43,7 +43,7 @@ def _module_has_finite_gradient(module: nn.Module) -> bool:
 
 def _finite_nonempty_state(accelerator: Accelerator, module: nn.Module) -> dict[str, torch.Tensor]:
     state = accelerator.get_state_dict(module)
-    if not state:
+    if accelerator.is_main_process and not state:
         raise RuntimeError(f"Accelerate returned an empty state dict for {type(module).__name__}")
     nonfinite = [key for key, value in state.items() if not torch.isfinite(value).all()]
     if nonfinite:

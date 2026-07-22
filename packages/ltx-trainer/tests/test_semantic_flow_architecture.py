@@ -999,6 +999,7 @@ def test_accelerate_multimodel_smoke_matches_trainer_prepare_order() -> None:
     assert expected_prepare in script
     assert "class BasicAVTransformerBlock" in script
     assert "accelerator.get_state_dict(module)" in script
+    assert "if accelerator.is_main_process and not state:" in script
     assert '"accelerator_multimodel_prepare_passed": True' in script
 
 
