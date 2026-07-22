@@ -15,7 +15,7 @@ import pytest
 from PIL import Image
 
 from ltx_trainer.online_data import parallel_manifest
-from ltx_trainer.online_data.manifest import finalize_prepared_canonical_r2v_record
+from ltx_trainer.online_data.manifest import ManifestReject, finalize_prepared_canonical_r2v_record
 from ltx_trainer.online_data.parallel_manifest import (
     AnnotationSource,
     BuildOptions,

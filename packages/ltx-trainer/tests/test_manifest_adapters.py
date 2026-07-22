@@ -104,7 +104,8 @@ def test_23_fps_source_rejects_duplicate_source_indices() -> None:
     assert "Source FPS 23.0" in message
     assert "target FPS 24.0" in message
     assert "121 unique source frames" in message
-    assert "duplicate at target indices" in message
+    assert "first_duplicate=" in message
+    assert "target_indices=" in message
     assert "clip=[30,146)" in message
 
 
