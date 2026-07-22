@@ -361,6 +361,35 @@ def normalize_r2v_source(
         raise ManifestReject(exc.reason, str(exc)) from exc
 
 
+def build_strict_source_indices(
+    *,
+    sample_start: int,
+    source_fps: float,
+    target_fps: float,
+    target_frame_count: int,
+    clip_start: int | None = None,
+    clip_end: int | None = None,
+) -> list[int]:
+    """Build a source-frame plan and reject frame-rate-induced duplicates."""
+    indices = [
+        round(sample_start + index * source_fps / target_fps)
+        for index in range(target_frame_count)
+    ]
+    for target_index, (left, right) in enumerate(zip(indices, indices[1:])):
+        if left < right:
+            continue
+        diagnostic_clip_start = sample_start if clip_start is None else clip_start
+        diagnostic_clip_end = "unknown" if clip_end is None else str(clip_end)
+        raise ManifestReject(
+            "source_fps_too_low_for_unique_24fps_sampling",
+            f"Source FPS {source_fps} cannot produce {target_frame_count} unique source frames "
+            f"at target FPS {target_fps}: duplicate at target indices "
+            f"{target_index}/{target_index + 1} -> source frames {left}/{right}, "
+            f"clip=[{diagnostic_clip_start},{diagnostic_clip_end})",
+        )
+    return indices
+
+
 def build_canonical_r2v_record(
     canonical: CanonicalR2VSource,
     *,
@@ -384,11 +413,6 @@ def build_canonical_r2v_record(
         raise ManifestReject("invalid_video_header", f"Could not read video header: {target_path}") from exc
     if not math.isfinite(original_fps) or original_fps <= 0 or frame_count <= 0:
         raise ManifestReject("invalid_video_header", f"Incomplete video header for {target_path}: {header}")
-    if original_fps < VIDEO_FPS:
-        raise ManifestReject(
-            "source_fps_below_24",
-            f"Source FPS {original_fps} is below required target FPS {VIDEO_FPS}: {target_path}",
-        )
     _validate_crop_xyxy(canonical.crop_xyxy, width=video_width, height=video_height)
     clip_start = canonical.clip_start_frame
     clip_end = canonical.clip_end_frame if canonical.clip_end_frame is not None else frame_count
@@ -416,14 +440,20 @@ def build_canonical_r2v_record(
         )
     rng_seed = int(stable_sample_key({"sample_key": sample_key, "manifest_seed": manifest_seed})[:16], 16)
     sample_start = random.Random(rng_seed).randint(clip_start, max_start)
-    source_indices = [round(sample_start + index * original_fps / VIDEO_FPS) for index in range(VIDEO_NUM_FRAMES)]
+    source_indices = build_strict_source_indices(
+        sample_start=sample_start,
+        source_fps=original_fps,
+        target_fps=VIDEO_FPS,
+        target_frame_count=VIDEO_NUM_FRAMES,
+        clip_start=clip_start,
+        clip_end=clip_end,
+    )
     if (
         len(source_indices) != VIDEO_NUM_FRAMES
-        or any(left >= right for left, right in zip(source_indices, source_indices[1:]))
         or source_indices[0] < clip_start
         or source_indices[-1] >= clip_end
     ):
-        raise ManifestReject("insufficient_frames_for_121_at_24fps", "Source index plan is not strictly increasing")
+        raise ManifestReject("insufficient_frames_for_121_at_24fps", "Source index plan is outside the clip")
 
     references = list(canonical.reference_paths)
     reference_reason = "phantom_missing_reference" if canonical.adapter_name == "phantom" else "missing_reference"
