@@ -333,12 +333,33 @@ class OnlineBatchEncoder:
         video = video.permute(0, 4, 1, 2, 3).div_(127.5).sub_(1.0)
         with torch.inference_mode(), self._frozen_encode_autocast():
             encoded = self.vae_encoder(video)
+        if encoded.ndim != 5:
+            raise RuntimeError(
+                "VAE target encoder must return [B,C,F,H,W], "
+                f"got {tuple(encoded.shape)}"
+            )
+        batch_size = encoded.shape[0]
         return {
             "latents": encoded,
-            "num_frames": torch.tensor([target_pixels.shape[1]], device=self.device, dtype=torch.long),
-            "height": torch.tensor([target_pixels.shape[2]], device=self.device, dtype=torch.long),
-            "width": torch.tensor([target_pixels.shape[3]], device=self.device, dtype=torch.long),
-            "fps": fps.to(device=self.device, dtype=torch.float32),
+            "num_frames": torch.full(
+                (batch_size,),
+                int(encoded.shape[2]),
+                device=self.device,
+                dtype=torch.long,
+            ),
+            "height": torch.full(
+                (batch_size,),
+                int(encoded.shape[3]),
+                device=self.device,
+                dtype=torch.long,
+            ),
+            "width": torch.full(
+                (batch_size,),
+                int(encoded.shape[4]),
+                device=self.device,
+                dtype=torch.long,
+            ),
+            "fps": fps.to(device=self.device, dtype=torch.float32).flatten(),
         }
 
     def _encode_reference_latents(

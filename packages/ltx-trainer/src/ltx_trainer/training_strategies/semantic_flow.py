@@ -357,6 +357,14 @@ class SemanticFlowStrategy(TrainingStrategy):
         target_tokens = self._video_patchifier.patchify(target_latents)
         batch_size = target_tokens.shape[0]
         device = target_tokens.device
+        for key in ("num_frames", "height", "width"):
+            values = latents[key].flatten()
+            if values.numel() != batch_size:
+                raise RuntimeError(
+                    f"Latent geometry metadata for {key} has {values.numel()} values, expected {batch_size}"
+                )
+            if not torch.equal(values, values[:1].expand_as(values)):
+                raise RuntimeError(f"Mixed latent geometry inside one batch for {key}: {values.tolist()}")
         sigma = timestep_sampler.sample_for(target_tokens)
         sigma_expanded = sigma.view(batch_size, 1, 1)
 
@@ -372,6 +380,16 @@ class SemanticFlowStrategy(TrainingStrategy):
             fps=latents.get("fps", torch.full((batch_size,), float(DEFAULT_FPS), device=device)).flatten(),
             device=device,
         )
+        if target_positions.shape[2] != target_tokens.shape[1]:
+            raise RuntimeError(
+                "Target position/token count mismatch: "
+                f"positions={target_positions.shape[2]}, "
+                f"tokens={target_tokens.shape[1]}, "
+                f"latent_shape={tuple(target_latents.shape)}, "
+                f"metadata_frames={latents['num_frames'].tolist()}, "
+                f"metadata_height={latents['height'].tolist()}, "
+                f"metadata_width={latents['width'].tolist()}"
+            )
 
         keep_sample = sample_semantic_keep_mask_with_stats(
             semantic_clean,
@@ -889,7 +907,17 @@ class SemanticFlowStrategy(TrainingStrategy):
             fps=1.0,
             device=ref_latents.device,
         )
+        if positions.shape[2] != tokens_per_reference:
+            raise RuntimeError(
+                "Reference position/token count mismatch: "
+                f"positions={positions.shape[2]}, tokens={tokens_per_reference}"
+            )
         positions = positions.reshape(batch_size, reference_count, 3, tokens_per_reference, 2)
+        if positions.shape[3] != tokens_per_reference:
+            raise RuntimeError(
+                "Reference position/token count mismatch after reshape: "
+                f"positions={positions.shape[3]}, tokens={tokens_per_reference}"
+            )
         target_height, target_width = target_latents.shape[-2:]
         positions[:, :, 1] *= float(target_height) / float(height)
         positions[:, :, 2] *= float(target_width) / float(width)
