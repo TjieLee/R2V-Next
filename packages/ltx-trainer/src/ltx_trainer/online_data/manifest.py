@@ -23,6 +23,7 @@ from ltx_trainer.online_data.adapters import (
     CanonicalR2VSource,
     get_r2v_adapter,
 )
+from ltx_trainer.online_data.anchor_geometry import uniform_anchor_indices
 from ltx_trainer.online_data.constants import (
     IMAGE_FPS,
     IMAGE_NUM_FRAMES,
@@ -263,19 +264,6 @@ def validate_sample_plan_sha256(record: Mapping[str, Any]) -> None:
         raise ValueError(f"sample_plan_sha256 mismatch for sample_key={record.get('sample_key')}")
 
 
-def uniform_integer_indices(*, start: int, end: int, count: int) -> list[int]:
-    if count <= 0 or end < start:
-        raise ValueError("uniform integer sampling requires count>0 and end>=start")
-    if count == 1:
-        return [start]
-    if count > end - start + 1:
-        raise ValueError("uniform integer sampling count exceeds inclusive range")
-    result = [round(start + index * (end - start) / (count - 1)) for index in range(count)]
-    if result[0] != start or result[-1] != end or any(a >= b for a, b in zip(result, result[1:])):
-        raise ValueError(f"uniform integer sampling failed for start={start}, end={end}, count={count}")
-    return result
-
-
 def build_i2i_record(
     row: Mapping[str, Any],
     *,
@@ -443,7 +431,10 @@ def build_canonical_r2v_record(
         raise ManifestReject(reference_reason, f"No references for {canonical.source_record_id}")
     _validate_reference_paths(references, image_validator=image_validator, reason=reference_reason)
     num_anchors = max(1, round(VIDEO_NUM_FRAMES * anchor_frame_ratio))
-    anchor_target_indices = uniform_integer_indices(start=0, end=VIDEO_NUM_FRAMES - 1, count=num_anchors)
+    anchor_target_indices = uniform_anchor_indices(
+        frame_count=VIDEO_NUM_FRAMES,
+        anchor_count=num_anchors,
+    )
     anchor_source_indices = [source_indices[index] for index in anchor_target_indices]
     record = {
         "sample_key": sample_key,

@@ -26,6 +26,10 @@ from ltx_core.multicond.visual_tokens import (
 from ltx_core.text_encoders.gemma.config import GEMMA3_CONFIG_FOR_LTX
 from ltx_core.utils import find_matching_file
 from ltx_trainer.config import OnlineEncodingConfig
+from ltx_trainer.online_data.anchor_geometry import (
+    normalized_anchor_timestamps,
+    uniform_anchor_indices,
+)
 from ltx_trainer.online_data.constants import IMAGE_TASK, VIDEO_TASK
 from ltx_trainer.online_data.transforms import (
     augment_reference_image,
@@ -250,7 +254,7 @@ class OnlineBatchEncoder:
                 key: torch.zeros_like(value) if isinstance(value, Tensor) else value
                 for key, value in conditions.items()
             }
-        evidence = self._encode_gt_evidence(raw_batch, task=task)
+        evidence = self._encode_gt_evidence(raw_batch)
         metrics["gemma_evidence_ms"] = (time.perf_counter() - evidence_started) * 1000.0
         semantic_teacher_inputs = {**prefix_inputs, **evidence}
 
@@ -475,11 +479,20 @@ class OnlineBatchEncoder:
         }
         return conditions, teacher_prefix
 
-    def _encode_gt_evidence(self, raw_batch: dict[str, Any], *, task: str) -> dict[str, Tensor]:
+    def _encode_gt_evidence(self, raw_batch: dict[str, Any]) -> dict[str, Tensor]:
         target_pixels = raw_batch["target_pixels"]
         indices = raw_batch["semantic_anchor_target_indices"][0].to(dtype=torch.long).tolist()
-        if task == IMAGE_TASK and indices != [0]:
-            raise ValueError(f"I2I semantic anchor indices must be [0], got {indices}")
+        frame_count = int(target_pixels.shape[1])
+        expected_indices = uniform_anchor_indices(
+            frame_count=frame_count,
+            anchor_count=len(indices),
+        )
+        if indices != expected_indices:
+            raise ValueError(
+                "Semantic anchor indices differ from canonical uniform sampling: "
+                f"actual={indices}, expected={expected_indices}, "
+                f"frame_count={frame_count}"
+            )
         selected = target_pixels[0, indices]
         processed = self.image_processor(images=[_to_pil(frame) for frame in selected], return_tensors="pt")
         pixel_values = processed["pixel_values"].to(device=self.device, dtype=self.dtype)
@@ -497,8 +510,12 @@ class OnlineBatchEncoder:
                 f"frames={len(indices)}, tokens={visual.tokens.shape[1]}"
             )
         evidence = visual.tokens.reshape(1, len(indices), EVIDENCE_TOKENS_PER_FRAME, -1).detach()
-        denominator = max(1, target_pixels.shape[1] - 1)
-        normalized = torch.tensor(indices, device=self.device, dtype=torch.float32).unsqueeze(0) / denominator
+        normalized = normalized_anchor_timestamps(
+            frame_count=frame_count,
+            anchor_count=len(indices),
+            device=self.device,
+            dtype=torch.float32,
+        ).unsqueeze(0)
         return {
             "evidence_tokens": evidence,
             "normalized_timestamps": normalized,
