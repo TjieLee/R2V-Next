@@ -463,6 +463,21 @@ class SemanticFlowStrategy(TrainingStrategy):
         ref_length = ref_tokens.shape[1]
         semantic_length = semantic_tokens.shape[1]
         target_length = target_tokens.shape[1]
+        reference_data = batch["reference_latents"]
+        reference_capacity = int(reference_data["latents"].shape[1])
+        ref_valid_mask = reference_data.get("ref_valid_mask")
+        if ref_valid_mask is None:
+            valid_reference_counts = torch.full(
+                (batch_size,),
+                reference_capacity,
+                device=device,
+                dtype=torch.long,
+            )
+        else:
+            valid_reference_counts = ref_valid_mask.to(
+                device=device,
+                dtype=torch.bool,
+            ).sum(dim=1)
         raw_task = batch.get("task", ["unknown"])
         task = str(raw_task[0]) if isinstance(raw_task, (list, tuple)) else str(raw_task)
         if task not in self._geometry_logged_tasks:
@@ -473,7 +488,8 @@ class SemanticFlowStrategy(TrainingStrategy):
                 f"target_tokens={target_length} "
                 f"target_positions={target_positions.shape[2]} "
                 f"fps={float(target_fps[0].item())} "
-                f"references={batch['reference_latents']['latents'].shape[1]} "
+                f"valid_references={valid_reference_counts.tolist()} "
+                f"reference_capacity={reference_capacity} "
                 f"reference_tokens={ref_length} "
                 f"reference_positions={ref_positions.shape[2]} "
                 f"reference_rope_mode={self.config.reference_rope_mode} "

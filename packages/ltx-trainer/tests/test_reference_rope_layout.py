@@ -120,6 +120,7 @@ def _prepare_training_and_inference_states(
     semantic_frame_count: int,
     pixel_frame_count: int,
     fps: float,
+    reference_valid_mask: list[bool] | None = None,
 ) -> tuple[ModelInputs, SemanticInferenceState]:
     feature_dim = 128
     strategy = SemanticFlowStrategy(SemanticFlowConfig(semantic_maximum_drop_rate=0.0))
@@ -138,9 +139,18 @@ def _prepare_training_and_inference_states(
             1, semantic_frame_count, SEMANTIC_TOKENS_PER_FRAME, 4, 4
         ),
     }
+    reference_valid_mask = reference_valid_mask or [True, True]
+    reference_capacity = len(reference_valid_mask)
     references = {
-        "latents": torch.zeros(1, 2, feature_dim, 1, latent_height, latent_width),
-        "ref_valid_mask": torch.tensor([[True, True]]),
+        "latents": torch.zeros(
+            1,
+            reference_capacity,
+            feature_dim,
+            1,
+            latent_height,
+            latent_width,
+        ),
+        "ref_valid_mask": torch.tensor([reference_valid_mask]),
     }
     conditions = {
         "video_prompt_embeds": torch.zeros(1, 2, feature_dim),
@@ -240,6 +250,30 @@ def test_r2v_training_and_inference_positions_are_identical_at_24_fps() -> None:
         fps=24.0,
     )
     _assert_position_segments_match(training, inference)
+
+
+def test_training_geometry_log_reports_valid_references_and_capacity(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level("INFO", logger="ltxv_trainer")
+    _prepare_training_and_inference_states(
+        latent_frames=1,
+        latent_height=15,
+        latent_width=26,
+        semantic_frame_count=1,
+        pixel_frame_count=1,
+        fps=1.0,
+        reference_valid_mask=[True, False, False, False],
+    )
+    geometry_logs = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("semantic-flow geometry:")
+    ]
+    assert len(geometry_logs) == 1
+    assert "valid_references=[1]" in geometry_logs[0]
+    assert "reference_capacity=4" in geometry_logs[0]
+    assert "references=4" not in geometry_logs[0]
 
 
 def test_online_runtime_records_real_i2i_and_r2v_geometry() -> None:
