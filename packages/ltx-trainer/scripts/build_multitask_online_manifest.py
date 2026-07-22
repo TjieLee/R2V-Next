@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import json
 import os
-import resource
+
+try:
+    import resource
+except ImportError:  # pragma: no cover - exercised on Windows
+    resource = None
 import sqlite3
 import stat
 import sys
@@ -24,10 +28,11 @@ from PIL import Image, ImageOps
 from ltx_trainer.online_data.constants import IMAGE_TASK, VIDEO_TASK
 from ltx_trainer.online_data.manifest import (
     ManifestReject,
+    build_canonical_r2v_record,
     build_i2i_record,
-    build_r2v_record,
-    iter_annotation_rows,
+    iter_annotation_items,
     load_multitask_data_config,
+    normalize_r2v_source,
     probe_video,
     resolve_media_path,
 )
@@ -271,6 +276,8 @@ def _iter_rows_with_bounded_probes(
 
 
 def _peak_rss_gb() -> float:
+    if resource is None:
+        return 0.0
     peak = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
     # Linux reports KiB; macOS reports bytes.
     peak_bytes = peak if sys.platform == "darwin" else peak * 1024.0
@@ -341,7 +348,7 @@ def main(  # noqa: PLR0913, PLR0915
                 annotation_path = dataset.get("ann_path") or dataset.get("parquet") or dataset.get("path")
                 if annotation_path is None:
                     raise ValueError(f"Dataset {dataset_name!r} has no ann_path/parquet/path")
-                rows: Iterable[dict[str, Any]] = iter_annotation_rows(
+                rows: Iterable[tuple[str, dict[str, Any]]] = iter_annotation_items(
                     annotation_path,
                     batch_size=annotation_batch_size,
                 )
@@ -349,22 +356,10 @@ def main(  # noqa: PLR0913, PLR0915
                 if max_samples is not None:
                     rows = islice(rows, int(max_samples))
                 data_root = dataset.get("data_root", config.get("data_root"))
-                if task == VIDEO_TASK:
-                    row_stream: Iterable[
-                        tuple[dict[str, Any], dict[str, Any] | None, ManifestReject | None]
-                    ] = (
-                        _iter_rows_with_bounded_probes(
-                            rows,
-                            data_root=data_root,
-                            workers=probe_workers,
-                            batch_size=probe_batch_size,
-                            validation_cache=validation_cache,
-                        )
-                    )
-                else:
-                    row_stream = ((row, None, None) for row in rows)
+                dataset_type = str(dataset.get("dataset_type", ""))
+                adapter_config = dataset.get("adapter")
 
-                for row_index, (row, video_header, probe_error) in enumerate(row_stream):
+                for row_index, (source_record_id, row) in enumerate(rows):
                     raw_rows += 1
                     try:
                         if task == IMAGE_TASK:
@@ -379,16 +374,22 @@ def main(  # noqa: PLR0913, PLR0915
                                 image_validator=validation_cache.validate_image,
                             )
                         elif task == VIDEO_TASK:
-                            if probe_error is not None or video_header is None:
-                                raise probe_error or ManifestReject("invalid_video_header", "Video probe failed")
-                            record = build_r2v_record(
+                            canonical = normalize_r2v_source(
                                 row,
+                                row_id=source_record_id,
                                 dataset_name=dataset_name,
+                                dataset_type=dataset_type,
                                 data_root=data_root,
+                                adapter_config=adapter_config,
                                 manifest_seed=manifest_seed,
-                                video_header=video_header,
+                            )
+                            record = build_canonical_r2v_record(
+                                canonical,
+                                manifest_seed=manifest_seed,
+                                anchor_frame_ratio=float(dataset.get("anchor_frame_ratio", 0.10)),
+                                video_header=probe_video(canonical.video_path),
                                 image_validator=validation_cache.validate_image,
-                                target_path_validated=True,
+                                target_path_validated=False,
                             )
                         else:
                             raise ValueError(f"Unsupported task {task!r} in dataset {dataset_name!r}")
@@ -423,6 +424,7 @@ def main(  # noqa: PLR0913, PLR0915
                                     "row_index": row_index,
                                     "task": task,
                                     "reason": reason,
+                                    "source_record_id": source_record_id,
                                     "message": str(exc),
                                 },
                                 ensure_ascii=False,

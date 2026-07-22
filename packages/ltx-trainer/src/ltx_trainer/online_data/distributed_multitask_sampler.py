@@ -33,7 +33,7 @@ def _indices_tensor(values: Sequence[int]) -> torch.Tensor:
     return torch.as_tensor(values, dtype=torch.long).clone()
 
 
-class DistributedMultiTaskMicrobatchSampler(Sampler[int]):
+class _TaskOnlyDistributedMultiTaskMicrobatchSampler(Sampler[int]):
     """Yield one rank-local sample per accumulation microstep.
 
     A shuffled optimizer-step task table is shared across ranks. Each step uses
@@ -274,7 +274,7 @@ class DistributedMultiTaskMicrobatchSampler(Sampler[int]):
     @staticmethod
     def _build_task_occurrence(schedule: torch.Tensor) -> torch.Tensor:
         occurrence = torch.empty_like(schedule, dtype=torch.long)
-        counters = {task_id: 0 for task_id in _ID_TO_TASK}
+        counters = dict.fromkeys(_ID_TO_TASK, 0)
         for step, raw_task_id in enumerate(schedule.tolist()):
             task_id = int(raw_task_id)
             occurrence[step] = counters[task_id]
@@ -342,3 +342,225 @@ class DistributedMultiTaskMicrobatchSampler(Sampler[int]):
             self._state.task_schedule_cursor,
             self._state.microstep_in_optimizer_step,
         )
+
+class DistributedMultiTaskMicrobatchSampler(_TaskOnlyDistributedMultiTaskMicrobatchSampler):
+    """Two-level task/source schedule with deterministic same-source retries."""
+
+    def __init__(
+        self,
+        task_indices: Mapping[str, Sequence[int]],
+        *,
+        total_optimizer_steps: int,
+        gradient_accumulation_steps: int,
+        rank: int,
+        world_size: int,
+        seed: int = 42,
+        image_ratio: float = 0.3,
+        video_ratio: float = 0.7,
+        dataset_indices: Mapping[str, Sequence[int]] | None = None,
+        video_source_ratios: Mapping[str, float] | None = None,
+    ) -> None:
+        super().__init__(
+            task_indices,
+            total_optimizer_steps=total_optimizer_steps,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            rank=rank,
+            world_size=world_size,
+            seed=seed,
+            image_ratio=image_ratio,
+            video_ratio=video_ratio,
+        )
+        self._video_source_names: tuple[str, ...] = ()
+        self._video_source_indices: dict[str, torch.Tensor] = {}
+        self._video_source_schedule: tuple[str, ...] = ()
+        self._video_source_occurrence = torch.empty(0, dtype=torch.long)
+        self._video_source_streams: dict[str, torch.Tensor] = {}
+        ratios = dict(video_source_ratios or {})
+        if not ratios:
+            logger.warning("R2V source ratios are not configured; source ratio follows manifest row counts")
+            return
+        if dataset_indices is None:
+            raise ValueError("video_source_ratios requires source-aware dataset_indices")
+        if any(value < 0 for value in ratios.values()) or abs(sum(ratios.values()) - 1.0) > 1.0e-8:
+            raise ValueError("video_source_ratios must be non-negative and sum to 1")
+        self._video_source_names = tuple(sorted(ratios))
+        video_set = set(int(value) for value in task_indices.get(VIDEO_TASK, ()))
+        for source_name in self._video_source_names:
+            indices = _indices_tensor(dataset_indices.get(source_name, ()))
+            if indices.numel() == 0:
+                raise ValueError(f"No manifest indices are available for R2V source {source_name!r}")
+            if any(int(value) not in video_set for value in indices.tolist()):
+                raise ValueError(f"R2V source {source_name!r} contains a non-video manifest index")
+            self._video_source_indices[source_name] = indices
+        video_steps = int((self._task_schedule == _TASK_TO_ID[VIDEO_TASK]).sum().item())
+        self._video_source_schedule = self._build_and_share_video_source_schedule(
+            video_steps=video_steps,
+            ratios=ratios,
+        )
+        self._video_source_occurrence = self._build_source_occurrence(self._video_source_schedule)
+        counts = {name: self._video_source_schedule.count(name) for name in self._video_source_names}
+        self._video_source_streams = {
+            name: self._build_index_stream(
+                self._video_source_indices[name],
+                step_count=counts[name],
+                stream_seed=_seed_for(self.seed, self._source_seed(name), 211),
+            )
+            for name in self._video_source_names
+        }
+
+    @property
+    def current_source(self) -> str | None:
+        if not self._video_source_schedule or self.current_task != VIDEO_TASK:
+            return None
+        occurrence = int(self._task_occurrence[self._state.task_schedule_cursor].item())
+        return self._video_source_schedule[occurrence]
+
+    @property
+    def video_source_schedule(self) -> tuple[str, ...]:
+        return self._video_source_schedule
+
+    def __iter__(self) -> Iterator[int]:
+        start_step = self._state.task_schedule_cursor
+        start_microstep = self._state.microstep_in_optimizer_step
+        for step in range(start_step, self.total_optimizer_steps):
+            block = self._normal_block_for_step(step)
+            first_microstep = start_microstep if step == start_step else 0
+            for microstep in range(first_microstep, self.gradient_accumulation_steps):
+                global_slot = microstep * self.world_size + self.rank
+                yield int(block[global_slot].item())
+
+    def current_normal_block(self) -> torch.Tensor:
+        return self._normal_block_for_step(self._state.task_schedule_cursor).clone()
+
+    def mark_microbatch_consumed(self, global_indices: Sequence[int] | None = None) -> None:
+        if self._state.task_schedule_cursor >= self.total_optimizer_steps:
+            raise RuntimeError("Cannot advance an exhausted online sampler")
+        if global_indices is not None:
+            consumed = [int(index) for index in global_indices]
+            if len(consumed) != self.world_size:
+                raise ValueError(
+                    f"global_indices must contain one sample per rank ({self.world_size}), got {len(consumed)}"
+                )
+            active_size = int(self._active_indices().numel())
+            if active_size >= self.global_samples_per_step:
+                overlap = self._consumed_indices_in_step.intersection(consumed)
+                if overlap or len(set(consumed)) != len(consumed):
+                    raise RuntimeError("Online sampler produced duplicate successful same-source samples")
+            self._consumed_indices_in_step.update(consumed)
+        self._state.microstep_in_optimizer_step += 1
+        if self._state.microstep_in_optimizer_step == self.gradient_accumulation_steps:
+            self._state.task_schedule_cursor += 1
+            self._state.microstep_in_optimizer_step = 0
+            self._consumed_indices_in_step.clear()
+        self._refresh_derived_state()
+
+    def retry_index(self, attempt: int) -> int:
+        if attempt <= 0:
+            raise ValueError("Retry attempt must be positive")
+        indices = self._active_indices()
+        step = self._state.task_schedule_cursor
+        source_seed = self._source_seed(self.current_source or self.current_task)
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(
+            _seed_for(self.seed, step, self._state.microstep_in_optimizer_step, attempt, source_seed)
+        )
+        shuffled = indices[torch.randperm(indices.numel(), generator=generator)]
+        normal_block = self.current_normal_block()
+        consumed = torch.tensor(sorted(self._consumed_indices_in_step), dtype=torch.long)
+        strict_excluded = torch.cat([normal_block, consumed]) if consumed.numel() else normal_block
+        strict_candidates = shuffled[~torch.isin(shuffled, strict_excluded)]
+        if strict_candidates.numel() >= self.world_size:
+            candidate_block = strict_candidates[: self.world_size]
+        else:
+            fallback = shuffled
+            if consumed.numel():
+                fallback = fallback[~torch.isin(fallback, consumed)]
+            if fallback.numel() < self.world_size:
+                raise RuntimeError(
+                    "Cannot construct a rank-unique same-source retry microbatch: "
+                    f"source={self.current_source}, available={fallback.numel()}, world_size={self.world_size}"
+                )
+            candidate_block = fallback[: self.world_size]
+        if candidate_block.unique().numel() != self.world_size:
+            raise RuntimeError("Same-source retry candidate block contains duplicate rank slots")
+        return int(candidate_block[self.rank].item())
+
+    def _active_indices(self) -> torch.Tensor:
+        source = self.current_source
+        return self._video_source_indices[source] if source is not None else self._indices[self.current_task]
+
+    def _normal_block_for_step(self, step: int) -> torch.Tensor:
+        task = _ID_TO_TASK[int(self._task_schedule[step].item())]
+        task_occurrence = int(self._task_occurrence[step].item())
+        if task != VIDEO_TASK or not self._video_source_schedule:
+            return self._task_streams[task][task_occurrence]
+        source = self._video_source_schedule[task_occurrence]
+        source_occurrence = int(self._video_source_occurrence[task_occurrence].item())
+        return self._video_source_streams[source][source_occurrence]
+
+    def _build_and_share_video_source_schedule(
+        self,
+        *,
+        video_steps: int,
+        ratios: Mapping[str, float],
+    ) -> tuple[str, ...]:
+        schedule: list[str] | None = None
+        is_distributed = dist.is_available() and dist.is_initialized()
+        if not is_distributed or dist.get_rank() == 0:
+            raw = {name: video_steps * ratios[name] for name in self._video_source_names}
+            counts = {name: int(raw[name]) for name in self._video_source_names}
+            remaining = video_steps - sum(counts.values())
+            order = sorted(self._video_source_names, key=lambda name: (-(raw[name] - counts[name]), name))
+            for name in order[:remaining]:
+                counts[name] += 1
+            labels = [name for name in self._video_source_names for _ in range(counts[name])]
+            generator = torch.Generator(device="cpu").manual_seed(_seed_for(self.seed, 223))
+            permutation = torch.randperm(len(labels), generator=generator).tolist()
+            schedule = [labels[index] for index in permutation]
+        if is_distributed:
+            payload: list[Any] = [schedule]
+            dist.broadcast_object_list(payload, src=0)
+            schedule = payload[0]
+        if schedule is None or len(schedule) != video_steps:
+            raise RuntimeError("Failed to create the distributed R2V source schedule")
+        return tuple(schedule)
+
+    @staticmethod
+    def _build_source_occurrence(schedule: Sequence[str]) -> torch.Tensor:
+        occurrence = torch.empty(len(schedule), dtype=torch.long)
+        counters: dict[str, int] = {}
+        for index, source in enumerate(schedule):
+            occurrence[index] = counters.get(source, 0)
+            counters[source] = int(occurrence[index].item()) + 1
+        return occurrence
+
+    def _build_index_stream(
+        self,
+        indices: torch.Tensor,
+        *,
+        step_count: int,
+        stream_seed: int,
+    ) -> torch.Tensor:
+        dataset_size = int(indices.numel())
+        block_size = self.global_samples_per_step
+        stream = torch.empty(step_count, block_size, dtype=torch.long)
+        generator = torch.Generator(device="cpu").manual_seed(stream_seed)
+        permutation = indices[torch.randperm(dataset_size, generator=generator)]
+        cursor = 0
+        for step in range(step_count):
+            block: list[int] = []
+            while len(block) < block_size:
+                if cursor >= dataset_size:
+                    permutation = indices[torch.randperm(dataset_size, generator=generator)]
+                    cursor = 0
+                candidate = int(permutation[cursor].item())
+                cursor += 1
+                if dataset_size >= block_size and candidate in block:
+                    continue
+                block.append(candidate)
+            stream[step] = torch.tensor(block, dtype=torch.long)
+        return stream
+
+    @staticmethod
+    def _source_seed(source: str) -> int:
+        return int.from_bytes(hashlib.sha256(source.encode("utf-8")).digest()[:4], "little")

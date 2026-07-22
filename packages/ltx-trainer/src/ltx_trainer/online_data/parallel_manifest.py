@@ -9,11 +9,16 @@ import math
 import multiprocessing as mp
 import os
 import queue
-import resource
+
+try:
+    import resource
+except ImportError:  # pragma: no cover - exercised on Windows
+    resource = None
 import shutil
 import socket
 import sqlite3
 import struct
+import sys
 import threading
 import time
 from collections import Counter
@@ -30,13 +35,11 @@ from PIL import Image, ImageOps
 from ltx_trainer.online_data.constants import IMAGE_TASK, VIDEO_NUM_FRAMES, VIDEO_TASK
 from ltx_trainer.online_data.manifest import (
     ManifestReject,
+    build_canonical_r2v_record,
     build_i2i_record,
-    build_r2v_record,
     iter_annotation_rows,
     load_multitask_data_config,
-    parse_numeric_list,
-    parse_pair,
-    parse_path_list,
+    normalize_r2v_source,
     probe_video,
 )
 from ltx_trainer.online_data.manifest_index import (
@@ -80,6 +83,8 @@ class AnnotationSource:
     mtime_ns: int
     fingerprint: str
     suffix: str
+    dataset_type: str = ""
+    adapter_config: dict[str, Any] | None = None
     jsonl_index_path: str | None = None
 
 
@@ -141,8 +146,8 @@ class R2VPrefilterResult:
     target_path: str
     reference_paths: tuple[str, ...]
     caption: str
-    crop_xyxy: tuple[float, float, float, float]
-    face_cut: tuple[int, int]
+    crop_xyxy: tuple[float, float, float, float] | None
+    face_cut: tuple[int, int | None]
 
 
 class BuildRuntimeStats:
@@ -167,53 +172,36 @@ def prefilter_r2v_annotation(
     row: Mapping[str, Any],
     *,
     data_root: str | Path | None,
+    row_id: str = "0",
+    dataset_name: str = "r2v",
+    dataset_type: str = "OpenS2VDataset",
+    adapter_config: Mapping[str, Any] | None = None,
+    manifest_seed: int = 42,
 ) -> R2VPrefilterResult:
     """Reject annotation-only impossibilities without touching any media."""
-    required = {"video_path", "text", "crop", "face_cut", "ref_images"}
-    missing = sorted(required - row.keys())
-    if missing:
-        raise ManifestReject(
-            "r2v_schema_mismatch",
-            f"OpenS2V adapter fields are missing: {missing}. Available columns: {sorted(row)}",
-        )
-    caption = str(row["text"]).strip() if row["text"] is not None else ""
-    if not caption:
-        raise ManifestReject("empty_caption", "Caption/instruction is empty")
-    try:
-        crop_raw = parse_numeric_list(row["crop"], field="crop")
-    except Exception as exc:
-        raise ManifestReject("invalid_crop", "Invalid OpenS2V crop") from exc
-    if not all(math.isfinite(value) for value in crop_raw):
-        raise ManifestReject("invalid_crop", f"OpenS2V crop contains non-finite values: {crop_raw}")
-    if crop_raw[1] <= crop_raw[0] or crop_raw[3] <= crop_raw[2]:
-        raise ManifestReject("invalid_crop", f"OpenS2V crop has non-positive extent: {crop_raw}")
-    try:
-        face_cut = parse_pair(row["face_cut"], field="face_cut")
-    except Exception as exc:
-        raise ManifestReject("invalid_face_cut", "Invalid OpenS2V face_cut") from exc
-    if face_cut[0] < 0 or face_cut[1] <= face_cut[0]:
-        raise ManifestReject("invalid_face_cut", f"Invalid face_cut={face_cut}")
-    try:
-        reference_values = parse_path_list(row["ref_images"], field="ref_images")
-    except Exception as exc:
-        raise ManifestReject("missing_reference", "No usable reference paths in ref_images") from exc
-    if face_cut[1] - face_cut[0] < VIDEO_NUM_FRAMES:
+    canonical = normalize_r2v_source(
+        row,
+        row_id=row_id,
+        dataset_name=dataset_name,
+        dataset_type=dataset_type,
+        data_root=data_root,
+        adapter_config=adapter_config,
+        manifest_seed=manifest_seed,
+    )
+    clip_end = canonical.clip_end_frame
+    if clip_end is not None and clip_end - canonical.clip_start_frame < VIDEO_NUM_FRAMES:
         raise ManifestReject(
             "insufficient_face_cut_span_for_121",
-            f"face_cut={face_cut} contains fewer than {VIDEO_NUM_FRAMES} source frames",
+            "Canonical clip contains fewer than "
+            f"{VIDEO_NUM_FRAMES} source frames: "
+            f"[{canonical.clip_start_frame}, {clip_end})",
         )
-    def annotation_path(value: Any) -> str:
-        path = Path(str(value)).expanduser()
-        if not path.is_absolute() and data_root is not None:
-            path = Path(data_root).expanduser() / path
-        return os.path.abspath(path)  # noqa: PTH100 - Stage A must not resolve or stat media.
-
     return R2VPrefilterResult(
-        target_path=annotation_path(row["video_path"]),
-        reference_paths=tuple(annotation_path(path) for path in reference_values),
-        caption=caption,
-        crop_xyxy=(crop_raw[0], crop_raw[2], crop_raw[1], crop_raw[3]),
-        face_cut=(face_cut[0], face_cut[1]),
+        target_path=canonical.video_path,
+        reference_paths=tuple(canonical.reference_paths),
+        caption=canonical.caption,
+        crop_xyxy=tuple(canonical.crop_xyxy) if canonical.crop_xyxy is not None else None,
+        face_cut=(canonical.clip_start_frame, clip_end),
     )
 
 
@@ -246,8 +234,10 @@ def file_sha256(path: str | Path) -> str:
 
 
 def peak_rss_gb() -> float:
+    if resource is None:
+        return 0.0
     value = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
-    if os.uname().sysname == "Darwin":
+    if sys.platform == "darwin":
         return value / (1024**3)
     return value / (1024**2)
 
@@ -467,7 +457,7 @@ def _annotation_row_count(
     suffix = path.suffix.lower()
     if suffix == ".parquet":
         try:
-            import pyarrow.parquet as parquet  # noqa: PLC0415
+            from pyarrow import parquet  # noqa: PLC0415
         except ImportError as exc:
             raise RuntimeError("Parallel parquet manifests require pyarrow") from exc
         return int(parquet.ParquetFile(path).metadata.num_rows), None
@@ -494,7 +484,7 @@ def discover_annotation_sources(
     root = Path(shard_root)
     index_dir = root / "indexes"
     index_dir.mkdir(parents=True, exist_ok=True)
-    task_offsets = {task: 0 for task in selected}
+    task_offsets = dict.fromkeys(selected, 0)
     sources: dict[str, list[AnnotationSource]] = {task: [] for task in selected}
     global_root = config.get("data_root")
     for dataset_order, dataset in enumerate(config["datasets"]):
@@ -529,6 +519,8 @@ def discover_annotation_sources(
                 dataset_order=dataset_order,
                 annotation_path=str(annotation_path),
                 data_root=str(Path(data_root).expanduser().resolve()) if data_root is not None else None,
+                dataset_type=str(dataset.get("dataset_type", "")),
+                adapter_config=dict(dataset.get("adapter", {})),
                 row_count=count,
                 task_start_row=start,
                 task_end_row=end,
@@ -576,7 +568,7 @@ def _iter_parquet_range(
     batch_size: int,
 ) -> Iterator[tuple[int, dict[str, Any]]]:
     try:
-        import pyarrow.parquet as parquet  # noqa: PLC0415
+        from pyarrow import parquet  # noqa: PLC0415
     except ImportError as exc:
         raise RuntimeError("Parallel parquet manifests require pyarrow") from exc
     parquet_file = parquet.ParquetFile(source.annotation_path)
@@ -1161,7 +1153,15 @@ def _build_row(
             )
         elif task == VIDEO_TASK:
             try:
-                prefilter = prefilter_r2v_annotation(row, data_root=source.data_root)
+                canonical = normalize_r2v_source(
+                    row,
+                    row_id=str(source_row_index),
+                    dataset_name=source.dataset_name,
+                    dataset_type=source.dataset_type,
+                    data_root=source.data_root,
+                    adapter_config=source.adapter_config,
+                    manifest_seed=options.manifest_seed,
+                )
             except Exception:
                 if runtime_stats is not None:
                     runtime_stats.increment("annotation_prefilter_rejected")
@@ -1179,11 +1179,9 @@ def _build_row(
                 return cache.validate_image(path)
 
             try:
-                header = cache.probe_video(prefilter.target_path)
-                record = build_r2v_record(
-                    row,
-                    dataset_name=source.dataset_name,
-                    data_root=source.data_root,
+                header = cache.probe_video(canonical.video_path)
+                record = build_canonical_r2v_record(
+                    canonical,
                     manifest_seed=options.manifest_seed,
                     video_header=header,
                     image_validator=validate_reference,
@@ -1417,19 +1415,15 @@ def run_r2v_prefilter(
         ) as rejected_handle:
             for task_row_index, source, source_row_index, row in rows:
                 try:
-                    histogram_face_cut = parse_pair(row.get("face_cut"), field="face_cut")
-                except Exception:
-                    pass
-                else:
-                    span_histogram[str(histogram_face_cut[1] - histogram_face_cut[0])] += 1
-                try:
-                    histogram_references = parse_path_list(row.get("ref_images"), field="ref_images")
-                except Exception:
-                    pass
-                else:
-                    ref_count_histogram[str(len(histogram_references))] += 1
-                try:
-                    prefilter_r2v_annotation(row, data_root=source.data_root)
+                    prefiltered = prefilter_r2v_annotation(
+                        row,
+                        data_root=source.data_root,
+                        row_id=str(source_row_index),
+                        dataset_name=source.dataset_name,
+                        dataset_type=source.dataset_type,
+                        adapter_config=source.adapter_config,
+                        manifest_seed=options.manifest_seed,
+                    )
                 except Exception as exc:
                     rejection = _make_rejection(
                         task=VIDEO_TASK,
@@ -1442,6 +1436,10 @@ def run_r2v_prefilter(
                     rejected += 1
                     reject_reasons[str(rejection["reason"])] += 1
                     continue
+                clip_start, clip_end = prefiltered.face_cut
+                if clip_end is not None:
+                    span_histogram[str(clip_end - clip_start)] += 1
+                ref_count_histogram[str(len(prefiltered.reference_paths))] += 1
                 accepted_handle.write(
                     json.dumps(
                         {

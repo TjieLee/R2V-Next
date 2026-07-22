@@ -111,6 +111,7 @@ def _write_r2v_fixture(tmp_path: Path, *, rows: int = 12) -> tuple[Path, list[di
         "datasets:\n"
         "  - name: r2v_fixture\n"
         "    task: r2v\n"
+        "    dataset_type: OpenS2VDataset\n"
         f"    ann_path: {annotation}\n",
         encoding="utf-8",
     )
@@ -195,6 +196,7 @@ def test_i2i_and_r2v_task_builds_share_root_without_overwriting_metadata(tmp_pat
         f"    ann_path: {i2i_annotation}\n"
         "  - name: r2v_fixture\n"
         "    task: r2v\n"
+        "    dataset_type: OpenS2VDataset\n"
         f"    ann_path: {r2v_annotation}\n",
         encoding="utf-8",
     )
@@ -333,6 +335,7 @@ def test_parquet_source_reads_only_requested_row_range(tmp_path: Path) -> None:
         "datasets:\n"
         "  - name: parquet_fixture\n"
         "    task: r2v\n"
+        "    dataset_type: OpenS2VDataset\n"
         f"    ann_path: {annotation}\n",
         encoding="utf-8",
     )

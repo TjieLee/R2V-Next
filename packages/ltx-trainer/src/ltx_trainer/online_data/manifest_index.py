@@ -13,10 +13,10 @@ from typing import Any, BinaryIO, Iterator
 
 from ltx_trainer.online_data.constants import IMAGE_TASK, VIDEO_TASK
 
-INDEX_MAGIC = b"LTXIDX02"
-LEGACY_INDEX_MAGIC = b"LTXIDX01"
-INDEX_HEADER = struct.Struct("<QQI32s")
-INDEX_ENTRY = struct.Struct("<QB")
+INDEX_MAGIC = b"LTXIDX03"
+LEGACY_INDEX_MAGICS = {b"LTXIDX01", b"LTXIDX02"}
+INDEX_HEADER = struct.Struct("<QQII32s")
+INDEX_ENTRY = struct.Struct("<QBH")
 _TASK_TO_ID = {IMAGE_TASK: 0, VIDEO_TASK: 1}
 _ID_TO_TASK = {value: key for key, value in _TASK_TO_ID.items()}
 
@@ -26,6 +26,7 @@ class ManifestIndexMetadata:
     manifest_size_bytes: int
     manifest_row_count: int
     index_entry_size: int
+    dataset_table_size: int
     manifest_sha256: str
 
 
@@ -40,20 +41,20 @@ def _rebuild_error(message: str, path: Path) -> ValueError:
 
 def _read_header(handle: BinaryIO, path: Path) -> ManifestIndexMetadata:
     magic = handle.read(len(INDEX_MAGIC))
-    if magic == LEGACY_INDEX_MAGIC:
-        raise _rebuild_error("Legacy LTXIDX01 index is not supported", path)
+    if magic in LEGACY_INDEX_MAGICS:
+        raise _rebuild_error("Legacy online manifest index is not source-aware", path)
     if magic != INDEX_MAGIC:
         raise _rebuild_error("Invalid online manifest index header", path)
     packed = handle.read(INDEX_HEADER.size)
     if len(packed) != INDEX_HEADER.size:
         raise _rebuild_error("Truncated online manifest index header", path)
-    manifest_size, row_count, entry_size, digest = INDEX_HEADER.unpack(packed)
+    manifest_size, row_count, entry_size, table_size, digest = INDEX_HEADER.unpack(packed)
     if entry_size != INDEX_ENTRY.size:
         raise _rebuild_error(
             f"Unsupported index entry size {entry_size}; expected {INDEX_ENTRY.size}",
             path,
         )
-    expected_size = len(INDEX_MAGIC) + INDEX_HEADER.size + row_count * entry_size
+    expected_size = len(INDEX_MAGIC) + INDEX_HEADER.size + row_count * entry_size + table_size
     actual_size = path.stat().st_size
     if actual_size != expected_size:
         raise _rebuild_error(
@@ -64,8 +65,25 @@ def _read_header(handle: BinaryIO, path: Path) -> ManifestIndexMetadata:
         manifest_size_bytes=manifest_size,
         manifest_row_count=row_count,
         index_entry_size=entry_size,
+        dataset_table_size=table_size,
         manifest_sha256=digest.hex(),
     )
+
+
+def _read_dataset_table(handle: BinaryIO, metadata: ManifestIndexMetadata, path: Path) -> list[str]:
+    handle.seek(len(INDEX_MAGIC) + INDEX_HEADER.size + metadata.manifest_row_count * INDEX_ENTRY.size)
+    raw = handle.read(metadata.dataset_table_size)
+    if len(raw) != metadata.dataset_table_size:
+        raise _rebuild_error("Truncated dataset table", path)
+    try:
+        names = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise _rebuild_error("Invalid dataset table", path) from exc
+    if not isinstance(names, list) or any(not isinstance(name, str) or not name for name in names):
+        raise _rebuild_error("Invalid dataset names in index", path)
+    if len(names) != len(set(names)):
+        raise _rebuild_error("Duplicate dataset names in index", path)
+    return names
 
 
 def _manifest_fingerprint(path: Path) -> tuple[int, str]:
@@ -87,15 +105,13 @@ def _validate_manifest_fingerprint(
     manifest_size = manifest_path.stat().st_size
     if manifest_size != metadata.manifest_size_bytes:
         raise _rebuild_error(
-            "Manifest/index file-size mismatch: "
-            f"manifest={manifest_size}, indexed={metadata.manifest_size_bytes}",
+            f"Manifest/index file-size mismatch: manifest={manifest_size}, indexed={metadata.manifest_size_bytes}",
             index_path,
         )
     _, digest = _manifest_fingerprint(manifest_path)
     if digest != metadata.manifest_sha256:
         raise _rebuild_error(
-            "Manifest/index SHA256 mismatch: "
-            f"manifest={digest}, indexed={metadata.manifest_sha256}",
+            f"Manifest/index SHA256 mismatch: manifest={digest}, indexed={metadata.manifest_sha256}",
             index_path,
         )
 
@@ -104,7 +120,7 @@ def build_manifest_offset_index(
     manifest_path: str | Path,
     index_path: str | Path | None = None,
 ) -> Path:
-    """Stream a finalized JSONL manifest into an atomic fixed-record v2 index."""
+    """Stream a finalized JSONL manifest into an atomic source-aware v3 index."""
     manifest = Path(manifest_path).expanduser().resolve()
     destination = (
         Path(index_path).expanduser().resolve()
@@ -116,6 +132,7 @@ def build_manifest_offset_index(
     try:
         digest = hashlib.sha256()
         row_count = 0
+        dataset_ids: dict[str, int] = {}
         with manifest.open("rb") as source, temporary.open("w+b") as output:
             output.write(INDEX_MAGIC)
             output.write(bytes(INDEX_HEADER.size))
@@ -129,17 +146,27 @@ def build_manifest_offset_index(
                     continue
                 record = json.loads(line)
                 task = str(record.get("task"))
+                dataset_name = str(record.get("dataset_name", ""))
                 if task not in _TASK_TO_ID:
                     raise ValueError(f"Manifest row at byte {offset} has unsupported task {task!r}")
-                output.write(INDEX_ENTRY.pack(offset, _TASK_TO_ID[task]))
+                if not dataset_name:
+                    raise ValueError(f"Manifest row at byte {offset} has no dataset_name")
+                dataset_id = dataset_ids.setdefault(dataset_name, len(dataset_ids))
+                if dataset_id > 0xFFFF:
+                    raise ValueError("Online manifest index supports at most 65536 datasets")
+                output.write(INDEX_ENTRY.pack(offset, _TASK_TO_ID[task], dataset_id))
                 row_count += 1
             manifest_size = source.tell()
+            names_by_id = [name for name, _ in sorted(dataset_ids.items(), key=lambda item: item[1])]
+            dataset_table = json.dumps(names_by_id, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            output.write(dataset_table)
             output.seek(len(INDEX_MAGIC))
             output.write(
                 INDEX_HEADER.pack(
                     manifest_size,
                     row_count,
                     INDEX_ENTRY.size,
+                    len(dataset_table),
                     digest.digest(),
                 )
             )
@@ -156,8 +183,8 @@ def read_manifest_index(
     index_path: str | Path,
     *,
     manifest_path: str | Path | None = None,
-) -> tuple[array, dict[str, array]]:
-    """Load compact offsets/task-local row ids and optionally verify manifest identity."""
+) -> tuple[array, dict[str, array], dict[str, array]]:
+    """Load offsets plus task- and dataset-local manifest row indices."""
     path = Path(index_path).expanduser().resolve()
     offsets = array("Q")
     task_indices = {IMAGE_TASK: array("q"), VIDEO_TASK: array("q")}
@@ -169,16 +196,22 @@ def read_manifest_index(
                 manifest_path=Path(manifest_path).expanduser().resolve(),
                 index_path=path,
             )
+        dataset_names = _read_dataset_table(handle, metadata, path)
+        dataset_indices = {name: array("q") for name in dataset_names}
+        handle.seek(len(INDEX_MAGIC) + INDEX_HEADER.size)
         for row_index in range(metadata.manifest_row_count):
             entry = handle.read(INDEX_ENTRY.size)
             if len(entry) != INDEX_ENTRY.size:
                 raise _rebuild_error("Truncated online manifest index", path)
-            offset, task_id = INDEX_ENTRY.unpack(entry)
+            offset, task_id, dataset_id = INDEX_ENTRY.unpack(entry)
             if task_id not in _ID_TO_TASK:
                 raise _rebuild_error(f"Invalid task id {task_id} in online manifest index", path)
+            if dataset_id >= len(dataset_names):
+                raise _rebuild_error(f"Invalid dataset id {dataset_id} in online manifest index", path)
             offsets.append(offset)
             task_indices[_ID_TO_TASK[task_id]].append(row_index)
-    return offsets, task_indices
+            dataset_indices[dataset_names[dataset_id]].append(row_index)
+    return offsets, task_indices, dataset_indices
 
 
 def read_jsonl_record_at(handle: BinaryIO, offset: int) -> dict[str, Any]:
@@ -192,25 +225,27 @@ def read_jsonl_record_at(handle: BinaryIO, offset: int) -> dict[str, Any]:
     return record
 
 
-def iter_index_entries(index_path: str | Path) -> Iterator[tuple[int, str]]:
+def iter_index_entries(index_path: str | Path) -> Iterator[tuple[int, str, str]]:
     path = Path(index_path).expanduser().resolve()
     with path.open("rb") as handle:
         metadata = _read_header(handle, path)
+        dataset_names = _read_dataset_table(handle, metadata, path)
+        handle.seek(len(INDEX_MAGIC) + INDEX_HEADER.size)
         for _ in range(metadata.manifest_row_count):
             entry = handle.read(INDEX_ENTRY.size)
             if len(entry) != INDEX_ENTRY.size:
                 raise _rebuild_error("Truncated online manifest index", path)
-            offset, task_id = INDEX_ENTRY.unpack(entry)
-            if task_id not in _ID_TO_TASK:
-                raise _rebuild_error(f"Invalid task id {task_id} in online manifest index", path)
-            yield offset, _ID_TO_TASK[task_id]
+            offset, task_id, dataset_id = INDEX_ENTRY.unpack(entry)
+            if task_id not in _ID_TO_TASK or dataset_id >= len(dataset_names):
+                raise _rebuild_error("Invalid task or dataset id in online manifest index", path)
+            yield offset, _ID_TO_TASK[task_id], dataset_names[dataset_id]
 
 
 def validate_manifest_index(
     manifest_path: str | Path,
     index_path: str | Path | None = None,
 ) -> ManifestIndexMetadata:
-    """Strictly verify fingerprint plus every indexed offset and task id."""
+    """Strictly verify fingerprint plus every indexed offset, task, and dataset."""
     manifest = Path(manifest_path).expanduser().resolve()
     index = (
         Path(index_path).expanduser().resolve()
@@ -232,15 +267,17 @@ def validate_manifest_index(
             if not line.strip():
                 continue
             try:
-                indexed_offset, indexed_task = next(entries)
+                indexed_offset, indexed_task, indexed_dataset = next(entries)
             except StopIteration as exc:
                 raise _rebuild_error("Manifest contains more rows than its index", index) from exc
             record = json.loads(line)
             task = str(record.get("task"))
-            if indexed_offset != offset or indexed_task != task:
+            dataset_name = str(record.get("dataset_name"))
+            if indexed_offset != offset or indexed_task != task or indexed_dataset != dataset_name:
                 raise _rebuild_error(
                     "Manifest index entry mismatch at row "
-                    f"{observed_rows}: offset={indexed_offset}/{offset}, task={indexed_task!r}/{task!r}",
+                    f"{observed_rows}: offset={indexed_offset}/{offset}, "
+                    f"task={indexed_task!r}/{task!r}, dataset={indexed_dataset!r}/{dataset_name!r}",
                     index,
                 )
             observed_rows += 1

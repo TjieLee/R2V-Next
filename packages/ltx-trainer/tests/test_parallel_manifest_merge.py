@@ -57,7 +57,7 @@ def _merge(root: Path, tmp_path: Path):
     )
 
 
-def test_merge_deduplicates_globally_strips_build_fields_and_builds_ltxidx02(tmp_path: Path) -> None:
+def test_merge_deduplicates_globally_strips_build_fields_and_builds_source_index(tmp_path: Path) -> None:
     root = _built_shards(tmp_path)
     summary = _merge(root, tmp_path)
     manifest = tmp_path / "train_unique.jsonl"
@@ -69,9 +69,10 @@ def test_merge_deduplicates_globally_strips_build_fields_and_builds_ltxidx02(tmp
     assert summary["duplicate_rows"] == 1
     metadata = validate_manifest_index(manifest)
     assert metadata.manifest_row_count == 3
-    offsets, task_indices = read_manifest_index(f"{manifest}.idx", manifest_path=manifest)
+    offsets, task_indices, dataset_indices = read_manifest_index(f"{manifest}.idx", manifest_path=manifest)
     assert len(offsets) == 3
     assert list(task_indices["i2i"]) == [0, 1, 2]
+    assert list(dataset_indices["first_dataset"]) == [0, 1, 2]
 
 
 def test_merge_rejects_missing_done_marker(tmp_path: Path) -> None:

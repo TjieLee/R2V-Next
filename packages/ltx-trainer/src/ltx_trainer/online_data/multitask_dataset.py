@@ -20,7 +20,6 @@ from ltx_trainer.online_data.constants import (
     VIDEO_NUM_FRAMES,
     VIDEO_TASK,
 )
-from ltx_trainer.online_data.media_decoder import decode_image_rgb, decode_video_indices
 from ltx_trainer.online_data.manifest_index import (
     default_manifest_index_path,
     read_jsonl_record_at,
@@ -28,8 +27,11 @@ from ltx_trainer.online_data.manifest_index import (
 )
 from ltx_trainer.online_data.manifest_schema import (
     as_int_list as _as_int_list,
+)
+from ltx_trainer.online_data.manifest_schema import (
     validate_manifest_record,
 )
+from ltx_trainer.online_data.media_decoder import decode_image_rgb, decode_video_indices
 from ltx_trainer.online_data.transforms import deterministic_resize_center_crop
 
 
@@ -133,12 +135,12 @@ class OnlineMultiTaskDataset(Dataset[dict[str, Any] | SampleLoadError]):
         self._manifest_handle: BinaryIO | None = None
         index_path = default_manifest_index_path(self.manifest_path)
         if index_path.is_file():
-            self._offsets, self.task_indices = read_manifest_index(
+            self._offsets, self.task_indices, self.dataset_indices = read_manifest_index(
                 index_path,
                 manifest_path=self.manifest_path,
             )
         else:
-            self._offsets, self.task_indices = self._scan_manifest_offsets()
+            self._offsets, self.task_indices, self.dataset_indices = self._scan_manifest_offsets()
         if not self._offsets:
             raise ValueError(f"Online manifest is empty: {self.manifest_path}")
         for task, indices in self.task_indices.items():
@@ -153,9 +155,10 @@ class OnlineMultiTaskDataset(Dataset[dict[str, Any] | SampleLoadError]):
         state["_manifest_handle"] = None
         return state
 
-    def _scan_manifest_offsets(self) -> tuple[array, dict[str, array]]:
+    def _scan_manifest_offsets(self) -> tuple[array, dict[str, array], dict[str, array]]:
         offsets = array("Q")
         task_indices = {IMAGE_TASK: array("q"), VIDEO_TASK: array("q")}
+        dataset_indices: dict[str, array] = {}
         with self.manifest_path.open("rb") as handle:
             row_index = 0
             while True:
@@ -169,8 +172,9 @@ class OnlineMultiTaskDataset(Dataset[dict[str, Any] | SampleLoadError]):
                 validate_manifest_record(record, row_index)
                 offsets.append(offset)
                 task_indices[str(record["task"])].append(row_index)
+                dataset_indices.setdefault(str(record["dataset_name"]), array("q")).append(row_index)
                 row_index += 1
-        return offsets, task_indices
+        return offsets, task_indices, dataset_indices
 
     def _read_record(self, index: int) -> dict[str, Any]:
         if self._manifest_handle is None or self._manifest_handle.closed:
@@ -215,14 +219,19 @@ class OnlineMultiTaskDataset(Dataset[dict[str, Any] | SampleLoadError]):
                 else references_vae
             )
             target_indices = torch.tensor(record["target_source_frame_indices"], dtype=torch.long)
-            vlm_target_indices = torch.tensor(record["vlm_target_frame_indices"], dtype=torch.long)
+            semantic_target_indices = torch.tensor(record["semantic_anchor_target_indices"], dtype=torch.long)
+            semantic_source_indices = torch.tensor(record["semantic_anchor_source_indices"], dtype=torch.long)
             return {
                 "sample_key": str(record["sample_key"]),
                 "sample_plan_sha256": str(record["sample_plan_sha256"]),
+                "dataset_name": str(record["dataset_name"]),
+                "adapter_name": str(record["adapter_name"]),
+                "source_record_id": str(record["source_record_id"]),
                 "task": str(record["task"]),
                 "target_modality": str(record["target_modality"]),
                 "target_pixels": target,
                 "reference_pixels_vae": references_vae,
+                "semantic_teacher_pixels": target.index_select(0, semantic_target_indices),
                 "reference_images_vlm": references_vlm,
                 "reference_pixels": references_vae,
                 "vlm_reference_preprocess": self.vlm_reference_preprocess,
@@ -231,8 +240,8 @@ class OnlineMultiTaskDataset(Dataset[dict[str, Any] | SampleLoadError]):
                 "target_fps": float(record["target_fps"]),
                 "target_num_frames": int(record["target_num_frames"]),
                 "target_source_frame_indices": target_indices,
-                "vlm_target_frame_indices": vlm_target_indices,
-                "vlm_source_frame_indices": torch.tensor(record["vlm_source_frame_indices"], dtype=torch.long),
+                "semantic_anchor_target_indices": semantic_target_indices,
+                "semantic_anchor_source_indices": semantic_source_indices,
                 "reference_paths": [str(path) for path in reference_paths],
                 "manifest_index": int(index),
                 "data_decode_ms": (time.perf_counter() - started) * 1000.0,
@@ -294,10 +303,14 @@ def collate_online_raw_batch(samples: Sequence[dict[str, Any] | SampleLoadError]
         "sample_key": [record["sample_key"] for record in records],
         "sample_plan_sha256": [record["sample_plan_sha256"] for record in records],
         "task": [record["task"] for record in records],
+        "dataset_name": [record["dataset_name"] for record in records],
+        "adapter_name": [record["adapter_name"] for record in records],
+        "source_record_id": [record["source_record_id"] for record in records],
         "target_modality": [record["target_modality"] for record in records],
         "target_pixels": torch.stack([record["target_pixels"] for record in records], dim=0),
         "reference_pixels_vae": [record["reference_pixels_vae"] for record in records],
         "reference_images_vlm": [record["reference_images_vlm"] for record in records],
+        "semantic_teacher_pixels": torch.stack([record["semantic_teacher_pixels"] for record in records], dim=0),
         "reference_pixels": [record["reference_pixels_vae"] for record in records],
         "vlm_reference_preprocess": [record["vlm_reference_preprocess"] for record in records],
         "video_decoder": [record["video_decoder"] for record in records],
@@ -309,11 +322,11 @@ def collate_online_raw_batch(samples: Sequence[dict[str, Any] | SampleLoadError]
         "target_source_frame_indices": torch.stack(
             [record["target_source_frame_indices"] for record in records], dim=0
         ),
-        "vlm_target_frame_indices": torch.stack(
-            [record["vlm_target_frame_indices"] for record in records], dim=0
+        "semantic_anchor_target_indices": torch.stack(
+            [record["semantic_anchor_target_indices"] for record in records], dim=0
         ),
-        "vlm_source_frame_indices": torch.stack(
-            [record["vlm_source_frame_indices"] for record in records], dim=0
+        "semantic_anchor_source_indices": torch.stack(
+            [record["semantic_anchor_source_indices"] for record in records], dim=0
         ),
         "reference_paths": [record["reference_paths"] for record in records],
         "manifest_index": torch.tensor([record["manifest_index"] for record in records], dtype=torch.long),

@@ -3,24 +3,25 @@ from __future__ import annotations
 import json
 import sqlite3
 import tracemalloc
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from scripts import build_multitask_online_manifest as manifest_builder
 
 from ltx_trainer.online_data.manifest import iter_annotation_rows, read_annotation_rows
 from ltx_trainer.online_data.manifest_index import (
     INDEX_ENTRY,
     INDEX_HEADER,
     INDEX_MAGIC,
-    LEGACY_INDEX_MAGIC,
+    LEGACY_INDEX_MAGICS,
     build_manifest_offset_index,
     read_jsonl_record_at,
     read_manifest_index,
     validate_manifest_index,
 )
-from scripts import build_multitask_online_manifest as manifest_builder
 
 
 def test_iter_annotation_rows_streams_100k_jsonl_without_read_text(
@@ -54,14 +55,15 @@ def test_streaming_rows_match_eager_wrapper_for_small_input(tmp_path: Path) -> N
 def test_binary_manifest_index_preserves_offsets_and_compact_task_indices(tmp_path: Path) -> None:
     manifest = tmp_path / "train.jsonl"
     rows = [
-        {"sample_key": f"sample-{index}", "task": "i2i" if index % 2 == 0 else "r2v"}
+        {"sample_key": f"sample-{index}", "task": "i2i" if index % 2 == 0 else "r2v", "dataset_name": "unit"}
         for index in range(1000)
     ]
     manifest.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
     index_path = build_manifest_offset_index(manifest)
-    offsets, task_indices = read_manifest_index(index_path, manifest_path=manifest)
+    offsets, task_indices, dataset_indices = read_manifest_index(index_path, manifest_path=manifest)
     assert len(offsets) == 1000
     assert len(task_indices["i2i"]) == 500
+    assert len(dataset_indices["unit"]) == 1000
     assert len(task_indices["r2v"]) == 500
     with manifest.open("rb") as handle:
         assert read_jsonl_record_at(handle, offsets[731]) == rows[731]
@@ -72,9 +74,9 @@ def test_binary_manifest_index_preserves_offsets_and_compact_task_indices(tmp_pa
 
 def test_manifest_index_rejects_same_row_count_content_replacement(tmp_path: Path) -> None:
     manifest = tmp_path / "train.jsonl"
-    manifest.write_text('{"task":"i2i","value":"aaaa"}\n', encoding="utf-8")
+    manifest.write_text('{"task":"i2i","dataset_name":"unit","value":"aaaa"}\n', encoding="utf-8")
     index_path = build_manifest_offset_index(manifest)
-    manifest.write_text('{"task":"i2i","value":"bbbb"}\n', encoding="utf-8")
+    manifest.write_text('{"task":"i2i","dataset_name":"unit","value":"bbbb"}\n', encoding="utf-8")
 
     with pytest.raises(ValueError, match="SHA256 mismatch.*Rebuild"):
         read_manifest_index(index_path, manifest_path=manifest)
@@ -82,9 +84,16 @@ def test_manifest_index_rejects_same_row_count_content_replacement(tmp_path: Pat
 
 def test_manifest_index_rejects_manifest_size_or_offset_change(tmp_path: Path) -> None:
     manifest = tmp_path / "train.jsonl"
-    manifest.write_text('{"task":"i2i"}\n{"task":"r2v"}\n', encoding="utf-8")
+    manifest.write_text(
+        '{"task":"i2i","dataset_name":"unit"}\n{"task":"r2v","dataset_name":"unit"}\n',
+        encoding="utf-8",
+    )
     index_path = build_manifest_offset_index(manifest)
-    manifest.write_text('{"task":"i2i","longer":true}\n{"task":"r2v"}\n', encoding="utf-8")
+    manifest.write_text(
+        '{"task":"i2i","dataset_name":"unit","longer":true}\n'
+        '{"task":"r2v","dataset_name":"unit"}\n',
+        encoding="utf-8",
+    )
 
     with pytest.raises(ValueError, match="file-size mismatch.*Rebuild"):
         read_manifest_index(index_path, manifest_path=manifest)
@@ -92,7 +101,7 @@ def test_manifest_index_rejects_manifest_size_or_offset_change(tmp_path: Path) -
 
 def test_manifest_index_rejects_truncated_index(tmp_path: Path) -> None:
     manifest = tmp_path / "train.jsonl"
-    manifest.write_text('{"task":"i2i"}\n', encoding="utf-8")
+    manifest.write_text('{"task":"i2i","dataset_name":"unit"}\n', encoding="utf-8")
     index_path = build_manifest_offset_index(manifest)
     index_path.write_bytes(index_path.read_bytes()[:-1])
 
@@ -102,19 +111,22 @@ def test_manifest_index_rejects_truncated_index(tmp_path: Path) -> None:
 
 def test_manifest_index_rejects_legacy_v1_with_rebuild_message(tmp_path: Path) -> None:
     index_path = tmp_path / "train.jsonl.idx"
-    index_path.write_bytes(LEGACY_INDEX_MAGIC + INDEX_ENTRY.pack(0, 0))
+    index_path.write_bytes(next(iter(LEGACY_INDEX_MAGICS)))
 
-    with pytest.raises(ValueError, match="Legacy LTXIDX01.*Rebuild"):
+    with pytest.raises(ValueError, match="Legacy online manifest index.*Rebuild"):
         read_manifest_index(index_path)
 
 
 def test_strict_manifest_index_validation_checks_offsets_and_tasks(tmp_path: Path) -> None:
     manifest = tmp_path / "train.jsonl"
-    manifest.write_text('{"task":"i2i"}\n{"task":"r2v"}\n', encoding="utf-8")
+    manifest.write_text(
+        '{"task":"i2i","dataset_name":"unit"}\n{"task":"r2v","dataset_name":"unit"}\n',
+        encoding="utf-8",
+    )
     index_path = build_manifest_offset_index(manifest)
     payload = bytearray(index_path.read_bytes())
     first_entry = len(INDEX_MAGIC) + INDEX_HEADER.size
-    payload[first_entry : first_entry + INDEX_ENTRY.size] = INDEX_ENTRY.pack(1, 0)
+    payload[first_entry : first_entry + INDEX_ENTRY.size] = INDEX_ENTRY.pack(1, 0, 0)
     index_path.write_bytes(payload)
 
     with pytest.raises(ValueError, match="entry mismatch.*Rebuild"):
@@ -228,11 +240,11 @@ def _patch_synthetic_builder(
         },
     )
 
-    def _rows(path: str, *, batch_size: int) -> Iterator[dict[str, Any]]:
+    def _rows(path: str, *, batch_size: int) -> Iterator[tuple[str, dict[str, Any]]]:
         del batch_size
         task = "i2i" if "images" in str(path) else "r2v"
         for index in range(rows_per_task):
-            yield {"index": index, "task": task}
+            yield str(index), {"index": index, "task": task}
 
     def _record(row: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
         task = str(row["task"])
@@ -241,19 +253,26 @@ def _patch_synthetic_builder(
             "sample_key": f"{task}-{index:08d}",
             "sample_plan_sha256": f"plan-{task}-{index:08d}",
             "task": task,
+            "dataset_name": str(_kwargs["dataset_name"]),
         }
 
-    def _probed(
-        rows: Iterable[dict[str, Any]],
-        **_kwargs: Any,
-    ) -> Iterator[tuple[dict[str, Any], dict[str, float], None]]:
-        for row in rows:
-            yield row, {"fps": 24.0, "frame_count": 240, "width": 832, "height": 480}, None
-
-    monkeypatch.setattr(manifest_builder, "iter_annotation_rows", _rows)
+    monkeypatch.setattr(manifest_builder, "iter_annotation_items", _rows)
     monkeypatch.setattr(manifest_builder, "build_i2i_record", _record)
-    monkeypatch.setattr(manifest_builder, "build_r2v_record", _record)
-    monkeypatch.setattr(manifest_builder, "_iter_rows_with_bounded_probes", _probed)
+    monkeypatch.setattr(
+        manifest_builder,
+        "normalize_r2v_source",
+        lambda row, **kwargs: SimpleNamespace(
+            video_path="synthetic.mp4",
+            dataset_name=kwargs["dataset_name"],
+            row=row,
+        ),
+    )
+    monkeypatch.setattr(
+        manifest_builder,
+        "build_canonical_r2v_record",
+        lambda source, **kwargs: _record(source.row, dataset_name=source.dataset_name, **kwargs),
+    )
+    monkeypatch.setattr(manifest_builder, "probe_video", lambda _path: {})
     monkeypatch.setattr(manifest_builder, "assert_write_path_allowed", lambda path: Path(path).resolve())
 
 

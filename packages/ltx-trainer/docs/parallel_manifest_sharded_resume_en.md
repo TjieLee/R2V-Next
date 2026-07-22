@@ -1,7 +1,7 @@
 # Parallel, Sharded, Resumable Multi-Task Manifests
 
-This workflow changes manifest construction only. Stage 1/2/3 training, checkpoints, CFG, and inference remain
-unchanged. The legacy `scripts/build_multitask_online_manifest.py` entry point keeps its current behavior. The
+This workflow changes manifest construction only; semantic-flow training, checkpoints, and inference remain
+unchanged. The `scripts/build_multitask_online_manifest.py` entry point keeps its current behavior. The
 new workflow writes an independent shard tree, so separate I2I and R2V processes can run concurrently.
 
 ## Path contract

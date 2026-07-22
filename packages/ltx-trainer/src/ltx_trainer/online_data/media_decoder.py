@@ -8,14 +8,15 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Literal, Sequence
+from typing import TYPE_CHECKING, Literal, Sequence
 
-import av
-import cv2
 import numpy as np
 import torch
 from PIL import Image, ImageOps
 from torch import Tensor
+
+if TYPE_CHECKING:
+    import av
 
 
 def decode_image_rgb(path: str | Path) -> Tensor:
@@ -26,6 +27,8 @@ def decode_image_rgb(path: str | Path) -> Tensor:
 
 
 def probe_video(path: str | Path) -> dict[str, float | int]:
+    import av  # noqa: PLC0415
+
     with av.open(str(path)) as container:
         stream = container.streams.video[0]
         rate = (
@@ -100,6 +103,8 @@ def _decode_video_indices_pyav(
     *,
     timeout_seconds: float,
 ) -> Tensor:
+    import av  # noqa: PLC0415
+
     started = time.monotonic()
     timeout = (timeout_seconds, timeout_seconds)
     with av.open(str(path), timeout=timeout) as container:
@@ -160,6 +165,8 @@ def _decode_video_indices_opencv(
     *,
     timeout_seconds: float,
 ) -> Tensor:
+    import cv2  # noqa: PLC0415
+
     started = time.monotonic()
     wanted = set(requested)
     decoded: dict[int, Tensor] = {}

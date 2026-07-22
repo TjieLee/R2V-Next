@@ -1,4 +1,4 @@
-"""Launch each online Stage 3 smoke case in a fresh Accelerate process group."""
+"""Launch each semantic-flow online smoke case in a fresh Accelerate process group."""
 
 from __future__ import annotations
 
@@ -39,7 +39,7 @@ def main(
     accelerate_executable: str = typer.Option("accelerate", "--accelerate-executable"),
 ) -> None:
     if num_processes != 2:
-        raise typer.BadParameter("Stage 3 DDP smoke matrix requires --num-processes 2")
+        raise typer.BadParameter("Semantic-flow DDP smoke matrix requires --num-processes 2")
     root = assert_write_path_allowed(output_root)
     root.mkdir(parents=True, exist_ok=True)
     worker_script = Path(__file__).with_name("check_multitask_online_ddp.py")
@@ -62,11 +62,11 @@ def main(
             "--task",
             task,
             "--output-dir",
-            str(root / f"stage3_{task}"),
+            str(root / f"semantic_flow_{task}"),
         ]
         if init_checkpoint is not None:
             command.extend(["--init-checkpoint", init_checkpoint])
-        typer.echo(f"Launching isolated Stage 3 {task} DDP smoke")
+        typer.echo(f"Launching isolated semantic-flow {task} DDP smoke")
         subprocess.run(command, check=True, env=environment)
 
 

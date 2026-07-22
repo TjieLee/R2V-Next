@@ -77,7 +77,7 @@ def main(
         ...,
         help="Full manifest file or a directory containing shard manifests.",
     ),
-    output_dir: str = typer.Argument(..., help="Output directory to watch, e.g. .precomputed/gt_siglip_tokens."),
+    output_dir: str = typer.Argument(..., help="Output directory to watch."),
     label: str = typer.Option("precompute", help="Progress label shown in the terminal."),
     interval: float = typer.Option(20.0, help="Refresh interval in seconds."),
 ) -> None:
