@@ -13,11 +13,13 @@ from ltx_core.multicond.semantic_tokens import (
 from ltx_core.types import VideoLatentShape
 from ltx_trainer.online_data.constants import IMAGE_TASK
 from ltx_trainer.online_data.online_batch_encoder import _build_messages
+from ltx_trainer.training_strategies.base_strategy import ModelInputs
 from ltx_trainer.training_strategies.semantic_flow import (
     ENTITY_GLOBAL,
     ENTITY_REF_0,
     SemanticFlowConfig,
     SemanticFlowStrategy,
+    SemanticInferenceState,
 )
 
 
@@ -107,39 +109,58 @@ def test_semantic_rope_remains_target_interpolated_eight_by_eight() -> None:
     assert torch.equal(positions[:, 2, :, 1].amax(), target_positions[:, 2, :, 1].amax())
 
 
-def test_training_and_inference_reference_positions_are_identical() -> None:
-    strategy = SemanticFlowStrategy(SemanticFlowConfig(semantic_minimum_tokens_per_frame=64))
-    strategy._semantic_dim = 4
-    strategy._gemma_dim = 4
-    strategy._query_initializer = SemanticQueryInitializer(4)
-    strategy._semantic_encoder = SemanticEncoder(4, 4)
-    strategy._reconstruction_decoder = SemanticReconstructionDecoder(4, 4)
-    semantic_clean = torch.ones(1, 1, SEMANTIC_TOKENS_PER_FRAME, 4)
+def _prepare_training_and_inference_states(
+    *,
+    latent_frames: int,
+    latent_height: int,
+    latent_width: int,
+    semantic_frame_count: int,
+    fps: float,
+) -> tuple[ModelInputs, SemanticInferenceState]:
+    feature_dim = 128
+    strategy = SemanticFlowStrategy(SemanticFlowConfig(semantic_maximum_drop_rate=0.0))
+    strategy._semantic_dim = feature_dim
+    strategy._gemma_dim = feature_dim
+    strategy._query_initializer = SemanticQueryInitializer(feature_dim)
+    strategy._semantic_encoder = SemanticEncoder(feature_dim, feature_dim)
+    strategy._reconstruction_decoder = SemanticReconstructionDecoder(feature_dim, feature_dim)
+    semantic_clean = torch.ones(1, semantic_frame_count, SEMANTIC_TOKENS_PER_FRAME, feature_dim)
     strategy.build_semantic_teacher_outputs = lambda _inputs: {  # type: ignore[method-assign]
         "semantic_clean": semantic_clean,
-        "reconstruction_prediction": torch.zeros(1, 1, SEMANTIC_TOKENS_PER_FRAME, 4, 4),
-        "reconstruction_target": torch.zeros(1, 1, SEMANTIC_TOKENS_PER_FRAME, 4, 4),
+        "reconstruction_prediction": torch.zeros(
+            1, semantic_frame_count, SEMANTIC_TOKENS_PER_FRAME, 4, 4
+        ),
+        "reconstruction_target": torch.zeros(
+            1, semantic_frame_count, SEMANTIC_TOKENS_PER_FRAME, 4, 4
+        ),
     }
     references = {
-        "latents": torch.arange(32, dtype=torch.float32).reshape(1, 2, 4, 1, 2, 2),
+        "latents": torch.zeros(1, 2, feature_dim, 1, latent_height, latent_width),
         "ref_valid_mask": torch.tensor([[True, True]]),
     }
     conditions = {
-        "video_prompt_embeds": torch.zeros(1, 2, 4),
+        "video_prompt_embeds": torch.zeros(1, 2, feature_dim),
         "prompt_attention_mask": torch.ones(1, 2, dtype=torch.bool),
     }
+    target_shape = VideoLatentShape(
+        batch=1,
+        channels=feature_dim,
+        frames=latent_frames,
+        height=latent_height,
+        width=latent_width,
+    )
     training = strategy.prepare_training_inputs(
         {
             "semantic_teacher_inputs": {
                 "prefix_attention_mask": torch.ones(1, 2, dtype=torch.bool),
-                "normalized_timestamps": torch.tensor([[0.0]]),
+                "normalized_timestamps": torch.linspace(0.0, 1.0, semantic_frame_count).unsqueeze(0),
             },
             "latents": {
-                "latents": torch.zeros(1, 4, 1, 2, 2),
-                "num_frames": torch.tensor([1]),
-                "height": torch.tensor([2]),
-                "width": torch.tensor([2]),
-                "fps": torch.tensor([24.0]),
+                "latents": torch.zeros(target_shape.to_torch_shape()),
+                "num_frames": torch.tensor([latent_frames]),
+                "height": torch.tensor([latent_height]),
+                "width": torch.tensor([latent_width]),
+                "fps": torch.tensor([fps]),
             },
             "reference_latents": references,
             "conditions": conditions,
@@ -149,22 +170,54 @@ def test_training_and_inference_reference_positions_are_identical() -> None:
     inference = strategy.prepare_inference_state(
         conditions=conditions,
         reference_latents=references,
-        target_shape=VideoLatentShape(batch=1, channels=4, frames=1, height=2, width=2),
-        semantic_frame_count=1,
-        fps=24.0,
+        target_shape=target_shape,
+        semantic_frame_count=semantic_frame_count,
+        fps=fps,
         seed=7,
     )
+    return training, inference
+
+
+def _assert_position_segments_match(training: ModelInputs, inference: SemanticInferenceState) -> None:
     assert training.sequence_offsets is not None
-    reference_end = training.sequence_offsets["reference_end"]
-    assert torch.equal(
-        training.video.positions[:, :, :reference_end],
-        inference.modality.positions[:, :, :reference_end],
+    assert training.video is not None
+    offsets = training.sequence_offsets
+    assert offsets == inference.sequence_offsets
+    for start, end in (
+        (0, offsets["reference_end"]),
+        (offsets["reference_end"], offsets["semantic_end"]),
+        (offsets["semantic_end"], offsets["target_end"]),
+    ):
+        assert torch.equal(
+            training.video.positions[:, :, start:end],
+            inference.modality.positions[:, :, start:end],
+        )
+
+
+def test_i2i_training_and_inference_positions_are_identical_at_one_fps() -> None:
+    training, inference = _prepare_training_and_inference_states(
+        latent_frames=1,
+        latent_height=15,
+        latent_width=26,
+        semantic_frame_count=1,
+        fps=1.0,
     )
-    assert torch.equal(
-        training.video.entity_ids[:, :reference_end],
-        inference.modality.entity_ids[:, :reference_end],
+    _assert_position_segments_match(training, inference)
+    assert training.video is not None
+    assert torch.equal(training.video.entity_ids, inference.modality.entity_ids)
+    assert torch.equal(training.video.token_type_ids, inference.modality.token_type_ids)
+    assert torch.count_nonzero(training.video.entity_ids - ENTITY_GLOBAL) > 0
+
+
+def test_r2v_training_and_inference_positions_are_identical_at_24_fps() -> None:
+    training, inference = _prepare_training_and_inference_states(
+        latent_frames=16,
+        latent_height=15,
+        latent_width=26,
+        semantic_frame_count=12,
+        fps=24.0,
     )
-    assert torch.count_nonzero(training.video.entity_ids[:, reference_end:] - ENTITY_GLOBAL) == 0
+    _assert_position_segments_match(training, inference)
 
 
 def test_vlm_reference_placeholders_keep_input_order_and_one_based_numbering() -> None:
