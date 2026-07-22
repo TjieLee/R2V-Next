@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from types import SimpleNamespace
 
 import pytest
 import torch
 from torch import nn
 
+import ltx_trainer.online_data.online_batch_encoder as online_batch_encoder_module
+from ltx_core.multicond.semantic_tokens import EVIDENCE_TOKENS_PER_FRAME
 from ltx_trainer.online_data.online_batch_encoder import OnlineBatchEncoder
 from ltx_trainer.training_strategies.semantic_flow import SemanticFlowConfig, SemanticFlowStrategy
 
@@ -21,6 +24,12 @@ class _FakeVAE(nn.Module):
             device=pixels.device,
             dtype=pixels.dtype,
         )
+
+
+class _FakeImageProcessor:
+    def __call__(self, *, images: list[object], return_tensors: str) -> dict[str, torch.Tensor]:
+        assert return_tensors == "pt"
+        return {"pixel_values": torch.zeros(len(images), 3, 2, 2)}
 
 
 def test_online_target_metadata_uses_encoded_latent_geometry() -> None:
@@ -69,3 +78,39 @@ def test_target_and_reference_position_counts_match_latent_tokens(frames: int, e
         target_positions=target_positions,
     )
     assert ref_tokens.shape[1] == ref_positions.shape[2]
+
+
+def test_online_encoder_validates_canonical_anchor_indices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    canonical = [0, 11, 22, 33, 44, 55, 65, 76, 87, 98, 109, 120]
+    encoder = OnlineBatchEncoder.__new__(OnlineBatchEncoder)
+    encoder.device = torch.device("cpu")
+    encoder.dtype = torch.float32
+    encoder.image_processor = _FakeImageProcessor()
+    encoder.last_dtype_diagnostics = {}
+    encoder._keep_frozen_modules_eval = lambda: None  # type: ignore[method-assign]
+    encoder._frozen_encode_autocast = nullcontext  # type: ignore[method-assign]
+    encoder._unwrap_text_encoder = lambda: SimpleNamespace(model=nn.Identity())  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        online_batch_encoder_module,
+        "extract_projected_visual_tokens",
+        lambda _model, _pixels, *, image_counts, **_kwargs: SimpleNamespace(
+            tokens=torch.zeros(1, int(image_counts.item()) * EVIDENCE_TOKENS_PER_FRAME, 4)
+        ),
+    )
+    raw_batch = {
+        "target_pixels": torch.zeros(1, 121, 2, 2, 3, dtype=torch.uint8),
+        "semantic_anchor_target_indices": torch.tensor([canonical]),
+    }
+
+    evidence = encoder._encode_gt_evidence(raw_batch)
+    expected = torch.tensor(canonical, dtype=torch.float32).unsqueeze(0) / 120
+    assert torch.equal(evidence["normalized_timestamps"], expected)
+
+    invalid = dict(raw_batch)
+    invalid["semantic_anchor_target_indices"] = torch.tensor(
+        [[0, 11, 22, 33, 44, 55, 66, 76, 87, 98, 109, 120]]
+    )
+    with pytest.raises(ValueError, match="differ from canonical uniform sampling"):
+        encoder._encode_gt_evidence(invalid)

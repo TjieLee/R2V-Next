@@ -195,6 +195,8 @@ def _assert_position_segments_match(training: ModelInputs, inference: SemanticIn
     assert training.video is not None
     offsets = training.sequence_offsets
     assert offsets == inference.sequence_offsets
+    assert torch.equal(training.video.entity_ids, inference.modality.entity_ids)
+    assert torch.equal(training.video.token_type_ids, inference.modality.token_type_ids)
     for start, end in (
         (0, offsets["reference_end"]),
         (offsets["reference_end"], offsets["semantic_end"]),
@@ -223,6 +225,12 @@ def test_i2i_training_and_inference_positions_are_identical_at_one_fps() -> None
 
 
 def test_r2v_training_and_inference_positions_are_identical_at_24_fps() -> None:
+    canonical_timestamps = normalized_anchor_timestamps(
+        frame_count=121,
+        anchor_count=12,
+        device=torch.device("cpu"),
+    )
+    assert not torch.equal(canonical_timestamps, torch.linspace(0.0, 1.0, 12))
     training, inference = _prepare_training_and_inference_states(
         latent_frames=16,
         latent_height=15,
@@ -295,6 +303,31 @@ def test_inference_rejects_non_positive_or_non_finite_fps(fps: float) -> None:
             semantic_frame_count=1,
             pixel_frame_count=1,
             fps=fps,
+            seed=7,
+        )
+
+
+@pytest.mark.parametrize(
+    ("semantic_frame_count", "pixel_frame_count", "message"),
+    [
+        (1, 0, "pixel_frame_count must be positive"),
+        (2, 1, "semantic_frame_count cannot exceed pixel_frame_count"),
+    ],
+)
+def test_inference_rejects_invalid_pixel_anchor_geometry(
+    semantic_frame_count: int,
+    pixel_frame_count: int,
+    message: str,
+) -> None:
+    strategy = SemanticFlowStrategy(SemanticFlowConfig())
+    with pytest.raises(ValueError, match=message):
+        strategy.prepare_inference_state(
+            conditions={},
+            reference_latents={},
+            target_shape=VideoLatentShape(batch=1, channels=128, frames=1, height=15, width=26),
+            semantic_frame_count=semantic_frame_count,
+            pixel_frame_count=pixel_frame_count,
+            fps=1.0,
             seed=7,
         )
 
