@@ -74,6 +74,7 @@ def validate_locked_gpu_hardware(
 def build_semantic_flow_runtime_lock(
     runtime_report: dict[str, Any],
     fsdp_smoke_result: dict[str, Any],
+    accelerate_prepare_smoke_result: dict[str, Any],
 ) -> dict[str, Any]:
     if runtime_report.get("ready") is not True:
         raise SemanticFlowRuntimeLockError("Cannot lock a runtime whose capability audit did not pass")
@@ -81,6 +82,12 @@ def build_semantic_flow_runtime_lock(
         raise SemanticFlowRuntimeLockError("Tiny FSDP checkpoint smoke must run with exactly two processes")
     if float(fsdp_smoke_result.get("max_abs_tensor_diff_after_reload", float("inf"))) != 0.0:
         raise SemanticFlowRuntimeLockError("Tiny FSDP checkpoint smoke did not reload tensors exactly")
+    if accelerate_prepare_smoke_result.get("world_size") != 2:
+        raise SemanticFlowRuntimeLockError("Accelerate multi-model prepare smoke must run with exactly two processes")
+    if accelerate_prepare_smoke_result.get("accelerator_multimodel_prepare_passed") is not True:
+        raise SemanticFlowRuntimeLockError("Accelerate multi-model prepare smoke did not pass")
+    if accelerate_prepare_smoke_result.get("all_trainable_modules_have_finite_gradients") is not True:
+        raise SemanticFlowRuntimeLockError("Accelerate multi-model prepare smoke did not validate all gradients")
 
     torch_runtime = runtime_report.get("torch_runtime") or {}
     gemma = runtime_report.get("gemma") or {}
@@ -118,6 +125,7 @@ def build_semantic_flow_runtime_lock(
         "state_dict_type": accelerate_capability.get("state_dict_type"),
         "checkpoint_roundtrip_world_size": 2,
         "checkpoint_roundtrip_max_abs_tensor_diff": 0.0,
+        "accelerator_multimodel_prepare_passed": True,
         "gpu_count": num_processes,
         **selected_hardware,
     }

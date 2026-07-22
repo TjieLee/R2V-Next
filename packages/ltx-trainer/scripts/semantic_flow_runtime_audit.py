@@ -238,6 +238,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--runtime-lock", type=Path)
     parser.add_argument("--fsdp-smoke-result", type=Path)
+    parser.add_argument("--accelerate-prepare-smoke-result", type=Path)
     parser.add_argument("--refresh-runtime-lock", action="store_true")
     args = parser.parse_args()
 
@@ -296,12 +297,22 @@ def main() -> None:
         try:
             if args.fsdp_smoke_result is None:
                 raise ValueError("--runtime-lock requires --fsdp-smoke-result")
+            if args.accelerate_prepare_smoke_result is None:
+                raise ValueError("--runtime-lock requires --accelerate-prepare-smoke-result")
             smoke_path = args.fsdp_smoke_result.expanduser().resolve()
             smoke_result = json.loads(smoke_path.read_text(encoding="utf-8"))
             if not isinstance(smoke_result, dict):
                 raise ValueError(f"FSDP smoke result must be a JSON object: {smoke_path}")
+            accelerate_smoke_path = args.accelerate_prepare_smoke_result.expanduser().resolve()
+            accelerate_smoke_result = json.loads(accelerate_smoke_path.read_text(encoding="utf-8"))
+            if not isinstance(accelerate_smoke_result, dict):
+                raise ValueError(f"Accelerate smoke result must be a JSON object: {accelerate_smoke_path}")
             report["ready"] = not errors
-            runtime_lock = build_semantic_flow_runtime_lock(report, smoke_result)
+            runtime_lock = build_semantic_flow_runtime_lock(
+                report,
+                smoke_result,
+                accelerate_smoke_result,
+            )
             lock_path = assert_write_path_allowed(args.runtime_lock)
             action = write_or_validate_semantic_flow_runtime_lock(
                 lock_path,

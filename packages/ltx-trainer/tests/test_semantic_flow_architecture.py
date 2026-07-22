@@ -890,7 +890,12 @@ def test_semantic_flow_runtime_lock_requires_exact_environment_and_fsdp_roundtri
         },
     }
     fsdp_result = {"world_size": 2, "max_abs_tensor_diff_after_reload": 0.0}
-    current = build_semantic_flow_runtime_lock(report, fsdp_result)
+    accelerate_result = {
+        "world_size": 2,
+        "accelerator_multimodel_prepare_passed": True,
+        "all_trainable_modules_have_finite_gradients": True,
+    }
+    current = build_semantic_flow_runtime_lock(report, fsdp_result, accelerate_result)
     assert current["gpu_count"] == 8
     assert current["gpu_models"] == ["NVIDIA H200"] * 8
     assert current["gpu_total_memory_bytes"] == [151_000_000_000] * 8
@@ -905,7 +910,33 @@ def test_semantic_flow_runtime_lock_requires_exact_environment_and_fsdp_roundtri
         write_or_validate_semantic_flow_runtime_lock(lock_path, changed, refresh=False)
 
     with pytest.raises(SemanticFlowRuntimeLockError, match="exactly two processes"):
-        build_semantic_flow_runtime_lock(report, {"world_size": 8, "max_abs_tensor_diff_after_reload": 0.0})
+        build_semantic_flow_runtime_lock(
+            report,
+            {"world_size": 8, "max_abs_tensor_diff_after_reload": 0.0},
+            accelerate_result,
+        )
+    with pytest.raises(SemanticFlowRuntimeLockError, match="multi-model prepare smoke did not pass"):
+        build_semantic_flow_runtime_lock(
+            report,
+            fsdp_result,
+            {**accelerate_result, "accelerator_multimodel_prepare_passed": False},
+        )
+
+
+def test_accelerate_multimodel_smoke_matches_trainer_prepare_order() -> None:
+    script = (
+        Path(__file__).resolve().parents[1] / "scripts" / "smoke_semantic_flow_accelerate_prepare.py"
+    ).read_text(encoding="utf-8")
+    expected_prepare = """accelerator.prepare(
+        transformer,
+        semantic_query,
+        semantic_encoder,
+        semantic_reconstruction_decoder,
+    )"""
+    assert expected_prepare in script
+    assert "class BasicAVTransformerBlock" in script
+    assert "accelerator.get_state_dict(module)" in script
+    assert '"accelerator_multimodel_prepare_passed": True' in script
 
 
 def test_runtime_lock_validates_selected_gpu_hardware_and_allows_extras() -> None:

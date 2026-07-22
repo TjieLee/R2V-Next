@@ -44,6 +44,8 @@ RUNTIME_LOCK="$R2V_ROOT/train/runtime_lock.json"
 SMOKE_SUCCESS_MARKER="$R2V_ROOT/train/semantic_flow_smoke_success.json"
 FSDP_SMOKE_ROOT="$SMOKE_ROOT/fsdp_checkpoint"
 FSDP_SMOKE_RESULT="$FSDP_SMOKE_ROOT/result.json"
+ACCELERATE_PREPARE_SMOKE_ROOT="$SMOKE_ROOT/accelerate_prepare"
+ACCELERATE_PREPARE_SMOKE_RESULT="$ACCELERATE_PREPARE_SMOKE_ROOT/result.json"
 
 semantic_flow_train_preflight() {
   local mode="$1"
@@ -228,6 +230,9 @@ case "${1:-}" in
     accelerate launch --config_file "$FSDP_SMOKE_ACCELERATE_CONFIG" \
       "$REPO_ROOT/packages/ltx-trainer/scripts/smoke_semantic_flow_fsdp_checkpoint.py" \
       --output-dir "$FSDP_SMOKE_ROOT"
+    accelerate launch --config_file "$FSDP_SMOKE_ACCELERATE_CONFIG" \
+      "$REPO_ROOT/packages/ltx-trainer/scripts/smoke_semantic_flow_accelerate_prepare.py" \
+      --output-dir "$ACCELERATE_PREPARE_SMOKE_ROOT"
     accelerate launch --config_file "$ACCELERATE_CONFIG" \
       "$REPO_ROOT/packages/ltx-trainer/scripts/check_multitask_online_distributed.py" \
       --config "$TRAIN_CONFIG" \
@@ -272,6 +277,7 @@ case "${1:-}" in
       --output "$RUNTIME_AUDIT" \
       --runtime-lock "$RUNTIME_LOCK" \
       --fsdp-smoke-result "$FSDP_SMOKE_RESULT" \
+      --accelerate-prepare-smoke-result "$ACCELERATE_PREPARE_SMOKE_RESULT" \
       --refresh-runtime-lock
     CODE_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD)"
     python3 "$REPO_ROOT/packages/ltx-trainer/scripts/semantic_flow_smoke_marker.py" write \
@@ -315,7 +321,8 @@ case "${1:-}" in
       --accelerate-config "$ACCELERATE_CONFIG" \
       --output "$TRAIN_RUNTIME_AUDIT" \
       --runtime-lock "$RUNTIME_LOCK" \
-      --fsdp-smoke-result "$FSDP_SMOKE_RESULT"
+      --fsdp-smoke-result "$FSDP_SMOKE_RESULT" \
+      --accelerate-prepare-smoke-result "$ACCELERATE_PREPARE_SMOKE_RESULT"
     accelerate launch --config_file "$ACCELERATE_CONFIG" \
       "$REPO_ROOT/packages/ltx-trainer/scripts/train.py" \
       "$TRAIN_CONFIG"
