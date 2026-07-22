@@ -3,11 +3,11 @@ from typing import Annotated, Literal, Union
 
 from pydantic import BaseModel, ConfigDict, Discriminator, Field, Tag, ValidationInfo, field_validator, model_validator
 
+from ltx_trainer.online_data.transforms import OnlineAugmentationConfig
 from ltx_trainer.quantization import QuantizationOptions
 from ltx_trainer.training_strategies.base_strategy import TrainingStrategyConfigBase
 from ltx_trainer.training_strategies.flexible import FlexibleStrategyConfig
-from ltx_trainer.training_strategies.multi_reference_planner_stage2 import MultiReferencePlannerStage2Config
-from ltx_trainer.training_strategies.multi_reference_video import MultiReferenceVideoConfig
+from ltx_trainer.training_strategies.semantic_flow import SemanticFlowConfig
 from ltx_trainer.training_strategies.text_to_video import TextToVideoConfig
 from ltx_trainer.training_strategies.video_to_video import VideoToVideoConfig
 
@@ -312,7 +312,7 @@ class TextEncoderLoraConfig(ConfigBaseModel):
     dropout: float = Field(default=0.0, ge=0.0, le=1.0)
     target_modules: list[str] = Field(
         default=["q_proj", "k_proj", "v_proj", "o_proj"],
-        description="Gemma language-model modules targeted by the Stage 2 LoRA adapter.",
+        description="Gemma language-model modules targeted by the optional LoRA adapter.",
     )
 
 
@@ -327,8 +327,7 @@ def _get_strategy_discriminator(v: dict | TrainingStrategyConfigBase) -> str:
 TrainingStrategyConfig = Annotated[
     Annotated[TextToVideoConfig, Tag("text_to_video")]
     | Annotated[VideoToVideoConfig, Tag("video_to_video")]
-    | Annotated[MultiReferencePlannerStage2Config, Tag("multi_reference_planner_stage2")]
-    | Annotated[MultiReferenceVideoConfig, Tag("multi_reference_video")]
+    | Annotated[SemanticFlowConfig, Tag("semantic_flow")]
     | Annotated[FlexibleStrategyConfig, Tag("flexible")],
     Discriminator(_get_strategy_discriminator),
 ]
@@ -427,10 +426,9 @@ class OnlineEncodingConfig(ConfigBaseModel):
     image_fps: float = Field(default=1.0, gt=0.0)
     video_num_frames: int = Field(default=121, ge=1)
     video_fps: float = Field(default=24.0, gt=0.0)
-    vlm_video_frame_indices: list[int] = Field(default_factory=lambda: [0, 17, 34, 51, 69, 86, 103, 120])
-    visual_token_capacity: int = Field(default=2048, ge=1)
-    tokens_per_frame: int = Field(default=256, ge=1)
-    raw_visual_dim: int = Field(default=3840, ge=1)
+    anchor_frame_ratio: float = Field(default=0.10, gt=0.0, le=1.0)
+    vlm_prefix_max_length: int = Field(default=2560, ge=128, le=2560)
+    vlm_teacher_max_length: int = Field(default=6656, ge=448)
     encoder_dtype: Literal["bfloat16", "float16", "float32"] = "bfloat16"
     encoder_device_policy: Literal["resident_cuda", "sequential_cuda", "cpu_offload"] = "resident_cuda"
     vlm_reference_preprocess: Literal["original", "target_crop"] = "original"
@@ -439,12 +437,12 @@ class OnlineEncodingConfig(ConfigBaseModel):
     pin_memory: bool = True
     prefetch_factor: int = Field(default=2, ge=1)
     cpu_transform_chunk_frames: int = Field(default=4, ge=1, le=16)
-    planner_max_length: int = Field(default=4096, ge=2051)
     max_ref_images: int | None = Field(default=4, ge=1)
     image_ratio: float = Field(default=0.3, ge=0.0, le=1.0)
     video_ratio: float = Field(default=0.7, ge=0.0, le=1.0)
     runtime_max_retries: int = Field(default=8, ge=0)
     runtime_reject_log_dir: str | None = None
+    augmentation: OnlineAugmentationConfig = Field(default_factory=OnlineAugmentationConfig)
 
     @model_validator(mode="after")
     def validate_online_contract(self) -> "OnlineEncodingConfig":
@@ -454,12 +452,12 @@ class OnlineEncodingConfig(ConfigBaseModel):
             raise ValueError("Online I2I requires image_num_frames=1 and image_fps=1.0")
         if self.video_num_frames != 121 or self.video_num_frames % 8 != 1 or self.video_fps != 24.0:
             raise ValueError("Online R2V requires video_num_frames=121, frames % 8 == 1, and video_fps=24.0")
-        if self.vlm_video_frame_indices != [0, 17, 34, 51, 69, 86, 103, 120]:
-            raise ValueError("Online 121-frame training requires fixed VLM indices [0,17,34,51,69,86,103,120]")
-        if self.visual_token_capacity != 2048 or self.tokens_per_frame != 256:
-            raise ValueError("Online full-token training requires visual_token_capacity=2048 and tokens_per_frame=256")
-        if self.raw_visual_dim != 3840:
-            raise ValueError("Online SigLIP/projector tokens must use raw_visual_dim=3840")
+        if self.vlm_prefix_max_length > 2560:
+            raise ValueError("Online VLM prefix maximum cannot exceed 2560")
+        if self.vlm_teacher_max_length < self.vlm_prefix_max_length + 320:
+            raise ValueError("Online VLM teacher maximum must leave room for one evidence/query frame")
+        if not 0.0 < self.anchor_frame_ratio <= 1.0:
+            raise ValueError("anchor_frame_ratio must be in (0,1]")
         if self.encoder_device_policy != "resident_cuda":
             raise ValueError(
                 "Only encoder_device_policy='resident_cuda' is currently implemented end to end; "
@@ -467,6 +465,7 @@ class OnlineEncodingConfig(ConfigBaseModel):
             )
         if abs(self.image_ratio + self.video_ratio - 1.0) > 1.0e-8:
             raise ValueError("image_ratio and video_ratio must sum to 1.0")
+        self.augmentation.validate()
         return self
 
 
@@ -805,26 +804,6 @@ class CheckpointsConfig(ConfigBaseModel):
         "'off': nothing saved, resume not possible.",
     )
 
-    allow_warm_resume_without_optimizer: bool = Field(
-        default=False,
-        description="Allow an explicit warm resume from minimal Stage 3 state. "
-        "Optimizer moments are reset while scheduler/RNG/step are restored.",
-    )
-
-    def validate_stage3_resume_mode(self) -> None:
-        """Require exact optimizer state unless warm resume is explicitly requested."""
-        if self.no_resume or self.save_training_state == "full":
-            return
-        if self.save_training_state == "minimal" and self.allow_warm_resume_without_optimizer:
-            return
-        if self.save_training_state == "minimal":
-            raise ValueError(
-                "Exact Stage 3 resume requires save_training_state='full'. "
-                "Set allow_warm_resume_without_optimizer=true only when intentionally "
-                "restarting Adam moments from the loaded model weights."
-            )
-        raise ValueError("Stage 3 resume requires save_training_state='full' or an explicitly allowed warm resume")
-
 
 class HubConfig(ConfigBaseModel):
     """Configuration for Hugging Face Hub integration"""
@@ -971,41 +950,23 @@ class LtxTrainerConfig(ConfigBaseModel):
         if self.training_strategy.name == "video_to_video" and self.model.training_mode != "lora":
             raise ValueError("Training mode must be 'lora' when using video_to_video strategy")
 
-        if self.training_strategy.name == "multi_reference_planner_stage2":
-            training_phase = self.training_strategy.training_phase
-            if self.model.training_mode != "lora" or self.lora is None:
-                raise ValueError(f"{training_phase} requires the Stage 1 DiT LoRA configuration")
-            if self.lora.rank != 128 or self.lora.alpha != 128:
-                raise ValueError(f"{training_phase} DiT LoRA must match Stage 1 rank=128, alpha=128")
-            required_dit_targets = {
-                "attn1.to_k",
-                "attn1.to_q",
-                "attn1.to_v",
-                "attn1.to_out.0",
-                "attn2.to_k",
-                "attn2.to_q",
-                "attn2.to_v",
-                "attn2.to_out.0",
-                "ff.net.0.proj",
-                "ff.net.2",
-            }
-            if set(self.lora.target_modules) != required_dit_targets:
-                raise ValueError(
-                    f"{training_phase} DiT LoRA target_modules must exactly match the Stage 1 full-token config"
-                )
-            if not self.text_encoder_lora.enabled or self.text_encoder_lora.rank != 16:
-                raise ValueError(f"{training_phase} requires text_encoder_lora.enabled=true with rank=16")
-            if self.text_encoder_lora.alpha != 16 or set(self.text_encoder_lora.target_modules) != {
-                "q_proj",
-                "k_proj",
-                "v_proj",
-                "o_proj",
-            }:
-                raise ValueError(f"{training_phase} Gemma LoRA must use alpha=16 and q/k/v/o projections")
-            if self.model.load_checkpoint is None:
-                source = "merged Stage 2 checkpoint" if training_phase == "stage3" else "Stage 1 checkpoint"
-                raise ValueError(f"{training_phase} requires model.load_checkpoint pointing to the {source}")
-            if training_phase == "stage3":
-                self.checkpoints.validate_stage3_resume_mode()
+        if self.training_strategy.name == "semantic_flow":
+            if self.model.training_mode != "full":
+                raise ValueError("semantic_flow requires full DiT training; LoRA is forbidden")
+            if self.lora is not None:
+                raise ValueError("semantic_flow must not configure DiT LoRA")
+            if self.text_encoder_lora.enabled:
+                raise ValueError("semantic_flow keeps Gemma frozen and forbids text-encoder LoRA")
+            if self.data.encoding_mode != "online":
+                raise ValueError("semantic_flow requires online raw-media encoding for the GT teacher")
+            online = self.data.online_encoding
+            if online is None:
+                raise ValueError("semantic_flow requires data.online_encoding")
+            if online.vlm_prefix_max_length != self.training_strategy.vlm_prefix_max_length:
+                raise ValueError("online and semantic_flow vlm_prefix_max_length values must match")
+            if online.vlm_teacher_max_length != self.training_strategy.vlm_teacher_max_length:
+                raise ValueError("online and semantic_flow vlm_teacher_max_length values must match")
+            if online.anchor_frame_ratio != self.training_strategy.anchor_frame_ratio:
+                raise ValueError("online and semantic_flow anchor_frame_ratio values must match")
 
         return self

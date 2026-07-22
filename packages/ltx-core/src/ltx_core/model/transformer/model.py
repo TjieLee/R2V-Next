@@ -1,4 +1,5 @@
 import logging
+from dataclasses import replace
 from enum import Enum
 
 import torch
@@ -142,6 +143,13 @@ class LTXModel(torch.nn.Module):
         # wrap (not replace) this with a processor that also marks the seq dim
         # dynamic, so any caller customisation here is preserved as the inner.
         self.block_input_processor = BlockPerturbationsProcessor()
+        self.semantic_token_type_embedding: torch.nn.Embedding | None = None
+        self.semantic_entity_embedding: torch.nn.Embedding | None = None
+        self.semantic_position_adapter: torch.nn.Module | None = None
+        self.semantic_norm_out: torch.nn.RMSNorm | None = None
+        self.semantic_proj_out: torch.nn.Linear | None = None
+        self.semantic_token_type_id: int | None = None
+        self.reference_token_type_id: int | None = None
 
     @property
     def _adaln_embedding_coefficient(self) -> int:
@@ -359,6 +367,75 @@ class LTXModel(torch.nn.Module):
         """
         self._enable_gradient_checkpointing = enable
 
+    def enable_semantic_flow_conditioning(
+        self,
+        *,
+        semantic_dim: int,
+        num_token_types: int = 3,
+        num_entities: int = 5,
+        semantic_token_type_id: int = 1,
+        reference_token_type_id: int = 0,
+    ) -> None:
+        """Install trainable token metadata adapters and the semantic flow head."""
+        if semantic_dim != self.patchify_proj.in_features:
+            raise ValueError(
+                f"semantic_dim={semantic_dim} must match video input token dim={self.patchify_proj.in_features}"
+            )
+        if self.semantic_proj_out is not None:
+            if self.semantic_proj_out.out_features != semantic_dim:
+                raise ValueError("semantic flow conditioning was already initialized with a different dimension")
+            return
+        parameter = next(self.parameters())
+        device, dtype = parameter.device, parameter.dtype
+        self.semantic_token_type_embedding = torch.nn.Embedding(num_token_types, self.inner_dim).to(
+            device=device, dtype=dtype
+        )
+        self.semantic_entity_embedding = torch.nn.Embedding(num_entities, self.inner_dim).to(device=device, dtype=dtype)
+        self.semantic_position_adapter = torch.nn.Sequential(
+            torch.nn.Linear(6, self.inner_dim),
+            torch.nn.SiLU(),
+            torch.nn.Linear(self.inner_dim, self.inner_dim),
+        ).to(device=device, dtype=dtype)
+        self.semantic_norm_out = torch.nn.RMSNorm(self.inner_dim, elementwise_affine=True).to(
+            device=device, dtype=dtype
+        )
+        self.semantic_proj_out = torch.nn.Linear(self.inner_dim, semantic_dim).to(device=device, dtype=dtype)
+        self.semantic_token_type_id = int(semantic_token_type_id)
+        torch.nn.init.zeros_(self.semantic_token_type_embedding.weight)
+        self.reference_token_type_id = int(reference_token_type_id)
+        torch.nn.init.zeros_(self.semantic_entity_embedding.weight)
+        torch.nn.init.normal_(self.semantic_position_adapter[0].weight, std=1.0e-4)
+        torch.nn.init.zeros_(self.semantic_position_adapter[0].bias)
+        torch.nn.init.zeros_(self.semantic_position_adapter[2].weight)
+        torch.nn.init.zeros_(self.semantic_position_adapter[2].bias)
+
+    def _apply_video_token_metadata(self, video_args: TransformerArgs, video: Modality) -> TransformerArgs:
+        x = video_args.x
+        if video.token_type_ids is not None:
+            if self.semantic_token_type_embedding is None:
+                raise RuntimeError("token_type_ids require semantic flow conditioning to be initialized")
+            x = x + self.semantic_token_type_embedding(video.token_type_ids).to(dtype=x.dtype)
+        if video.entity_ids is not None:
+            if self.semantic_entity_embedding is None:
+                raise RuntimeError("entity_ids require semantic flow conditioning to be initialized")
+            x = x + self.semantic_entity_embedding(video.entity_ids).to(dtype=x.dtype)
+        if video.semantic_position_bounds is not None:
+            if self.semantic_position_adapter is None or self.semantic_token_type_id is None:
+                raise RuntimeError("semantic_position_bounds require semantic flow conditioning to be initialized")
+            if video.semantic_position_bounds.shape != (*x.shape[:2], 6):
+                raise ValueError(
+                    "semantic_position_bounds must be [B,T,6], got "
+                    f"{tuple(video.semantic_position_bounds.shape)} for hidden {tuple(x.shape)}"
+                )
+            semantic_position = self.semantic_position_adapter(
+                video.semantic_position_bounds.to(device=x.device, dtype=x.dtype)
+            )
+            if video.token_type_ids is None:
+                raise ValueError("semantic_position_bounds require token_type_ids")
+            semantic_mask = (video.token_type_ids == self.semantic_token_type_id).unsqueeze(-1)
+            x = x + semantic_position * semantic_mask.to(dtype=x.dtype)
+        return replace(video_args, x=x)
+
     def _process_transformer_blocks(
         self,
         video: TransformerArgs | None,
@@ -438,6 +515,8 @@ class LTXModel(torch.nn.Module):
             raise ValueError("Audio is not enabled for this model")
 
         video_args = self.video_args_preprocessor.prepare(video, audio) if video is not None else None
+        if video_args is not None and video is not None:
+            video_args = self._apply_video_token_metadata(video_args, video)
         audio_args = self.audio_args_preprocessor.prepare(audio, video) if audio is not None else None
         # Process transformer blocks
         video_out, audio_out = self._process_transformer_blocks(
@@ -447,13 +526,24 @@ class LTXModel(torch.nn.Module):
         )
 
         # Process output
-        vx = (
-            self._process_output(
+        vx = None
+        if video_out is not None:
+            vx = self._process_output(
                 self.scale_shift_table, self.norm_out, self.proj_out, video_out.x, video_out.embedded_timestep
             )
-            if video_out is not None
-            else None
-        )
+            if (
+                video is not None
+                and video.token_type_ids is not None
+                and self.semantic_norm_out is not None
+                and self.semantic_proj_out is not None
+                and self.semantic_token_type_id is not None
+            ):
+                semantic_velocity = self.semantic_proj_out(self.semantic_norm_out(video_out.x))
+                semantic_mask = (video.token_type_ids == self.semantic_token_type_id).unsqueeze(-1)
+                vx = torch.where(semantic_mask, semantic_velocity, vx)
+                if self.reference_token_type_id is not None:
+                    reference_mask = (video.token_type_ids == self.reference_token_type_id).unsqueeze(-1)
+                    vx = torch.where(reference_mask, torch.zeros_like(vx), vx)
         ax = (
             self._process_output(
                 self.audio_scale_shift_table,

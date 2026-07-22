@@ -74,16 +74,6 @@ StepCallback = Callable[[int, int, list[Path]], None]  # (step, total, list[samp
 
 MEMORY_CHECK_INTERVAL = 200
 
-_STAGE3_CHECKPOINT_REQUIRED_PREFIXES = (
-    "diffusion_model.",
-    "training_strategy.planner_tokens.",
-    "training_strategy.visual_token_projection.",
-    "training_strategy.visual_full_encoder.",
-    "embeddings_processor.video_connector.",
-    "text_encoder.model.model.language_model.",
-)
-
-
 def normalize_peft_adapter_key(key: str) -> str:
     """Normalize PEFT adapter keys across saved and in-memory naming variants."""
     normalized = key
@@ -187,8 +177,6 @@ class LtxvTrainer:
         self._init_optimizer()
 
         if training_state is not None and not self._restore_training_state(training_state):
-            if self._is_strict_stage3_resume():
-                raise RuntimeError("Failed to restore the Stage 3 training state")
             initial_step = 0
             resuming = False
 
@@ -397,14 +385,15 @@ class LtxvTrainer:
                             total_time = f"{total_estimated // 3600:.0f}h {(total_estimated % 3600) // 60:.0f}m"
                         else:
                             total_time = "calculating..."
-                        flow_text = self._format_optional_metric(strategy_metrics, "train/loss_flow")
-                        siglip_text = self._format_optional_metric(strategy_metrics, "train/loss_siglip")
-                        ntp_text = self._format_optional_metric(strategy_metrics, "train/loss_ntp")
-                        cosine_text = self._format_optional_metric(strategy_metrics, "train/siglip_cosine")
+                        video_text = self._format_optional_metric(strategy_metrics, "train/loss_video_flow")
+                        semantic_text = self._format_optional_metric(strategy_metrics, "train/loss_semantic_flow")
+                        reconstruction_text = self._format_optional_metric(
+                            strategy_metrics, "train/loss_semantic_reconstruction"
+                        )
                         logger.info(
                             f"Step {self._global_step}/{cfg.optimization.steps} - "
-                            f"Total: {step_loss:.4f}, Flow: {flow_text}, SigLIP: {siglip_text}, "
-                            f"NTP: {ntp_text}, SigLIP cosine: {cosine_text}, LR: {current_lr:.2e}, "
+                            f"Total: {step_loss:.4f}, Video flow: {video_text}, Semantic flow: {semantic_text}, "
+                            f"Reconstruction: {reconstruction_text}, LR: {current_lr:.2e}, "
                             f"Time/Step: {step_time:.2f}s, Total Time: {total_time}",
                         )
 
@@ -480,17 +469,12 @@ class LtxvTrainer:
         """Perform the full training step inside the caller's autocast context."""
         # Apply embedding connectors to transform pre-computed text embeddings
         conditions = batch["conditions"]
-        planner_started = time.perf_counter()
+        condition_started = time.perf_counter()
         conditions = self._training_strategy.prepare_conditions(batch, conditions)
         if self._config.data.encoding_mode == "online":
             online_metrics = batch.setdefault("_online_metrics", {})
-            condition_prepare_ms = (time.perf_counter() - planner_started) * 1000.0
+            condition_prepare_ms = (time.perf_counter() - condition_started) * 1000.0
             online_metrics["condition_prepare_ms"] = condition_prepare_ms
-            if getattr(self._training_strategy.config, "name", "") == "multi_reference_planner_stage2":
-                online_metrics["planner_forward_ms"] = condition_prepare_ms
-                online_metrics["vlm_planner_ms"] = float(
-                    online_metrics.get("vlm_planner_ms", 0.0)
-                ) + condition_prepare_ms
         batch["conditions"] = conditions
 
         if "video_prompt_embeds" in conditions:
@@ -537,7 +521,7 @@ class LtxvTrainer:
                     "task_id": 0.0 if task == "i2i" else 1.0,
                     "is_image": 1.0 if task == "i2i" else 0.0,
                     "target_num_frames": 1.0 if task == "i2i" else 121.0,
-                    "valid_visual_tokens": 256.0 if task == "i2i" else 2048.0,
+                    "semantic_token_count": 64.0 if task == "i2i" else 768.0,
                 }
             )
 
@@ -692,7 +676,7 @@ class LtxvTrainer:
             raise ValueError("No trainable parameters were found for the selected training strategy.")
 
         logger.debug(f"Trainable params count: {sum(p.numel() for p in self._trainable_params):,}")
-        self._log_stage3_parameter_summary(strategy_modules)
+        self._log_parameter_summary(strategy_modules)
 
     @staticmethod
     def _deduplicate_parameters(parameters: list[Tensor]) -> list[Tensor]:
@@ -707,35 +691,18 @@ class LtxvTrainer:
                 unique.append(parameter)
         return unique
 
-    def _log_stage3_parameter_summary(self, strategy_modules: dict[str, torch.nn.Module]) -> None:
-        if getattr(self._training_strategy.config, "training_phase", "stage2") != "stage3":
-            return
-
+    def _log_parameter_summary(self, strategy_modules: dict[str, torch.nn.Module]) -> None:
+        """Log the full-rank/adapter and frozen parameter ownership clearly."""
         count = lambda parameters: sum(parameter.numel() for parameter in parameters)  # noqa: E731
-        dit_lora = [
-            parameter
-            for name, parameter in self._transformer.named_parameters()
-            if parameter.requires_grad and "lora_" in name
-        ]
-        frozen_dit = [
-            parameter
-            for name, parameter in self._transformer.named_parameters()
-            if not parameter.requires_grad and "lora_" not in name
-        ]
-        gemma_lora = []
-        frozen_gemma_base = []
+        trainable_dit = [parameter for parameter in self._transformer.parameters() if parameter.requires_grad]
+        frozen_dit = [parameter for parameter in self._transformer.parameters() if not parameter.requires_grad]
+        frozen_gemma = []
         frozen_vision_projector = []
         if self._text_encoder is not None:
-            gemma_lora = [
-                parameter
-                for name, parameter in self._text_encoder.named_parameters()
-                if parameter.requires_grad and "lora_" in name
-            ]
-            frozen_gemma_base = [
+            frozen_gemma = [
                 parameter
                 for name, parameter in self._text_encoder.named_parameters()
                 if not parameter.requires_grad
-                and "lora_" not in name
                 and "vision_tower" not in name
                 and "multi_modal_projector" not in name
             ]
@@ -745,26 +712,14 @@ class LtxvTrainer:
                 if not parameter.requires_grad
                 and ("vision_tower" in name or "multi_modal_projector" in name)
             ]
-        connector_params = [
-            parameter
-            for parameter in self._embeddings_processor.video_connector.parameters()
-            if parameter.requires_grad
-        ]
-        logger.info(f"Stage 3 trainable DiT LoRA params: {count(dit_lora):,}")
-        logger.info(f"Stage 3 trainable Gemma LoRA params: {count(gemma_lora):,}")
-        logger.info(f"Stage 3 trainable planner params: {count(strategy_modules['planner_tokens'].parameters()):,}")
-        logger.info(
-            "Stage 3 trainable visual projection params: "
-            f"{count(strategy_modules['visual_token_projection'].parameters()):,}"
-        )
-        logger.info(
-            "Stage 3 trainable visual encoder params: "
-            f"{count(strategy_modules['visual_full_encoder'].parameters()):,}"
-        )
-        logger.info(f"Stage 3 trainable text connector params: {count(connector_params):,}")
-        logger.info(f"Stage 3 total trainable params: {count(self._trainable_params):,}")
+        connector_trainable = [p for p in self._embeddings_processor.video_connector.parameters() if p.requires_grad]
+        logger.info(f"Trainable DiT params: {count(trainable_dit):,}")
+        for module_name, module in sorted(strategy_modules.items()):
+            logger.info(f"Trainable strategy module {module_name}: {count(module.parameters()):,}")
+        logger.info(f"Trainable text connector params: {count(connector_trainable):,}")
+        logger.info(f"Total trainable params: {count(self._trainable_params):,}")
         logger.info(f"Frozen base DiT params: {count(frozen_dit):,}")
-        logger.info(f"Frozen Gemma base params: {count(frozen_gemma_base):,}")
+        logger.info(f"Frozen Gemma params: {count(frozen_gemma):,}")
         logger.info(f"Frozen vision/projector params: {count(frozen_vision_projector):,}")
 
     def _init_timestep_sampler(self) -> None:
@@ -959,7 +914,7 @@ class LtxvTrainer:
         label: str,
     ) -> None:
         if not checkpoint_state:
-            raise RuntimeError(f"Stage 3 checkpoint is missing {label}")
+            raise RuntimeError(f"Checkpoint is missing {label}")
         expected_state = module.state_dict()
         missing = sorted(set(expected_state) - set(checkpoint_state))
         unexpected = sorted(set(checkpoint_state) - set(expected_state))
@@ -1023,22 +978,14 @@ class LtxvTrainer:
             logger.info("No LoRA weights found in checkpoint; loaded auxiliary weights only")
             return
 
-        if self._is_stage3_phase():
-            self._strict_load_peft_adapter_state(
-                self._transformer,
-                state_dict,
-                label="Stage 1 DiT LoRA",
-            )
-        else:
-            # Older strategies retain their permissive PEFT loading behavior.
-            base_model = self._transformer.get_base_model()
-            try:
-                set_peft_model_state_dict(base_model, state_dict)
-            except RuntimeError as exc:
-                raise RuntimeError(
-                    "LoRA config does not match checkpoint. Use the original training config or matching "
-                    "rank/target_modules."
-                ) from exc
+        base_model = self._transformer.get_base_model()
+        try:
+            set_peft_model_state_dict(base_model, state_dict)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "LoRA config does not match checkpoint. Use the original training config or matching "
+                "rank/target_modules."
+            ) from exc
 
         logger.info("✅ LoRA checkpoint loaded successfully")
 
@@ -1054,10 +1001,6 @@ class LtxvTrainer:
 
     def _load_auxiliary_checkpoint_state(self, state_dict: dict[str, Tensor]) -> None:
         self._training_strategy.load_extra_checkpoint_state_dict(state_dict)
-
-        if self._is_stage3_phase():
-            self._load_stage3_auxiliary_checkpoint_state(state_dict)
-            return
 
         processor_state = {
             key.removeprefix("embeddings_processor."): value
@@ -1090,7 +1033,7 @@ class LtxvTrainer:
                     logger.debug(f"Unexpected text encoder keys while loading auxiliary checkpoint: {unexpected}")
                 logger.info("✅ Text encoder checkpoint loaded successfully")
 
-    def _load_stage3_auxiliary_checkpoint_state(self, state_dict: dict[str, Tensor]) -> None:
+    def _load_legacy_auxiliary_checkpoint_state(self, state_dict: dict[str, Tensor]) -> None:
         connector_prefix = "embeddings_processor.video_connector."
         connector_state = {
             key.removeprefix(connector_prefix): value
@@ -1111,30 +1054,30 @@ class LtxvTrainer:
             if key.startswith(gemma_prefix)
         }
         if self._text_encoder is None:
-            raise RuntimeError("Stage 3 checkpoint contains Gemma LoRA weights but no text encoder is loaded")
+            raise RuntimeError("Legacy checkpoint contains Gemma LoRA weights but no text encoder is loaded")
         get_language_model = getattr(self._training_strategy, "_get_language_model", None)
         if not callable(get_language_model):
-            raise RuntimeError("Stage 3 strategy does not expose its Gemma PEFT language model")
+            raise RuntimeError("Legacy strategy does not expose its Gemma PEFT language model")
         self._strict_load_peft_adapter_state(
             get_language_model(),
             gemma_adapter_state,
-            label="Stage 2 Gemma LoRA",
+            label="legacy Gemma LoRA",
         )
         logger.info("✅ Complete Gemma LoRA checkpoint loaded successfully")
 
-    def _is_stage3_phase(self) -> bool:
+    def _is_legacy_phase(self) -> bool:
         strategy_config = getattr(self._training_strategy, "config", None)
-        return getattr(strategy_config, "training_phase", None) == "stage3"
+        return getattr(strategy_config, "legacy_phase", None) is not None
 
-    def _is_strict_stage3_resume(self) -> bool:
-        return self._is_stage3_phase() and not self._config.checkpoints.no_resume
+    def _is_strict_legacy_resume(self) -> bool:
+        return self._is_legacy_phase() and not self._config.checkpoints.no_resume
 
-    def _is_warm_stage3_resume(self) -> bool:
+    def _is_warm_legacy_resume(self) -> bool:
         checkpoints = self._config.checkpoints
         return (
-            self._is_strict_stage3_resume()
+            self._is_strict_legacy_resume()
             and checkpoints.save_training_state == "minimal"
-            and checkpoints.allow_warm_resume_without_optimizer
+            and getattr(checkpoints, "allow_legacy_warm_resume", False)
         )
 
     def _resolve_resume_state(self) -> tuple[int, TrainingState | None]:
@@ -1145,22 +1088,22 @@ class LtxvTrainer:
         if self._config.checkpoints.no_resume or self._loaded_checkpoint_path is None:
             return 0, None
 
-        strict_stage3_resume = self._is_strict_stage3_resume()
+        strict_legacy_resume = self._is_strict_legacy_resume()
         checkpoint_metadata: dict[str, str] | None = None
-        if strict_stage3_resume:
+        if strict_legacy_resume:
             checkpoint_metadata = self._read_safetensors_metadata(self._loaded_checkpoint_path)
-            if checkpoint_metadata.get("training_phase") != "stage3":
-                raise RuntimeError(self._stage3_resume_error_message())
+            if checkpoint_metadata.get("legacy_phase") is None:
+                raise RuntimeError(self._legacy_resume_error_message())
 
         state = self._load_training_state(self._loaded_checkpoint_path)
         if state is None:
-            if strict_stage3_resume:
-                raise RuntimeError(self._stage3_resume_error_message())
+            if strict_legacy_resume:
+                raise RuntimeError(self._legacy_resume_error_message())
             return 0, None
 
-        if strict_stage3_resume:
+        if strict_legacy_resume:
             assert checkpoint_metadata is not None
-            self._validate_stage3_resume_state(
+            self._validate_legacy_resume_state(
                 checkpoint_path=self._loaded_checkpoint_path,
                 metadata=checkpoint_metadata,
                 state=state,
@@ -1183,9 +1126,9 @@ class LtxvTrainer:
         ):
             mismatches.append(f"lora_rank: {fp.lora_rank} → {cfg.lora.rank}")
         if mismatches:
-            if strict_stage3_resume:
+            if strict_legacy_resume:
                 raise RuntimeError(
-                    f"Stage 3 training state config mismatch: {', '.join(mismatches)}"
+                    f"Legacy training state config mismatch: {', '.join(mismatches)}"
                 )
             logger.warning(
                 f"⚠️ Training state config mismatch ({', '.join(mismatches)}). "
@@ -1194,18 +1137,18 @@ class LtxvTrainer:
             return 0, None
 
         if state.global_step < 0:
-            if strict_stage3_resume:
-                raise RuntimeError(f"Stage 3 training state has invalid global_step={state.global_step!r}")
+            if strict_legacy_resume:
+                raise RuntimeError(f"Legacy training state has invalid global_step={state.global_step!r}")
             logger.warning(
                 f"⚠️ Training state has invalid global_step={state.global_step!r}. Starting from step 0."
             )
             return 0, None
-        if self._is_warm_stage3_resume():
-            logger.warning("Warm Stage 3 resume: optimizer moments are reset.")
+        if self._is_warm_legacy_resume():
+            logger.warning("Warm legacy resume: optimizer moments are reset.")
         logger.info(f"📌 Resuming from step {state.global_step}")
         return state.global_step, state
 
-    def _validate_stage3_resume_state(
+    def _validate_legacy_resume_state(
         self,
         *,
         checkpoint_path: Path,
@@ -1214,49 +1157,49 @@ class LtxvTrainer:
     ) -> None:
         filename_step = self._checkpoint_step(checkpoint_path)
         if filename_step is None:
-            raise RuntimeError(f"Cannot parse Stage 3 resume step from checkpoint filename: {checkpoint_path.name}")
+            raise RuntimeError(f"Cannot parse legacy resume step from checkpoint filename: {checkpoint_path.name}")
         metadata_step_raw = metadata.get("global_step")
         if metadata_step_raw is None:
             raise RuntimeError(
-                "Stage 3 checkpoint metadata is missing global_step. "
+                "Legacy checkpoint metadata is missing global_step. "
                 "This checkpoint predates strict resume metadata; migrate it by re-saving it with the updated trainer."
             )
         try:
             metadata_step = int(metadata_step_raw)
         except (TypeError, ValueError) as exc:
-            raise RuntimeError(f"Invalid Stage 3 checkpoint metadata global_step={metadata_step_raw!r}") from exc
+            raise RuntimeError(f"Invalid legacy checkpoint metadata global_step={metadata_step_raw!r}") from exc
 
         state_step = state.global_step
         if filename_step != metadata_step or filename_step != state_step:
             raise RuntimeError(
-                "Stage 3 resume step mismatch:\n"
+                "Legacy resume step mismatch:\n"
                 f"filename={filename_step}, metadata={metadata_step}, training_state={state_step}"
             )
         if state_step < 0:
-            raise RuntimeError(f"Stage 3 resume global_step must be non-negative, got {state_step}")
+            raise RuntimeError(f"Legacy resume global_step must be non-negative, got {state_step}")
         if state_step >= self._config.optimization.steps:
             raise RuntimeError(
-                f"Stage 3 resume global_step={state_step} must be less than "
+                f"Legacy resume global_step={state_step} must be less than "
                 f"optimization.steps={self._config.optimization.steps}"
             )
 
         scheduler_state = state.lr_scheduler_state_dict
         if self._config.optimization.scheduler_type != "constant":
             if scheduler_state is None:
-                raise RuntimeError("Stage 3 resume is missing LR scheduler state")
+                raise RuntimeError("Legacy resume is missing LR scheduler state")
             scheduler_last_epoch = scheduler_state.get("last_epoch")
             if scheduler_last_epoch is None:
-                raise RuntimeError("Stage 3 LR scheduler state is missing last_epoch")
+                raise RuntimeError("Legacy LR scheduler state is missing last_epoch")
             expected_scheduler_last_epoch = state_step
             if int(scheduler_last_epoch) != expected_scheduler_last_epoch:
                 raise RuntimeError(
-                    "Stage 3 scheduler/global_step mismatch: "
+                    "Legacy scheduler/global_step mismatch: "
                     f"last_epoch={scheduler_last_epoch}, global_step={state_step}, "
                     f"expected_last_epoch={expected_scheduler_last_epoch}"
                 )
 
-        if not self._is_warm_stage3_resume() and state.optimizer_state_dict is None:
-            raise RuntimeError("Exact Stage 3 resume requires optimizer state in the matching training state file")
+        if not self._is_warm_legacy_resume() and state.optimizer_state_dict is None:
+            raise RuntimeError("Exact legacy resume requires optimizer state in the matching training state file")
 
     @staticmethod
     def _checkpoint_step(path: Path) -> int | None:
@@ -1272,10 +1215,10 @@ class LtxvTrainer:
             raise RuntimeError(f"Could not read checkpoint metadata from {checkpoint_path}") from exc
 
     @staticmethod
-    def _stage3_resume_error_message() -> str:
+    def _legacy_resume_error_message() -> str:
         return (
-            "Stage 3 resume requires a Stage 3 checkpoint and matching training state. "
-            "Use no_resume=true when initializing from a Stage 2 checkpoint."
+            "Legacy resume requires a matching checkpoint and training state. "
+            "Use no_resume=true when initializing from weights only."
         )
 
     @staticmethod
@@ -1306,7 +1249,7 @@ class LtxvTrainer:
         Returns True if restore succeeded, False if it failed (caller should fall back to step 0).
         """
         try:
-            if training_state.optimizer_state_dict is not None and not self._is_warm_stage3_resume():
+            if training_state.optimizer_state_dict is not None:
                 self._optimizer.load_state_dict(training_state.optimizer_state_dict)
                 logger.debug("Restored optimizer state (full mode)")
 
@@ -1353,16 +1296,13 @@ class LtxvTrainer:
                 "Restored optimizer learning rates do not match scheduler learning rates: "
                 f"optimizer={optimizer_lrs}, scheduler={scheduler_lrs}"
             )
-        if self._is_stage3_phase():
-            logger.info(f"Stage 3 resumed learning rates: {optimizer_lrs}")
+        logger.info(f"Resumed learning rates: {optimizer_lrs}")
 
     def _prepare_models_for_training(self) -> None:
         """Prepare models for training with Accelerate."""
 
         if self._accelerator.distributed_type == DistributedType.FSDP and not self._train_transformer:
-            raise RuntimeError(
-                "Stage 2 frozen-Transformer FSDP is not implemented. Use DDP or single GPU."
-            )
+            raise RuntimeError("Frozen-Transformer FSDP is not implemented. Use DDP or single GPU.")
 
         # For FSDP + LoRA: Cast entire model to FP32.
         # FSDP requires uniform dtype across all parameters in wrapped modules.
@@ -1531,17 +1471,31 @@ class LtxvTrainer:
             )
 
         source_config = load_multitask_data_config(data_config.train_data_config)
-        configured_ratios: dict[str, float] = {}
-        for dataset in source_config["datasets"]:
-            task = str(dataset.get("task"))
-            configured_ratios[task] = configured_ratios.get(task, 0.0) + float(
-                dataset.get("ratio", dataset.get("weight", 0.0))
-            )
-        expected_ratios = {"i2i": online_config.image_ratio, "r2v": online_config.video_ratio}
-        if any(abs(configured_ratios.get(task, -1.0) - ratio) > 1.0e-8 for task, ratio in expected_ratios.items()):
+        sampling_config = source_config.get("online_sampling", {})
+        if not isinstance(sampling_config, dict):
+            raise ValueError("train_data_config online_sampling must be a mapping")
+        image_ratio = float(sampling_config.get("image_ratio", online_config.image_ratio))
+        video_ratio = float(sampling_config.get("video_ratio", online_config.video_ratio))
+        if (
+            abs(image_ratio - online_config.image_ratio) > 1.0e-8
+            or abs(video_ratio - online_config.video_ratio) > 1.0e-8
+        ):
             raise ValueError(
-                f"train_data_config ratios {configured_ratios} do not match online_encoding ratios {expected_ratios}"
+                "train_data_config online_sampling ratios do not match online_encoding: "
+                f"data={image_ratio}/{video_ratio}, model={online_config.image_ratio}/{online_config.video_ratio}"
             )
+        raw_source_ratios = sampling_config.get("video_source_ratios", {})
+        if not isinstance(raw_source_ratios, dict):
+            raise ValueError("online_sampling.video_source_ratios must be a mapping")
+        video_source_ratios = {str(name): float(ratio) for name, ratio in raw_source_ratios.items()}
+
+        raw_augmentation = source_config.get("online_augmentation")
+        if raw_augmentation is not None:
+            if not isinstance(raw_augmentation, dict):
+                raise ValueError("train_data_config online_augmentation must be a mapping")
+            from ltx_trainer.online_data.transforms import OnlineAugmentationConfig  # noqa: PLC0415
+
+            online_config.augmentation = OnlineAugmentationConfig.from_mapping(raw_augmentation)
 
         self._online_sampler = DistributedMultiTaskMicrobatchSampler(
             self._dataset.task_indices,
@@ -1552,6 +1506,8 @@ class LtxvTrainer:
             seed=self._config.seed,
             image_ratio=online_config.image_ratio,
             video_ratio=online_config.video_ratio,
+            dataset_indices=self._dataset.dataset_indices,
+            video_source_ratios=video_source_ratios,
         )
         if self._pending_online_data_state is not None:
             self._online_sampler.load_state_dict(self._pending_online_data_state)
@@ -1602,9 +1558,7 @@ class LtxvTrainer:
             "Online multi-task schedule: "
             f"{image_steps} I2I optimizer steps, {video_steps} R2V optimizer steps, "
             f"effective global batch={effective_batch}, "
-            f"exposures/stage={effective_batch * self._config.optimization.steps}. "
-            "If Stage 1, Stage 2, and Stage 3 each run this schedule, "
-            f"three-stage exposures={3 * effective_batch * self._config.optimization.steps}."
+            f"total exposures={effective_batch * self._config.optimization.steps}."
         )
 
     def _prepare_online_batch_with_retry(self, initial_raw_batch: dict[str, Any]) -> dict[str, Any]:
@@ -1649,10 +1603,13 @@ class LtxvTrainer:
             encoded_batch = None
             encode_error: Exception | None = None
             try:
+                sampler_state = self._online_sampler.state_dict()
                 encoded_batch = self._online_batch_encoder.encode_for_strategy(
                     raw_batch,
                     strategy=self._training_strategy,
-                    training_phase=getattr(self._training_strategy.config, "training_phase", "stage1"),
+                    optimizer_step=sampler_state["task_schedule_cursor"],
+                    microstep=sampler_state["microstep_in_optimizer_step"],
+                    global_seed=self._config.seed,
                 )
             except Exception as exc:  # synchronize before any rank enters the trainable graph
                 if isinstance(exc, OnlineSampleEncodeError):
@@ -2071,7 +2028,7 @@ class LtxvTrainer:
         auxiliary_state_dict = self._collect_auxiliary_checkpoint_state(save_dtype)
 
         # For LoRA: extract only adapter weights; for full: use as-is
-        checkpoint_metadata: dict[str, str] | None = None
+        checkpoint_metadata = self._build_checkpoint_metadata()
         if is_lora:
             unwrapped = self._accelerator.unwrap_model(self._transformer, keep_torch_compile=False)
             # For FSDP, pass full_state_dict since model params aren't directly accessible
@@ -2087,40 +2044,38 @@ class LtxvTrainer:
             state_dict = {k: v.to(save_dtype) if isinstance(v, Tensor) else v for k, v in state_dict.items()}
             state_dict.update(auxiliary_state_dict)
 
-            if self._is_stage3_phase():
-                self._validate_stage3_checkpoint_components(state_dict)
-
             validate_checkpoint = getattr(self._training_strategy, "validate_checkpoint_state_dict", None)
             if callable(validate_checkpoint):
                 validate_checkpoint(state_dict)
-
-            # Build metadata for safetensors file
-            checkpoint_metadata = self._build_checkpoint_metadata()
 
             # Publish only after the complete safetensors file passes structural validation.
             self._atomic_save_safetensors(
                 state_dict,
                 saved_weights_path,
                 metadata=checkpoint_metadata,
-                required_prefixes=(
-                    _STAGE3_CHECKPOINT_REQUIRED_PREFIXES
-                    if self._is_stage3_phase()
-                    else ()
-                ),
+                required_prefixes=(),
             )
         else:
             # Cast to configured precision
             full_state_dict = {k: v.to(save_dtype) if isinstance(v, Tensor) else v for k, v in full_state_dict.items()}
             full_state_dict.update(auxiliary_state_dict)
 
-            # Save to disk
-            self._accelerator.save(full_state_dict, saved_weights_path)
+            required_prefixes = tuple(
+                f"training_strategy.{name}."
+                for name in self._training_strategy.get_trainable_modules()
+            )
+            self._atomic_save_safetensors(
+                full_state_dict,
+                saved_weights_path,
+                metadata=checkpoint_metadata,
+                required_prefixes=required_prefixes,
+            )
 
         rel_path = saved_weights_path.relative_to(self._config.output_dir)
         logger.info(f"💾 {prefix.capitalize()} weights for step {self._global_step} saved in {rel_path}")
 
         training_state_path = self._save_training_state(save_dir)
-        if checkpoint_metadata is not None and training_state_path is not None:
+        if training_state_path is not None:
             self._publish_checkpoint_ready_marker(
                 checkpoint_path=saved_weights_path,
                 training_state_path=training_state_path,
@@ -2215,7 +2170,7 @@ class LtxvTrainer:
             "training_state_path": str(training_state_path.resolve()),
             "checkpoint_size_bytes": checkpoint_path.stat().st_size,
             "checkpoint_sha256": self._sha256_file(checkpoint_path),
-            "metadata_training_phase": metadata.get("training_phase"),
+            "metadata_architecture": metadata.get("architecture"),
             "metadata_global_step": metadata.get("global_step"),
             "config_path": str((Path(self._config.output_dir) / "training_config.yaml").resolve()),
         }
@@ -2269,18 +2224,18 @@ class LtxvTrainer:
             if key.startswith(prefix)
         }
 
-    def _validate_stage3_checkpoint_components(self, state_dict: dict[str, Tensor]) -> None:
-        """Reject incomplete Stage 3 checkpoints before they are written."""
+    def _validate_legacy_checkpoint_components(self, state_dict: dict[str, Tensor]) -> None:
+        """Reject incomplete legacy adapter checkpoints before they are written."""
         transformer = self._accelerator.unwrap_model(self._transformer, keep_torch_compile=False)
         self._validate_peft_adapter_state(
             transformer,
             self._checkpoint_substate(state_dict, "diffusion_model."),
-            label="Stage 1 DiT LoRA",
+            label="legacy DiT LoRA",
         )
 
         get_language_model = getattr(self._training_strategy, "_get_language_model", None)
         if not callable(get_language_model):
-            raise RuntimeError("Stage 3 strategy does not expose its Gemma PEFT language model")
+            raise RuntimeError("Legacy strategy does not expose its Gemma PEFT language model")
         language_model = self._accelerator.unwrap_model(
             get_language_model(),
             keep_torch_compile=False,
@@ -2291,19 +2246,19 @@ class LtxvTrainer:
                 state_dict,
                 "text_encoder.model.model.language_model.",
             ),
-            label="Stage 2 Gemma LoRA",
+            label="legacy Gemma LoRA",
         )
 
         strategy_modules = self._training_strategy.get_trainable_modules()
         required_strategy_modules = {
-            "planner_tokens": "planner",
-            "visual_token_projection": "visual projection",
-            "visual_full_encoder": "Visual3DTokenEncoder",
+            "semantic_query": "semantic query initializer",
+            "semantic_encoder": "semantic encoder",
+            "semantic_reconstruction_decoder": "semantic reconstruction decoder",
         }
         for module_name, label in required_strategy_modules.items():
             module = strategy_modules.get(module_name)
             if module is None:
-                raise RuntimeError(f"Stage 3 strategy is missing required module {module_name}")
+                raise RuntimeError(f"Legacy strategy is missing required module {module_name}")
             module = self._accelerator.unwrap_model(module, keep_torch_compile=False)
             self._validate_module_state(
                 module,
@@ -2442,11 +2397,6 @@ class LtxvTrainer:
         optimizer_state = None
         if mode == "full":
             if is_fsdp:
-                if self._is_stage3_phase():
-                    raise RuntimeError(
-                        "Exact Stage 3 resume requires optimizer state, but full optimizer-state saving "
-                        "is not supported with FSDP. Use DDP for exact Stage 3 resume."
-                    )
                 logger.warning(
                     "⚠️ save_training_state='full' is not supported with FSDP. "
                     "Saving 'minimal' state (scheduler + RNG only)."
@@ -2492,10 +2442,10 @@ class LtxvTrainer:
         file_size_gb = state_path.stat().st_size / (1024**3)
         if file_size_gb > 1.0 and not self._training_state_size_warned:
             self._training_state_size_warned = True
-            if self._is_stage3_phase() and mode == "full":
+            if self._is_legacy_phase() and mode == "full":
                 logger.warning(
                     f"⚠️ Training state file is {file_size_gb:.1f} GB. Full optimizer state is required "
-                    "for exact Stage 3 resume; use explicitly allowed warm resume only if resetting Adam moments "
+                    "for exact legacy resume; use warm resume only if resetting Adam moments "
                     "is intentional."
                 )
             else:

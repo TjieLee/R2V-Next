@@ -17,11 +17,7 @@ from ltx_trainer.training_strategies.base_strategy import (
     TrainingStrategyConfigBase,
 )
 from ltx_trainer.training_strategies.flexible import FlexibleStrategy, FlexibleStrategyConfig
-from ltx_trainer.training_strategies.multi_reference_planner_stage2 import (
-    MultiReferencePlannerStage2Config,
-    MultiReferencePlannerStage2Strategy,
-)
-from ltx_trainer.training_strategies.multi_reference_video import MultiReferenceVideoConfig, MultiReferenceVideoStrategy
+from ltx_trainer.training_strategies.semantic_flow import SemanticFlowConfig, SemanticFlowStrategy
 from ltx_trainer.training_strategies.text_to_video import TextToVideoConfig, TextToVideoStrategy
 from ltx_trainer.training_strategies.video_to_video import VideoToVideoConfig, VideoToVideoStrategy
 
@@ -30,8 +26,7 @@ TrainingStrategyConfig = (
     TextToVideoConfig
     | VideoToVideoConfig
     | FlexibleStrategyConfig
-    | MultiReferenceVideoConfig
-    | MultiReferencePlannerStage2Config
+    | SemanticFlowConfig
 )
 
 __all__ = [
@@ -40,10 +35,8 @@ __all__ = [
     "FlexibleStrategy",
     "FlexibleStrategyConfig",
     "ModelInputs",
-    "MultiReferencePlannerStage2Config",
-    "MultiReferencePlannerStage2Strategy",
-    "MultiReferenceVideoConfig",
-    "MultiReferenceVideoStrategy",
+    "SemanticFlowConfig",
+    "SemanticFlowStrategy",
     "TextToVideoConfig",
     "TextToVideoStrategy",
     "TrainingStrategy",
@@ -90,10 +83,8 @@ def get_training_strategy(config: TrainingStrategyConfig) -> TrainingStrategy:
             strategy = VideoToVideoStrategy(config)
         case FlexibleStrategyConfig():
             strategy = FlexibleStrategy(config)
-        case MultiReferencePlannerStage2Config():
-            strategy = MultiReferencePlannerStage2Strategy(config)
-        case MultiReferenceVideoConfig():
-            strategy = MultiReferenceVideoStrategy(config)
+        case SemanticFlowConfig():
+            strategy = SemanticFlowStrategy(config)
         case _:
             raise ValueError(f"Unknown training strategy config type: {type(config).__name__}")
 

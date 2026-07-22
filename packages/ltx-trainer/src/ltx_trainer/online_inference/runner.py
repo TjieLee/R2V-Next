@@ -1,17 +1,14 @@
-"""One-sample raw online Stage 3 inference orchestration."""
+"""Strict-no-GT semantic-flow inference orchestration."""
 
 from __future__ import annotations
 
-import shutil
+import json
 import time
-from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import torch
-from torch import Tensor
 
-from ltx_core.types import VideoLatentShape, VideoPixelShape
 from ltx_trainer.online_data.constants import IMAGE_TASK, VIDEO_TASK
 from ltx_trainer.online_inference.checkpoint_runtime import OnlineInferenceRuntime
 from ltx_trainer.online_inference.output_artifacts import (
@@ -26,19 +23,13 @@ from ltx_trainer.online_inference.output_artifacts import (
     save_reference_montage,
     tensor_frame_to_pil,
 )
-from ltx_trainer.online_inference.raw_condition_encoder import (
-    encode_selected_sample_conditions,
-)
+from ltx_trainer.online_inference.raw_condition_encoder import encode_selected_sample_conditions
 from ltx_trainer.online_inference.vae_decode import decode_video_latents
 
 
 def _bundle_reference_path(bundle_root: Path, value: str) -> Path:
     path = Path(value).expanduser()
-    if not path.is_absolute():
-        path = bundle_root / path
-    # Keep the bundle export path visible in metadata instead of resolving a symlink
-    # back to its original source.
-    return path.absolute()
+    return (bundle_root / path).absolute() if not path.is_absolute() else path.absolute()
 
 
 def read_selected_samples(
@@ -47,73 +38,29 @@ def read_selected_samples(
     tasks: set[str] | None = None,
     limit: int | None = None,
 ) -> list[dict[str, Any]]:
-    selected: list[dict[str, Any]] = []
+    """Read a selection bundle without opening any target media."""
     selection_path = Path(path).expanduser().resolve()
     bundle_root = selection_path.parent
+    selected: list[dict[str, Any]] = []
     with selection_path.open("r", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
             if not line.strip():
                 continue
-            sample = __import__("json").loads(line)
+            sample = json.loads(line)
             task = str(sample.get("task"))
             if task not in {IMAGE_TASK, VIDEO_TASK}:
                 raise ValueError(f"Selected sample line {line_number} has invalid task {task!r}")
             if tasks is not None and task not in tasks:
                 continue
-            original_reference_paths = list(
-                sample.get("original_reference_paths", sample.get("reference_paths", []))
-            )
-            if "reference_exports" in sample:
-                reference_values = list(sample["reference_exports"])
-            else:
-                reference_values = list(sample.get("reference_paths", []))
-            sample["original_reference_paths"] = original_reference_paths
+            reference_values = sample.get("reference_exports", sample.get("reference_paths", []))
+            sample["original_reference_paths"] = list(sample.get("reference_paths", reference_values))
             sample["reference_paths"] = [
-                str(_bundle_reference_path(bundle_root, str(value)))
-                for value in reference_values
+                str(_bundle_reference_path(bundle_root, str(value))) for value in reference_values
             ]
-            sample["reference_export_modes"] = list(
-                sample.get("reference_export_modes", [])
-            )
             selected.append(sample)
             if limit is not None and len(selected) >= limit:
                 break
     return selected
-
-
-def build_noise_shape_metadata(
-    sample: dict[str, Any],
-    *,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> dict[str, Tensor]:
-    pixel_shape = VideoPixelShape(
-        batch=1,
-        frames=int(sample["num_frames"]),
-        height=int(sample["height"]),
-        width=int(sample["width"]),
-        fps=float(sample["fps"]),
-    )
-    latent_shape = VideoLatentShape.from_pixel_shape(pixel_shape)
-    return {
-        "latents": torch.zeros(latent_shape.to_torch_shape(), device=device, dtype=dtype),
-        "num_frames": torch.tensor([latent_shape.frames], device=device, dtype=torch.long),
-        "height": torch.tensor([latent_shape.height], device=device, dtype=torch.long),
-        "width": torch.tensor([latent_shape.width], device=device, dtype=torch.long),
-        "fps": torch.tensor([pixel_shape.fps], device=device, dtype=torch.float32),
-    }
-
-
-def _clean_diagnostics(diagnostics: dict[str, Any]) -> dict[str, Any]:
-    cleaned: dict[str, Any] = {}
-    for key, value in diagnostics.items():
-        if isinstance(value, Tensor):
-            if key in {"predicted_visual_tokens", "predicted_visual_token_mask", "token_positions"}:
-                continue
-            cleaned[key] = list(value.shape)
-        else:
-            cleaned[key] = value
-    return cleaned
 
 
 def _peak_memory_gib(device: torch.device) -> float | None:
@@ -131,191 +78,71 @@ def run_online_sample(
     overwrite: bool,
     seed: int,
     num_inference_steps: int,
-    guidance_scale: float,
-    ref_guidance_scale: float,
-    vision_guidance_scale: float,
-    ref_guidance_mode: str,
-    guidance_rescale: float,
-    stg_scale: float,
-    stg_blocks: list[int] | None,
     decode_tile: bool,
-    code_commit: str | None,
-    condition_encoder: Callable[[Any, dict[str, Any]], dict[str, Any]] | None = None,
-    sample_dir_override: Path | None = None,
-    metadata_overrides: dict[str, Any] | None = None,
-    save_mid_frame: bool = False,
-) -> dict[str, Any]:  # noqa: PLR0913, PLR0915
+    code_commit: str | None = None,
+) -> dict[str, Any]:
+    """Encode references/text and jointly generate semantics/video; target pixels are never read."""
     started = time.perf_counter()
-    sample_dir = sample_dir_override or sample_output_dir(output_root, sample)
-    if sample_dir.exists():
-        if output_is_complete(sample_dir) and not overwrite:
-            return {"status": "skipped_existing", "sample_dir": str(sample_dir)}
-        if not overwrite:
-            raise FileExistsError(
-                f"Incomplete output already exists; pass --overwrite to retry: {sample_dir}"
-            )
-        shutil.rmtree(sample_dir)
+    sample_dir = sample_output_dir(output_root, sample)
+    if output_is_complete(sample_dir) and not overwrite:
+        return {"status": "skipped_existing", "sample_dir": str(sample_dir)}
     sample_dir.mkdir(parents=True, exist_ok=True)
-    if runtime.device.type == "cuda":
-        torch.cuda.reset_peak_memory_stats(runtime.device)
 
-    encode_conditions = condition_encoder or encode_selected_sample_conditions
-    raw = encode_conditions(runtime.online_encoder, sample)
-    latents_metadata = build_noise_shape_metadata(
-        sample,
-        device=runtime.device,
-        dtype=runtime.dtype,
-    )
-    batch = {
-        "latents": latents_metadata,
-        "multi_ref_latents": raw["multi_ref_latents"],
-        "multi_reference_latents": raw["multi_reference_latents"],
-    }
-    with torch.inference_mode(), runtime.stage2._autocast_context(runtime.device, runtime.dtype):
-        guidance = runtime.stage2._prepare_guidance_condition_bundle(
-            strategy=runtime.strategy,
-            conditions=raw["conditions"],
-            text_conditions=raw["text_conditions"],
-            planner_vlm_inputs=raw["planner_vlm_inputs"],
-            latents_metadata=latents_metadata,
-            visual_position_metadata=raw["visual_position_metadata"],
-            negative_text_conditions=runtime.negative_conditions,
-            guidance_scale=guidance_scale,
-            ref_guidance_scale=ref_guidance_scale,
-            vision_guidance_scale=vision_guidance_scale,
-            ref_guidance_mode=ref_guidance_mode,
-        )
-
-    diagnostics = _clean_diagnostics(guidance.inference_diagnostics)
-    planner_output_mask = raw["planner_vlm_inputs"]["planner_output_mask"]
-    output_name = "generated.png" if sample["task"] == IMAGE_TASK else "generated.mp4"
+    encoded = encode_selected_sample_conditions(runtime.online_encoder, sample)
+    strict_checks = encoded["strict_no_gt_checks"]
+    if strict_checks.get("target_path_passed_to_condition_encoder") is not False:
+        raise RuntimeError("Strict-no-GT guard failed before denoising")
     metadata: dict[str, Any] = {
-        "code_commit": code_commit,
+        "architecture": "semantic_flow_v1",
         "sample_key": sample["sample_key"],
-        "manifest_path": sample.get("manifest_path"),
-        "manifest_index": sample.get("manifest_index"),
-        "sample_plan_sha256": sample.get("sample_plan_sha256"),
         "task": sample["task"],
         "caption": sample["caption"],
-        "reference_paths": list(sample["reference_paths"]),
-        "reference_paths_used": list(
-            raw["reference_metadata"].get("reference_paths_used", sample["reference_paths"])
-        ),
-        "original_reference_paths": list(
-            raw["reference_metadata"].get(
-                "original_reference_paths",
-                sample.get("original_reference_paths", sample["reference_paths"]),
-            )
-        ),
-        "reference_export_modes": list(
-            raw["reference_metadata"].get(
-                "reference_export_modes",
-                sample.get("reference_export_modes", []),
-            )
-        ),
-        "reference_count": len(sample["reference_paths"]),
-        "reference_order": list(range(len(sample["reference_paths"]))),
-        "strict_no_gt": True,
-        "strict_no_gt_checks": dict(raw["strict_no_gt_checks"]),
-        "target_open_count": 0,
-        "target_open_count_instrumented": False,
-        "uses_target_latents": False,
-        "uses_gt_siglip_tokens": False,
-        "uses_precomputed_conditions": False,
-        "geometry": {
-            "width": int(sample["width"]),
-            "height": int(sample["height"]),
-            "num_frames": int(sample["num_frames"]),
-            "fps": float(sample["fps"]),
-        },
-        "width": int(sample["width"]),
-        "height": int(sample["height"]),
-        "frames": int(sample["num_frames"]),
-        "fps": float(sample["fps"]),
-        "latent_shape": list(latents_metadata["latents"].shape),
-        "checkpoint": str(runtime.checkpoint_path),
-        "checkpoint_path": str(runtime.checkpoint_path),
-        "checkpoint_sha256": runtime.checkpoint_audit["checkpoint_sha256"],
-        "checkpoint_step": runtime.checkpoint_audit["checkpoint_step"],
-        "config_path": str(runtime.config_path),
-        "checkpoint_audit": runtime.checkpoint_audit,
-        "checkpoint_flags": runtime.checkpoint_flags,
-        "negative_prompt": runtime.negative_prompt if guidance_scale > 1.0 else None,
+        "reference_count": encoded["reference_metadata"]["reference_count"],
+        "reference_metadata": encoded["reference_metadata"],
+        "strict_no_gt_checks": strict_checks,
+        "semantic_initialization": "independent_noise",
+        "video_initialization": "independent_noise",
+        "reference_sigma": 0.0,
+        "reference_velocity": 0.0,
+        "shared_semantic_video_sigma": True,
         "seed": seed,
         "num_inference_steps": num_inference_steps,
-        "guidance_scale": guidance_scale,
-        "ref_guidance_scale": ref_guidance_scale,
-        "vision_guidance_scale": vision_guidance_scale,
-        "ref_guidance_mode": ref_guidance_mode,
-        "guidance_rescale": guidance_rescale,
-        "stg_scale": stg_scale,
-        "stg_blocks": stg_blocks,
-        "planner_forward_count": guidance.planner_forward_count,
-        "system_prompt_id": int(raw["task_system_prompt_id"].item()),
-        "planner_token_count": int(
-            raw["planner_vlm_inputs"]["planner_token_count"].flatten()[0].item()
-        ),
-        "planner_output_mask_true_count": int(planner_output_mask.sum().item()),
-        "planner_diagnostics": diagnostics,
-        "dtype_diagnostics": raw["dtype_diagnostics"],
+        "checkpoint": str(runtime.checkpoint_path),
+        "checkpoint_sha256": runtime.checkpoint_audit["checkpoint_sha256"],
+        "code_commit": code_commit,
         "dry_run": dry_run,
-        "output_path": str(sample_dir / output_name),
     }
-    if metadata_overrides:
-        metadata.update(metadata_overrides)
     atomic_write_text(sample_dir / "prompt.txt", f"{sample['caption']}\n")
     save_reference_montage(list(sample["reference_paths"]), sample_dir / "references.png")
     reference_outputs = save_reference_images(list(sample["reference_paths"]), sample_dir)
-
     if dry_run:
         metadata["elapsed_seconds"] = time.perf_counter() - started
-        metadata["peak_vram_gb"] = _peak_memory_gib(runtime.device)
-        metadata["peak_vram_gib"] = metadata["peak_vram_gb"]
+        metadata["peak_vram_gib"] = _peak_memory_gib(runtime.device)
         atomic_write_json(sample_dir / "dry_run.json", metadata)
-        atomic_write_json(
-            sample_dir / "dry_run.success.json",
-            {"status": "dry_run_success", "metadata": "dry_run.json"},
-        )
         return {"status": "dry_run_success", "sample_dir": str(sample_dir), **metadata}
 
-    generated_latents = runtime.stage1._denoise_stage1(
-        transformer=runtime.transformer,
-        strategy=runtime.strategy,
-        batch=batch,
-        positive_conditions=guidance.positive_conditions,
-        negative_conditions=guidance.negative_conditions,
-        no_ref_conditions=guidance.no_ref_conditions,
-        no_visual_conditions=guidance.no_visual_conditions,
-        guidance_scale=guidance_scale,
-        cfg_drop_ref_latents_in_negative=False,
-        ref_guidance_scale=ref_guidance_scale,
-        vision_guidance_scale=vision_guidance_scale,
-        siglip_guidance_scale=0.0,
-        guidance_rescale=guidance_rescale,
-        stg_scale=stg_scale,
-        stg_blocks=stg_blocks,
-        num_inference_steps=num_inference_steps,
-        seed=seed,
-        device=runtime.device,
-        dtype=runtime.dtype,
-    )
     if runtime.vae_decoder is None:
-        raise RuntimeError("Generation requires a loaded VAE decoder; dry-run runtime cannot denoise")
+        raise RuntimeError("Generation requires a loaded VAE decoder")
+    semantic, generated_latents = runtime.generate_latents(
+        encoded,
+        width=int(sample["width"]),
+        height=int(sample["height"]),
+        num_frames=int(sample["num_frames"]),
+        fps=float(sample["fps"]),
+        seed=seed,
+        num_inference_steps=num_inference_steps,
+    )
     decoded, decode_diagnostics = decode_video_latents(
         vae_decoder=runtime.vae_decoder,
         latents=generated_latents,
         decode_tile=decode_tile,
     )
-    metadata.update(
-        {
-            "vae_decoder_weight_dtype": decode_diagnostics.decoder_weight_dtype,
-            "vae_decoder_input_dtype": decode_diagnostics.decoder_input_dtype,
-            "vae_decoder_output_dtype": decode_diagnostics.decoder_output_dtype,
-            "vae_decoder_device": decode_diagnostics.decoder_device,
-        }
+    expected_shape = (
+        int(sample["num_frames"]),
+        3,
+        int(sample["height"]),
+        int(sample["width"]),
     )
-    expected_frames = int(sample["num_frames"])
-    expected_shape = (expected_frames, 3, int(sample["height"]), int(sample["width"]))
     if tuple(decoded.shape) != expected_shape:
         raise RuntimeError(f"Decoded output shape {tuple(decoded.shape)} != expected {expected_shape}")
 
@@ -324,37 +151,32 @@ def run_online_sample(
         atomic_save_png(tensor_frame_to_pil(decoded[0]), sample_dir / "generated.png")
         artifacts.append("generated.png")
     else:
-        atomic_save_video(
-            decoded,
-            sample_dir / "generated.mp4",
-            fps=float(sample["fps"]),
-            save_video=runtime.stage1.save_video,
-        )
+        from ltx_trainer.video_utils import save_video
+
+        atomic_save_video(decoded, sample_dir / "generated.mp4", fps=float(sample["fps"]), save_video=save_video)
         atomic_save_png(tensor_frame_to_pil(decoded[0]), sample_dir / "generated_first.png")
         atomic_save_png(tensor_frame_to_pil(decoded[-1]), sample_dir / "generated_last.png")
-        if save_mid_frame:
-            atomic_save_png(
-                tensor_frame_to_pil(decoded[int(decoded.shape[0]) // 2]),
-                sample_dir / "generated_mid.png",
-            )
-        save_contact_sheet(decoded, sample_dir / "generated_contact_sheet.png", frame_count=8)
+        save_contact_sheet(decoded, sample_dir / "generated_contact_sheet.png")
         artifacts.extend(
-            [
-                "generated.mp4",
-                "generated_first.png",
-                "generated_last.png",
-                "generated_contact_sheet.png",
-            ]
+            ["generated.mp4", "generated_first.png", "generated_last.png", "generated_contact_sheet.png"]
         )
-        if save_mid_frame:
-            artifacts.append("generated_mid.png")
-    metadata["elapsed_seconds"] = time.perf_counter() - started
-    metadata["peak_vram_gb"] = _peak_memory_gib(runtime.device)
-    metadata["peak_vram_gib"] = metadata["peak_vram_gb"]
-    metadata["output_shape"] = list(decoded.shape)
+    metadata.update(
+        {
+            "semantic_token_count": int(semantic.shape[1]),
+            "semantic_shape": list(semantic.shape),
+            "latent_shape": list(generated_latents.shape),
+            "output_shape": list(decoded.shape),
+            "vae_decode": decode_diagnostics.__dict__,
+            "elapsed_seconds": time.perf_counter() - started,
+            "peak_vram_gib": _peak_memory_gib(runtime.device),
+        }
+    )
     atomic_write_json(sample_dir / "metadata.json", metadata)
     atomic_write_json(
         sample_dir / "success.json",
         {"status": "success", "artifacts": artifacts, "sample_key": sample["sample_key"]},
     )
     return {"status": "success", "sample_dir": str(sample_dir), **metadata}
+
+
+__all__ = ["read_selected_samples", "run_online_sample"]

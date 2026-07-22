@@ -38,8 +38,7 @@ class TrainingStrategyConfigBase(BaseModel):
         "text_to_video",
         "video_to_video",
         "flexible",
-        "multi_reference_video",
-        "multi_reference_planner_stage2",
+        "semantic_flow",
     ] = Field(
         description="Unique name identifying the training strategy type"
     )
@@ -70,6 +69,13 @@ class ModelInputs:
     video_loss_mask: Tensor | None
     audio_loss_mask: Tensor | None
 
+    # Optional joint semantic-flow state.
+    semantic_targets: Tensor | None = None
+    semantic_loss_mask: Tensor | None = None
+    semantic_reconstruction_prediction: Tensor | None = None
+    semantic_reconstruction_target: Tensor | None = None
+    sequence_offsets: dict[str, int] | None = None
+
 
 class TrainingStrategy(ABC):
     """Abstract base class for training strategies.
@@ -93,11 +99,7 @@ class TrainingStrategy(ABC):
         embeddings_processor: nn.Module,
         text_encoder: nn.Module | None = None,
     ) -> None:
-        """Attach loaded model modules before optimizer construction.
-
-        Most strategies do not need this hook. Planner-style strategies use it
-        to initialize small trainable adapters from existing connector tokens.
-        """
+        """Attach loaded modules before optimizer construction."""
 
     def train_transformer(self) -> bool:
         """Whether the transformer/LoRA parameters should be optimized."""
@@ -139,14 +141,20 @@ class TrainingStrategy(ABC):
         state_dict: dict[str, Tensor] = {}
         for name, module in self.get_trainable_modules().items():
             unwrapped = accelerator.unwrap_model(module, keep_torch_compile=False)
-            state_dict.update({f"training_strategy.{name}.{key}": value for key, value in unwrapped.state_dict().items()})
+            state_dict.update(
+                {f"training_strategy.{name}.{key}": value for key, value in unwrapped.state_dict().items()}
+            )
         return state_dict
 
     def load_extra_checkpoint_state_dict(self, state_dict: dict[str, Tensor]) -> None:
         """Load extra strategy-owned weights from a checkpoint if present."""
         for name, module in self.get_trainable_modules().items():
             prefix = f"training_strategy.{name}."
-            module_state = {key.removeprefix(prefix): value for key, value in state_dict.items() if key.startswith(prefix)}
+            module_state = {
+                key.removeprefix(prefix): value
+                for key, value in state_dict.items()
+                if key.startswith(prefix)
+            }
             if module_state:
                 module.load_state_dict(module_state, strict=True)
 

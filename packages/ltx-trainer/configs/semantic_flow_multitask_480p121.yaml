@@ -1,0 +1,107 @@
+# Full-DiT reference-aware semantic/video flow training.
+# Replace the absolute paths below with local model, manifest, and output paths.
+model:
+  model_path: "/path/to/ltx-2.3-22b-dev.safetensors"
+  text_encoder_path: "/path/to/gemma-3-12b-it"
+  training_mode: "full"
+  load_checkpoint: null
+
+text_encoder_lora:
+  enabled: false
+
+training_strategy:
+  name: "semantic_flow"
+  reference_latents_dir: "reference_latents"
+  conditions_dir: "conditions"
+  max_ref_images_per_sample: 4
+  anchor_frame_ratio: 0.10
+  vlm_prefix_max_length: 2560
+  vlm_teacher_max_length: 6656
+  semantic_hidden_dim: 512
+  semantic_position_gate_init: 0.0
+  semantic_maximum_drop_rate: 0.20
+  semantic_minimum_tokens_per_frame: 56
+  video_flow_weight: 1.0
+  semantic_flow_weight: 1.0
+  semantic_reconstruction_weight: 1.0
+  condition_full_p: 0.70
+  condition_drop_text_p: 0.10
+  condition_drop_reference_all_p: 0.15
+  condition_drop_all_p: 0.05
+
+optimization:
+  learning_rate: 1.0e-5
+  steps: 30000
+  batch_size: 1
+  gradient_accumulation_steps: 4
+  max_grad_norm: 1.0
+  optimizer_type: "adamw"
+  scheduler_type: "linear"
+  scheduler_params: {}
+  enable_gradient_checkpointing: true
+
+acceleration:
+  mixed_precision_mode: "bf16"
+  quantization: null
+  load_text_encoder_in_8bit: false
+  offload_optimizer_during_validation: false
+
+data:
+  encoding_mode: "online"
+  train_data_config: "/path/to/multitask_online_480p121_data.yaml"
+  manifest_path: "/path/to/train_unique.jsonl"
+  num_dataloader_workers: 2
+  online_encoding:
+    width: 832
+    height: 480
+    image_num_frames: 1
+    image_fps: 1.0
+    video_num_frames: 121
+    video_fps: 24.0
+    anchor_frame_ratio: 0.10
+    vlm_prefix_max_length: 2560
+    vlm_teacher_max_length: 6656
+    encoder_dtype: "bfloat16"
+    encoder_device_policy: "resident_cuda"
+    vlm_reference_preprocess: "original"
+    video_decoder: "pyav"
+    decode_timeout_seconds: 120.0
+    pin_memory: true
+    prefetch_factor: 2
+    cpu_transform_chunk_frames: 4
+    max_ref_images: 4
+    image_ratio: 0.30
+    video_ratio: 0.70
+    runtime_max_retries: 8
+    runtime_reject_log_dir: null
+
+validation:
+  interval: null
+  skip_initial_validation: true
+  generate_audio: false
+  generate_video: true
+
+checkpoints:
+  interval: 2500
+  keep_last_n: 2
+  precision: "bfloat16"
+  no_resume: false
+  save_training_state: "full"
+
+hub:
+  push_to_hub: false
+  hub_model_id: null
+
+flow_matching:
+  timestep_sampling_mode: "shifted_logit_normal"
+  timestep_sampling_params: {}
+
+wandb:
+  enabled: false
+  project: "r2v-semantic-flow"
+  entity: null
+  tags: ["reference-aware", "semantic-flow", "online", "480p", "121f"]
+  log_validation_videos: false
+
+seed: 42
+output_dir: "/path/to/semantic_flow_output"

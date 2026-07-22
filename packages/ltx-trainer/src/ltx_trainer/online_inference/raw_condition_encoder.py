@@ -1,10 +1,10 @@
-"""Strict-no-GT bridge from selected raw references to planner conditions."""
+"""Strict-no-GT bridge from raw references to semantic-flow conditions."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from torch import Tensor
 
@@ -19,13 +19,15 @@ from ltx_trainer.online_data.constants import (
     VIDEO_TASK,
 )
 from ltx_trainer.online_data.media_decoder import decode_image_rgb
-from ltx_trainer.online_data.online_batch_encoder import OnlineBatchEncoder
 from ltx_trainer.online_data.transforms import deterministic_resize_center_crop
 from ltx_trainer.online_inference.media_identity import (
     RawReferenceLoadError,
     TargetReferenceAliasError,
     assert_references_do_not_alias_target,
 )
+
+if TYPE_CHECKING:
+    from ltx_trainer.online_data.online_batch_encoder import OnlineBatchEncoder
 
 
 @dataclass(frozen=True)
@@ -110,7 +112,7 @@ def encode_selected_sample_conditions(
     encoder: OnlineBatchEncoder,
     sample: dict[str, Any],
 ) -> dict[str, Any]:
-    """Create online Stage 3 conditions without touching target media or target-derived tensors."""
+    """Create online semantic-flow conditions without touching target-derived tensors."""
     references = load_reference_inputs(
         sample,
         vlm_reference_preprocess=encoder.config.vlm_reference_preprocess,
@@ -140,7 +142,7 @@ def encode_selected_sample_conditions(
         "target_path_passed_to_condition_encoder": False,
         "target_path_passed_to_denoiser": False,
         "uses_target_latents": False,
-        "uses_gt_siglip_tokens": False,
+        "uses_gt_teacher_evidence": False,
     }
     return conditions
 
@@ -209,7 +211,7 @@ def encode_external_reference_only_conditions(
         "target_path_passed_to_condition_encoder": False,
         "target_path_passed_to_denoiser": False,
         "uses_target_latents": False,
-        "uses_gt_siglip_tokens": False,
+        "uses_gt_teacher_evidence": False,
     }
     return conditions
 

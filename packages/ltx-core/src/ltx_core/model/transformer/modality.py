@@ -38,6 +38,11 @@ class Modality:
             attention. ``None`` means unrestricted (full) attention between
             all tokens. Built incrementally by conditioning items; see
             :class:`~ltx_core.conditioning.types.attention_strength_wrapper.ConditioningItemAttentionStrengthWrapper`.
+        token_type_ids: Optional IDs for reference/semantic/target token types.
+        entity_ids: Optional IDs for global and reference entities.
+        semantic_position_bounds: Optional normalized ``[t0,t1,h0,h1,w0,w1]``
+            bounds. Non-semantic rows should be zero; the transformer masks the
+            trainable semantic position adapter by ``token_type_ids``.
     """
 
     latent: (
@@ -53,6 +58,9 @@ class Modality:
     enabled: bool = True
     context_mask: torch.Tensor | None = None
     attention_mask: torch.Tensor | None = None
+    token_type_ids: torch.Tensor | None = None
+    entity_ids: torch.Tensor | None = None
+    semantic_position_bounds: torch.Tensor | None = None
 
     def split(self, sizes: list[int]) -> list[Modality]:
         """Split along the batch dimension into chunks of the given sizes."""
