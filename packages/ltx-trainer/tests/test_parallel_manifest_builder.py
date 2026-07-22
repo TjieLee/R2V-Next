@@ -15,7 +15,7 @@ import pytest
 from PIL import Image
 
 from ltx_trainer.online_data import parallel_manifest
-from ltx_trainer.online_data.manifest import build_canonical_r2v_record
+from ltx_trainer.online_data.manifest import finalize_prepared_canonical_r2v_record
 from ltx_trainer.online_data.parallel_manifest import (
     AnnotationSource,
     BuildOptions,
@@ -196,6 +196,240 @@ def _canonical_probe_rows(tmp_path: Path) -> list[tuple[str, dict[str, object]]]
     ]
 
 
+def _write_r2v_two_stage_rows(tmp_path: Path) -> list[tuple[str, dict[str, object]]]:
+    rows: list[tuple[str, dict[str, object]]] = []
+    for index in range(100):
+        video = tmp_path / f"two_stage_video_{index:03d}.mp4"
+        video.write_bytes(f"video-{index}".encode())
+        references = []
+        for reference_index in range(2):
+            reference = tmp_path / f"two_stage_ref_{index:03d}_{reference_index}.png"
+            reference.write_bytes(b"reference")
+            references.append(str(reference))
+        clip_end = 60 if index < 90 else 160
+        rows.append(
+            (
+                f"row-{index:03d}",
+                {
+                    "video_path": str(video),
+                    "text": f"video request {index}",
+                    "crop": [0, 64, 0, 48],
+                    "face_cut": [0, clip_end],
+                    "ref_images": references,
+                },
+            )
+        )
+    return rows
+
+
+def _build_r2v_two_stage_payload(
+    builder,
+    rows: list[tuple[str, dict[str, object]]],
+    *,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    workers: int,
+) -> tuple[bytes, bytes, dict[str, object]]:
+    video_calls: list[str] = []
+    image_calls: list[str] = []
+
+    def fake_probe_video(path: str) -> dict[str, float | int]:
+        video_calls.append(path)
+        return {"fps": 24.0, "frame_count": 200, "width": 64, "height": 48}
+
+    def fake_probe_image(path: str):
+        image_calls.append(path)
+        return builder._ValidationResult({"width": 64, "height": 48})
+
+    monkeypatch.setattr(builder, "probe_video", fake_probe_video)
+    monkeypatch.setattr(builder, "_probe_resolved_image", fake_probe_image)
+    connection = sqlite3.connect(":memory:")
+    cache = builder._MediaValidationCache(connection)
+    accepted: list[dict[str, object]] = []
+    rejected: list[dict[str, object]] = []
+    try:
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="manifest-media") as executor:
+            for row_index, (row_id, prepared, error) in enumerate(
+                builder._iter_canonical_rows_with_bounded_probes(
+                    rows,
+                    dataset_name="r2v_fixture",
+                    dataset_type="OpenS2VDataset",
+                    data_root=None,
+                    adapter_config=None,
+                    manifest_seed=42,
+                    anchor_frame_ratio=0.10,
+                    executor=executor,
+                    batch_size=100,
+                    validation_cache=cache,
+                )
+            ):
+                try:
+                    if error is not None:
+                        raise error
+                    assert prepared is not None
+                    accepted.append(
+                        finalize_prepared_canonical_r2v_record(
+                            prepared,
+                            image_validator=cache.require_image,
+                        )
+                    )
+                except ManifestReject as exc:
+                    rejected.append(
+                        {
+                            "row_index": row_index,
+                            "source_record_id": row_id,
+                            "reason": exc.reason,
+                        }
+                    )
+    finally:
+        connection.close()
+    accepted_payload = b"".join(
+        (json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n").encode()
+        for record in accepted
+    )
+    rejected_payload = b"".join(
+        (json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n").encode()
+        for record in rejected
+    )
+    return accepted_payload, rejected_payload, {
+        "video_calls": video_calls,
+        "image_calls": image_calls,
+        "image_probe_submitted": cache.image_probe_submitted,
+        "video_probe_submitted": cache.video_probe_submitted,
+        "tmp_path": str(tmp_path),
+    }
+
+
+def test_r2v_reference_probes_defer_until_video_plan_passes_and_remain_deterministic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_online_manifest_builder_module()
+    rows = _write_r2v_two_stage_rows(tmp_path)
+
+    results = [
+        _build_r2v_two_stage_payload(
+            builder,
+            rows,
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+            workers=workers,
+        )
+        for workers in (1, 4, 16)
+    ]
+
+    for payload_index in (0, 1):
+        assert results[0][payload_index] == results[1][payload_index] == results[2][payload_index]
+    stats = results[0][2]
+    assert len(stats["video_calls"]) == 100
+    assert len(stats["image_calls"]) == 20
+    assert stats["video_probe_submitted"] == 100
+    assert stats["image_probe_submitted"] == 20
+    for index in range(90):
+        assert not any(f"two_stage_ref_{index:03d}_" in path for path in stats["image_calls"])
+    accepted = [json.loads(line) for line in results[0][0].splitlines()]
+    rejected = [json.loads(line) for line in results[0][1].splitlines()]
+    assert [record["source_record_id"] for record in accepted] == [f"row-{index:03d}" for index in range(90, 100)]
+    assert [record["source_record_id"] for record in rejected] == [f"row-{index:03d}" for index in range(90)]
+    assert {record["reason"] for record in rejected} == {"insufficient_frames_for_121_at_24fps"}
+
+
+def test_r2v_missing_or_invalid_video_skips_references_but_feasible_invalid_reference_rejects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_online_manifest_builder_module()
+    invalid_video = tmp_path / "invalid_video.mp4"
+    invalid_video.write_bytes(b"invalid")
+    feasible_video = tmp_path / "feasible_video.mp4"
+    feasible_video.write_bytes(b"feasible")
+    invalid_reference = tmp_path / "invalid_reference.png"
+    invalid_reference.write_bytes(b"invalid-ref")
+    skipped_reference = tmp_path / "skipped_reference.png"
+    skipped_reference.write_bytes(b"skipped-ref")
+    rows = [
+        (
+            "missing-video",
+            {
+                "video_path": str(tmp_path / "missing_video.mp4"),
+                "text": "missing target",
+                "crop": [0, 64, 0, 48],
+                "face_cut": [0, 160],
+                "ref_images": [str(skipped_reference)],
+            },
+        ),
+        (
+            "invalid-video",
+            {
+                "video_path": str(invalid_video),
+                "text": "invalid target",
+                "crop": [0, 64, 0, 48],
+                "face_cut": [0, 160],
+                "ref_images": [str(skipped_reference)],
+            },
+        ),
+        (
+            "invalid-reference",
+            {
+                "video_path": str(feasible_video),
+                "text": "invalid reference",
+                "crop": [0, 64, 0, 48],
+                "face_cut": [0, 160],
+                "ref_images": [str(invalid_reference)],
+            },
+        ),
+    ]
+    image_calls: list[str] = []
+
+    def fake_probe_video(path: str) -> dict[str, float | int]:
+        if path == str(invalid_video):
+            raise RuntimeError("bad video")
+        return {"fps": 24.0, "frame_count": 200, "width": 64, "height": 48}
+
+    def fake_probe_image(path: str):
+        image_calls.append(path)
+        return builder._ValidationResult(None, "invalid_image", f"bad image: {path}")
+
+    monkeypatch.setattr(builder, "probe_video", fake_probe_video)
+    monkeypatch.setattr(builder, "_probe_resolved_image", fake_probe_image)
+    connection = sqlite3.connect(":memory:")
+    cache = builder._MediaValidationCache(connection)
+    rejected: list[tuple[str, str]] = []
+    try:
+        with ThreadPoolExecutor(max_workers=4, thread_name_prefix="manifest-media") as executor:
+            for row_id, prepared, error in builder._iter_canonical_rows_with_bounded_probes(
+                rows,
+                dataset_name="r2v_fixture",
+                dataset_type="OpenS2VDataset",
+                data_root=None,
+                adapter_config=None,
+                manifest_seed=42,
+                anchor_frame_ratio=0.10,
+                executor=executor,
+                batch_size=3,
+                validation_cache=cache,
+            ):
+                try:
+                    if error is not None:
+                        raise error
+                    assert prepared is not None
+                    finalize_prepared_canonical_r2v_record(
+                        prepared,
+                        image_validator=cache.require_image,
+                    )
+                except ManifestReject as exc:
+                    rejected.append((row_id, exc.reason))
+    finally:
+        connection.close()
+
+    assert image_calls == [str(invalid_reference)]
+    assert rejected == [
+        ("missing-video", "missing_target"),
+        ("invalid-video", "invalid_video_header"),
+        ("invalid-reference", "missing_reference"),
+    ]
+
+
 def test_canonical_manifest_probe_is_parallel_cached_ordered_and_rejects_probe_errors(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -225,6 +459,7 @@ def test_canonical_manifest_probe_is_parallel_cached_ordered_and_rejects_probe_e
                 data_root=None,
                 adapter_config=None,
                 manifest_seed=42,
+                anchor_frame_ratio=0.10,
                 executor=executor,
                 batch_size=8,
                 validation_cache=cache,
@@ -235,9 +470,9 @@ def test_canonical_manifest_probe_is_parallel_cached_ordered_and_rejects_probe_e
     assert len(thread_names) > 1
     assert call_paths.count(str(tmp_path / "video_0.mp4")) == 1
     assert len(call_paths) == 4
-    assert results[3][3] is not None
-    assert results[3][3].reason == "invalid_video_header"
-    assert [result[1].source_record_id for result in results if result[3] is None] == [
+    assert results[3][2] is not None
+    assert results[3][2].reason == "invalid_video_header"
+    assert [result[1].record["source_record_id"] for result in results if result[2] is None] == [
         "row-0",
         "row-1",
         "row-2",
@@ -265,26 +500,24 @@ def test_canonical_manifest_probe_worker_count_does_not_change_records_or_sha(
             max_workers=workers,
             thread_name_prefix="manifest-media",
         ) as executor:
-            for _row_id, canonical, header, error in builder._iter_canonical_rows_with_bounded_probes(
+            for _row_id, prepared, error in builder._iter_canonical_rows_with_bounded_probes(
                 rows,
                 dataset_name="r2v_fixture",
                 dataset_type="OpenS2VDataset",
                 data_root=None,
                 adapter_config=None,
                 manifest_seed=42,
+                anchor_frame_ratio=0.10,
                 executor=executor,
                 batch_size=2,
                 validation_cache=cache,
             ):
                 assert error is None
-                assert canonical is not None and header is not None
+                assert prepared is not None
                 records.append(
-                    build_canonical_r2v_record(
-                        canonical,
-                        manifest_seed=42,
-                        video_header=header,
+                    finalize_prepared_canonical_r2v_record(
+                        prepared,
                         image_validator=lambda _path: (64, 48),
-                        target_path_validated=True,
                     )
                 )
         payload = "".join(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n" for record in records)

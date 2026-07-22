@@ -11,6 +11,7 @@ import random
 import warnings
 from collections import Counter
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
@@ -248,6 +249,12 @@ def resolve_media_path(value: Any, *, data_root: str | Path | None) -> str:
 ImageValidator = Callable[[str], tuple[int, int]]
 
 
+@dataclass(frozen=True)
+class PreparedCanonicalR2VRecord:
+    record: dict[str, Any]
+    reference_paths: tuple[str, ...]
+
+
 def _validate_reference_paths(
     paths: list[str],
     *,
@@ -421,21 +428,20 @@ def build_strict_source_indices(
     return indices
 
 
-def build_canonical_r2v_record(
+def prepare_canonical_r2v_record(
     canonical: CanonicalR2VSource,
     *,
     manifest_seed: int,
     anchor_frame_ratio: float = 0.10,
-    video_header: Mapping[str, float | int] | None = None,
-    image_validator: ImageValidator | None = None,
+    video_header: Mapping[str, float | int],
     target_path_validated: bool = False,
-) -> dict[str, Any]:
+) -> PreparedCanonicalR2VRecord:
     target_path = canonical.video_path
     missing_target_reason = "phantom_missing_target" if canonical.adapter_name == "phantom" else "missing_target"
     if not target_path_validated and not Path(target_path).is_file():
         raise ManifestReject(missing_target_reason, f"Target video does not exist: {target_path}")
     try:
-        header = dict(video_header) if video_header is not None else probe_video(target_path)
+        header = dict(video_header)
         original_fps = float(header["fps"])
         frame_count = int(header["frame_count"])
         video_width = int(header["width"])
@@ -486,11 +492,7 @@ def build_canonical_r2v_record(
     ):
         raise ManifestReject("insufficient_frames_for_121_at_24fps", "Source index plan is outside the clip")
 
-    references = list(canonical.reference_paths)
-    reference_reason = "phantom_missing_reference" if canonical.adapter_name == "phantom" else "missing_reference"
-    if not references:
-        raise ManifestReject(reference_reason, f"No references for {canonical.source_record_id}")
-    _validate_reference_paths(references, image_validator=image_validator, reason=reference_reason)
+    references = tuple(canonical.reference_paths)
     num_anchors = max(1, round(VIDEO_NUM_FRAMES * anchor_frame_ratio))
     anchor_target_indices = uniform_anchor_indices(
         frame_count=VIDEO_NUM_FRAMES,
@@ -505,7 +507,7 @@ def build_canonical_r2v_record(
         "task": VIDEO_TASK,
         "target_modality": "video",
         "target_path": target_path,
-        "reference_paths": references,
+        "reference_paths": list(references),
         "caption": canonical.caption,
         "crop_xyxy": canonical.crop_xyxy,
         "clip_start_frame": clip_start,
@@ -520,7 +522,49 @@ def build_canonical_r2v_record(
         "semantic_anchor_source_indices": anchor_source_indices,
         **_json_safe(canonical.metadata),
     }
+    return PreparedCanonicalR2VRecord(record=record, reference_paths=references)
+
+
+def finalize_prepared_canonical_r2v_record(
+    prepared: PreparedCanonicalR2VRecord,
+    *,
+    image_validator: ImageValidator | None = None,
+) -> dict[str, Any]:
+    record = dict(prepared.record)
+    references = list(prepared.reference_paths)
+    reference_reason = (
+        "phantom_missing_reference"
+        if record.get("adapter_name") == "phantom"
+        else "missing_reference"
+    )
+    if not references:
+        raise ManifestReject(reference_reason, f"No references for {record.get('source_record_id')}")
+    _validate_reference_paths(references, image_validator=image_validator, reason=reference_reason)
+    record["reference_paths"] = references
     return finalize_manifest_record(record)
+
+
+def build_canonical_r2v_record(
+    canonical: CanonicalR2VSource,
+    *,
+    manifest_seed: int,
+    anchor_frame_ratio: float = 0.10,
+    video_header: Mapping[str, float | int] | None = None,
+    image_validator: ImageValidator | None = None,
+    target_path_validated: bool = False,
+) -> dict[str, Any]:
+    header = video_header if video_header is not None else probe_video(canonical.video_path)
+    prepared = prepare_canonical_r2v_record(
+        canonical,
+        manifest_seed=manifest_seed,
+        anchor_frame_ratio=anchor_frame_ratio,
+        video_header=header,
+        target_path_validated=target_path_validated,
+    )
+    return finalize_prepared_canonical_r2v_record(
+        prepared,
+        image_validator=image_validator,
+    )
 
 
 def deduplicate_records(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:

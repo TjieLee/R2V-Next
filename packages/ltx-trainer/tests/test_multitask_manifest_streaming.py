@@ -284,8 +284,16 @@ def _patch_synthetic_builder(
     )
     monkeypatch.setattr(
         manifest_builder,
-        "build_canonical_r2v_record",
-        lambda source, **kwargs: _record(source.row, dataset_name=source.dataset_name, **kwargs),
+        "prepare_canonical_r2v_record",
+        lambda source, **kwargs: SimpleNamespace(
+            record=_record(source.row, dataset_name=source.dataset_name, **kwargs),
+            reference_paths=(),
+        ),
+    )
+    monkeypatch.setattr(
+        manifest_builder,
+        "finalize_prepared_canonical_r2v_record",
+        lambda prepared, **_kwargs: prepared.record,
     )
     monkeypatch.setattr(
         manifest_builder,

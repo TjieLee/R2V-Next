@@ -29,13 +29,15 @@ from ltx_trainer.online_data.constants import IMAGE_TASK, VIDEO_TASK
 from ltx_trainer.online_data.manifest import (
     CanonicalR2VSource,
     ManifestReject,
+    PreparedCanonicalR2VRecord,
     annotation_row_count,
-    build_canonical_r2v_record,
     build_i2i_record,
+    finalize_prepared_canonical_r2v_record,
     iter_annotation_items,
     load_multitask_data_config,
     normalize_r2v_source,
     parse_path_list,
+    prepare_canonical_r2v_record,
     probe_video,
     resolve_media_path,
 )
@@ -431,10 +433,11 @@ def _iter_canonical_rows_with_bounded_probes(
     data_root: str | Path | None,
     adapter_config: Mapping[str, Any] | None,
     manifest_seed: int,
+    anchor_frame_ratio: float,
     executor: ThreadPoolExecutor,
     batch_size: int,
     validation_cache: _MediaValidationCache,
-) -> Iterator[tuple[str, CanonicalR2VSource | None, dict[str, Any] | None, ManifestReject | None]]:
+) -> Iterator[tuple[str, PreparedCanonicalR2VRecord | None, ManifestReject | None]]:
     """Normalize R2V rows, probe canonical paths in bounded parallel batches, and preserve order."""
     for row_batch in _batched(rows, batch_size):
         canonicals: list[CanonicalR2VSource | None] = []
@@ -461,15 +464,10 @@ def _iter_canonical_rows_with_bounded_probes(
             (canonical.video_path for canonical in canonicals if canonical is not None),
             executor=executor,
         )
-        validation_cache.prefetch_images(
-            (
-                path
-                for canonical in canonicals
-                if canonical is not None
-                for path in canonical.reference_paths
-            ),
-            executor=executor,
-        )
+
+        prepared_rows: list[PreparedCanonicalR2VRecord | None] = []
+        row_errors: list[ManifestReject | None] = []
+        reference_paths_to_probe: list[str] = []
 
         for (source_record_id, _row), canonical, error in zip(
             row_batch,
@@ -478,12 +476,43 @@ def _iter_canonical_rows_with_bounded_probes(
             strict=True,
         ):
             if error is not None:
-                yield source_record_id, None, None, error
+                prepared_rows.append(None)
+                row_errors.append(error)
                 continue
             if canonical is None:  # pragma: no cover - guarded by paired error state
                 raise RuntimeError("Normalized R2V source is missing without an error")
             header, probe_error = validation_cache.require_video(canonical.video_path).as_probe_result()
-            yield source_record_id, canonical, header, probe_error
+            if probe_error is not None:
+                prepared_rows.append(None)
+                row_errors.append(probe_error)
+                continue
+            if header is None:  # pragma: no cover - guarded by paired result state
+                raise RuntimeError("R2V video header is missing without an error")
+            try:
+                prepared = prepare_canonical_r2v_record(
+                    canonical,
+                    manifest_seed=manifest_seed,
+                    anchor_frame_ratio=anchor_frame_ratio,
+                    video_header=header,
+                    target_path_validated=True,
+                )
+            except ManifestReject as exc:
+                prepared_rows.append(None)
+                row_errors.append(exc)
+                continue
+            prepared_rows.append(prepared)
+            row_errors.append(None)
+            reference_paths_to_probe.extend(prepared.reference_paths)
+
+        validation_cache.prefetch_images(reference_paths_to_probe, executor=executor)
+
+        for (source_record_id, _row), prepared, error in zip(
+            row_batch,
+            prepared_rows,
+            row_errors,
+            strict=True,
+        ):
+            yield source_record_id, prepared, error
 
 
 def _peak_rss_gb() -> float:
@@ -698,24 +727,21 @@ def main(  # noqa: PLR0913, PLR0915
                         data_root=data_root,
                         adapter_config=adapter_config,
                         manifest_seed=manifest_seed,
+                        anchor_frame_ratio=float(dataset.get("anchor_frame_ratio", 0.10)),
                         executor=executor,
                         batch_size=media_batch_size,
                         validation_cache=validation_cache,
                     )
-                    for row_index, (source_record_id, canonical, video_header, probe_error) in enumerate(probed_rows):
+                    for row_index, (source_record_id, prepared, probe_error) in enumerate(probed_rows):
                         raw_rows += 1
                         try:
                             if probe_error is not None:
                                 raise probe_error
-                            if canonical is None or video_header is None:
-                                raise RuntimeError("R2V canonical row was not probed")
-                            record = build_canonical_r2v_record(
-                                canonical,
-                                manifest_seed=manifest_seed,
-                                anchor_frame_ratio=float(dataset.get("anchor_frame_ratio", 0.10)),
-                                video_header=video_header,
+                            if prepared is None:
+                                raise RuntimeError("R2V prepared row is missing")
+                            record = finalize_prepared_canonical_r2v_record(
+                                prepared,
                                 image_validator=validation_cache.require_image,
-                                target_path_validated=True,
                             )
                             if accept_record(record):
                                 progress.record_accepted()
