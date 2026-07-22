@@ -611,6 +611,7 @@ def test_joint_ode_keeps_references_clean_and_shares_semantic_video_sigma() -> N
         reference_latents=references,
         target_shape=VideoLatentShape(batch=1, channels=128, frames=1, height=2, width=2),
         semantic_frame_count=1,
+        pixel_frame_count=1,
         fps=1.0,
         seed=13,
     )

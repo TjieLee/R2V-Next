@@ -27,6 +27,7 @@ from ltx_core.multicond.semantic_tokens import (
 )
 from ltx_core.types import VideoLatentShape
 from ltx_trainer import logger
+from ltx_trainer.online_data.anchor_geometry import normalized_anchor_timestamps
 from ltx_trainer.timestep_samplers import TimestepSampler
 from ltx_trainer.training_strategies.base_strategy import (
     DEFAULT_FPS,
@@ -612,12 +613,21 @@ class SemanticFlowStrategy(TrainingStrategy):
         reference_latents: dict[str, Tensor],
         target_shape: VideoLatentShape,
         semantic_frame_count: int,
+        pixel_frame_count: int,
         fps: float,
         seed: int,
     ) -> SemanticInferenceState:
         """Initialize strict-no-GT joint state from references, context, and noise only."""
         if semantic_frame_count < 1:
             raise ValueError("semantic_frame_count must be positive")
+        if pixel_frame_count < 1:
+            raise ValueError(f"pixel_frame_count must be positive, got {pixel_frame_count}")
+        if semantic_frame_count > pixel_frame_count:
+            raise ValueError(
+                "semantic_frame_count cannot exceed pixel_frame_count: "
+                f"semantic_frame_count={semantic_frame_count}, "
+                f"pixel_frame_count={pixel_frame_count}"
+            )
         fps_value = float(fps)
         if not math.isfinite(fps_value) or fps_value <= 0:
             raise ValueError(f"Inference fps must be finite and positive, got {fps}")
@@ -654,10 +664,9 @@ class SemanticFlowStrategy(TrainingStrategy):
             fps=fps_value,
             device=device,
         )
-        normalized_timestamps = torch.linspace(
-            0.0,
-            1.0,
-            semantic_frame_count,
+        normalized_timestamps = normalized_anchor_timestamps(
+            frame_count=pixel_frame_count,
+            anchor_count=semantic_frame_count,
             device=device,
             dtype=target_positions.dtype,
         ).unsqueeze(0).expand(batch_size, -1)

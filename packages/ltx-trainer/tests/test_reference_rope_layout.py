@@ -12,6 +12,7 @@ from ltx_core.multicond.semantic_tokens import (
     SemanticReconstructionDecoder,
 )
 from ltx_core.types import VideoLatentShape
+from ltx_trainer.online_data.anchor_geometry import normalized_anchor_timestamps
 from ltx_trainer.online_data.constants import IMAGE_TASK, VIDEO_TASK
 from ltx_trainer.online_data.online_batch_encoder import _build_messages
 from ltx_trainer.online_inference.checkpoint_runtime import OnlineInferenceRuntime
@@ -117,6 +118,7 @@ def _prepare_training_and_inference_states(
     latent_height: int,
     latent_width: int,
     semantic_frame_count: int,
+    pixel_frame_count: int,
     fps: float,
 ) -> tuple[ModelInputs, SemanticInferenceState]:
     feature_dim = 128
@@ -157,7 +159,11 @@ def _prepare_training_and_inference_states(
             "task": [task],
             "semantic_teacher_inputs": {
                 "prefix_attention_mask": torch.ones(1, 2, dtype=torch.bool),
-                "normalized_timestamps": torch.linspace(0.0, 1.0, semantic_frame_count).unsqueeze(0),
+                "normalized_timestamps": normalized_anchor_timestamps(
+                    frame_count=pixel_frame_count,
+                    anchor_count=semantic_frame_count,
+                    device=torch.device("cpu"),
+                ).unsqueeze(0),
             },
             "latents": {
                 "latents": torch.zeros(target_shape.to_torch_shape()),
@@ -176,6 +182,7 @@ def _prepare_training_and_inference_states(
         reference_latents=references,
         target_shape=target_shape,
         semantic_frame_count=semantic_frame_count,
+        pixel_frame_count=pixel_frame_count,
         fps=fps,
         seed=7,
     )
@@ -205,6 +212,7 @@ def test_i2i_training_and_inference_positions_are_identical_at_one_fps() -> None
         latent_height=15,
         latent_width=26,
         semantic_frame_count=1,
+        pixel_frame_count=1,
         fps=1.0,
     )
     _assert_position_segments_match(training, inference)
@@ -220,6 +228,7 @@ def test_r2v_training_and_inference_positions_are_identical_at_24_fps() -> None:
         latent_height=15,
         latent_width=26,
         semantic_frame_count=12,
+        pixel_frame_count=121,
         fps=24.0,
     )
     _assert_position_segments_match(training, inference)
@@ -284,6 +293,7 @@ def test_inference_rejects_non_positive_or_non_finite_fps(fps: float) -> None:
             reference_latents={},
             target_shape=VideoLatentShape(batch=1, channels=128, frames=1, height=15, width=26),
             semantic_frame_count=1,
+            pixel_frame_count=1,
             fps=fps,
             seed=7,
         )
