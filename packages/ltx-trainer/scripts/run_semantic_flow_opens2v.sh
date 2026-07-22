@@ -262,14 +262,10 @@ case "${1:-}" in
   train)
     semantic_flow_train_preflight
     SKIP_SMOKE_GUARD=false
-    REFRESH_RUNTIME_LOCK=false
     for option in "${@:2}"; do
       case "$option" in
         --skip-smoke-guard)
           SKIP_SMOKE_GUARD=true
-          ;;
-        --refresh-runtime-lock)
-          REFRESH_RUNTIME_LOCK=true
           ;;
         *)
           printf 'Unknown train option: %s\n' "$option" >&2
@@ -278,7 +274,7 @@ case "${1:-}" in
       esac
     done
     if [[ "$SKIP_SMOKE_GUARD" == true ]]; then
-      printf '%s\n' "Skipping semantic-flow smoke guard by explicit request."
+      printf '%s\n' "WARNING: --skip-smoke-guard bypasses validated checkpoints, inference artifacts, and runtime lock evidence."
     else
       CODE_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD)"
       python3 "$REPO_ROOT/packages/ltx-trainer/scripts/semantic_flow_smoke_marker.py" validate \
@@ -287,24 +283,18 @@ case "${1:-}" in
         --training-config "$TRAIN_CONFIG" \
         --accelerate-config "$ACCELERATE_CONFIG"
     fi
-    RUNTIME_AUDIT_ARGS=(
-      --config "$TRAIN_CONFIG"
-      --accelerate-config "$ACCELERATE_CONFIG"
-      --output "$TRAIN_RUNTIME_AUDIT"
-      --runtime-lock "$RUNTIME_LOCK"
-      --fsdp-smoke-result "$FSDP_SMOKE_RESULT"
-    )
-    if [[ "$REFRESH_RUNTIME_LOCK" == true ]]; then
-      RUNTIME_AUDIT_ARGS+=(--refresh-runtime-lock)
-    fi
     python3 "$REPO_ROOT/packages/ltx-trainer/scripts/semantic_flow_runtime_audit.py" \
-      "${RUNTIME_AUDIT_ARGS[@]}"
+      --config "$TRAIN_CONFIG" \
+      --accelerate-config "$ACCELERATE_CONFIG" \
+      --output "$TRAIN_RUNTIME_AUDIT" \
+      --runtime-lock "$RUNTIME_LOCK" \
+      --fsdp-smoke-result "$FSDP_SMOKE_RESULT"
     accelerate launch --config_file "$ACCELERATE_CONFIG" \
       "$REPO_ROOT/packages/ltx-trainer/scripts/train.py" \
       "$TRAIN_CONFIG"
     ;;
   *)
-    printf '%s\n' "Usage: $0 {build-manifest|smoke|train [--skip-smoke-guard] [--refresh-runtime-lock]}"
+    printf '%s\n' "Usage: $0 {build-manifest|smoke|train [--skip-smoke-guard]}"
     printf '%s\n' "Required distributed mode: FSDP FULL_SHARD with at least 4 processes; 8 is recommended."
     exit 2
     ;;

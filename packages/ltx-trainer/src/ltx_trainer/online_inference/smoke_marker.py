@@ -177,17 +177,28 @@ def validate_semantic_flow_smoke_marker(
             f"Smoke marker code commit changed: {marker.get('code_commit')} != {code_commit}"
         )
 
+    inference_summary = _require_file(
+        "non-dry-run inference summary",
+        str(marker.get("non_dry_run_inference_summary", "")),
+    )
+    inference_result = validate_non_dry_run_i2i_summary(inference_summary)
+    sample_dir = Path(str(inference_result["sample_dir"])).expanduser().resolve()
     current_files = {
         "training_config": _require_file("training config", training_config_path),
         "accelerate_config": _require_file("accelerate config", accelerate_config_path),
         "i2i_checkpoint": _require_file("I2I checkpoint", str(marker.get("i2i_checkpoint", ""))),
         "r2v_checkpoint": _require_file("R2V checkpoint", str(marker.get("r2v_checkpoint", ""))),
         "runtime_audit": _require_file("runtime audit", str(marker.get("runtime_audit", ""))),
+        "runtime_lock": _require_file("runtime lock", str(marker.get("runtime_lock", ""))),
+        "non_dry_run_inference_summary": inference_summary,
+        "generated_png": _require_file("generated I2I PNG", sample_dir / "generated.png"),
+        "inference_success_json": _require_file("I2I success.json", sample_dir / "success.json"),
+        "inference_metadata_json": _require_file("I2I metadata.json", sample_dir / "metadata.json"),
     }
     errors = []
     for label, path in current_files.items():
         expected_path = marker.get(label)
-        if label in {"training_config", "accelerate_config"} and expected_path != str(path):
+        if expected_path != str(path):
             errors.append(f"{label} path changed: {expected_path} != {path}")
         expected_sha = marker.get(f"{label}_sha256")
         actual_sha = sha256_file(path)

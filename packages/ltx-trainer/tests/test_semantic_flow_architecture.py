@@ -801,6 +801,41 @@ def test_semantic_flow_smoke_marker_binds_code_configs_checkpoints_and_real_infe
             training_config_path=training_config,
             accelerate_config_path=accelerate_config,
         )
+    training_config.write_text("training: true\n", encoding="utf-8")
+
+    evidence_files = {
+        "runtime_lock SHA256 changed": runtime_lock,
+        "non_dry_run_inference_summary SHA256 changed": inference_summary,
+        "generated_png SHA256 changed": sample_dir / "generated.png",
+        "inference_success_json SHA256 changed": sample_dir / "success.json",
+        "inference_metadata_json SHA256 changed": sample_dir / "metadata.json",
+    }
+    for expected_error, path in evidence_files.items():
+        original = path.read_bytes()
+        if path.suffix == ".json":
+            payload = json.loads(original)
+            payload["test_mutation"] = True
+            path.write_text(json.dumps(payload), encoding="utf-8")
+        else:
+            path.write_bytes(original + b"changed")
+        with pytest.raises(SemanticFlowSmokeMarkerError, match=expected_error):
+            validate_semantic_flow_smoke_marker(
+                marker_path,
+                code_commit=code_commit,
+                training_config_path=training_config,
+                accelerate_config_path=accelerate_config,
+            )
+        path.write_bytes(original)
+
+
+def test_production_train_cannot_refresh_runtime_lock() -> None:
+    script = (
+        Path(__file__).resolve().parents[1] / "scripts" / "run_semantic_flow_opens2v.sh"
+    ).read_text(encoding="utf-8")
+    train_block = script.split("  train)", maxsplit=1)[1]
+    assert "--refresh-runtime-lock)" not in train_block
+    assert "Usage: $0 {build-manifest|smoke|train [--skip-smoke-guard]}" in script
+    assert "WARNING: --skip-smoke-guard bypasses" in train_block
 
 
 def test_inference_git_commit_is_resolved_from_repository_root(
