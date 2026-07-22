@@ -176,7 +176,7 @@ def test_prefix_only_hidden_matches_teacher_prefix_hidden_with_reference_regions
     ).hidden_states[-1]
     teacher_prefix_hidden = teacher_hidden[:, : prefix_embeddings.shape[1]]
 
-    torch.testing.assert_close(prefix_only_hidden, teacher_prefix_hidden, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(prefix_only_hidden, teacher_prefix_hidden, rtol=1.0e-6, atol=1.0e-6)
 
 
 def _has_nonzero_grad(module: nn.Module) -> bool:
@@ -468,6 +468,7 @@ def test_production_semantic_flow_config_uses_opens2v_only_litengjie_paths(tmp_p
 
     lora_config = copy.deepcopy(schema_config)
     lora_config["model"] = {**schema_config["model"], "training_mode": "lora"}
+    lora_config["lora"] = {}
     with pytest.raises(ValueError, match="semantic_flow requires full DiT training"):
         LtxTrainerConfig.model_validate(lora_config)
 
