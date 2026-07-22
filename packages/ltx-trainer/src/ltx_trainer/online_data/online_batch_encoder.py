@@ -12,7 +12,11 @@ from PIL import Image
 from torch import Tensor, nn
 from transformers import AutoImageProcessor, AutoTokenizer, Gemma3Processor
 
-from ltx_core.multicond.semantic_tokens import EVIDENCE_TOKENS_PER_FRAME, round_up_prefix_length
+from ltx_core.multicond.semantic_tokens import (
+    EVIDENCE_TOKENS_PER_FRAME,
+    build_multimodal_prefix_attention_mask,
+    round_up_prefix_length,
+)
 from ltx_core.multicond.visual_tokens import (
     extract_projected_visual_tokens,
     module_compute_device_dtype,
@@ -409,10 +413,22 @@ class OnlineBatchEncoder:
             raise RuntimeError("Online prefix encoding requires embeddings_processor.feature_extractor")
         feature_extractor.requires_grad_(False).eval()
         language_model.eval()
+        prefix_reference_mask = reference_region_mask.to(device=self.device).unsqueeze(0)
+        prefix_visibility = build_multimodal_prefix_attention_mask(
+            attention_mask,
+            reference_region_mask=prefix_reference_mask,
+        )
+        finfo = torch.finfo(inputs_embeds.dtype)
+        attention_bias = torch.zeros_like(prefix_visibility, dtype=inputs_embeds.dtype)
+        attention_bias.masked_fill_(~prefix_visibility, finfo.min)
+        attention_bias = attention_bias.unsqueeze(1)
+        position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device, dtype=torch.long)
+        position_ids = position_ids.unsqueeze(0).expand(input_ids.shape[0], -1)
         with torch.inference_mode(), self._frozen_encode_autocast():
             outputs = language_model(
                 inputs_embeds=inputs_embeds,
-                attention_mask=attention_mask,
+                attention_mask=attention_bias,
+                position_ids=position_ids,
                 output_hidden_states=True,
                 return_dict=True,
                 use_cache=False,
@@ -428,7 +444,7 @@ class OnlineBatchEncoder:
         teacher_prefix = {
             "prefix_inputs_embeds": inputs_embeds.detach(),
             "prefix_attention_mask": attention_mask,
-            "prefix_reference_region_mask": reference_region_mask.to(device=self.device).unsqueeze(0),
+            "prefix_reference_region_mask": prefix_reference_mask,
         }
         return conditions, teacher_prefix
 

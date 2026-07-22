@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -14,6 +16,7 @@ from ltx_core.multicond.semantic_tokens import (
     EVIDENCE_TOKENS_PER_FRAME,
     SEMANTIC_TOKENS_PER_FRAME,
     SemanticQueryInitializer,
+    build_multimodal_prefix_attention_mask,
     build_semantic_teacher_attention_mask,
     gather_local_evidence,
     sample_semantic_keep_mask,
@@ -55,6 +58,95 @@ def test_teacher_mask_blocks_prefix_from_gt_and_queries_from_nonlocal_evidence()
     assert visible_evidence.tolist() == [0, 1, 16, 17]
     assert mask[0, first_query, first_query]
     assert not mask[0, first_query, first_query + 1 :].any()
+
+
+class _TinyMaskedAttentionLanguageModel(nn.Module):
+    def forward(
+        self,
+        *,
+        inputs_embeds: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        output_hidden_states: bool,
+        return_dict: bool,
+        use_cache: bool,
+    ):
+        assert output_hidden_states and return_dict and not use_cache
+        visible = attention_mask[:, 0] == 0
+        source = inputs_embeds + position_ids.to(dtype=inputs_embeds.dtype).unsqueeze(-1) * 0.01
+        scores = torch.matmul(source, source.transpose(-1, -2)) / math.sqrt(source.shape[-1])
+        scores = scores.masked_fill(~visible, -1.0e9)
+        weights = torch.softmax(scores, dim=-1)
+        weights = torch.where(visible.any(dim=-1, keepdim=True), weights, torch.zeros_like(weights))
+        hidden = torch.matmul(weights, source)
+        return SimpleNamespace(hidden_states=(hidden,))
+
+
+def _to_additive_attention_mask(visible: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    bias = torch.zeros_like(visible, dtype=dtype)
+    bias.masked_fill_(~visible, torch.finfo(dtype).min)
+    return bias.unsqueeze(1)
+
+
+def test_prefix_only_hidden_matches_teacher_prefix_hidden_with_reference_regions_and_padding() -> None:
+    generator = torch.Generator().manual_seed(11)
+    prefix_embeddings = torch.randn(1, 12, 8, generator=generator)
+    suffix_embeddings = torch.randn(
+        1,
+        EVIDENCE_TOKENS_PER_FRAME + SEMANTIC_TOKENS_PER_FRAME,
+        8,
+        generator=generator,
+    )
+    prefix_attention = torch.tensor([[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0]], dtype=torch.bool)
+    reference_regions = torch.zeros_like(prefix_attention)
+    reference_regions[:, 2:5] = True
+    reference_regions[:, 6:9] = True
+
+    prefix_visible = build_multimodal_prefix_attention_mask(
+        prefix_attention,
+        reference_region_mask=reference_regions,
+    )
+    assert prefix_visible[0, 2, 4]
+    assert prefix_visible[0, 4, 2]
+    assert prefix_visible[0, 6, 8]
+    assert prefix_visible[0, 8, 6]
+    assert not prefix_visible[0, 2, 6]
+    assert prefix_visible[0, 6, 2]
+    assert not prefix_visible[0, 10].any()
+    assert not prefix_visible[0, :, 10].any()
+
+    teacher_visible = build_semantic_teacher_attention_mask(
+        prefix_attention,
+        frame_count=1,
+        reference_region_mask=reference_regions,
+    )
+    assert torch.equal(teacher_visible[:, : prefix_embeddings.shape[1], : prefix_embeddings.shape[1]], prefix_visible)
+    assert not teacher_visible[:, : prefix_embeddings.shape[1], prefix_embeddings.shape[1] :].any()
+
+    language_model = _TinyMaskedAttentionLanguageModel()
+    prefix_positions = torch.arange(prefix_embeddings.shape[1]).unsqueeze(0)
+    prefix_only_hidden = language_model(
+        inputs_embeds=prefix_embeddings,
+        attention_mask=_to_additive_attention_mask(prefix_visible, prefix_embeddings.dtype),
+        position_ids=prefix_positions,
+        output_hidden_states=True,
+        return_dict=True,
+        use_cache=False,
+    ).hidden_states[-1]
+
+    teacher_embeddings = torch.cat([prefix_embeddings, suffix_embeddings], dim=1)
+    teacher_positions = torch.arange(teacher_embeddings.shape[1]).unsqueeze(0)
+    teacher_hidden = language_model(
+        inputs_embeds=teacher_embeddings,
+        attention_mask=_to_additive_attention_mask(teacher_visible, teacher_embeddings.dtype),
+        position_ids=teacher_positions,
+        output_hidden_states=True,
+        return_dict=True,
+        use_cache=False,
+    ).hidden_states[-1]
+    teacher_prefix_hidden = teacher_hidden[:, : prefix_embeddings.shape[1]]
+
+    torch.testing.assert_close(prefix_only_hidden, teacher_prefix_hidden, rtol=0.0, atol=0.0)
 
 
 def test_semantic_dropout_keeps_at_least_56_tokens_per_frame() -> None:

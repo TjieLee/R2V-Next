@@ -169,27 +169,10 @@ def build_semantic_teacher_attention_mask(
     frame_span = EVIDENCE_TOKENS_PER_FRAME + SEMANTIC_TOKENS_PER_FRAME
     total_length = prefix_length + frame_count * frame_span
     allowed = torch.zeros(batch_size, total_length, total_length, dtype=torch.bool, device=prefix_valid.device)
-
-    causal = torch.ones(prefix_length, prefix_length, dtype=torch.bool, device=prefix_valid.device).tril()
-    allowed[:, :prefix_length, :prefix_length] = causal[None] & prefix_valid[:, :, None] & prefix_valid[:, None, :]
-
-    if reference_region_mask is not None:
-        if reference_region_mask.shape != prefix_valid.shape:
-            raise ValueError("reference_region_mask must match prefix_attention_mask")
-        reference_region_mask = reference_region_mask.to(device=allowed.device, dtype=torch.bool)
-        for batch_index in range(batch_size):
-            indices = torch.nonzero(reference_region_mask[batch_index], as_tuple=False).flatten().tolist()
-            if not indices:
-                continue
-            run_start = indices[0]
-            previous = indices[0]
-            for index in indices[1:] + [None]:
-                if index is not None and index == previous + 1:
-                    previous = index
-                    continue
-                allowed[batch_index, run_start : previous + 1, run_start : previous + 1] = True
-                if index is not None:
-                    run_start = previous = index
+    allowed[:, :prefix_length, :prefix_length] = build_multimodal_prefix_attention_mask(
+        prefix_attention_mask,
+        reference_region_mask=reference_region_mask,
+    )
 
     for frame_index in range(frame_count):
         frame_start = prefix_length + frame_index * frame_span
@@ -213,6 +196,40 @@ def build_semantic_teacher_attention_mask(
             for local_index in local_indices:
                 allowed[:, query_position, evidence_start + local_index] = True
             allowed[:, query_position, query_position] = True
+    return allowed
+
+
+def build_multimodal_prefix_attention_mask(
+    prefix_attention_mask: Tensor,
+    *,
+    reference_region_mask: Tensor | None = None,
+) -> Tensor:
+    """Return [B,P,P] visibility for causal text plus bidirectional reference-image regions."""
+    if prefix_attention_mask.ndim != 2:
+        raise ValueError("prefix_attention_mask must be [B,P]")
+    prefix_valid = prefix_attention_mask.to(dtype=torch.bool)
+    batch_size, prefix_length = prefix_valid.shape
+    causal = torch.ones(prefix_length, prefix_length, dtype=torch.bool, device=prefix_valid.device).tril()
+    allowed = causal[None] & prefix_valid[:, :, None] & prefix_valid[:, None, :]
+
+    if reference_region_mask is None:
+        return allowed
+    if reference_region_mask.shape != prefix_valid.shape:
+        raise ValueError("reference_region_mask must match prefix_attention_mask")
+    reference_region_mask = reference_region_mask.to(device=allowed.device, dtype=torch.bool) & prefix_valid
+    for batch_index in range(batch_size):
+        indices = torch.nonzero(reference_region_mask[batch_index], as_tuple=False).flatten().tolist()
+        if not indices:
+            continue
+        run_start = indices[0]
+        previous = indices[0]
+        for index in indices[1:] + [None]:
+            if index is not None and index == previous + 1:
+                previous = index
+                continue
+            allowed[batch_index, run_start : previous + 1, run_start : previous + 1] = True
+            if index is not None:
+                run_start = previous = index
     return allowed
 
 
