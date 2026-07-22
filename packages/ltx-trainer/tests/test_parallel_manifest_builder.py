@@ -216,20 +216,20 @@ def test_canonical_manifest_probe_is_parallel_cached_ordered_and_rejects_probe_e
     monkeypatch.setattr(builder, "probe_video", fake_probe)
     connection = sqlite3.connect(":memory:")
     cache = builder._MediaValidationCache(connection)
-
-    results = list(
-        builder._iter_canonical_rows_with_bounded_probes(
-            rows,
-            dataset_name="r2v_fixture",
-            dataset_type="OpenS2VDataset",
-            data_root=None,
-            adapter_config=None,
-            manifest_seed=42,
-            workers=4,
-            batch_size=8,
-            validation_cache=cache,
+    with ThreadPoolExecutor(max_workers=4, thread_name_prefix="manifest-media") as executor:
+        results = list(
+            builder._iter_canonical_rows_with_bounded_probes(
+                rows,
+                dataset_name="r2v_fixture",
+                dataset_type="OpenS2VDataset",
+                data_root=None,
+                adapter_config=None,
+                manifest_seed=42,
+                executor=executor,
+                batch_size=8,
+                validation_cache=cache,
+            )
         )
-    )
 
     assert [source_record_id for source_record_id, *_ in results] == [row_id for row_id, _ in rows]
     assert len(thread_names) > 1
@@ -261,28 +261,32 @@ def test_canonical_manifest_probe_worker_count_does_not_change_records_or_sha(
         connection = sqlite3.connect(":memory:")
         cache = builder._MediaValidationCache(connection)
         records = []
-        for _row_id, canonical, header, error in builder._iter_canonical_rows_with_bounded_probes(
-            rows,
-            dataset_name="r2v_fixture",
-            dataset_type="OpenS2VDataset",
-            data_root=None,
-            adapter_config=None,
-            manifest_seed=42,
-            workers=workers,
-            batch_size=2,
-            validation_cache=cache,
-        ):
-            assert error is None
-            assert canonical is not None and header is not None
-            records.append(
-                build_canonical_r2v_record(
-                    canonical,
-                    manifest_seed=42,
-                    video_header=header,
-                    image_validator=lambda _path: (64, 48),
-                    target_path_validated=True,
+        with ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="manifest-media",
+        ) as executor:
+            for _row_id, canonical, header, error in builder._iter_canonical_rows_with_bounded_probes(
+                rows,
+                dataset_name="r2v_fixture",
+                dataset_type="OpenS2VDataset",
+                data_root=None,
+                adapter_config=None,
+                manifest_seed=42,
+                executor=executor,
+                batch_size=2,
+                validation_cache=cache,
+            ):
+                assert error is None
+                assert canonical is not None and header is not None
+                records.append(
+                    build_canonical_r2v_record(
+                        canonical,
+                        manifest_seed=42,
+                        video_header=header,
+                        image_validator=lambda _path: (64, 48),
+                        target_path_validated=True,
+                    )
                 )
-            )
         payload = "".join(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n" for record in records)
         return payload, hashlib.sha256(payload.encode()).hexdigest()
 
@@ -291,6 +295,230 @@ def test_canonical_manifest_probe_worker_count_does_not_change_records_or_sha(
 
     assert serial_payload == parallel_payload
     assert serial_sha == parallel_sha
+
+
+def _write_v7_manifest_fixture(tmp_path: Path) -> Path:
+    target_slow = tmp_path / "target_slow.png"
+    target_fast = tmp_path / "target_fast.png"
+    reference_slow = tmp_path / "reference_slow.png"
+    reference_fast = tmp_path / "reference_fast.png"
+    for index, path in enumerate((target_slow, target_fast, reference_slow, reference_fast)):
+        _write_image(path, (index * 30, index * 20, index * 10))
+
+    i2i_rows = [
+        {
+            "source_record_id": "i2i-0",
+            "image": str(target_slow),
+            "edit_image": [str(reference_slow), str(reference_slow), str(reference_fast)],
+            "prompt": "first deterministic edit",
+        },
+        {
+            "source_record_id": "i2i-bad",
+            "image": str(target_fast),
+            "edit_image": [str(reference_slow)],
+        },
+        {
+            "source_record_id": "i2i-1",
+            "image": str(target_fast),
+            "edit_image": [str(reference_fast)],
+            "prompt": "second deterministic edit",
+        },
+    ]
+    i2i_rows.append(dict(i2i_rows[0]))
+    i2i_annotation = tmp_path / "i2i_v7.jsonl"
+    i2i_annotation.write_text(
+        "".join(json.dumps(row) + "\n" for row in i2i_rows),
+        encoding="utf-8",
+    )
+
+    video_slow = tmp_path / "video_slow.mp4"
+    video_fast = tmp_path / "video_fast.mp4"
+    video_slow.write_bytes(b"slow video signature")
+    video_fast.write_bytes(b"fast video signature")
+    r2v_rows = [
+        {
+            "source_record_id": "r2v-0",
+            "video_path": str(video_slow),
+            "text": "first deterministic video",
+            "crop": [0, 64, 0, 48],
+            "face_cut": [0, 121],
+            "ref_images": [str(reference_slow), str(reference_slow)],
+        },
+        {
+            "source_record_id": "r2v-1",
+            "video_path": str(video_fast),
+            "text": "second deterministic video",
+            "crop": [0, 64, 0, 48],
+            "face_cut": [0, 121],
+            "ref_images": [str(reference_fast)],
+        },
+        {
+            "source_record_id": "r2v-bad",
+            "text": "missing target video",
+            "crop": [0, 64, 0, 48],
+            "face_cut": [0, 121],
+            "ref_images": [str(reference_fast)],
+        },
+    ]
+    r2v_rows.append(dict(r2v_rows[0]))
+    r2v_annotation = tmp_path / "r2v_v7.jsonl"
+    r2v_annotation.write_text(
+        "".join(json.dumps(row) + "\n" for row in r2v_rows),
+        encoding="utf-8",
+    )
+
+    config = tmp_path / "v7_data.yaml"
+    config.write_text(
+        "datasets:\n"
+        "  - name: i2i_v7\n"
+        "    task: i2i\n"
+        f"    ann_path: {i2i_annotation}\n"
+        "  - name: r2v_v7\n"
+        "    task: r2v\n"
+        "    dataset_type: OpenS2VDataset\n"
+        f"    ann_path: {r2v_annotation}\n",
+        encoding="utf-8",
+    )
+    return config
+
+
+def test_manifest_builder_is_byte_deterministic_for_workers_1_4_16_and_delayed_probes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    builder = _load_online_manifest_builder_module()
+    config = _write_v7_manifest_fixture(tmp_path)
+    monkeypatch.setattr(builder, "assert_write_path_allowed", lambda path: Path(path).resolve())
+    original_image_probe = builder._verified_image_size
+    probe_threads: set[str] = set()
+
+    def delayed_image_probe(path: str) -> tuple[int, int]:
+        probe_threads.add(threading.current_thread().name)
+        time.sleep(0.03 if "slow" in path else 0.001)
+        return original_image_probe(path)
+
+    def delayed_video_probe(path: str) -> dict[str, float | int]:
+        probe_threads.add(threading.current_thread().name)
+        time.sleep(0.03 if "slow" in path else 0.001)
+        return {"fps": 24.0, "frame_count": 300, "width": 64, "height": 48}
+
+    monkeypatch.setattr(builder, "_verified_image_size", delayed_image_probe)
+    monkeypatch.setattr(builder, "probe_video", delayed_video_probe)
+    output = tmp_path / "train.jsonl"
+    rejects = tmp_path / "rejected.jsonl"
+    summary_path = tmp_path / "summary.json"
+
+    def run(workers: int) -> tuple[bytes, bytes, bytes, dict[str, object]]:
+        builder.main(
+            train_data_config=str(config),
+            output=str(output),
+            reject_output=str(rejects),
+            summary_output=str(summary_path),
+            manifest_seed=42,
+            annotation_batch_size=2,
+            media_workers=workers,
+            media_batch_size=2,
+            progress_interval_seconds=10.0,
+            progress_every_rows=10_000,
+            count_total_rows=True,
+            i2i_target_field="image",
+            i2i_reference_field="edit_image",
+            i2i_caption_field="prompt",
+            i2i_crop_field=None,
+        )
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        return (
+            output.read_bytes(),
+            rejects.read_bytes(),
+            Path(f"{output}.idx").read_bytes(),
+            summary,
+        )
+
+    results = [run(workers) for workers in (1, 4, 16)]
+    for position in range(3):
+        assert results[0][position] == results[1][position] == results[2][position]
+    ignored_summary_fields = {"elapsed_seconds", "peak_rss_gb", "rows_per_second", "eta_seconds"}
+    stable_summaries = [
+        {key: value for key, value in result[3].items() if key not in ignored_summary_fields}
+        for result in results
+    ]
+    assert stable_summaries[0] == stable_summaries[1] == stable_summaries[2]
+
+    records = [json.loads(line) for line in results[0][0].splitlines()]
+    rejected = [json.loads(line) for line in results[0][1].splitlines()]
+    assert [record["source_record_id"] for record in records] == ["i2i-0", "i2i-1", "r2v-0", "r2v-1"]
+    assert [record["source_record_id"] for record in rejected] == ["i2i-bad", "r2v-bad"]
+    summary = results[0][3]
+    assert summary["accepted_rows"] == 4
+    assert summary["rejected_rows"] == 2
+    assert summary["duplicate_rows"] == 2
+    assert summary["task_counts"] == {"i2i": 2, "r2v": 2}
+    assert summary["dataset_counts"] == {"i2i_v7": 2, "r2v_v7": 2}
+    assert summary["image_probe_submitted"] == 4
+    assert summary["video_probe_submitted"] == 2
+    assert probe_threads
+    assert all(name.startswith("manifest-media") for name in probe_threads)
+    assert not list(tmp_path.glob("*.tmp.*"))
+    assert not list(tmp_path.glob("*.dedup.*.sqlite"))
+    captured = capsys.readouterr()
+    assert '"accepted_rows": 4' in captured.out
+    assert "event=dataset_start" in captured.err
+    assert "event=dataset_complete" in captured.err
+    assert "event=manifest_complete" in captured.err
+
+
+def test_media_prefetch_deduplicates_paths_and_keeps_sqlite_on_main_thread(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_online_manifest_builder_module()
+    raw_connection = sqlite3.connect(":memory:")
+    sqlite_thread_ids: list[int] = []
+
+    class RecordingConnection:
+        def execute(self, *args, **kwargs):
+            sqlite_thread_ids.append(threading.get_ident())
+            return raw_connection.execute(*args, **kwargs)
+
+    cache = builder._MediaValidationCache(RecordingConnection())
+    images = [tmp_path / f"cache_{index}.png" for index in range(3)]
+    for index, path in enumerate(images):
+        _write_image(path, (index, index, index))
+    original_probe = builder._probe_resolved_image
+    worker_thread_ids: list[int] = []
+
+    def recording_probe(path: str):
+        worker_thread_ids.append(threading.get_ident())
+        time.sleep(0.005)
+        return original_probe(path)
+
+    monkeypatch.setattr(builder, "_probe_resolved_image", recording_probe)
+    main_thread_id = threading.get_ident()
+    with ThreadPoolExecutor(max_workers=3, thread_name_prefix="manifest-media") as executor:
+        with pytest.raises(RuntimeError, match="cache miss after batch prefetch"):
+            cache.require_image(str(images[2]))
+        cache.prefetch_images(
+            [str(images[0]), str(images[0]), str(images[1]), str(images[0])],
+            executor=executor,
+        )
+        assert cache.require_image(str(images[0])) == (64, 48)
+        assert cache.require_image(str(images[0])) == (64, 48)
+        cache.prefetch_images(
+            [str(images[0]), str(images[1]), str(images[2]), str(images[2])],
+            executor=executor,
+        )
+        assert cache.require_image(str(images[2])) == (64, 48)
+        with pytest.raises(RuntimeError, match="owner thread"):
+            executor.submit(cache.require_image, str(images[0])).result()
+
+    assert cache.image_probe_submitted == 3
+    assert len(worker_thread_ids) == 3
+    assert all(thread_id != main_thread_id for thread_id in worker_thread_ids)
+    assert sqlite_thread_ids
+    assert set(sqlite_thread_ids) == {main_thread_id}
+    assert cache.image_cache_hits >= 4
+    raw_connection.close()
 
 
 def test_media_cache_runtime_writes_use_dedicated_writer_thread(tmp_path: Path) -> None:

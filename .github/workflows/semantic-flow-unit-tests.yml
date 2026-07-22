@@ -51,6 +51,9 @@ jobs:
         run: |
           pytest -q \
             packages/ltx-trainer/tests/test_anchor_geometry.py \
+            packages/ltx-trainer/tests/test_manifest_adapters.py \
+            packages/ltx-trainer/tests/test_manifest_progress.py \
+            packages/ltx-trainer/tests/test_multitask_manifest_streaming.py \
             packages/ltx-trainer/tests/test_semantic_flow_architecture.py \
             packages/ltx-trainer/tests/test_parallel_manifest_builder.py \
             packages/ltx-trainer/tests/test_gemma3_attention_masks.py \

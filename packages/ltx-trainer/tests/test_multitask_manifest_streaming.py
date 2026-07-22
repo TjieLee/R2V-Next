@@ -1,15 +1,17 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import sqlite3
+import sys
 import tracemalloc
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from scripts import build_multitask_online_manifest as manifest_builder
 
 from ltx_trainer.online_data.manifest import iter_annotation_rows, read_annotation_rows
 from ltx_trainer.online_data.manifest_index import (
@@ -22,6 +24,20 @@ from ltx_trainer.online_data.manifest_index import (
     read_manifest_index,
     validate_manifest_index,
 )
+
+
+def _load_online_manifest_builder_module():
+    path = Path(__file__).resolve().parents[1] / "scripts" / "build_multitask_online_manifest.py"
+    name = "_test_streaming_build_multitask_online_manifest"
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+manifest_builder = _load_online_manifest_builder_module()
 
 
 def test_iter_annotation_rows_streams_100k_jsonl_without_read_text(
@@ -160,12 +176,15 @@ def test_same_build_image_validation_cache_reuses_results_and_invalidates_on_cha
         return (64, 48)
 
     monkeypatch.setattr(manifest_builder, "_verified_image_size", _verify)
-    assert cache.validate_image(str(image_path)) == (64, 48)
-    assert cache.validate_image(str(image_path)) == (64, 48)
-    assert calls == 1
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        cache.prefetch_images([str(image_path), str(image_path)], executor=executor)
+        assert cache.require_image(str(image_path)) == (64, 48)
+        assert cache.require_image(str(image_path)) == (64, 48)
+        assert calls == 1
 
-    image_path.write_bytes(b"second-version-is-longer")
-    assert cache.validate_image(str(image_path)) == (64, 48)
+        image_path.write_bytes(b"second-version-is-longer")
+        cache.prefetch_images([str(image_path)], executor=executor)
+        assert cache.require_image(str(image_path)) == (64, 48)
     assert calls == 2
     connection.close()
 
@@ -186,9 +205,11 @@ def test_same_build_media_cache_reuses_negative_image_result(
         raise ValueError("bad image")
 
     monkeypatch.setattr(manifest_builder, "_verified_image_size", _fail)
-    for _ in range(2):
-        with pytest.raises(RuntimeError, match="Unreadable image"):
-            cache.validate_image(str(image_path))
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        cache.prefetch_images([str(image_path)], executor=executor)
+        for _ in range(2):
+            with pytest.raises(RuntimeError, match="Unreadable image"):
+                cache.require_image(str(image_path))
     assert calls == 1
     connection.close()
 
@@ -209,18 +230,11 @@ def test_bounded_video_probe_cache_deduplicates_repeated_paths(
         return {"fps": 24.0, "frame_count": 240, "width": 832, "height": 480}
 
     monkeypatch.setattr(manifest_builder, "probe_video", _probe)
-    rows = [{"video_path": str(video_path)} for _ in range(8)]
-    results = list(
-        manifest_builder._iter_rows_with_bounded_probes(
-            rows,
-            data_root=None,
-            workers=2,
-            batch_size=8,
-            validation_cache=cache,
-        )
-    )
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        cache.prefetch_videos([str(video_path)] * 8, executor=executor)
+        results = [cache.require_video(str(video_path)).as_probe_result() for _ in range(8)]
     assert calls == 1
-    assert all(header is not None and error is None for _, header, error in results)
+    assert all(header is not None and error is None for header, error in results)
     connection.close()
 
 
@@ -264,6 +278,7 @@ def _patch_synthetic_builder(
         lambda row, **kwargs: SimpleNamespace(
             video_path="synthetic.mp4",
             dataset_name=kwargs["dataset_name"],
+            reference_paths=[],
             row=row,
         ),
     )
@@ -272,7 +287,11 @@ def _patch_synthetic_builder(
         "build_canonical_r2v_record",
         lambda source, **kwargs: _record(source.row, dataset_name=source.dataset_name, **kwargs),
     )
-    monkeypatch.setattr(manifest_builder, "probe_video", lambda _path: {})
+    monkeypatch.setattr(
+        manifest_builder,
+        "_probe_resolved_video",
+        lambda _path: manifest_builder._ValidationResult({}),
+    )
     monkeypatch.setattr(manifest_builder, "assert_write_path_allowed", lambda path: Path(path).resolve())
 
 
@@ -287,8 +306,11 @@ def _run_synthetic_builder(tmp_path: Path) -> tuple[Path, Path, Path]:
         summary_output=str(summary),
         manifest_seed=42,
         annotation_batch_size=4096,
-        probe_workers=2,
-        probe_batch_size=128,
+        media_workers=2,
+        media_batch_size=128,
+        progress_interval_seconds=10.0,
+        progress_every_rows=10_000,
+        count_total_rows=False,
         i2i_target_field="target",
         i2i_reference_field="sources",
         i2i_caption_field="caption",
