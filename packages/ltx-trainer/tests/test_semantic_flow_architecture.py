@@ -17,12 +17,14 @@ from ltx_core.multicond.semantic_tokens import (
     EVIDENCE_TOKENS_PER_FRAME,
     SEMANTIC_TOKENS_PER_FRAME,
     SemanticEncoder,
+    SemanticKeepMaskSample,
     SemanticQueryInitializer,
     SemanticReconstructionDecoder,
     build_multimodal_prefix_attention_mask,
     build_semantic_teacher_attention_mask,
     gather_local_evidence,
     sample_semantic_keep_mask,
+    sample_semantic_keep_mask_with_stats,
 )
 from ltx_core.types import VideoLatentShape
 from ltx_trainer.online_inference.checkpoint_runtime import (
@@ -154,16 +156,29 @@ def test_prefix_only_hidden_matches_teacher_prefix_hidden_with_reference_regions
     torch.testing.assert_close(prefix_only_hidden, teacher_prefix_hidden, rtol=0.0, atol=0.0)
 
 
-def test_semantic_dropout_keeps_at_least_56_tokens_per_frame() -> None:
+def test_semantic_dropout_uses_exact_counts_between_48_and_64_tokens_per_frame() -> None:
     generator = torch.Generator().manual_seed(7)
-    mask = sample_semantic_keep_mask(
+    sample = sample_semantic_keep_mask_with_stats(
         torch.zeros(8, 12, 64, 16),
-        maximum_drop_rate=0.2,
-        minimum_tokens_per_frame=56,
+        maximum_drop_rate=0.25,
+        minimum_tokens_per_frame=48,
         generator=generator,
     )
+    mask = sample.keep_mask
     assert mask.shape == (8, 12, 64)
-    assert (mask.sum(dim=-1) >= 56).all()
+    per_frame_kept = mask.sum(dim=-1)
+    assert (per_frame_kept >= 48).all()
+    assert (per_frame_kept <= 64).all()
+    assert torch.equal(per_frame_kept, per_frame_kept[:, :1].expand_as(per_frame_kept))
+    assert torch.equal(sample.drop_count_per_frame, 64 - per_frame_kept[:, 0])
+    assert torch.equal(sample.requested_drop_rate, sample.drop_count_per_frame.float() / 64.0)
+    wrapper_mask = sample_semantic_keep_mask(
+        torch.zeros(2, 3, 64, 4),
+        maximum_drop_rate=0.25,
+        minimum_tokens_per_frame=48,
+        generator=torch.Generator().manual_seed(9),
+    )
+    assert wrapper_mask.shape == (2, 3, 64)
 
 
 def test_semantic_flow_reports_actual_kept_prefix_and_latent_metrics(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -183,7 +198,16 @@ def test_semantic_flow_reports_actual_kept_prefix_and_latent_metrics(monkeypatch
     strategy.build_semantic_teacher_outputs = lambda _teacher_inputs: teacher  # type: ignore[method-assign]
     keep_mask = torch.zeros(1, 2, SEMANTIC_TOKENS_PER_FRAME, dtype=torch.bool)
     keep_mask[:, :, :40] = True
-    monkeypatch.setattr(semantic_flow_module, "sample_semantic_keep_mask", lambda *args, **kwargs: keep_mask)
+    keep_sample = SemanticKeepMaskSample(
+        keep_mask=keep_mask,
+        requested_drop_rate=torch.tensor([24.0 / 64.0]),
+        drop_count_per_frame=torch.tensor([24]),
+    )
+    monkeypatch.setattr(
+        semantic_flow_module,
+        "sample_semantic_keep_mask_with_stats",
+        lambda *args, **kwargs: keep_sample,
+    )
 
     batch = {
         "semantic_teacher_inputs": {
@@ -210,6 +234,8 @@ def test_semantic_flow_reports_actual_kept_prefix_and_latent_metrics(monkeypatch
 
     inputs = strategy.prepare_training_inputs(batch, sampler)
     metrics = strategy.get_last_training_metrics()
+    assert float(metrics["train/semantic_requested_drop_rate"]) == pytest.approx(24.0 / 64.0)
+    assert float(metrics["train/semantic_drop_count_per_frame"]) == 24.0
     assert float(metrics["train/semantic_token_count_before_dropout"]) == 128.0
     assert float(metrics["train/semantic_token_count_kept"]) == 80.0
     assert float(metrics["train/semantic_keep_ratio"]) == pytest.approx(80.0 / 128.0)

@@ -19,7 +19,7 @@ from ltx_core.multicond.semantic_tokens import (
     SemanticReconstructionDecoder,
     build_semantic_teacher_attention_mask,
     gather_local_evidence,
-    sample_semantic_keep_mask,
+    sample_semantic_keep_mask_with_stats,
     semantic_reconstruction_loss,
 )
 from ltx_core.types import VideoLatentShape
@@ -64,8 +64,8 @@ class SemanticFlowConfig(TrainingStrategyConfigBase):
 
     semantic_hidden_dim: int = Field(default=512, ge=1)
     semantic_position_gate_init: float = Field(default=0.0, ge=0.0, le=0.01)
-    semantic_maximum_drop_rate: float = Field(default=0.20, ge=0.0, le=1.0)
-    semantic_minimum_tokens_per_frame: int = Field(default=56, ge=1, le=SEMANTIC_TOKENS_PER_FRAME)
+    semantic_maximum_drop_rate: float = Field(default=0.25, ge=0.0, le=1.0)
+    semantic_minimum_tokens_per_frame: int = Field(default=48, ge=1, le=SEMANTIC_TOKENS_PER_FRAME)
 
     video_flow_weight: float = Field(default=1.0, ge=0.0)
     semantic_flow_weight: float = Field(default=1.0, ge=0.0)
@@ -282,11 +282,12 @@ class SemanticFlowStrategy(TrainingStrategy):
             device=device,
         )
 
-        keep_mask = sample_semantic_keep_mask(
+        keep_sample = sample_semantic_keep_mask_with_stats(
             semantic_clean,
             maximum_drop_rate=self.config.semantic_maximum_drop_rate,
             minimum_tokens_per_frame=self.config.semantic_minimum_tokens_per_frame,
         )
+        keep_mask = keep_sample.keep_mask
         semantic_noise = torch.randn_like(semantic_clean)
         semantic_noisy_all = (1.0 - sigma[:, None, None, None]) * semantic_clean + (
             sigma[:, None, None, None] * semantic_noise
@@ -316,6 +317,12 @@ class SemanticFlowStrategy(TrainingStrategy):
         )
         semantic_token_count_kept = semantic_valid.sum(dim=1).to(dtype=torch.float32)
         self._last_training_metrics = {
+            "train/semantic_requested_drop_rate": keep_sample.requested_drop_rate.to(device=device).detach().mean(),
+            "train/semantic_drop_count_per_frame": keep_sample.drop_count_per_frame.to(
+                device=device, dtype=torch.float32
+            )
+            .detach()
+            .mean(),
             "train/semantic_token_count_before_dropout": semantic_token_count_before_dropout.detach().mean(),
             "train/semantic_token_count_kept": semantic_token_count_kept.detach().mean(),
             "train/semantic_keep_ratio": (

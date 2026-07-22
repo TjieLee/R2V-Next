@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 import torch
 from torch import Tensor, nn
@@ -13,6 +14,13 @@ SEMANTIC_GRID_SIZE = 8
 EVIDENCE_TOKENS_PER_FRAME = EVIDENCE_GRID_SIZE**2
 SEMANTIC_TOKENS_PER_FRAME = SEMANTIC_GRID_SIZE**2
 LOCAL_EVIDENCE_TOKENS = 4
+
+
+@dataclass(frozen=True)
+class SemanticKeepMaskSample:
+    keep_mask: Tensor
+    requested_drop_rate: Tensor
+    drop_count_per_frame: Tensor
 
 
 class SemanticQueryInitializer(nn.Module):
@@ -236,11 +244,27 @@ def build_multimodal_prefix_attention_mask(
 def sample_semantic_keep_mask(
     semantic_latent: Tensor,
     *,
-    maximum_drop_rate: float = 0.2,
-    minimum_tokens_per_frame: int = 56,
+    maximum_drop_rate: float = 0.25,
+    minimum_tokens_per_frame: int = 48,
     generator: torch.Generator | None = None,
 ) -> Tensor:
-    """Sample per-example rates and per-frame masks without renumbering tokens."""
+    """Sample exact-count per-frame masks without renumbering tokens."""
+    return sample_semantic_keep_mask_with_stats(
+        semantic_latent,
+        maximum_drop_rate=maximum_drop_rate,
+        minimum_tokens_per_frame=minimum_tokens_per_frame,
+        generator=generator,
+    ).keep_mask
+
+
+def sample_semantic_keep_mask_with_stats(
+    semantic_latent: Tensor,
+    *,
+    maximum_drop_rate: float = 0.25,
+    minimum_tokens_per_frame: int = 48,
+    generator: torch.Generator | None = None,
+) -> SemanticKeepMaskSample:
+    """Sample one exact drop count per sample, with independent spatial positions per frame."""
     if semantic_latent.ndim != 4 or semantic_latent.shape[-2] != SEMANTIC_TOKENS_PER_FRAME:
         raise ValueError("semantic_latent must be [B,F,64,C]")
     if not 0.0 <= maximum_drop_rate <= 1.0:
@@ -248,24 +272,41 @@ def sample_semantic_keep_mask(
     minimum_tokens_per_frame = min(max(1, int(minimum_tokens_per_frame)), SEMANTIC_TOKENS_PER_FRAME)
     batch_size, frame_count = semantic_latent.shape[:2]
     device = semantic_latent.device
-    rates = torch.rand(batch_size, device=device, generator=generator) * maximum_drop_rate
-    keep = torch.rand(
+    max_drop_by_rate = math.floor(float(maximum_drop_rate) * SEMANTIC_TOKENS_PER_FRAME + 1.0e-8)
+    max_drop_by_minimum = SEMANTIC_TOKENS_PER_FRAME - minimum_tokens_per_frame
+    max_drop_count = max(0, min(max_drop_by_rate, max_drop_by_minimum))
+    drop_counts = torch.randint(
+        low=0,
+        high=max_drop_count + 1,
+        size=(batch_size,),
+        device=device,
+        generator=generator,
+        dtype=torch.long,
+    )
+    keep = torch.zeros(
+        batch_size,
+        frame_count,
+        SEMANTIC_TOKENS_PER_FRAME,
+        device=device,
+        dtype=torch.bool,
+    )
+    scores = torch.rand(
         batch_size,
         frame_count,
         SEMANTIC_TOKENS_PER_FRAME,
         device=device,
         generator=generator,
-    ) >= rates[:, None, None]
+    )
     for batch_index in range(batch_size):
+        keep_count = SEMANTIC_TOKENS_PER_FRAME - int(drop_counts[batch_index].item())
         for frame_index in range(frame_count):
-            kept = int(keep[batch_index, frame_index].sum().item())
-            if kept >= minimum_tokens_per_frame:
-                continue
-            scores = torch.rand(SEMANTIC_TOKENS_PER_FRAME, device=device, generator=generator)
-            selected = scores.topk(minimum_tokens_per_frame).indices
-            keep[batch_index, frame_index] = False
+            selected = scores[batch_index, frame_index].topk(keep_count).indices
             keep[batch_index, frame_index, selected] = True
-    return keep
+    return SemanticKeepMaskSample(
+        keep_mask=keep,
+        requested_drop_rate=drop_counts.to(dtype=torch.float32) / float(SEMANTIC_TOKENS_PER_FRAME),
+        drop_count_per_frame=drop_counts,
+    )
 
 
 def round_up_prefix_length(actual_length: int, *, multiple: int = 128, maximum: int = 2560) -> int:
