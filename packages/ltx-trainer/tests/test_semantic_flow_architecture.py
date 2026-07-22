@@ -530,17 +530,24 @@ def test_semantic_flow_full_training_requires_fsdp_full_shard() -> None:
     )
 
 
-def test_semantic_flow_fsdp_accelerate_config_is_full_shard() -> None:
-    config_path = (
-        Path(__file__).resolve().parents[1]
-        / "configs"
-        / "accelerate_semantic_flow_fsdp_full_shard.yaml"
-    )
+@pytest.mark.parametrize(
+    ("filename", "expected_processes"),
+    [
+        ("accelerate_semantic_flow_fsdp_smoke_2gpu.yaml", 2),
+        ("accelerate_semantic_flow_fsdp_train_8gpu.yaml", 8),
+    ],
+)
+def test_semantic_flow_fsdp_accelerate_configs_are_full_shard(
+    filename: str,
+    expected_processes: int,
+) -> None:
+    config_path = Path(__file__).resolve().parents[1] / "configs" / filename
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     fsdp_config = config["fsdp_config"]
     assert config["compute_environment"] == "LOCAL_MACHINE"
     assert config["distributed_type"] == "FSDP"
     assert config["mixed_precision"] == "bf16"
+    assert config["num_processes"] == expected_processes
     assert fsdp_config["fsdp_version"] == 1
     assert fsdp_config["fsdp_sharding_strategy"] == "FULL_SHARD"
     assert fsdp_config["fsdp_state_dict_type"] == "FULL_STATE_DICT"

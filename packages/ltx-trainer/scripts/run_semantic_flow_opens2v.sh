@@ -34,7 +34,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 DATA_CONFIG="$R2V_ROOT/manifests/multitask_online_480p121_opens2v.yaml"
 TRAIN_CONFIG="$REPO_ROOT/packages/ltx-trainer/configs/semantic_flow_multitask_480p121.yaml"
-ACCELERATE_CONFIG="${ACCELERATE_CONFIG:-$REPO_ROOT/packages/ltx-trainer/configs/accelerate_semantic_flow_fsdp_full_shard.yaml}"
+ACCELERATE_CONFIG="${ACCELERATE_CONFIG:-$REPO_ROOT/packages/ltx-trainer/configs/accelerate_semantic_flow_fsdp_train_8gpu.yaml}"
+FSDP_SMOKE_ACCELERATE_CONFIG="${FSDP_SMOKE_ACCELERATE_CONFIG:-$REPO_ROOT/packages/ltx-trainer/configs/accelerate_semantic_flow_fsdp_smoke_2gpu.yaml}"
 SMOKE_ROOT="$R2V_ROOT/smoke"
 INFERENCE_SMOKE_ROOT="/mnt/workspace/litengjie/jd_ltx_multitask_online_480p121/inference/semantic_flow_v2_smoke"
 RUNTIME_AUDIT="$R2V_ROOT/train/runtime_audit.json"
@@ -132,6 +133,8 @@ if accelerate_config.get("distributed_type") != "FSDP":
     errors.append("Accelerate distributed_type must be FSDP")
 if accelerate_config.get("mixed_precision") != "bf16":
     errors.append("Accelerate mixed_precision must be bf16")
+if int(accelerate_config.get("num_processes", 0)) < 4:
+    errors.append("Real 22B semantic-flow smoke/training requires num_processes >= 4; 8 is recommended")
 if fsdp_config.get("fsdp_version") != 1:
     errors.append("Accelerate fsdp_version must be 1")
 if fsdp_config.get("fsdp_sharding_strategy") != "FULL_SHARD":
@@ -220,13 +223,13 @@ case "${1:-}" in
       --accelerate-config "$ACCELERATE_CONFIG" \
       --output "$RUNTIME_AUDIT"
     accelerate launch --config_file "$ACCELERATE_CONFIG" \
-      "$REPO_ROOT/packages/ltx-trainer/scripts/check_multitask_online_ddp.py" \
+      "$REPO_ROOT/packages/ltx-trainer/scripts/check_multitask_online_distributed.py" \
       --config "$TRAIN_CONFIG" \
       --task i2i \
       --output-dir "$SMOKE_ROOT/i2i"
     I2I_CHECKPOINT="$(latest_smoke_checkpoint "$SMOKE_ROOT/i2i")"
     accelerate launch --config_file "$ACCELERATE_CONFIG" \
-      "$REPO_ROOT/packages/ltx-trainer/scripts/check_multitask_online_ddp.py" \
+      "$REPO_ROOT/packages/ltx-trainer/scripts/check_multitask_online_distributed.py" \
       --config "$TRAIN_CONFIG" \
       --task r2v \
       --init-checkpoint "$I2I_CHECKPOINT" \
@@ -271,8 +274,7 @@ case "${1:-}" in
     ;;
   *)
     printf '%s\n' "Usage: $0 {build-manifest|smoke|train [--skip-smoke-guard]}"
-    printf '%s\n' "Required distributed mode: FSDP FULL_SHARD"
-    printf '%s\n' "Plain DDP is unsupported for full 22B DiT semantic-flow training."
+    printf '%s\n' "Required distributed mode: FSDP FULL_SHARD with at least 4 processes; 8 is recommended."
     exit 2
     ;;
 esac

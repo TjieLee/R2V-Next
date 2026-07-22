@@ -1,4 +1,4 @@
-"""Run one task and one Trainer in a single two-rank Accelerate launch."""
+"""Run one real semantic-flow task in a multi-rank FSDP launch."""
 
 from __future__ import annotations
 
@@ -27,8 +27,11 @@ def main(
     output_dir: str = typer.Option(..., "--output-dir"),
 ) -> None:
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    if world_size != 2:
-        raise RuntimeError(f"DDP smoke requires exactly two processes, got {world_size}")
+    if world_size < 4:
+        raise RuntimeError(
+            "Real 22B semantic-flow smoke requires at least 4 processes; "
+            "8 is recommended"
+        )
     run_one_step_training_smoke(
         config,
         task=_validate_task(task),
