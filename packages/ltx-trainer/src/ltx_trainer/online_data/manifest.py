@@ -137,6 +137,37 @@ def iter_annotation_rows(path: str | Path, *, batch_size: int = 4096) -> Iterato
         yield row
 
 
+def annotation_row_count(path: str | Path) -> int | None:
+    """Return an annotation row count without decoding media or scanning parquet rows."""
+    annotation_path = Path(path).expanduser().resolve()
+    if not annotation_path.is_file():
+        raise FileNotFoundError(f"Annotation file does not exist: {annotation_path}")
+    suffix = annotation_path.suffix.lower()
+    if suffix == ".parquet":
+        try:
+            from pyarrow import parquet  # noqa: PLC0415
+        except ImportError as exc:
+            raise RuntimeError("Counting parquet annotations requires pyarrow") from exc
+        return int(parquet.ParquetFile(annotation_path).metadata.num_rows)
+    if suffix == ".jsonl":
+        count = 0
+        last_byte = b""
+        with annotation_path.open("rb") as handle:
+            while block := handle.read(1024 * 1024):
+                count += block.count(b"\n")
+                last_byte = block[-1:]
+        return count + int(bool(last_byte) and last_byte != b"\n")
+    if suffix == ".csv":
+        return None
+    if suffix == ".json":
+        with annotation_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if isinstance(payload, (Mapping, list)):
+            return len(payload)
+        raise ValueError(f"JSON annotation must be a list or dict-of-records: {annotation_path}")
+    return None
+
+
 def read_annotation_rows(path: str | Path) -> list[dict[str, Any]]:
     return list(iter_annotation_rows(path))
 

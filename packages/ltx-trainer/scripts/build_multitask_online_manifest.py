@@ -17,10 +17,10 @@ import time
 from collections import Counter
 from collections.abc import Iterable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import islice
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, Callable, TextIO, TypeVar
 
 import typer
 from PIL import Image, ImageOps
@@ -29,6 +29,7 @@ from ltx_trainer.online_data.constants import IMAGE_TASK, VIDEO_TASK
 from ltx_trainer.online_data.manifest import (
     CanonicalR2VSource,
     ManifestReject,
+    annotation_row_count,
     build_canonical_r2v_record,
     build_i2i_record,
     iter_annotation_items,
@@ -245,6 +246,112 @@ class _MediaValidationCache:
     validate_image = require_image
 
 
+@dataclass
+class _ManifestProgress:
+    started_at: float
+    last_emitted_at: float
+    last_emitted_rows: int
+    total_rows: int | None
+    progress_interval_seconds: float
+    progress_every_rows: int
+    validation_cache: _MediaValidationCache
+    clock: Callable[[], float] = time.perf_counter
+    stream: TextIO = field(default_factory=lambda: sys.stderr)
+    dataset_name: str = ""
+    task: str = ""
+    dataset_total: int | None = None
+    global_processed: int = 0
+    global_accepted: int = 0
+    global_rejected: int = 0
+    global_duplicates: int = 0
+    dataset_processed: int = 0
+    dataset_accepted: int = 0
+    dataset_rejected: int = 0
+    dataset_duplicates: int = 0
+    dataset_reject_reasons: Counter[str] = field(default_factory=Counter)
+
+    def start_dataset(self, *, dataset_name: str, task: str, total_rows: int | None) -> None:
+        self.dataset_name = dataset_name
+        self.task = task
+        self.dataset_total = total_rows
+        self.dataset_processed = 0
+        self.dataset_accepted = 0
+        self.dataset_rejected = 0
+        self.dataset_duplicates = 0
+        self.dataset_reject_reasons.clear()
+        self.maybe_emit(force=True, event="dataset_start")
+
+    def record_accepted(self) -> None:
+        self.global_processed += 1
+        self.global_accepted += 1
+        self.dataset_processed += 1
+        self.dataset_accepted += 1
+
+    def record_rejected(self, reason: str) -> None:
+        self.global_processed += 1
+        self.global_rejected += 1
+        self.dataset_processed += 1
+        self.dataset_rejected += 1
+        self.dataset_reject_reasons[reason] += 1
+
+    def record_duplicate(self) -> None:
+        self.global_processed += 1
+        self.global_duplicates += 1
+        self.dataset_processed += 1
+        self.dataset_duplicates += 1
+
+    def maybe_emit(self, *, force: bool = False, event: str = "progress") -> None:
+        now = self.clock()
+        if not force:
+            interval_reached = now - self.last_emitted_at >= self.progress_interval_seconds
+            rows_reached = self.global_processed - self.last_emitted_rows >= self.progress_every_rows
+            if not interval_reached and not rows_reached:
+                return
+
+        elapsed = max(0.0, now - self.started_at)
+        rows_per_second = self.global_processed / elapsed if elapsed > 0 else 0.0
+        eta_seconds: float | None = None
+        if self.total_rows is not None and rows_per_second > 0:
+            eta_seconds = max(0.0, (self.total_rows - self.global_processed) / rows_per_second)
+        accept_rate = self.global_accepted / self.global_processed if self.global_processed else 0.0
+        top_rejects = sorted(
+            self.dataset_reject_reasons.items(),
+            key=lambda item: (-item[1], item[0]),
+        )[:5]
+        fields = {
+            "event": event,
+            "dataset_name": self.dataset_name or "unknown",
+            "task": self.task or "unknown",
+            "dataset_processed": self.dataset_processed,
+            "dataset_total": self.dataset_total if self.dataset_total is not None else "unknown",
+            "global_processed": self.global_processed,
+            "global_total": self.total_rows if self.total_rows is not None else "unknown",
+            "accepted": self.global_accepted,
+            "rejected": self.global_rejected,
+            "duplicates": self.global_duplicates,
+            "dataset_accepted": self.dataset_accepted,
+            "dataset_rejected": self.dataset_rejected,
+            "dataset_duplicates": self.dataset_duplicates,
+            "accept_rate": f"{accept_rate:.2%}",
+            "rows_per_second": f"{rows_per_second:.1f}",
+            "elapsed_seconds": f"{elapsed:.1f}",
+            "eta_seconds": "unknown" if eta_seconds is None else f"{eta_seconds:.1f}",
+            "image_cache_hits": self.validation_cache.image_cache_hits,
+            "image_cache_misses": self.validation_cache.image_cache_misses,
+            "video_cache_hits": self.validation_cache.video_cache_hits,
+            "video_cache_misses": self.validation_cache.video_cache_misses,
+            "top_reject_reasons": ",".join(f"{reason}:{count}" for reason, count in top_rejects)
+            or "none",
+        }
+        print(
+            "[manifest] " + " ".join(f"{key}={value}" for key, value in fields.items()),
+            file=self.stream,
+            flush=True,
+        )
+        self.last_emitted_at = now
+        self.last_emitted_rows = self.global_processed
+
+
 def _temporary_path(path: Path) -> Path:
     return Path(f"{path}.tmp.{os.getpid()}")
 
@@ -398,6 +505,9 @@ def main(  # noqa: PLR0913, PLR0915
     annotation_batch_size: int = typer.Option(4096, "--annotation-batch-size", min=1),
     probe_workers: int = typer.Option(8, "--probe-workers", min=1),
     probe_batch_size: int = typer.Option(256, "--probe-batch-size", min=1),
+    progress_interval_seconds: float = typer.Option(10.0, "--progress-interval-seconds", min=0.5),
+    progress_every_rows: int = typer.Option(10_000, "--progress-every-rows", min=1),
+    count_total_rows: bool = typer.Option(True, "--count-total-rows/--no-count-total-rows"),
     i2i_target_field: str = typer.Option(..., "--i2i-target-field"),
     i2i_reference_field: str = typer.Option(..., "--i2i-reference-field"),
     i2i_caption_field: str = typer.Option(..., "--i2i-caption-field"),
@@ -422,11 +532,48 @@ def main(  # noqa: PLR0913, PLR0915
         output_path.with_suffix(output_path.suffix + f".dedup.{os.getpid()}.sqlite")
     )
     config = load_multitask_data_config(train_data_config)
+    dataset_row_totals: list[int | None] = []
+    for dataset in config["datasets"]:
+        if not isinstance(dataset, dict):
+            raise ValueError("Each datasets entry must be a mapping")
+        if not count_total_rows:
+            dataset_row_totals.append(None)
+            continue
+        dataset_name = str(dataset.get("name", dataset.get("task", "unknown")))
+        annotation_path = dataset.get("ann_path") or dataset.get("parquet") or dataset.get("path")
+        count_failed = False
+        try:
+            total = annotation_row_count(annotation_path) if annotation_path is not None else None
+            if total is not None and dataset.get("max_samples") is not None:
+                total = min(total, int(dataset["max_samples"]))
+        except Exception as exc:
+            total = None
+            count_failed = True
+            print(
+                f"[manifest] event=warning dataset_name={dataset_name} "
+                f"message=annotation_row_count_failed:{type(exc).__name__}:{exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+        if total is None and not count_failed:
+            print(
+                f"[manifest] event=warning dataset_name={dataset_name} "
+                "message=annotation_row_count_unknown",
+                file=sys.stderr,
+                flush=True,
+            )
+        dataset_row_totals.append(total)
+    global_total_rows = (
+        sum(total for total in dataset_row_totals if total is not None)
+        if all(total is not None for total in dataset_row_totals)
+        else None
+    )
     raw_rows = 0
     accepted_rows = 0
     rejected_rows = 0
     duplicate_rows = 0
     task_counts: Counter[str] = Counter()
+    dataset_counts: Counter[str] = Counter()
     reject_reason_counts: Counter[str] = Counter()
 
     connection: sqlite3.Connection | None = None
@@ -440,6 +587,15 @@ def main(  # noqa: PLR0913, PLR0915
             "CREATE TABLE dedup (sample_key TEXT PRIMARY KEY, sample_plan_sha256 TEXT NOT NULL) WITHOUT ROWID"
         )
         validation_cache = _MediaValidationCache(connection)
+        progress = _ManifestProgress(
+            started_at=started,
+            last_emitted_at=started,
+            last_emitted_rows=0,
+            total_rows=global_total_rows,
+            progress_interval_seconds=progress_interval_seconds,
+            progress_every_rows=progress_every_rows,
+            validation_cache=validation_cache,
+        )
 
         with (
             ThreadPoolExecutor(
@@ -449,7 +605,7 @@ def main(  # noqa: PLR0913, PLR0915
             output_temporary.open("w", encoding="utf-8") as accepted_handle,
             reject_temporary.open("w", encoding="utf-8") as reject_handle,
         ):
-            def accept_record(record: dict[str, Any]) -> None:
+            def accept_record(record: dict[str, Any]) -> bool:
                 nonlocal accepted_rows, duplicate_rows
                 sample_key = str(record["sample_key"])
                 plan_sha = str(record["sample_plan_sha256"])
@@ -461,13 +617,15 @@ def main(  # noqa: PLR0913, PLR0915
                     if str(existing[0]) != plan_sha:
                         raise _ManifestCollisionError(f"sample_key collision with different plans: {sample_key}")
                     duplicate_rows += 1
-                    return
+                    return False
                 connection.execute("INSERT INTO dedup VALUES (?, ?)", (sample_key, plan_sha))
                 accepted_handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
                 accepted_rows += 1
                 task_counts[str(record["task"])] += 1
+                dataset_counts[str(record["dataset_name"])] += 1
                 if accepted_rows % 10_000 == 0:
                     connection.commit()
+                return True
 
             def reject_record(
                 *,
@@ -476,7 +634,7 @@ def main(  # noqa: PLR0913, PLR0915
                 task: str,
                 source_record_id: str,
                 exc: Exception,
-            ) -> None:
+            ) -> str:
                 nonlocal rejected_rows
                 reason = exc.reason if isinstance(exc, ManifestReject) else type(exc).__name__
                 reject_handle.write(
@@ -496,12 +654,16 @@ def main(  # noqa: PLR0913, PLR0915
                 )
                 rejected_rows += 1
                 reject_reason_counts[reason] += 1
+                return reason
 
-            for dataset in config["datasets"]:
-                if not isinstance(dataset, dict):
-                    raise ValueError("Each datasets entry must be a mapping")
+            for dataset_index, dataset in enumerate(config["datasets"]):
                 task = str(dataset.get("task", ""))
                 dataset_name = str(dataset.get("name", task))
+                progress.start_dataset(
+                    dataset_name=dataset_name,
+                    task=task,
+                    total_rows=dataset_row_totals[dataset_index],
+                )
                 annotation_path = dataset.get("ann_path") or dataset.get("parquet") or dataset.get("path")
                 if annotation_path is None:
                     raise ValueError(f"Dataset {dataset_name!r} has no ann_path/parquet/path")
@@ -543,17 +705,23 @@ def main(  # noqa: PLR0913, PLR0915
                                 image_validator=validation_cache.require_image,
                                 target_path_validated=True,
                             )
-                            accept_record(record)
+                            if accept_record(record):
+                                progress.record_accepted()
+                            else:
+                                progress.record_duplicate()
                         except Exception as exc:
                             if isinstance(exc, _ManifestCollisionError):
                                 raise
-                            reject_record(
+                            reason = reject_record(
                                 dataset_name=dataset_name,
                                 row_index=row_index,
                                 task=task,
                                 source_record_id=source_record_id,
                                 exc=exc,
                             )
+                            progress.record_rejected(reason)
+                        progress.maybe_emit()
+                    progress.maybe_emit(force=True, event="dataset_complete")
                     continue
 
                 if task != IMAGE_TASK:
@@ -585,18 +753,25 @@ def main(  # noqa: PLR0913, PLR0915
                                 crop_field=i2i_crop_field,
                                 image_validator=validation_cache.require_image,
                             )
-                            accept_record(record)
+                            if accept_record(record):
+                                progress.record_accepted()
+                            else:
+                                progress.record_duplicate()
                         except Exception as exc:
                             if isinstance(exc, _ManifestCollisionError):
                                 raise
-                            reject_record(
+                            reason = reject_record(
                                 dataset_name=dataset_name,
                                 row_index=row_index,
                                 task=task,
                                 source_record_id=source_record_id,
                                 exc=exc,
                             )
+                            progress.record_rejected(reason)
+                        progress.maybe_emit()
                         row_index += 1
+                progress.maybe_emit(force=True, event="dataset_complete")
+            progress.maybe_emit(force=True, event="manifest_complete")
             connection.commit()
             _flush_and_sync(accepted_handle)
             _flush_and_sync(reject_handle)
@@ -613,8 +788,11 @@ def main(  # noqa: PLR0913, PLR0915
             "rejected_rows": rejected_rows,
             "duplicate_rows": duplicate_rows,
             "task_counts": dict(sorted(task_counts.items())),
+            "dataset_counts": dict(sorted(dataset_counts.items())),
             "reject_reason_counts": dict(sorted(reject_reason_counts.items())),
             "elapsed_seconds": time.perf_counter() - started,
+            "rows_per_second": raw_rows / max(time.perf_counter() - started, 1e-9),
+            "total_rows": global_total_rows,
             "peak_rss_gb": _peak_rss_gb(),
             "manifest_path": str(output_path),
             "manifest_index_path": str(index_path),
