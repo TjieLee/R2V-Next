@@ -20,6 +20,57 @@ def _package_version(report: dict[str, Any], name: str) -> str:
     return str(package["version"])
 
 
+def collect_visible_cuda_hardware(torch_module: Any | None = None) -> dict[str, Any]:
+    if torch_module is None:
+        import torch as torch_module  # noqa: PLC0415
+
+    cuda = torch_module.cuda
+    if not cuda.is_available():
+        return {
+            "gpu_count": 0,
+            "gpu_models": [],
+            "gpu_total_memory_bytes": [],
+            "gpu_compute_capabilities": [],
+        }
+    count = int(cuda.device_count())
+    return {
+        "gpu_count": count,
+        "gpu_models": [str(cuda.get_device_name(index)) for index in range(count)],
+        "gpu_total_memory_bytes": [int(cuda.get_device_properties(index).total_memory) for index in range(count)],
+        "gpu_compute_capabilities": [
+            ".".join(str(value) for value in cuda.get_device_capability(index)) for index in range(count)
+        ],
+    }
+
+
+def validate_locked_gpu_hardware(
+    runtime_lock: dict[str, Any],
+    current_hardware: dict[str, Any],
+    *,
+    num_processes: int,
+) -> None:
+    if num_processes < 1:
+        raise SemanticFlowRuntimeLockError("Accelerate num_processes must be positive")
+    visible_count = int(current_hardware.get("gpu_count", 0))
+    if visible_count < num_processes:
+        raise SemanticFlowRuntimeLockError(
+            f"Visible GPU count {visible_count} is smaller than accelerate num_processes {num_processes}"
+        )
+    if int(runtime_lock.get("gpu_count", 0)) != num_processes:
+        raise SemanticFlowRuntimeLockError(
+            f"Runtime lock GPU count {runtime_lock.get('gpu_count')} does not match num_processes {num_processes}"
+        )
+    fields = ("gpu_models", "gpu_total_memory_bytes", "gpu_compute_capabilities")
+    mismatches = {}
+    for field in fields:
+        locked = list(runtime_lock.get(field) or [])
+        current = list(current_hardware.get(field) or [])[:num_processes]
+        if locked != current:
+            mismatches[field] = {"locked": locked, "current_selected": current}
+    if mismatches:
+        raise SemanticFlowRuntimeLockError(f"Selected training GPUs differ from runtime lock: {mismatches}")
+
+
 def build_semantic_flow_runtime_lock(
     runtime_report: dict[str, Any],
     fsdp_smoke_result: dict[str, Any],
@@ -34,6 +85,20 @@ def build_semantic_flow_runtime_lock(
     torch_runtime = runtime_report.get("torch_runtime") or {}
     gemma = runtime_report.get("gemma") or {}
     accelerate_capability = ((runtime_report.get("capabilities") or {}).get("accelerate_fsdp_plugin") or {})
+    accelerate_report = runtime_report.get("accelerate") or {}
+    torch_hardware = runtime_report.get("torch_runtime") or {}
+    num_processes = int(accelerate_report.get("num_processes") or 0)
+    if int(torch_hardware.get("gpu_count", 0)) < num_processes or num_processes < 1:
+        raise SemanticFlowRuntimeLockError(
+            "Runtime lock requires at least accelerate num_processes visible CUDA devices"
+        )
+    hardware_fields = ("gpu_models", "gpu_total_memory_bytes", "gpu_compute_capabilities")
+    selected_hardware = {}
+    for field in hardware_fields:
+        values = list(torch_hardware.get(field) or [])
+        if len(values) < num_processes:
+            raise SemanticFlowRuntimeLockError(f"Runtime report is missing per-GPU field {field}")
+        selected_hardware[field] = values[:num_processes]
     if gemma.get("sliding_window") != 1024:
         raise SemanticFlowRuntimeLockError(
             f"Production Gemma sliding_window must be 1024, got {gemma.get('sliding_window')}"
@@ -53,6 +118,8 @@ def build_semantic_flow_runtime_lock(
         "state_dict_type": accelerate_capability.get("state_dict_type"),
         "checkpoint_roundtrip_world_size": 2,
         "checkpoint_roundtrip_max_abs_tensor_diff": 0.0,
+        "gpu_count": num_processes,
+        **selected_hardware,
     }
 
 
@@ -89,5 +156,7 @@ def write_or_validate_semantic_flow_runtime_lock(
 __all__ = [
     "SemanticFlowRuntimeLockError",
     "build_semantic_flow_runtime_lock",
+    "collect_visible_cuda_hardware",
+    "validate_locked_gpu_hardware",
     "write_or_validate_semantic_flow_runtime_lock",
 ]

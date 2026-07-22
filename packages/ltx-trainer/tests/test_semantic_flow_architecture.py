@@ -44,6 +44,7 @@ from ltx_trainer.online_inference.checkpoint_runtime import (
 from ltx_trainer.online_inference.runtime_lock import (
     SemanticFlowRuntimeLockError,
     build_semantic_flow_runtime_lock,
+    validate_locked_gpu_hardware,
     write_or_validate_semantic_flow_runtime_lock,
 )
 from ltx_trainer.online_inference.smoke_marker import (
@@ -869,7 +870,15 @@ def test_semantic_flow_runtime_lock_requires_exact_environment_and_fsdp_roundtri
                 "safetensors": "0.5.3",
             }.items()
         },
-        "torch_runtime": {"cuda_version": "12.8", "nccl_version": [2, 26, 2]},
+        "torch_runtime": {
+            "cuda_version": "12.8",
+            "nccl_version": [2, 26, 2],
+            "gpu_count": 8,
+            "gpu_models": ["NVIDIA H200"] * 8,
+            "gpu_total_memory_bytes": [151_000_000_000] * 8,
+            "gpu_compute_capabilities": ["9.0"] * 8,
+        },
+        "accelerate": {"num_processes": 8},
         "gemma": {"sliding_window": 1024},
         "capabilities": {
             "accelerate_fsdp_plugin": {
@@ -882,6 +891,10 @@ def test_semantic_flow_runtime_lock_requires_exact_environment_and_fsdp_roundtri
     }
     fsdp_result = {"world_size": 2, "max_abs_tensor_diff_after_reload": 0.0}
     current = build_semantic_flow_runtime_lock(report, fsdp_result)
+    assert current["gpu_count"] == 8
+    assert current["gpu_models"] == ["NVIDIA H200"] * 8
+    assert current["gpu_total_memory_bytes"] == [151_000_000_000] * 8
+    assert current["gpu_compute_capabilities"] == ["9.0"] * 8
     lock_path = tmp_path / "runtime_lock.json"
     assert write_or_validate_semantic_flow_runtime_lock(lock_path, current, refresh=True) == "refreshed"
     assert write_or_validate_semantic_flow_runtime_lock(lock_path, current, refresh=False) == "validated"
@@ -893,6 +906,30 @@ def test_semantic_flow_runtime_lock_requires_exact_environment_and_fsdp_roundtri
 
     with pytest.raises(SemanticFlowRuntimeLockError, match="exactly two processes"):
         build_semantic_flow_runtime_lock(report, {"world_size": 8, "max_abs_tensor_diff_after_reload": 0.0})
+
+
+def test_runtime_lock_validates_selected_gpu_hardware_and_allows_extras() -> None:
+    locked = {
+        "gpu_count": 2,
+        "gpu_models": ["GPU-A", "GPU-B"],
+        "gpu_total_memory_bytes": [100, 200],
+        "gpu_compute_capabilities": ["9.0", "9.0"],
+    }
+    current = {
+        "gpu_count": 3,
+        "gpu_models": ["GPU-A", "GPU-B", "GPU-extra"],
+        "gpu_total_memory_bytes": [100, 200, 300],
+        "gpu_compute_capabilities": ["9.0", "9.0", "8.0"],
+    }
+    validate_locked_gpu_hardware(locked, current, num_processes=2)
+
+    changed = copy.deepcopy(current)
+    changed["gpu_total_memory_bytes"][1] = 201
+    with pytest.raises(SemanticFlowRuntimeLockError, match="Selected training GPUs differ"):
+        validate_locked_gpu_hardware(locked, changed, num_processes=2)
+
+    with pytest.raises(SemanticFlowRuntimeLockError, match="smaller than accelerate num_processes"):
+        validate_locked_gpu_hardware(locked, {**current, "gpu_count": 1}, num_processes=2)
 
 
 def test_strategy_checkpoint_state_uses_precollected_full_states() -> None:

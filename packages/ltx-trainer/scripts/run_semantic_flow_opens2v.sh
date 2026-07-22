@@ -46,17 +46,24 @@ FSDP_SMOKE_ROOT="$SMOKE_ROOT/fsdp_checkpoint"
 FSDP_SMOKE_RESULT="$FSDP_SMOKE_ROOT/result.json"
 
 semantic_flow_train_preflight() {
-  python3 - "$TRAIN_CONFIG" "$ACCELERATE_CONFIG" "$R2V_ROOT" <<'PY'
+  local mode="$1"
+  python3 - "$TRAIN_CONFIG" "$ACCELERATE_CONFIG" "$R2V_ROOT" "$RUNTIME_LOCK" "$mode" <<'PY'
 import json
 import os
 import sys
 from pathlib import Path
 
 import yaml
+from ltx_trainer.online_inference.runtime_lock import (
+    collect_visible_cuda_hardware,
+    validate_locked_gpu_hardware,
+)
 
 train_config_path = Path(sys.argv[1]).expanduser().resolve()
 accelerate_config_path = Path(sys.argv[2]).expanduser().resolve()
 r2v_root = Path(sys.argv[3]).expanduser()
+runtime_lock_path = Path(sys.argv[4]).expanduser().resolve()
+mode = sys.argv[5]
 litengjie_root = Path("/mnt/workspace/litengjie")
 errors = []
 
@@ -156,10 +163,29 @@ if fsdp_config.get("fsdp_sync_module_states") is not True:
 if fsdp_config.get("fsdp_cpu_ram_efficient_loading") is not False:
     errors.append("Accelerate fsdp_cpu_ram_efficient_loading must be false")
 
+num_processes = int(accelerate_config.get("num_processes", 0))
+gpu_hardware = collect_visible_cuda_hardware()
+if int(gpu_hardware["gpu_count"]) < num_processes:
+    errors.append(
+        f"Visible GPU count {gpu_hardware['gpu_count']} is smaller than accelerate num_processes {num_processes}"
+    )
+if mode == "train":
+    try:
+        runtime_lock = json.loads(runtime_lock_path.read_text(encoding="utf-8"))
+        validate_locked_gpu_hardware(
+            runtime_lock,
+            gpu_hardware,
+            num_processes=num_processes,
+        )
+    except Exception as exc:
+        errors.append(f"runtime lock GPU validation failed: {type(exc).__name__}: {exc}")
+
 report = {
     "ready": not errors,
     "accelerate_config": str(accelerate_config_path),
     "training_config": str(train_config_path),
+    "gpu_hardware": gpu_hardware,
+    "mode": mode,
     "errors": errors,
 }
 print(json.dumps(report, indent=2, sort_keys=True))
@@ -194,7 +220,7 @@ case "${1:-}" in
       --probe-batch-size 512
     ;;
   smoke)
-    semantic_flow_train_preflight
+    semantic_flow_train_preflight smoke
     python3 "$REPO_ROOT/packages/ltx-trainer/scripts/semantic_flow_runtime_audit.py" \
       --config "$TRAIN_CONFIG" \
       --accelerate-config "$ACCELERATE_CONFIG" \
@@ -260,7 +286,7 @@ case "${1:-}" in
       --inference-summary "$INFERENCE_SMOKE_ROOT/run/i2i/run_summary.json"
     ;;
   train)
-    semantic_flow_train_preflight
+    semantic_flow_train_preflight train
     SKIP_SMOKE_GUARD=false
     for option in "${@:2}"; do
       case "$option" in
@@ -274,7 +300,8 @@ case "${1:-}" in
       esac
     done
     if [[ "$SKIP_SMOKE_GUARD" == true ]]; then
-      printf '%s\n' "WARNING: --skip-smoke-guard bypasses validated checkpoints, inference artifacts, and runtime lock evidence."
+      printf '%s\n' \
+        "WARNING: --skip-smoke-guard bypasses validated checkpoints, inference artifacts, and runtime lock evidence."
     else
       CODE_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD)"
       python3 "$REPO_ROOT/packages/ltx-trainer/scripts/semantic_flow_smoke_marker.py" validate \

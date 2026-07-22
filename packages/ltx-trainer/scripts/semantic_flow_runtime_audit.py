@@ -16,6 +16,7 @@ from typing import Any
 from ltx_trainer.online_data.path_safety import assert_write_path_allowed
 from ltx_trainer.online_inference.runtime_lock import (
     build_semantic_flow_runtime_lock,
+    collect_visible_cuda_hardware,
     write_or_validate_semantic_flow_runtime_lock,
 )
 
@@ -48,9 +49,7 @@ def _torch_runtime() -> dict[str, Any]:
         return {"available": False, "error": f"{type(exc).__name__}: {exc}"}
 
     cuda_available = bool(torch.cuda.is_available())
-    gpu_models = []
-    if cuda_available:
-        gpu_models = [torch.cuda.get_device_name(index) for index in range(torch.cuda.device_count())]
+    gpu_hardware = collect_visible_cuda_hardware(torch)
     try:
         nccl_version = torch.cuda.nccl.version() if cuda_available else None
         if isinstance(nccl_version, tuple):
@@ -63,8 +62,7 @@ def _torch_runtime() -> dict[str, Any]:
         "cuda_available": cuda_available,
         "cuda_version": getattr(getattr(torch, "version", None), "cuda", None),
         "nccl_version": nccl_version,
-        "gpu_count": torch.cuda.device_count() if cuda_available else 0,
-        "gpu_models": gpu_models,
+        **gpu_hardware,
     }
 
 
