@@ -748,26 +748,44 @@ def test_reference_rope_checkpoint_metadata_is_complete_and_fail_closed() -> Non
         "reference_rope_spatial_shift": "width_adjacent",
         "semantic_rope_mode": "target_interpolated_8x8",
     }
-    serialized = {key: str(value) for key, value in metadata.items()}
+    appended = {key: str(value) for key, value in metadata.items()}
+    native = {
+        key: str(value)
+        for key, value in SemanticFlowStrategy(
+            SemanticFlowConfig(reference_rope_mode="native_overlap")
+        ).get_checkpoint_metadata().items()
+    }
     validate_reference_rope_checkpoint_metadata(
-        serialized,
+        appended,
         expected_mode="appended_time_shifted_width",
     )
+
+    with pytest.raises(CheckpointAuditError, match="metadata mismatch"):
+        validate_reference_rope_checkpoint_metadata(appended, expected_mode="native_overlap")
+    with pytest.raises(CheckpointAuditError, match="metadata mismatch"):
+        validate_reference_rope_checkpoint_metadata(
+            native,
+            expected_mode="appended_time_shifted_width",
+        )
 
     with pytest.raises(CheckpointAuditError, match="missing Reference RoPE metadata"):
         validate_reference_rope_checkpoint_metadata({}, expected_mode="appended_time_shifted_width")
+    with pytest.raises(CheckpointAuditError, match="can only be loaded"):
+        validate_reference_rope_checkpoint_metadata(
+            {},
+            expected_mode="appended_time_shifted_width",
+            allow_legacy=True,
+        )
     validate_reference_rope_checkpoint_metadata(
         {},
-        expected_mode="appended_time_shifted_width",
+        expected_mode="native_overlap",
         allow_legacy=True,
     )
 
-    mismatched = dict(serialized)
-    mismatched["reference_rope_mode"] = "native_overlap"
-    with pytest.raises(CheckpointAuditError, match="metadata mismatch"):
+    with pytest.raises(CheckpointAuditError, match="missing Reference RoPE metadata"):
         validate_reference_rope_checkpoint_metadata(
-            mismatched,
-            expected_mode="appended_time_shifted_width",
+            {"reference_rope_mode": "native_overlap"},
+            expected_mode="native_overlap",
             allow_legacy=True,
         )
 

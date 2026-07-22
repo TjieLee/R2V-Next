@@ -197,8 +197,15 @@ def validate_reference_rope_checkpoint_metadata(
         "semantic_rope_mode": "target_interpolated_8x8",
     }
     present = set(required) & set(metadata)
-    if not present and allow_legacy:
-        return
+    if not present:
+        if allow_legacy and expected_mode == "native_overlap":
+            return
+        if allow_legacy:
+            raise CheckpointAuditError(
+                "Legacy Reference RoPE checkpoints can only be loaded "
+                "with reference_rope_mode='native_overlap'; "
+                f"current mode is {expected_mode!r}"
+            )
     missing = sorted(set(required) - set(metadata))
     if missing:
         raise CheckpointAuditError(

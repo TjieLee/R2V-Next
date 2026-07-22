@@ -69,7 +69,15 @@ def main(
     decode_tile: bool = typer.Option(True, "--decode-tile/--no-decode-tile"),
     dry_run: bool = typer.Option(False, "--dry-run/--no-dry-run"),
     overwrite: bool = typer.Option(False, "--overwrite/--no-overwrite"),
-    allow_legacy_reference_rope: bool = typer.Option(False, "--allow-legacy-reference-rope"),
+    allow_legacy_reference_rope: bool = typer.Option(
+        False,
+        "--allow-legacy-reference-rope",
+        help=(
+            "Allow a metadata-free legacy semantic-flow checkpoint only when "
+            "reference_rope_mode=native_overlap. It does not convert legacy weights "
+            "to the appended Reference RoPE layout."
+        ),
+    ),
 ) -> None:
     if limit is not None and limit < 1:
         raise typer.BadParameter("--limit must be >= 1")
