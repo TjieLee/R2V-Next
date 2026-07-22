@@ -296,6 +296,7 @@ def _build_r2v_two_stage_payload(
         "image_calls": image_calls,
         "image_probe_submitted": cache.image_probe_submitted,
         "video_probe_submitted": cache.video_probe_submitted,
+        "reference_probes_skipped_due_video_reject": cache.reference_probes_skipped_due_video_reject,
         "tmp_path": str(tmp_path),
     }
 
@@ -325,6 +326,7 @@ def test_r2v_reference_probes_defer_until_video_plan_passes_and_remain_determini
     assert len(stats["image_calls"]) == 20
     assert stats["video_probe_submitted"] == 100
     assert stats["image_probe_submitted"] == 20
+    assert stats["reference_probes_skipped_due_video_reject"] == 180
     for index in range(90):
         assert not any(f"two_stage_ref_{index:03d}_" in path for path in stats["image_calls"])
     accepted = [json.loads(line) for line in results[0][0].splitlines()]
@@ -750,8 +752,88 @@ def test_media_prefetch_deduplicates_paths_and_keeps_sqlite_on_main_thread(
     assert all(thread_id != main_thread_id for thread_id in worker_thread_ids)
     assert sqlite_thread_ids
     assert set(sqlite_thread_ids) == {main_thread_id}
-    assert cache.image_cache_hits >= 4
+    assert cache.image_require_calls == 4
+    assert cache.image_cache_hits == 2
     raw_connection.close()
+
+
+def test_media_require_uses_prefetched_signature_without_restat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_online_manifest_builder_module()
+    connection = sqlite3.connect(":memory:")
+    cache = builder._MediaValidationCache(connection)
+    image_path = str(tmp_path / "repeated.png")
+    signature_calls = 0
+    probe_calls = 0
+
+    def fake_signature(path: str):
+        nonlocal signature_calls
+        signature_calls += 1
+        return builder._MediaSignature(path, 123, 456)
+
+    def fake_probe(path: str):
+        nonlocal probe_calls
+        probe_calls += 1
+        return builder._ValidationResult({"width": 64, "height": 48})
+
+    monkeypatch.setattr(builder, "_media_signature", fake_signature)
+    monkeypatch.setattr(builder, "_probe_resolved_image", fake_probe)
+    try:
+        with ThreadPoolExecutor(max_workers=4, thread_name_prefix="manifest-media") as executor:
+            cache.prefetch_images([image_path] * 1000, executor=executor)
+            for _ in range(1000):
+                assert cache.require_image(image_path) == (64, 48)
+    finally:
+        connection.close()
+
+    assert signature_calls == 1
+    assert probe_calls == 1
+    assert cache.signature_submitted == 1
+    assert cache.image_probe_submitted == 1
+    assert cache.image_unique_paths == 1
+    assert cache.image_require_calls == 1000
+
+
+def test_media_signature_recomputed_per_batch_but_probe_reuses_sqlite_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_online_manifest_builder_module()
+    connection = sqlite3.connect(":memory:")
+    cache = builder._MediaValidationCache(connection)
+    image_path = str(tmp_path / "cached-across-batches.png")
+    signature_calls = 0
+    probe_calls = 0
+
+    def fake_signature(path: str):
+        nonlocal signature_calls
+        signature_calls += 1
+        return builder._MediaSignature(path, 777, 888)
+
+    def fake_probe(path: str):
+        nonlocal probe_calls
+        probe_calls += 1
+        return builder._ValidationResult({"width": 64, "height": 48})
+
+    monkeypatch.setattr(builder, "_media_signature", fake_signature)
+    monkeypatch.setattr(builder, "_probe_resolved_image", fake_probe)
+    try:
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="manifest-media") as executor:
+            cache.prefetch_images([image_path], executor=executor)
+            assert cache.require_image(image_path) == (64, 48)
+            cache.prefetch_images([image_path], executor=executor)
+            assert cache.require_image(image_path) == (64, 48)
+    finally:
+        connection.close()
+
+    assert signature_calls == 2
+    assert probe_calls == 1
+    assert cache.image_cache_hits == 1
+    assert cache.image_cache_misses == 1
+    assert cache.signature_submitted == 2
+    assert cache.image_probe_submitted == 1
 
 
 def test_media_cache_runtime_writes_use_dedicated_writer_thread(tmp_path: Path) -> None:

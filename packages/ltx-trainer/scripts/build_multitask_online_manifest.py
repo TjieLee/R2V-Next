@@ -50,6 +50,15 @@ from ltx_trainer.online_data.path_safety import assert_write_path_allowed
 app = typer.Typer(pretty_exceptions_enable=False, no_args_is_help=True)
 _T = TypeVar("_T")
 
+_REFERENCE_PREFETCH_SKIPPED_REASONS = {
+    "missing_target",
+    "invalid_video_header",
+    "invalid_crop",
+    "invalid_clip",
+    "insufficient_frames_for_121_at_24fps",
+    "source_fps_too_low_for_unique_24fps_sampling",
+}
+
 
 class _ManifestCollisionError(RuntimeError):
     pass
@@ -86,6 +95,17 @@ def _verified_image_size(path: str) -> tuple[int, int]:
         return ImageOps.exif_transpose(image).size
 
 
+def _media_signature(path: str) -> _MediaSignature:
+    resolved = str(Path(path).expanduser().resolve())
+    try:
+        metadata = Path(resolved).stat()
+        if not stat.S_ISREG(metadata.st_mode):
+            raise FileNotFoundError(resolved)
+        return _MediaSignature(resolved, int(metadata.st_size), int(metadata.st_mtime_ns))
+    except OSError:
+        return _MediaSignature(resolved, -1, -1)
+
+
 class _MediaValidationCache:
     """Bounded same-build validation cache backed by the builder's temporary SQLite DB."""
 
@@ -96,8 +116,15 @@ class _MediaValidationCache:
         self.image_cache_misses = 0
         self.video_cache_hits = 0
         self.video_cache_misses = 0
+        self.signature_submitted = 0
         self.image_probe_submitted = 0
         self.video_probe_submitted = 0
+        self.image_unique_paths = 0
+        self.video_unique_paths = 0
+        self.image_require_calls = 0
+        self.video_require_calls = 0
+        self.reference_probes_skipped_due_video_reject = 0
+        self._prefetched_signatures: dict[tuple[str, str], _MediaSignature] = {}
         connection.execute(
             """
             CREATE TABLE media_validation_cache (
@@ -126,18 +153,13 @@ class _MediaValidationCache:
         if threading.get_ident() != self.owner_thread_id:
             raise RuntimeError("Media validation SQLite cache may only be accessed by its owner thread")
 
-    @staticmethod
-    def signature(path: str) -> _MediaSignature:
-        resolved = str(Path(path).expanduser().resolve())
-        try:
-            metadata = Path(resolved).stat()
-            if not stat.S_ISREG(metadata.st_mode):
-                raise FileNotFoundError(resolved)
-            return _MediaSignature(resolved, int(metadata.st_size), int(metadata.st_mtime_ns))
-        except OSError:
-            return _MediaSignature(resolved, -1, -1)
-
-    def get(self, kind: str, signature: _MediaSignature) -> _ValidationResult | None:
+    def get(
+        self,
+        kind: str,
+        signature: _MediaSignature,
+        *,
+        count_stats: bool = True,
+    ) -> _ValidationResult | None:
         self._assert_owner_thread()
         row = self.connection.execute(
             """
@@ -148,15 +170,17 @@ class _MediaValidationCache:
             (kind, signature.path, signature.size, signature.mtime_ns),
         ).fetchone()
         if row is None:
-            if kind == "image":
-                self.image_cache_misses += 1
-            else:
-                self.video_cache_misses += 1
+            if count_stats:
+                if kind == "image":
+                    self.image_cache_misses += 1
+                else:
+                    self.video_cache_misses += 1
             return None
-        if kind == "image":
-            self.image_cache_hits += 1
-        else:
-            self.video_cache_hits += 1
+        if count_stats:
+            if kind == "image":
+                self.image_cache_hits += 1
+            else:
+                self.video_cache_hits += 1
         payload = json.loads(row[1]) if row[1] is not None else None
         return _ValidationResult(
             payload=payload,
@@ -192,26 +216,39 @@ class _MediaValidationCache:
         executor: ThreadPoolExecutor,
     ) -> None:
         self._assert_owner_thread()
-        missing: dict[_MediaSignature, str] = {}
-        seen: set[_MediaSignature] = set()
-        for path in paths:
-            signature = self.signature(path)
-            if signature in seen:
-                continue
-            seen.add(signature)
-            if self.get(kind, signature) is None:
-                missing[signature] = signature.path
-
-        signatures = list(missing)
-        if kind == "image":
-            self.image_probe_submitted += len(signatures)
-            results = executor.map(_probe_resolved_image, [missing[item] for item in signatures])
-        elif kind == "video":
-            self.video_probe_submitted += len(signatures)
-            results = executor.map(_probe_resolved_video, [missing[item] for item in signatures])
-        else:  # pragma: no cover - internal programming error
+        if kind not in {"image", "video"}:  # pragma: no cover - internal programming error
             raise ValueError(f"Unsupported media validation kind: {kind}")
-        for signature, result in zip(signatures, results, strict=True):
+        unique_paths: list[str] = []
+        seen_paths: set[str] = set()
+        for path in paths:
+            canonical_path = str(path)
+            if canonical_path in seen_paths:
+                continue
+            seen_paths.add(canonical_path)
+            unique_paths.append(canonical_path)
+
+        if kind == "image":
+            self.image_unique_paths += len(unique_paths)
+        else:
+            self.video_unique_paths += len(unique_paths)
+
+        self.signature_submitted += len(unique_paths)
+        signatures = list(executor.map(_media_signature, unique_paths))
+        for canonical_path, signature in zip(unique_paths, signatures, strict=True):
+            self._prefetched_signatures[(kind, canonical_path)] = signature
+
+        missing: list[_MediaSignature] = []
+        for signature in signatures:
+            if self.get(kind, signature) is None:
+                missing.append(signature)
+
+        if kind == "image":
+            self.image_probe_submitted += len(missing)
+            results = executor.map(_probe_resolved_image, [item.path for item in missing])
+        else:
+            self.video_probe_submitted += len(missing)
+            results = executor.map(_probe_resolved_video, [item.path for item in missing])
+        for signature, result in zip(missing, results, strict=True):
             self.put(kind, signature, result)
 
     def prefetch_images(
@@ -231,8 +268,18 @@ class _MediaValidationCache:
         self._prefetch("video", paths, executor=executor)
 
     def _require(self, kind: str, path: str) -> _ValidationResult:
-        signature = self.signature(path)
-        result = self.get(kind, signature)
+        self._assert_owner_thread()
+        if kind == "image":
+            self.image_require_calls += 1
+        else:
+            self.video_require_calls += 1
+        canonical_path = str(path)
+        signature = self._prefetched_signatures.get((kind, canonical_path))
+        if signature is None:
+            raise RuntimeError(
+                f"Media validation cache miss after batch prefetch: kind={kind}, path={canonical_path}"
+            )
+        result = self.get(kind, signature, count_stats=False)
         if result is None:
             raise RuntimeError(
                 f"Media validation cache miss after batch prefetch: kind={kind}, path={signature.path}"
@@ -342,6 +389,16 @@ class _ManifestProgress:
             "image_cache_misses": self.validation_cache.image_cache_misses,
             "video_cache_hits": self.validation_cache.video_cache_hits,
             "video_cache_misses": self.validation_cache.video_cache_misses,
+            "signature_submitted": self.validation_cache.signature_submitted,
+            "image_probe_submitted": self.validation_cache.image_probe_submitted,
+            "video_probe_submitted": self.validation_cache.video_probe_submitted,
+            "image_unique_paths": self.validation_cache.image_unique_paths,
+            "video_unique_paths": self.validation_cache.video_unique_paths,
+            "image_require_calls": self.validation_cache.image_require_calls,
+            "video_require_calls": self.validation_cache.video_require_calls,
+            "reference_probes_skipped_due_video_reject": (
+                self.validation_cache.reference_probes_skipped_due_video_reject
+            ),
             "top_reject_reasons": ",".join(f"{reason}:{count}" for reason, count in top_rejects)
             or "none",
         }
@@ -425,6 +482,15 @@ def _collect_i2i_media_paths(
     return paths
 
 
+def _record_skipped_reference_probes(
+    validation_cache: _MediaValidationCache,
+    canonical: CanonicalR2VSource,
+    error: ManifestReject,
+) -> None:
+    if error.reason in _REFERENCE_PREFETCH_SKIPPED_REASONS:
+        validation_cache.reference_probes_skipped_due_video_reject += len(canonical.reference_paths)
+
+
 def _iter_canonical_rows_with_bounded_probes(
     rows: Iterable[tuple[str, dict[str, Any]]],
     *,
@@ -483,6 +549,7 @@ def _iter_canonical_rows_with_bounded_probes(
                 raise RuntimeError("Normalized R2V source is missing without an error")
             header, probe_error = validation_cache.require_video(canonical.video_path).as_probe_result()
             if probe_error is not None:
+                _record_skipped_reference_probes(validation_cache, canonical, probe_error)
                 prepared_rows.append(None)
                 row_errors.append(probe_error)
                 continue
@@ -497,6 +564,7 @@ def _iter_canonical_rows_with_bounded_probes(
                     target_path_validated=True,
                 )
             except ManifestReject as exc:
+                _record_skipped_reference_probes(validation_cache, canonical, exc)
                 prepared_rows.append(None)
                 row_errors.append(exc)
                 continue
@@ -842,6 +910,14 @@ def main(  # noqa: PLR0913, PLR0915
             "image_cache_misses": validation_cache.image_cache_misses,
             "video_cache_hits": validation_cache.video_cache_hits,
             "video_cache_misses": validation_cache.video_cache_misses,
+            "signature_submitted": validation_cache.signature_submitted,
+            "image_unique_paths": validation_cache.image_unique_paths,
+            "video_unique_paths": validation_cache.video_unique_paths,
+            "image_require_calls": validation_cache.image_require_calls,
+            "video_require_calls": validation_cache.video_require_calls,
+            "reference_probes_skipped_due_video_reject": (
+                validation_cache.reference_probes_skipped_due_video_reject
+            ),
         }
         _atomic_write_json(summary_path, summary)
         typer.echo(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
