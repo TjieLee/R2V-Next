@@ -39,6 +39,11 @@ TYPE_TARGET = 2
 ENTITY_GLOBAL = 0
 ENTITY_REF_0 = 1
 MAX_REFERENCE_ENTITIES = 4
+REQUIRED_SEMANTIC_CHECKPOINT_MODULES = (
+    "semantic_query",
+    "semantic_encoder",
+    "semantic_reconstruction_decoder",
+)
 
 
 @dataclass(frozen=True)
@@ -188,6 +193,54 @@ class SemanticFlowStrategy(TrainingStrategy):
             self._semantic_encoder = modules["semantic_encoder"]  # type: ignore[assignment]
         if "semantic_reconstruction_decoder" in modules:
             self._reconstruction_decoder = modules["semantic_reconstruction_decoder"]  # type: ignore[assignment]
+
+    def load_extra_checkpoint_state_dict(self, state_dict: dict[str, Tensor]) -> None:
+        """Load semantic-flow adapters only from a complete, shape-compatible checkpoint."""
+        modules = self.get_trainable_modules()
+        missing_modules = [
+            name
+            for name in REQUIRED_SEMANTIC_CHECKPOINT_MODULES
+            if name not in modules
+        ]
+        if missing_modules:
+            raise RuntimeError(
+                f"semantic_flow checkpoint modules are not initialized: {missing_modules}"
+            )
+
+        errors: list[str] = []
+        module_states: dict[str, dict[str, Tensor]] = {}
+        for name in REQUIRED_SEMANTIC_CHECKPOINT_MODULES:
+            prefix = f"training_strategy.{name}."
+            module_state = {
+                key.removeprefix(prefix): value
+                for key, value in state_dict.items()
+                if key.startswith(prefix)
+            }
+            if not module_state:
+                errors.append(f"{name}: missing prefix {prefix}")
+                continue
+
+            expected_state = modules[name].state_dict()
+            missing_keys = sorted(set(expected_state) - set(module_state))
+            unexpected_keys = sorted(set(module_state) - set(expected_state))
+            shape_errors = [
+                f"{key}: expected {tuple(expected_state[key].shape)}, got {tuple(value.shape)}"
+                for key, value in module_state.items()
+                if key in expected_state and tuple(value.shape) != tuple(expected_state[key].shape)
+            ]
+            if missing_keys:
+                errors.append(f"{name}: missing keys {missing_keys}")
+            if unexpected_keys:
+                errors.append(f"{name}: unexpected keys {unexpected_keys}")
+            if shape_errors:
+                errors.append(f"{name}: shape mismatch {shape_errors}")
+            module_states[name] = module_state
+
+        if errors:
+            raise RuntimeError("semantic_flow checkpoint is incomplete: " + "; ".join(errors))
+
+        for name, module_state in module_states.items():
+            modules[name].load_state_dict(module_state, strict=True)
 
     def build_semantic_teacher_outputs(self, teacher_inputs: dict[str, Tensor]) -> dict[str, Tensor]:
         """Run frozen Gemma with the prefix plus native evidence/local-query suffix."""

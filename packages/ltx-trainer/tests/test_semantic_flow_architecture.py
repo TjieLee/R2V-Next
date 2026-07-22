@@ -389,6 +389,13 @@ def test_joint_ode_keeps_references_clean_and_shares_semantic_video_sigma() -> N
 def _semantic_checkpoint(path: Path, *, complete: bool = True) -> None:
     tensors = {
         "block.weight": torch.ones(1),
+        "semantic_token_type_embedding.weight": torch.ones(3, 4),
+        "semantic_entity_embedding.weight": torch.ones(5, 4),
+        "semantic_position_adapter.0.weight": torch.ones(4, 6),
+        "semantic_position_adapter.0.bias": torch.ones(4),
+        "semantic_norm_out.weight": torch.ones(4),
+        "semantic_proj_out.weight": torch.ones(2, 4),
+        "semantic_proj_out.bias": torch.ones(2),
         "training_strategy.semantic_query.weight": torch.ones(1),
         "training_strategy.semantic_encoder.weight": torch.ones(1),
     }
@@ -416,3 +423,77 @@ def test_checkpoint_audit_and_ready_resolution_require_semantic_modules(tmp_path
     _semantic_checkpoint(incomplete, complete=False)
     with pytest.raises(CheckpointAuditError, match="missing semantic modules"):
         audit_checkpoint(incomplete)
+
+    missing_transformer = tmp_path / "model_weights_step_00027.safetensors"
+    tensors = {
+        "block.weight": torch.ones(1),
+        "semantic_token_type_embedding.weight": torch.ones(3, 4),
+        "semantic_entity_embedding.weight": torch.ones(5, 4),
+        "semantic_position_adapter.0.weight": torch.ones(4, 6),
+        "semantic_position_adapter.0.bias": torch.ones(4),
+        "semantic_norm_out.weight": torch.ones(4),
+        "training_strategy.semantic_query.weight": torch.ones(1),
+        "training_strategy.semantic_encoder.weight": torch.ones(1),
+        "training_strategy.semantic_reconstruction_decoder.weight": torch.ones(1),
+    }
+    save_file(tensors, missing_transformer, metadata={"architecture": "semantic_flow_v1"})
+    with pytest.raises(CheckpointAuditError, match="semantic_proj_out"):
+        audit_checkpoint(missing_transformer)
+
+
+def test_strategy_checkpoint_state_uses_precollected_full_states() -> None:
+    strategy = SemanticFlowStrategy(SemanticFlowConfig())
+    modules = {
+        "semantic_query": nn.Linear(2, 2, bias=False),
+        "semantic_encoder": nn.Linear(2, 3, bias=False),
+        "semantic_reconstruction_decoder": nn.Linear(3, 2, bias=False),
+    }
+    strategy.set_trainable_modules(modules)
+    precollected = {
+        name: {key: value.detach().clone() + 1.0 for key, value in module.state_dict().items()}
+        for name, module in modules.items()
+    }
+
+    class _NoCollectAccelerator:
+        def get_state_dict(self, module: nn.Module) -> dict[str, torch.Tensor]:
+            del module
+            raise AssertionError("strategy state should already be precollected")
+
+    state = strategy.get_extra_checkpoint_state_dict(
+        _NoCollectAccelerator(),
+        precollected_states=precollected,
+    )
+
+    assert set(state) == {
+        "training_strategy.semantic_query.weight",
+        "training_strategy.semantic_encoder.weight",
+        "training_strategy.semantic_reconstruction_decoder.weight",
+    }
+    assert torch.equal(state["training_strategy.semantic_query.weight"], precollected["semantic_query"]["weight"])
+
+
+def test_semantic_strategy_load_rejects_missing_or_mismatched_modules() -> None:
+    strategy = SemanticFlowStrategy(SemanticFlowConfig())
+    modules = {
+        "semantic_query": nn.Linear(2, 2, bias=False),
+        "semantic_encoder": nn.Linear(2, 3, bias=False),
+        "semantic_reconstruction_decoder": nn.Linear(3, 2, bias=False),
+    }
+    strategy.set_trainable_modules(modules)
+    full_state = {
+        f"training_strategy.{name}.{key}": value.detach().clone()
+        for name, module in modules.items()
+        for key, value in module.state_dict().items()
+    }
+
+    missing = dict(full_state)
+    missing.pop("training_strategy.semantic_encoder.weight")
+    with pytest.raises(RuntimeError, match="semantic_encoder"):
+        strategy.load_extra_checkpoint_state_dict(missing)
+
+    mismatched = dict(full_state)
+    mismatched["training_strategy.semantic_query.weight"] = torch.ones(3, 3)
+    with pytest.raises(RuntimeError, match="shape mismatch"):
+        strategy.load_extra_checkpoint_state_dict(mismatched)
+
+    strategy.load_extra_checkpoint_state_dict(full_state)

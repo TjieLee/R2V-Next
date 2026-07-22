@@ -2039,6 +2039,7 @@ class LtxvTrainer:
         # Get state dict (collective operation - all processes must participate)
         self._accelerator.wait_for_everyone()
         full_state_dict = self._accelerator.get_state_dict(self._transformer)
+        strategy_checkpoint_states = self._collect_strategy_checkpoint_state_dicts()
 
         if not IS_MAIN_PROCESS:
             self._last_saved_step = self._global_step
@@ -2053,7 +2054,10 @@ class LtxvTrainer:
 
         # Determine save precision
         save_dtype = torch.bfloat16 if self._config.checkpoints.precision == "bfloat16" else torch.float32
-        auxiliary_state_dict = self._collect_auxiliary_checkpoint_state(save_dtype)
+        auxiliary_state_dict = self._collect_auxiliary_checkpoint_state(
+            save_dtype,
+            precollected_strategy_states=strategy_checkpoint_states,
+        )
 
         # For LoRA: extract only adapter weights; for full: use as-is
         checkpoint_metadata = self._build_checkpoint_metadata()
@@ -2216,8 +2220,23 @@ class LtxvTrainer:
             raise
         return marker_path
 
-    def _collect_auxiliary_checkpoint_state(self, save_dtype: torch.dtype) -> dict[str, Tensor]:
-        state_dict = self._training_strategy.get_extra_checkpoint_state_dict(self._accelerator)
+    def _collect_strategy_checkpoint_state_dicts(self) -> dict[str, dict[str, Tensor]]:
+        """Collect strategy module state on every rank before main-only checkpoint writes."""
+        return {
+            name: self._accelerator.get_state_dict(module)
+            for name, module in self._training_strategy.get_trainable_modules().items()
+        }
+
+    def _collect_auxiliary_checkpoint_state(
+        self,
+        save_dtype: torch.dtype,
+        *,
+        precollected_strategy_states: dict[str, dict[str, Tensor]] | None = None,
+    ) -> dict[str, Tensor]:
+        state_dict = self._training_strategy.get_extra_checkpoint_state_dict(
+            self._accelerator,
+            precollected_states=precollected_strategy_states,
+        )
 
         if self._train_embeddings_processor:
             processor_state = self._collect_trainable_embeddings_processor_state()

@@ -33,6 +33,18 @@ if TYPE_CHECKING:
 
 
 _STEP_PATTERN = re.compile(r"(?:^|_)step_(\d+)(?:\.|$)")
+SEMANTIC_STRATEGY_CHECKPOINT_PREFIXES = (
+    "training_strategy.semantic_query.",
+    "training_strategy.semantic_encoder.",
+    "training_strategy.semantic_reconstruction_decoder.",
+)
+SEMANTIC_TRANSFORMER_CHECKPOINT_PREFIXES = (
+    "semantic_token_type_embedding.",
+    "semantic_entity_embedding.",
+    "semantic_position_adapter.",
+    "semantic_norm_out.",
+    "semantic_proj_out.",
+)
 
 
 class CheckpointAuditError(RuntimeError):
@@ -128,11 +140,7 @@ def audit_checkpoint(path: Path) -> dict[str, Any]:
             shapes = {key: list(handle.get_slice(key).get_shape()) for key in keys}
     except Exception as exc:
         raise CheckpointAuditError(f"Invalid safetensors checkpoint {resolved}: {exc}") from exc
-    semantic_prefixes = (
-        "training_strategy.semantic_query.",
-        "training_strategy.semantic_encoder.",
-        "training_strategy.semantic_reconstruction_decoder.",
-    )
+    semantic_prefixes = SEMANTIC_STRATEGY_CHECKPOINT_PREFIXES + SEMANTIC_TRANSFORMER_CHECKPOINT_PREFIXES
     missing = [prefix for prefix in semantic_prefixes if not any(key.startswith(prefix) for key in keys)]
     if missing:
         raise CheckpointAuditError(f"Checkpoint is missing semantic modules: {missing}")
@@ -143,7 +151,8 @@ def audit_checkpoint(path: Path) -> dict[str, Any]:
         "checkpoint_keys": keys,
         "checkpoint_shapes": shapes,
         "metadata": metadata,
-        "semantic_module_prefixes": list(semantic_prefixes),
+        "semantic_module_prefixes": list(SEMANTIC_STRATEGY_CHECKPOINT_PREFIXES),
+        "semantic_transformer_prefixes": list(SEMANTIC_TRANSFORMER_CHECKPOINT_PREFIXES),
         "required_missing_keys": [],
         "unexpected_checkpoint_keys": [],
     }

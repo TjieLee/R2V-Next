@@ -136,13 +136,22 @@ class TrainingStrategy(ABC):
         """Optionally modify prompt context after embedding connector processing."""
         return conditions
 
-    def get_extra_checkpoint_state_dict(self, accelerator: Any) -> dict[str, Tensor]:
+    def get_extra_checkpoint_state_dict(
+        self,
+        accelerator: Any,
+        *,
+        precollected_states: dict[str, dict[str, Tensor]] | None = None,
+    ) -> dict[str, Tensor]:
         """Return extra strategy-owned weights for checkpoint saving."""
         state_dict: dict[str, Tensor] = {}
         for name, module in self.get_trainable_modules().items():
-            unwrapped = accelerator.unwrap_model(module, keep_torch_compile=False)
+            module_state = None
+            if precollected_states is not None:
+                module_state = precollected_states.get(name)
+            if module_state is None:
+                module_state = accelerator.get_state_dict(module)
             state_dict.update(
-                {f"training_strategy.{name}.{key}": value for key, value in unwrapped.state_dict().items()}
+                {f"training_strategy.{name}.{key}": value for key, value in module_state.items()}
             )
         return state_dict
 
