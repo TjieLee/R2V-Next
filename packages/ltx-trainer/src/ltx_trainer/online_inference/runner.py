@@ -132,11 +132,17 @@ def run_online_sample(
         seed=seed,
         num_inference_steps=num_inference_steps,
     )
+    if not torch.isfinite(semantic).all().item():
+        raise RuntimeError("Semantic ODE produced non-finite latents")
+    if not torch.isfinite(generated_latents).all().item():
+        raise RuntimeError("Video ODE produced non-finite latents")
     decoded, decode_diagnostics = decode_video_latents(
         vae_decoder=runtime.vae_decoder,
         latents=generated_latents,
         decode_tile=decode_tile,
     )
+    if not torch.isfinite(decoded).all().item():
+        raise RuntimeError("VAE decode produced non-finite pixels")
     expected_shape = (
         int(sample["num_frames"]),
         3,
@@ -166,6 +172,9 @@ def run_online_sample(
             "semantic_shape": list(semantic.shape),
             "latent_shape": list(generated_latents.shape),
             "output_shape": list(decoded.shape),
+            "semantic_latent_finite": True,
+            "video_latent_finite": True,
+            "decoded_image_finite": True,
             "vae_decode": decode_diagnostics.__dict__,
             "elapsed_seconds": time.perf_counter() - started,
             "peak_vram_gib": _peak_memory_gib(runtime.device),

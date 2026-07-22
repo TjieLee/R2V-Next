@@ -36,6 +36,11 @@ from ltx_trainer.online_inference.checkpoint_runtime import (
     audit_checkpoint,
     resolve_checkpoint,
 )
+from ltx_trainer.online_inference.smoke_marker import (
+    SemanticFlowSmokeMarkerError,
+    validate_semantic_flow_smoke_marker,
+    write_semantic_flow_smoke_marker,
+)
 from ltx_trainer.config import LtxTrainerConfig
 from ltx_trainer.trainer import _enforce_semantic_flow_fsdp_runtime_safety
 import ltx_trainer.training_strategies.semantic_flow as semantic_flow_module
@@ -660,6 +665,87 @@ def test_checkpoint_audit_and_ready_resolution_require_semantic_modules(tmp_path
     save_file(tensors, missing_transformer, metadata={"architecture": "semantic_flow_v1"})
     with pytest.raises(CheckpointAuditError, match="semantic_proj_out"):
         audit_checkpoint(missing_transformer)
+
+
+def test_semantic_flow_smoke_marker_binds_code_configs_checkpoints_and_real_inference(tmp_path: Path) -> None:
+    code_commit = "a" * 40
+    training_config = tmp_path / "train.yaml"
+    accelerate_config = tmp_path / "accelerate.yaml"
+    i2i_checkpoint = tmp_path / "i2i.safetensors"
+    r2v_checkpoint = tmp_path / "r2v.safetensors"
+    runtime_audit = tmp_path / "runtime_audit.json"
+    for path, content in (
+        (training_config, "training: true\n"),
+        (accelerate_config, "num_processes: 8\n"),
+        (i2i_checkpoint, "i2i checkpoint\n"),
+        (r2v_checkpoint, "r2v checkpoint\n"),
+        (runtime_audit, "{}\n"),
+    ):
+        path.write_text(content, encoding="utf-8")
+
+    sample_dir = tmp_path / "i2i-output"
+    sample_dir.mkdir()
+    (sample_dir / "generated.png").write_bytes(b"png")
+    (sample_dir / "success.json").write_text('{"status":"success"}\n', encoding="utf-8")
+    result = {
+        "status": "success",
+        "sample_dir": str(sample_dir),
+        "task": "i2i",
+        "dry_run": False,
+        "num_inference_steps": 2,
+        "reference_velocity": 0.0,
+        "shared_semantic_video_sigma": True,
+        "semantic_latent_finite": True,
+        "video_latent_finite": True,
+        "decoded_image_finite": True,
+        "strict_no_gt_checks": {"target_path_passed_to_condition_encoder": False},
+        "output_shape": [1, 3, 64, 64],
+        "code_commit": code_commit,
+        "checkpoint": str(i2i_checkpoint),
+        "checkpoint_sha256": hashlib.sha256(i2i_checkpoint.read_bytes()).hexdigest(),
+    }
+    metadata = {key: value for key, value in result.items() if key not in {"status", "sample_dir"}}
+    (sample_dir / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+    inference_summary = tmp_path / "run_summary.json"
+    inference_summary.write_text(
+        json.dumps(
+            {
+                "strict_no_gt": True,
+                "success_count": 1,
+                "failure_count": 0,
+                "results": [result],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    marker_path = tmp_path / "semantic_flow_smoke_success.json"
+    marker = write_semantic_flow_smoke_marker(
+        marker_path,
+        code_commit=code_commit,
+        training_config_path=training_config,
+        accelerate_config_path=accelerate_config,
+        i2i_checkpoint_path=i2i_checkpoint,
+        r2v_checkpoint_path=r2v_checkpoint,
+        runtime_audit_path=runtime_audit,
+        inference_summary_path=inference_summary,
+    )
+    assert marker["non_dry_run_inference_passed"] is True
+    assert validate_semantic_flow_smoke_marker(
+        marker_path,
+        code_commit=code_commit,
+        training_config_path=training_config,
+        accelerate_config_path=accelerate_config,
+    ) == marker
+
+    training_config.write_text("training: changed\n", encoding="utf-8")
+    with pytest.raises(SemanticFlowSmokeMarkerError, match="training_config SHA256 changed"):
+        validate_semantic_flow_smoke_marker(
+            marker_path,
+            code_commit=code_commit,
+            training_config_path=training_config,
+            accelerate_config_path=accelerate_config,
+        )
 
 
 def test_strategy_checkpoint_state_uses_precollected_full_states() -> None:

@@ -175,33 +175,6 @@ latest_smoke_checkpoint() {
   printf '%s\n' "$checkpoint"
 }
 
-write_smoke_success_marker() {
-  python3 - "$SMOKE_SUCCESS_MARKER" "$RUNTIME_AUDIT" "$1" "$2" <<'PY'
-import json
-import os
-import sys
-import time
-from pathlib import Path
-
-marker = Path(sys.argv[1])
-payload = {
-    "architecture": "semantic_flow_v1",
-    "completed_at_unix": time.time(),
-    "runtime_audit": str(Path(sys.argv[2]).resolve()),
-    "i2i_checkpoint": str(Path(sys.argv[3]).resolve()),
-    "r2v_checkpoint": str(Path(sys.argv[4]).resolve()),
-}
-temporary = Path(f"{marker}.tmp.{os.getpid()}")
-with temporary.open("w", encoding="utf-8") as handle:
-    json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
-    handle.write("\n")
-    handle.flush()
-    os.fsync(handle.fileno())
-temporary.replace(marker)
-print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
-PY
-}
-
 case "${1:-}" in
   build-manifest)
     cp "$REPO_ROOT/packages/ltx-trainer/configs/multitask_online_480p121_opens2v.yaml" "$DATA_CONFIG"
@@ -244,13 +217,32 @@ case "${1:-}" in
     python3 "$REPO_ROOT/packages/ltx-trainer/scripts/infer_multitask_online_train_samples.py" \
       --config "$TRAIN_CONFIG" \
       --samples "$INFERENCE_SMOKE_ROOT/selection/selected_samples.jsonl" \
-      --output-root "$INFERENCE_SMOKE_ROOT/run" \
+      --output-root "$INFERENCE_SMOKE_ROOT/run/dry" \
       --latest-ready-dir "$SMOKE_ROOT/r2v/checkpoints" \
       --task both \
       --limit 2 \
       --dry-run \
       --overwrite
-    write_smoke_success_marker "$I2I_CHECKPOINT" "$R2V_CHECKPOINT"
+    python3 "$REPO_ROOT/packages/ltx-trainer/scripts/infer_multitask_online_train_samples.py" \
+      --config "$TRAIN_CONFIG" \
+      --samples "$INFERENCE_SMOKE_ROOT/selection/selected_samples.jsonl" \
+      --output-root "$INFERENCE_SMOKE_ROOT/run/i2i" \
+      --checkpoint "$I2I_CHECKPOINT" \
+      --task i2i \
+      --limit 1 \
+      --num-inference-steps 2 \
+      --no-dry-run \
+      --overwrite
+    CODE_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+    python3 "$REPO_ROOT/packages/ltx-trainer/scripts/semantic_flow_smoke_marker.py" write \
+      --marker "$SMOKE_SUCCESS_MARKER" \
+      --code-commit "$CODE_COMMIT" \
+      --training-config "$TRAIN_CONFIG" \
+      --accelerate-config "$ACCELERATE_CONFIG" \
+      --i2i-checkpoint "$I2I_CHECKPOINT" \
+      --r2v-checkpoint "$R2V_CHECKPOINT" \
+      --runtime-audit "$RUNTIME_AUDIT" \
+      --inference-summary "$INFERENCE_SMOKE_ROOT/run/i2i/run_summary.json"
     ;;
   train)
     semantic_flow_train_preflight
@@ -259,10 +251,13 @@ case "${1:-}" in
     elif [[ -n "${2:-}" ]]; then
       printf 'Unknown train option: %s\n' "$2" >&2
       exit 2
-    elif [[ ! -f "$SMOKE_SUCCESS_MARKER" ]]; then
-      printf 'Missing semantic-flow smoke success marker: %s\n' "$SMOKE_SUCCESS_MARKER" >&2
-      printf '%s\n' "Run: bash $0 smoke" >&2
-      exit 1
+    else
+      CODE_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+      python3 "$REPO_ROOT/packages/ltx-trainer/scripts/semantic_flow_smoke_marker.py" validate \
+        --marker "$SMOKE_SUCCESS_MARKER" \
+        --code-commit "$CODE_COMMIT" \
+        --training-config "$TRAIN_CONFIG" \
+        --accelerate-config "$ACCELERATE_CONFIG"
     fi
     python3 "$REPO_ROOT/packages/ltx-trainer/scripts/semantic_flow_runtime_audit.py" \
       --config "$TRAIN_CONFIG" \
