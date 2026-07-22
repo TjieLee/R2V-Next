@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from ltx_core.multicond.semantic_tokens import (
@@ -11,8 +12,9 @@ from ltx_core.multicond.semantic_tokens import (
     SemanticReconstructionDecoder,
 )
 from ltx_core.types import VideoLatentShape
-from ltx_trainer.online_data.constants import IMAGE_TASK
+from ltx_trainer.online_data.constants import IMAGE_TASK, VIDEO_TASK
 from ltx_trainer.online_data.online_batch_encoder import _build_messages
+from ltx_trainer.online_inference.checkpoint_runtime import OnlineInferenceRuntime
 from ltx_trainer.training_strategies.base_strategy import ModelInputs
 from ltx_trainer.training_strategies.semantic_flow import (
     ENTITY_GLOBAL,
@@ -149,8 +151,10 @@ def _prepare_training_and_inference_states(
         height=latent_height,
         width=latent_width,
     )
+    task = IMAGE_TASK if latent_frames == 1 else VIDEO_TASK
     training = strategy.prepare_training_inputs(
         {
+            "task": [task],
             "semantic_teacher_inputs": {
                 "prefix_attention_mask": torch.ones(1, 2, dtype=torch.bool),
                 "normalized_timestamps": torch.linspace(0.0, 1.0, semantic_frame_count).unsqueeze(0),
@@ -175,6 +179,7 @@ def _prepare_training_and_inference_states(
         fps=fps,
         seed=7,
     )
+    assert strategy._geometry_logged_tasks == {task}
     return training, inference
 
 
@@ -218,6 +223,70 @@ def test_r2v_training_and_inference_positions_are_identical_at_24_fps() -> None:
         fps=24.0,
     )
     _assert_position_segments_match(training, inference)
+
+
+def test_online_runtime_records_real_i2i_and_r2v_geometry() -> None:
+    strategy = SemanticFlowStrategy(SemanticFlowConfig(max_ref_images_per_sample=1))
+    strategy._semantic_dim = 128
+
+    def fake_denoise(**kwargs):
+        state = kwargs["state"]
+        semantic_length = state.sequence_offsets["semantic_end"] - state.sequence_offsets["reference_end"]
+        return (
+            torch.zeros(1, semantic_length, 128),
+            torch.zeros(state.target_shape.to_torch_shape()),
+        )
+
+    strategy.denoise_joint = fake_denoise  # type: ignore[method-assign]
+    runtime = object.__new__(OnlineInferenceRuntime)
+    runtime.strategy = strategy
+    runtime.transformer = torch.nn.Identity()
+    runtime.connector_conditions = lambda conditions: conditions  # type: ignore[method-assign]
+    encoded = {
+        "conditions": {
+            "video_prompt_embeds": torch.zeros(1, 2, 128),
+            "prompt_attention_mask": torch.ones(1, 2, dtype=torch.bool),
+        },
+        "reference_latents": {
+            "latents": torch.zeros(1, 1, 128, 1, 15, 26),
+            "ref_valid_mask": torch.ones(1, 1, dtype=torch.bool),
+        },
+    }
+
+    for task, frames, fps, expected_shape, expected_tokens in (
+        (IMAGE_TASK, 1, 1.0, [1, 128, 1, 15, 26], 390),
+        (VIDEO_TASK, 121, 24.0, [1, 128, 16, 15, 26], 6240),
+    ):
+        runtime.generate_latents(
+            {**encoded, "task": task},
+            width=832,
+            height=480,
+            num_frames=frames,
+            fps=fps,
+            seed=7,
+            num_inference_steps=1,
+        )
+        assert runtime.last_generation_geometry == {
+            "fps": fps,
+            "target_latent_shape": expected_shape,
+            "target_token_count": expected_tokens,
+            "target_position_count": expected_tokens,
+            "reference_rope_mode": "appended_time_shifted_width",
+        }
+
+
+@pytest.mark.parametrize("fps", [0.0, -1.0, float("inf"), float("nan")])
+def test_inference_rejects_non_positive_or_non_finite_fps(fps: float) -> None:
+    strategy = SemanticFlowStrategy(SemanticFlowConfig())
+    with pytest.raises(ValueError, match="Inference fps must be finite and positive"):
+        strategy.prepare_inference_state(
+            conditions={},
+            reference_latents={},
+            target_shape=VideoLatentShape(batch=1, channels=128, frames=1, height=15, width=26),
+            semantic_frame_count=1,
+            fps=fps,
+            seed=7,
+        )
 
 
 def test_vlm_reference_placeholders_keep_input_order_and_one_based_numbering() -> None:

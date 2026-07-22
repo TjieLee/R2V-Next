@@ -169,6 +169,7 @@ def run_online_sample(
         )
     metadata.update(
         {
+            **runtime.last_generation_geometry,
             "semantic_token_count": int(semantic.shape[1]),
             "semantic_shape": list(semantic.shape),
             "latent_shape": list(generated_latents.shape),

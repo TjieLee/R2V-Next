@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -237,6 +237,7 @@ class OnlineInferenceRuntime:
     checkpoint_audit: dict[str, Any]
     device: torch.device
     dtype: torch.dtype
+    last_generation_geometry: dict[str, Any] = field(default_factory=dict)
 
     def connector_conditions(self, raw_conditions: dict[str, Tensor]) -> dict[str, Tensor]:
         """Apply the frozen LTX connector exactly once to Gemma prefix features."""
@@ -275,6 +276,7 @@ class OnlineInferenceRuntime:
         num_inference_steps: int,
     ) -> tuple[Tensor, Tensor]:
         """Generate semantic and video latents without accepting any target-derived input."""
+        self.last_generation_geometry = {}
         forbidden = {"target_pixels", "latents", "semantic_teacher_inputs", "evidence_tokens"}
         leaked = sorted(forbidden & encoded.keys())
         if leaked:
@@ -300,6 +302,15 @@ class OnlineInferenceRuntime:
             fps=float(fps),
             seed=seed,
         )
+        target_start = state.sequence_offsets["semantic_end"]
+        target_end = state.sequence_offsets["target_end"]
+        self.last_generation_geometry = {
+            "fps": float(fps),
+            "target_latent_shape": list(state.target_shape.to_torch_shape()),
+            "target_token_count": target_end - target_start,
+            "target_position_count": int(state.modality.positions[:, :, target_start:target_end].shape[2]),
+            "reference_rope_mode": self.strategy.config.reference_rope_mode,
+        }
         return self.strategy.denoise_joint(
             transformer=self.transformer,
             state=state,

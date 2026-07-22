@@ -125,6 +125,7 @@ class SemanticFlowStrategy(TrainingStrategy):
         self._semantic_dim: int | None = None
         self._gemma_dim: int | None = None
         self._last_training_metrics: dict[str, Tensor] = {}
+        self._geometry_logged_tasks: set[str] = set()
         self.teacher_checkpointed_layer_count = 0
         self.teacher_checkpoint_forward_calls = 0
 
@@ -373,12 +374,16 @@ class SemanticFlowStrategy(TrainingStrategy):
         noisy_target = (1.0 - sigma_expanded) * target_tokens + sigma_expanded * target_noise
         video_flow_target = target_noise - target_tokens
         target_timesteps = sigma.flatten()[:, None].expand(batch_size, target_tokens.shape[1])
+        target_fps = latents.get(
+            "fps",
+            torch.full((batch_size,), float(DEFAULT_FPS), device=device),
+        ).flatten()
         target_positions = self._get_video_positions(
             num_frames=int(latents["num_frames"][0].item()),
             height=int(latents["height"][0].item()),
             width=int(latents["width"][0].item()),
             batch_size=batch_size,
-            fps=latents.get("fps", torch.full((batch_size,), float(DEFAULT_FPS), device=device)).flatten(),
+            fps=target_fps,
             device=device,
         )
         if target_positions.shape[2] != target_tokens.shape[1]:
@@ -457,6 +462,25 @@ class SemanticFlowStrategy(TrainingStrategy):
         ref_length = ref_tokens.shape[1]
         semantic_length = semantic_tokens.shape[1]
         target_length = target_tokens.shape[1]
+        raw_task = batch.get("task", ["unknown"])
+        task = str(raw_task[0]) if isinstance(raw_task, (list, tuple)) else str(raw_task)
+        if task not in self._geometry_logged_tasks:
+            logger.info(
+                "semantic-flow geometry: "
+                f"task={task} "
+                f"target_latent={list(target_latents.shape)} "
+                f"target_tokens={target_length} "
+                f"target_positions={target_positions.shape[2]} "
+                f"fps={float(target_fps[0].item())} "
+                f"references={batch['reference_latents']['latents'].shape[1]} "
+                f"reference_tokens={ref_length} "
+                f"reference_positions={ref_positions.shape[2]} "
+                f"reference_rope_mode={self.config.reference_rope_mode} "
+                f"semantic_frames={semantic_clean.shape[1]} "
+                f"semantic_tokens={int(semantic_valid.sum().item())}/"
+                f"{semantic_clean.shape[1] * semantic_clean.shape[2]}"
+            )
+            self._geometry_logged_tasks.add(task)
         sequence = torch.cat([ref_tokens, semantic_tokens, noisy_target], dim=1)
         timesteps = torch.cat(
             [
@@ -594,8 +618,9 @@ class SemanticFlowStrategy(TrainingStrategy):
         """Initialize strict-no-GT joint state from references, context, and noise only."""
         if semantic_frame_count < 1:
             raise ValueError("semantic_frame_count must be positive")
-        if not math.isfinite(fps) or fps <= 0:
-            raise ValueError(f"fps must be finite and positive, got {fps!r}")
+        fps_value = float(fps)
+        if not math.isfinite(fps_value) or fps_value <= 0:
+            raise ValueError(f"Inference fps must be finite and positive, got {fps}")
         if self._semantic_dim is None:
             raise RuntimeError("semantic modules are not initialized; attach_models must run first")
         reference_latent_tensor = reference_latents["latents"]
@@ -626,7 +651,7 @@ class SemanticFlowStrategy(TrainingStrategy):
             height=target_shape.height,
             width=target_shape.width,
             batch_size=batch_size,
-            fps=float(fps),
+            fps=fps_value,
             device=device,
         )
         normalized_timestamps = torch.linspace(
