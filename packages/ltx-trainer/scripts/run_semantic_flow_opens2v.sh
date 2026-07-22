@@ -39,7 +39,11 @@ FSDP_SMOKE_ACCELERATE_CONFIG="${FSDP_SMOKE_ACCELERATE_CONFIG:-$REPO_ROOT/package
 SMOKE_ROOT="$R2V_ROOT/smoke"
 INFERENCE_SMOKE_ROOT="/mnt/workspace/litengjie/jd_ltx_multitask_online_480p121/inference/semantic_flow_v2_smoke"
 RUNTIME_AUDIT="$R2V_ROOT/train/runtime_audit.json"
+TRAIN_RUNTIME_AUDIT="$R2V_ROOT/train/runtime_audit_train.json"
+RUNTIME_LOCK="$R2V_ROOT/train/runtime_lock.json"
 SMOKE_SUCCESS_MARKER="$R2V_ROOT/train/semantic_flow_smoke_success.json"
+FSDP_SMOKE_ROOT="$SMOKE_ROOT/fsdp_checkpoint"
+FSDP_SMOKE_RESULT="$FSDP_SMOKE_ROOT/result.json"
 
 semantic_flow_train_preflight() {
   python3 - "$TRAIN_CONFIG" "$ACCELERATE_CONFIG" "$R2V_ROOT" <<'PY'
@@ -195,6 +199,9 @@ case "${1:-}" in
       --config "$TRAIN_CONFIG" \
       --accelerate-config "$ACCELERATE_CONFIG" \
       --output "$RUNTIME_AUDIT"
+    accelerate launch --config_file "$FSDP_SMOKE_ACCELERATE_CONFIG" \
+      "$REPO_ROOT/packages/ltx-trainer/scripts/smoke_semantic_flow_fsdp_checkpoint.py" \
+      --output-dir "$FSDP_SMOKE_ROOT"
     accelerate launch --config_file "$ACCELERATE_CONFIG" \
       "$REPO_ROOT/packages/ltx-trainer/scripts/check_multitask_online_distributed.py" \
       --config "$TRAIN_CONFIG" \
@@ -233,6 +240,13 @@ case "${1:-}" in
       --num-inference-steps 2 \
       --no-dry-run \
       --overwrite
+    python3 "$REPO_ROOT/packages/ltx-trainer/scripts/semantic_flow_runtime_audit.py" \
+      --config "$TRAIN_CONFIG" \
+      --accelerate-config "$ACCELERATE_CONFIG" \
+      --output "$RUNTIME_AUDIT" \
+      --runtime-lock "$RUNTIME_LOCK" \
+      --fsdp-smoke-result "$FSDP_SMOKE_RESULT" \
+      --refresh-runtime-lock
     CODE_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD)"
     python3 "$REPO_ROOT/packages/ltx-trainer/scripts/semantic_flow_smoke_marker.py" write \
       --marker "$SMOKE_SUCCESS_MARKER" \
@@ -246,11 +260,24 @@ case "${1:-}" in
     ;;
   train)
     semantic_flow_train_preflight
-    if [[ "${2:-}" == "--skip-smoke-guard" ]]; then
+    SKIP_SMOKE_GUARD=false
+    REFRESH_RUNTIME_LOCK=false
+    for option in "${@:2}"; do
+      case "$option" in
+        --skip-smoke-guard)
+          SKIP_SMOKE_GUARD=true
+          ;;
+        --refresh-runtime-lock)
+          REFRESH_RUNTIME_LOCK=true
+          ;;
+        *)
+          printf 'Unknown train option: %s\n' "$option" >&2
+          exit 2
+          ;;
+      esac
+    done
+    if [[ "$SKIP_SMOKE_GUARD" == true ]]; then
       printf '%s\n' "Skipping semantic-flow smoke guard by explicit request."
-    elif [[ -n "${2:-}" ]]; then
-      printf 'Unknown train option: %s\n' "$2" >&2
-      exit 2
     else
       CODE_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD)"
       python3 "$REPO_ROOT/packages/ltx-trainer/scripts/semantic_flow_smoke_marker.py" validate \
@@ -259,16 +286,24 @@ case "${1:-}" in
         --training-config "$TRAIN_CONFIG" \
         --accelerate-config "$ACCELERATE_CONFIG"
     fi
+    RUNTIME_AUDIT_ARGS=(
+      --config "$TRAIN_CONFIG"
+      --accelerate-config "$ACCELERATE_CONFIG"
+      --output "$TRAIN_RUNTIME_AUDIT"
+      --runtime-lock "$RUNTIME_LOCK"
+      --fsdp-smoke-result "$FSDP_SMOKE_RESULT"
+    )
+    if [[ "$REFRESH_RUNTIME_LOCK" == true ]]; then
+      RUNTIME_AUDIT_ARGS+=(--refresh-runtime-lock)
+    fi
     python3 "$REPO_ROOT/packages/ltx-trainer/scripts/semantic_flow_runtime_audit.py" \
-      --config "$TRAIN_CONFIG" \
-      --accelerate-config "$ACCELERATE_CONFIG" \
-      --output "$RUNTIME_AUDIT"
+      "${RUNTIME_AUDIT_ARGS[@]}"
     accelerate launch --config_file "$ACCELERATE_CONFIG" \
       "$REPO_ROOT/packages/ltx-trainer/scripts/train.py" \
       "$TRAIN_CONFIG"
     ;;
   *)
-    printf '%s\n' "Usage: $0 {build-manifest|smoke|train [--skip-smoke-guard]}"
+    printf '%s\n' "Usage: $0 {build-manifest|smoke|train [--skip-smoke-guard] [--refresh-runtime-lock]}"
     printf '%s\n' "Required distributed mode: FSDP FULL_SHARD with at least 4 processes; 8 is recommended."
     exit 2
     ;;

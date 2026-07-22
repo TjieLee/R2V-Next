@@ -17,6 +17,7 @@ from accelerate import DistributedType
 from safetensors.torch import save_file
 from torch import nn
 
+import ltx_trainer.training_strategies.semantic_flow as semantic_flow_module
 from ltx_core.multicond.semantic_tokens import (
     EVIDENCE_TOKENS_PER_FRAME,
     SEMANTIC_TOKENS_PER_FRAME,
@@ -31,20 +32,24 @@ from ltx_core.multicond.semantic_tokens import (
     sample_semantic_keep_mask_with_stats,
 )
 from ltx_core.types import VideoLatentShape
+from ltx_trainer.config import LtxTrainerConfig
 from ltx_trainer.online_inference.checkpoint_runtime import (
     CheckpointAuditError,
     audit_checkpoint,
     resolve_checkpoint,
+)
+from ltx_trainer.online_inference.runtime_lock import (
+    SemanticFlowRuntimeLockError,
+    build_semantic_flow_runtime_lock,
+    write_or_validate_semantic_flow_runtime_lock,
 )
 from ltx_trainer.online_inference.smoke_marker import (
     SemanticFlowSmokeMarkerError,
     validate_semantic_flow_smoke_marker,
     write_semantic_flow_smoke_marker,
 )
-from ltx_trainer.config import LtxTrainerConfig
-from ltx_trainer.trainer import _enforce_semantic_flow_fsdp_runtime_safety
-import ltx_trainer.training_strategies.semantic_flow as semantic_flow_module
 from ltx_trainer.training_strategies.semantic_flow import SemanticFlowConfig, SemanticFlowStrategy
+from ltx_trainer.trainer import _enforce_semantic_flow_fsdp_runtime_safety
 
 
 def test_local_queries_and_reconstruction_targets_preserve_spatial_neighborhoods() -> None:
@@ -746,6 +751,45 @@ def test_semantic_flow_smoke_marker_binds_code_configs_checkpoints_and_real_infe
             training_config_path=training_config,
             accelerate_config_path=accelerate_config,
         )
+
+
+def test_semantic_flow_runtime_lock_requires_exact_environment_and_fsdp_roundtrip(tmp_path: Path) -> None:
+    report = {
+        "ready": True,
+        "python": {"runtime_version": "3.11.9"},
+        "packages": {
+            name: {"installed": True, "version": version}
+            for name, version in {
+                "torch": "2.7.1",
+                "transformers": "4.53.1",
+                "accelerate": "1.12.0",
+                "safetensors": "0.5.3",
+            }.items()
+        },
+        "torch_runtime": {"cuda_version": "12.8", "nccl_version": [2, 26, 2]},
+        "gemma": {"sliding_window": 1024},
+        "capabilities": {
+            "accelerate_fsdp_plugin": {
+                "passed": True,
+                "fsdp_version": 1,
+                "sharding_strategy": "FULL_SHARD",
+                "state_dict_type": "FULL_STATE_DICT",
+            }
+        },
+    }
+    fsdp_result = {"world_size": 2, "max_abs_tensor_diff_after_reload": 0.0}
+    current = build_semantic_flow_runtime_lock(report, fsdp_result)
+    lock_path = tmp_path / "runtime_lock.json"
+    assert write_or_validate_semantic_flow_runtime_lock(lock_path, current, refresh=True) == "refreshed"
+    assert write_or_validate_semantic_flow_runtime_lock(lock_path, current, refresh=False) == "validated"
+
+    changed = dict(current)
+    changed["transformers"] = "different"
+    with pytest.raises(SemanticFlowRuntimeLockError, match="Runtime differs from lock"):
+        write_or_validate_semantic_flow_runtime_lock(lock_path, changed, refresh=False)
+
+    with pytest.raises(SemanticFlowRuntimeLockError, match="exactly two processes"):
+        build_semantic_flow_runtime_lock(report, {"world_size": 8, "max_abs_tensor_diff_after_reload": 0.0})
 
 
 def test_strategy_checkpoint_state_uses_precollected_full_states() -> None:

@@ -4,7 +4,7 @@
 Run from the repository root with:
 
     torchrun --nproc_per_node=2 packages/ltx-trainer/scripts/smoke_semantic_flow_fsdp_checkpoint.py \
-        --output-dir /tmp/r2v_semantic_flow_fsdp_smoke
+        --output-dir /mnt/workspace/litengjie/jd_ltx_multitask_online_480p121/semantic_flow_v2/fsdp_smoke
 """
 
 from __future__ import annotations
@@ -33,7 +33,9 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT / "packages" / "ltx-trainer" / "src"))
 sys.path.insert(0, str(REPO_ROOT / "packages" / "ltx-core" / "src"))
 
+from ltx_trainer.online_data.path_safety import assert_write_path_allowed  # noqa: E402
 from ltx_trainer.online_inference.checkpoint_runtime import audit_checkpoint  # noqa: E402
+from ltx_trainer.online_inference.output_artifacts import atomic_write_json  # noqa: E402
 from ltx_trainer.training_strategies.semantic_flow import SemanticFlowConfig, SemanticFlowStrategy  # noqa: E402
 
 
@@ -233,6 +235,11 @@ def run(output_dir: Path) -> dict[str, Any] | None:
     )
     max_diff_tensor = torch.tensor(max_diff, device=device)
     dist.all_reduce(max_diff_tensor, op=dist.ReduceOp.MAX)
+    if max_diff_tensor.item() != 0.0:
+        raise RuntimeError(
+            "Tiny FSDP checkpoint round-trip changed tensors: "
+            f"max_abs_diff={max_diff_tensor.item()}"
+        )
 
     if rank != 0:
         return None
@@ -256,8 +263,10 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
     try:
-        result = run(args.output_dir)
+        output_dir = assert_write_path_allowed(args.output_dir)
+        result = run(output_dir)
         if result is not None:
+            atomic_write_json(output_dir / "result.json", result)
             print(json.dumps(result, indent=2, sort_keys=True))
     finally:
         if dist.is_initialized():

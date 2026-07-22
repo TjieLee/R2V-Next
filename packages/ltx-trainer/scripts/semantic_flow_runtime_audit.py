@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Write a semantic-flow runtime/dependency audit JSON before smoke or training."""
+"""Audit required semantic-flow runtime capabilities and enforce an optional version lock."""
 
 from __future__ import annotations
 
@@ -14,6 +14,10 @@ from pathlib import Path
 from typing import Any
 
 from ltx_trainer.online_data.path_safety import assert_write_path_allowed
+from ltx_trainer.online_inference.runtime_lock import (
+    build_semantic_flow_runtime_lock,
+    write_or_validate_semantic_flow_runtime_lock,
+)
 
 
 def _package_version(name: str) -> dict[str, Any]:
@@ -29,9 +33,12 @@ def _load_yaml(path: Path) -> tuple[dict[str, Any], str | None]:
     except ModuleNotFoundError as exc:
         return {}, f"PyYAML is not installed: {exc}"
     try:
-        return yaml.safe_load(path.read_text(encoding="utf-8")) or {}, None
+        payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     except Exception as exc:
         return {}, f"{type(exc).__name__}: {exc}"
+    if not isinstance(payload, dict):
+        return {}, f"Expected a YAML mapping in {path}"
+    return payload, None
 
 
 def _torch_runtime() -> dict[str, Any]:
@@ -43,12 +50,11 @@ def _torch_runtime() -> dict[str, Any]:
     cuda_available = bool(torch.cuda.is_available())
     gpu_models = []
     if cuda_available:
-        gpu_models = [
-            torch.cuda.get_device_name(index)
-            for index in range(torch.cuda.device_count())
-        ]
+        gpu_models = [torch.cuda.get_device_name(index) for index in range(torch.cuda.device_count())]
     try:
         nccl_version = torch.cuda.nccl.version() if cuda_available else None
+        if isinstance(nccl_version, tuple):
+            nccl_version = list(nccl_version)
     except Exception as exc:
         nccl_version = f"{type(exc).__name__}: {exc}"
     return {
@@ -97,14 +103,15 @@ def _gemma_sliding_window(path: str | None) -> dict[str, Any]:
     }
 
 
-def _fsdp_report(accelerate_config: dict[str, Any], accelerate_error: str | None) -> dict[str, Any]:
+def _fsdp_config_report(accelerate_config: dict[str, Any], config_error: str | None) -> dict[str, Any]:
     fsdp_config = accelerate_config.get("fsdp_config") or {}
     return {
-        "config_error": accelerate_error,
+        "config_error": config_error,
         "distributed_type": accelerate_config.get("distributed_type"),
         "mixed_precision": accelerate_config.get("mixed_precision"),
+        "num_processes": accelerate_config.get("num_processes"),
         "version": fsdp_config.get("fsdp_version"),
-        "sharding_strategy": fsdp_config.get("fsdp_sharding_strategy") or fsdp_config.get("fsdp_reshard_after_forward"),
+        "sharding_strategy": fsdp_config.get("fsdp_sharding_strategy"),
         "auto_wrap_policy": fsdp_config.get("fsdp_auto_wrap_policy"),
         "transformer_layer_cls_to_wrap": fsdp_config.get("fsdp_transformer_layer_cls_to_wrap"),
         "state_dict_type": fsdp_config.get("fsdp_state_dict_type"),
@@ -112,6 +119,104 @@ def _fsdp_report(accelerate_config: dict[str, Any], accelerate_error: str | None
         "cpu_ram_efficient_loading": fsdp_config.get("fsdp_cpu_ram_efficient_loading"),
         "use_orig_params": fsdp_config.get("fsdp_use_orig_params"),
     }
+
+
+def _enum_name(value: Any) -> str | None:
+    name = getattr(value, "name", None)
+    return str(name) if name is not None else None
+
+
+def _transformers_mask_mapping_capability() -> dict[str, Any]:
+    try:
+        import torch
+        import transformers
+
+        from ltx_core.multicond.gemma3_attention import build_gemma3_attention_masks
+        from ltx_core.multicond.semantic_tokens import build_multimodal_prefix_attention_mask
+
+        config = transformers.Gemma3TextConfig(
+            vocab_size=32,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            head_dim=4,
+            sliding_window=4,
+            layer_types=["full_attention", "sliding_attention"],
+            use_cache=False,
+        )
+        model = transformers.Gemma3TextModel(config).eval()
+        inputs = torch.randn(1, 8, config.hidden_size)
+        valid = torch.ones(1, 8, dtype=torch.bool)
+        image = torch.zeros_like(valid)
+        image[:, 2:4] = True
+        custom = build_multimodal_prefix_attention_mask(valid, image_token_mask=image)
+        masks = build_gemma3_attention_masks(
+            valid_token_mask=valid,
+            image_token_mask=image,
+            custom_visibility=custom,
+            sliding_window=config.sliding_window,
+            dtype=inputs.dtype,
+        )
+        with torch.no_grad():
+            outputs = model(
+                inputs_embeds=inputs,
+                attention_mask=masks.as_mapping(),
+                position_ids=torch.arange(inputs.shape[1]).unsqueeze(0),
+                output_hidden_states=True,
+                return_dict=True,
+                use_cache=False,
+            )
+        output_shape = list(outputs.hidden_states[-1].shape)
+        if output_shape != list(inputs.shape):
+            raise RuntimeError(f"Unexpected tiny Gemma output shape: {output_shape}")
+        return {"passed": True, "output_shape": output_shape}
+    except Exception as exc:
+        return {"passed": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def _accelerate_fsdp_plugin_capability(accelerate_config: dict[str, Any]) -> dict[str, Any]:
+    fsdp_config = accelerate_config.get("fsdp_config") or {}
+    try:
+        from accelerate import FullyShardedDataParallelPlugin
+
+        plugin = FullyShardedDataParallelPlugin(
+            fsdp_version=fsdp_config.get("fsdp_version"),
+            sharding_strategy=fsdp_config.get("fsdp_sharding_strategy"),
+            backward_prefetch=fsdp_config.get("fsdp_backward_prefetch"),
+            mixed_precision_policy=accelerate_config.get("mixed_precision"),
+            auto_wrap_policy=fsdp_config.get("fsdp_auto_wrap_policy"),
+            cpu_offload=bool(fsdp_config.get("fsdp_offload_params", False)),
+            state_dict_type=fsdp_config.get("fsdp_state_dict_type"),
+            use_orig_params=fsdp_config.get("fsdp_use_orig_params"),
+            sync_module_states=fsdp_config.get("fsdp_sync_module_states"),
+            forward_prefetch=fsdp_config.get("fsdp_forward_prefetch"),
+            activation_checkpointing=fsdp_config.get("fsdp_activation_checkpointing"),
+            cpu_ram_efficient_loading=fsdp_config.get("fsdp_cpu_ram_efficient_loading"),
+            transformer_cls_names_to_wrap=[fsdp_config.get("fsdp_transformer_layer_cls_to_wrap")],
+        )
+        report = {
+            "passed": True,
+            "fsdp_version": getattr(plugin, "fsdp_version", None),
+            "sharding_strategy": _enum_name(getattr(plugin, "sharding_strategy", None)),
+            "state_dict_type": _enum_name(getattr(plugin, "state_dict_type", None)),
+        }
+        expected = {
+            "fsdp_version": 1,
+            "sharding_strategy": "FULL_SHARD",
+            "state_dict_type": "FULL_STATE_DICT",
+        }
+        mismatches = {
+            key: {"expected": value, "actual": report.get(key)}
+            for key, value in expected.items()
+            if report.get(key) != value
+        }
+        if mismatches:
+            raise RuntimeError(f"Accelerate FSDP plugin fields mismatch: {mismatches}")
+        return report
+    except Exception as exc:
+        return {"passed": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
@@ -133,17 +238,43 @@ def main() -> None:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--accelerate-config", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--runtime-lock", type=Path)
+    parser.add_argument("--fsdp-smoke-result", type=Path)
+    parser.add_argument("--refresh-runtime-lock", action="store_true")
     args = parser.parse_args()
 
     trainer_config, trainer_config_error = _load_yaml(args.config.expanduser().resolve())
     accelerate_config, accelerate_config_error = _load_yaml(args.accelerate_config.expanduser().resolve())
     output = assert_write_path_allowed(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
+    torch_runtime = _torch_runtime()
+    gemma = _gemma_sliding_window((trainer_config.get("model") or {}).get("text_encoder_path"))
+    capabilities = {
+        "transformers_mask_mapping": _transformers_mask_mapping_capability(),
+        "accelerate_fsdp_plugin": _accelerate_fsdp_plugin_capability(accelerate_config),
+    }
+    errors = []
+    for label, error in (
+        ("training config", trainer_config_error),
+        ("accelerate config", accelerate_config_error),
+    ):
+        if error:
+            errors.append(f"{label}: {error}")
+    if torch_runtime.get("available") is not True or torch_runtime.get("cuda_available") is not True:
+        errors.append("CUDA-enabled PyTorch is required")
+    if gemma.get("sliding_window") != 1024:
+        errors.append(f"Production Gemma sliding_window must be 1024, got {gemma.get('sliding_window')}")
+    for name, capability in capabilities.items():
+        if capability.get("passed") is not True:
+            errors.append(f"{name}: {capability.get('error', 'capability check failed')}")
 
-    report = {
+    report: dict[str, Any] = {
         "architecture": "semantic_flow_v1",
+        "ready": not errors,
+        "errors": errors,
         "python": {
             "version": sys.version,
+            "runtime_version": platform.python_version(),
             "executable": sys.executable,
             "platform": platform.platform(),
         },
@@ -151,16 +282,47 @@ def main() -> None:
             name: _package_version(name)
             for name in ("torch", "transformers", "accelerate", "safetensors")
         },
-        "torch_runtime": _torch_runtime(),
+        "torch_runtime": torch_runtime,
         "config": {
             "path": str(args.config.expanduser().resolve()),
             "error": trainer_config_error,
         },
-        "accelerate": _fsdp_report(accelerate_config, accelerate_config_error),
-        "gemma": _gemma_sliding_window((trainer_config.get("model") or {}).get("text_encoder_path")),
+        "accelerate": _fsdp_config_report(accelerate_config, accelerate_config_error),
+        "gemma": gemma,
+        "capabilities": capabilities,
     }
+
+    if args.refresh_runtime_lock and args.runtime_lock is None:
+        errors.append("--refresh-runtime-lock requires --runtime-lock")
+    if args.runtime_lock is not None:
+        try:
+            if args.fsdp_smoke_result is None:
+                raise ValueError("--runtime-lock requires --fsdp-smoke-result")
+            smoke_path = args.fsdp_smoke_result.expanduser().resolve()
+            smoke_result = json.loads(smoke_path.read_text(encoding="utf-8"))
+            if not isinstance(smoke_result, dict):
+                raise ValueError(f"FSDP smoke result must be a JSON object: {smoke_path}")
+            report["ready"] = not errors
+            runtime_lock = build_semantic_flow_runtime_lock(report, smoke_result)
+            lock_path = assert_write_path_allowed(args.runtime_lock)
+            action = write_or_validate_semantic_flow_runtime_lock(
+                lock_path,
+                runtime_lock,
+                refresh=args.refresh_runtime_lock,
+            )
+            report["runtime_lock"] = {
+                "path": str(lock_path),
+                "action": action,
+                "values": runtime_lock,
+            }
+        except Exception as exc:
+            errors.append(f"runtime_lock: {type(exc).__name__}: {exc}")
+    report["ready"] = not errors
+    report["errors"] = errors
     _atomic_json(output, report)
     print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+    if errors:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
