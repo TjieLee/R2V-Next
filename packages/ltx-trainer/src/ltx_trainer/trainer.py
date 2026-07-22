@@ -549,7 +549,6 @@ class LtxvTrainer:
                     "task_id": 0.0 if task == "i2i" else 1.0,
                     "is_image": 1.0 if task == "i2i" else 0.0,
                     "target_num_frames": 1.0 if task == "i2i" else 121.0,
-                    "semantic_token_count": 64.0 if task == "i2i" else 768.0,
                 }
             )
 

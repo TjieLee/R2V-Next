@@ -16,7 +16,9 @@ from torch import nn
 from ltx_core.multicond.semantic_tokens import (
     EVIDENCE_TOKENS_PER_FRAME,
     SEMANTIC_TOKENS_PER_FRAME,
+    SemanticEncoder,
     SemanticQueryInitializer,
+    SemanticReconstructionDecoder,
     build_multimodal_prefix_attention_mask,
     build_semantic_teacher_attention_mask,
     gather_local_evidence,
@@ -30,6 +32,7 @@ from ltx_trainer.online_inference.checkpoint_runtime import (
 )
 from ltx_trainer.config import LtxTrainerConfig
 from ltx_trainer.trainer import _enforce_semantic_flow_fsdp_runtime_safety
+import ltx_trainer.training_strategies.semantic_flow as semantic_flow_module
 from ltx_trainer.training_strategies.semantic_flow import SemanticFlowConfig, SemanticFlowStrategy
 
 
@@ -161,6 +164,65 @@ def test_semantic_dropout_keeps_at_least_56_tokens_per_frame() -> None:
     )
     assert mask.shape == (8, 12, 64)
     assert (mask.sum(dim=-1) >= 56).all()
+
+
+def test_semantic_flow_reports_actual_kept_prefix_and_latent_metrics(monkeypatch: pytest.MonkeyPatch) -> None:
+    strategy = SemanticFlowStrategy(SemanticFlowConfig())
+    strategy._semantic_dim = 4
+    strategy._gemma_dim = 4
+    strategy._query_initializer = SemanticQueryInitializer(4)
+    strategy._semantic_encoder = SemanticEncoder(4, 4)
+    strategy._reconstruction_decoder = SemanticReconstructionDecoder(4, 4)
+
+    semantic_clean = torch.ones(1, 2, SEMANTIC_TOKENS_PER_FRAME, 4)
+    teacher = {
+        "semantic_clean": semantic_clean,
+        "reconstruction_prediction": torch.zeros(1, 2, SEMANTIC_TOKENS_PER_FRAME, 4, 4),
+        "reconstruction_target": torch.zeros(1, 2, SEMANTIC_TOKENS_PER_FRAME, 4, 4),
+    }
+    strategy.build_semantic_teacher_outputs = lambda _teacher_inputs: teacher  # type: ignore[method-assign]
+    keep_mask = torch.zeros(1, 2, SEMANTIC_TOKENS_PER_FRAME, dtype=torch.bool)
+    keep_mask[:, :, :40] = True
+    monkeypatch.setattr(semantic_flow_module, "sample_semantic_keep_mask", lambda *args, **kwargs: keep_mask)
+
+    batch = {
+        "semantic_teacher_inputs": {
+            "prefix_attention_mask": torch.tensor([[1, 1, 1, 0, 0]], dtype=torch.bool),
+            "normalized_timestamps": torch.tensor([[0.0, 1.0]]),
+        },
+        "latents": {
+            "latents": torch.zeros(1, 4, 1, 1, 1),
+            "num_frames": torch.tensor([1]),
+            "height": torch.tensor([1]),
+            "width": torch.tensor([1]),
+            "fps": torch.tensor([24.0]),
+        },
+        "reference_latents": {
+            "latents": torch.zeros(1, 1, 4, 1, 1, 1),
+            "ref_valid_mask": torch.tensor([[True]]),
+        },
+        "conditions": {
+            "video_prompt_embeds": torch.zeros(1, 3, 4),
+            "prompt_attention_mask": torch.ones(1, 3, dtype=torch.bool),
+        },
+    }
+    sampler = SimpleNamespace(sample_for=lambda target_tokens: torch.full((target_tokens.shape[0],), 0.5))
+
+    inputs = strategy.prepare_training_inputs(batch, sampler)
+    metrics = strategy.get_last_training_metrics()
+    assert float(metrics["train/semantic_token_count_before_dropout"]) == 128.0
+    assert float(metrics["train/semantic_token_count_kept"]) == 80.0
+    assert float(metrics["train/semantic_keep_ratio"]) == pytest.approx(80.0 / 128.0)
+    assert float(metrics["train/prefix_token_count"]) == 3.0
+    assert float(metrics["train/anchor_frame_count"]) == 2.0
+    assert float(metrics["train/semantic_latent_rms"]) == pytest.approx(1.0)
+    assert float(metrics["train/query_position_gate"]) == pytest.approx(0.0)
+    assert float(metrics["train/semantic_global_scale"]) == pytest.approx(1.0)
+
+    strategy.compute_loss(torch.zeros_like(inputs.video.latent), None, inputs)
+    metrics = strategy.get_last_training_metrics()
+    assert "train/loss_semantic_flow" in metrics
+    assert float(metrics["train/semantic_token_count_kept"]) == 80.0
 
 
 def test_production_semantic_flow_config_uses_opens2v_only_litengjie_paths() -> None:

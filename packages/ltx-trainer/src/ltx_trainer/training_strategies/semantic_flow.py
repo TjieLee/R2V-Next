@@ -306,6 +306,31 @@ class SemanticFlowStrategy(TrainingStrategy):
                 semantic_bounds,
             )
         )
+        prefix_attention_mask = batch["semantic_teacher_inputs"]["prefix_attention_mask"].to(device=device)
+        query_initializer, semantic_encoder, _reconstruction_decoder = self._require_semantic_modules()
+        semantic_token_count_before_dropout = torch.full(
+            (batch_size,),
+            semantic_clean.shape[1] * semantic_clean.shape[2],
+            device=device,
+            dtype=torch.float32,
+        )
+        semantic_token_count_kept = semantic_valid.sum(dim=1).to(dtype=torch.float32)
+        self._last_training_metrics = {
+            "train/semantic_token_count_before_dropout": semantic_token_count_before_dropout.detach().mean(),
+            "train/semantic_token_count_kept": semantic_token_count_kept.detach().mean(),
+            "train/semantic_keep_ratio": (
+                semantic_token_count_kept / semantic_token_count_before_dropout.clamp_min(1.0)
+            ).detach().mean(),
+            "train/prefix_token_count": prefix_attention_mask.to(dtype=torch.float32).sum(dim=1).detach().mean(),
+            "train/anchor_frame_count": torch.tensor(
+                float(normalized_timestamps.shape[1]),
+                device=device,
+                dtype=torch.float32,
+            ),
+            "train/semantic_latent_rms": semantic_clean.detach().float().pow(2).mean().sqrt(),
+            "train/query_position_gate": self._module_scalar(query_initializer, "position_gate", device),
+            "train/semantic_global_scale": self._module_scalar(semantic_encoder, "global_scale", device),
+        }
 
         ref_tokens, ref_positions, ref_valid, ref_entities = self._reference_sequence(
             batch["reference_latents"],
@@ -428,6 +453,7 @@ class SemanticFlowStrategy(TrainingStrategy):
             + self.config.semantic_reconstruction_weight * reconstruction_loss
         )
         self._last_training_metrics = {
+            **self._last_training_metrics,
             "train/loss_video_flow": video_loss.detach().mean(),
             "train/loss_semantic_flow": semantic_loss.detach().mean(),
             "train/loss_semantic_reconstruction": reconstruction_loss.detach().mean(),
@@ -653,6 +679,19 @@ class SemanticFlowStrategy(TrainingStrategy):
         token_loss = (prediction - target).pow(2).mean(dim=-1)
         weights = mask.to(dtype=token_loss.dtype)
         return (token_loss * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
+
+    @staticmethod
+    def _module_scalar(module: nn.Module, name: str, device: torch.device) -> Tensor:
+        for candidate in (module, getattr(module, "module", None), getattr(module, "_fsdp_wrapped_module", None)):
+            if candidate is None:
+                continue
+            value = getattr(candidate, name, None)
+            if isinstance(value, Tensor):
+                return value.detach().float().mean()
+        for parameter_name, parameter in module.named_parameters():
+            if parameter_name.endswith(name):
+                return parameter.detach().float().mean()
+        return torch.tensor(float("nan"), device=device, dtype=torch.float32)
 
     def _reference_sequence(
         self,
