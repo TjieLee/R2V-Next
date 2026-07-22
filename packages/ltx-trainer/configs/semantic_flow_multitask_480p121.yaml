@@ -14,6 +14,7 @@ training_strategy:
   reference_latents_dir: "reference_latents"
   conditions_dir: "conditions"
   max_ref_images_per_sample: 4
+  reference_rope_mode: "appended_time_shifted_width"
   anchor_frame_ratio: 0.10
   vlm_prefix_max_length: 2560
   vlm_teacher_max_length: 6656

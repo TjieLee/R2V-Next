@@ -434,6 +434,7 @@ def test_production_semantic_flow_config_uses_opens2v_only_litengjie_paths(tmp_p
     assert training_config["data"]["online_encoding"]["runtime_reject_log_dir"].startswith(
         "/mnt/workspace/litengjie/"
     )
+    assert training_config["training_strategy"]["reference_rope_mode"] == "appended_time_shifted_width"
 
     model_path = tmp_path / "ltx-2.3-22b-dev.safetensors"
     model_path.write_bytes(b"fake safetensors placeholder")

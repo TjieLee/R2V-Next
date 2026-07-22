@@ -65,6 +65,10 @@ class SemanticFlowConfig(TrainingStrategyConfigBase):
     reference_latents_dir: str = "reference_latents"
     conditions_dir: str = "conditions"
     max_ref_images_per_sample: int = Field(default=4, ge=1, le=MAX_REFERENCE_ENTITIES)
+    reference_rope_mode: Literal[
+        "native_overlap",
+        "appended_time_shifted_width",
+    ] = "appended_time_shifted_width"
 
     anchor_frame_ratio: float = Field(default=0.10, gt=0.0, le=1.0)
     vlm_prefix_max_length: int = Field(default=2560, ge=128)
@@ -429,6 +433,7 @@ class SemanticFlowStrategy(TrainingStrategy):
         ref_tokens, ref_positions, ref_valid, ref_entities = self._reference_sequence(
             batch["reference_latents"],
             target_latents=target_latents,
+            target_positions=target_positions,
         )
         ref_length = ref_tokens.shape[1]
         semantic_length = semantic_tokens.shape[1]
@@ -616,6 +621,7 @@ class SemanticFlowStrategy(TrainingStrategy):
         ref_tokens, ref_positions, ref_valid, ref_entities = self._reference_sequence(
             reference_latents,
             target_latents=target_template,
+            target_positions=target_positions,
         )
         ref_length = ref_tokens.shape[1]
         semantic_length = semantic_noise.shape[1]
@@ -847,6 +853,7 @@ class SemanticFlowStrategy(TrainingStrategy):
         ref_data: dict[str, Tensor],
         *,
         target_latents: Tensor,
+        target_positions: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         ref_latents = ref_data["latents"]
         if ref_latents.ndim == 5:
@@ -880,6 +887,38 @@ class SemanticFlowStrategy(TrainingStrategy):
         target_height, target_width = target_latents.shape[-2:]
         positions[:, :, 1] *= float(target_height) / float(height)
         positions[:, :, 2] *= float(target_width) / float(width)
+        if target_positions.shape[0] != batch_size or target_positions.ndim != 4 or target_positions.shape[1] != 3:
+            raise ValueError(
+                "target_positions must be [B,3,N,2] with the same batch as references, "
+                f"got {tuple(target_positions.shape)}"
+            )
+        if target_positions.device != positions.device:
+            raise ValueError("target_positions and reference positions must be on the same device")
+        if self.config.reference_rope_mode == "appended_time_shifted_width":
+            target_t_start = target_positions[:, 0, :, 0]
+            target_t_end = target_positions[:, 0, :, 1]
+            video_end = target_t_end.amax(dim=1)
+            last_start = target_t_start.amax(dim=1)
+            last_interval_width = video_end - last_start
+            if not torch.isfinite(last_interval_width).all() or (last_interval_width <= 0).any():
+                raise RuntimeError("Target final temporal interval must be finite and positive")
+            delta_t = last_interval_width.clamp_min(1.0e-6)
+            slot_ids = torch.arange(
+                reference_count,
+                device=positions.device,
+                dtype=positions.dtype,
+            )
+            slot_start = video_end[:, None].to(dtype=positions.dtype) + slot_ids[None, :] * delta_t[
+                :, None
+            ].to(dtype=positions.dtype)
+            slot_end = slot_start + delta_t[:, None].to(dtype=positions.dtype)
+            positions[:, :, 0, :, 0] = slot_start[:, :, None]
+            positions[:, :, 0, :, 1] = slot_end[:, :, None]
+
+            target_w_max = target_positions[:, 2, :, 1].amax(dim=1).to(dtype=positions.dtype)
+            ref_w_min = positions[:, :, 2, :, 0].amin(dim=2)
+            w_shift = target_w_max[:, None] - ref_w_min
+            positions[:, :, 2] = positions[:, :, 2] + w_shift[:, :, None, None]
         positions = positions.permute(0, 2, 1, 3, 4).reshape(batch_size, 3, -1, 2)
 
         token_valid = ref_valid[:, :, None].expand(-1, -1, tokens_per_reference).reshape(batch_size, -1)
