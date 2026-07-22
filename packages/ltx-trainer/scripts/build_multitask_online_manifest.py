@@ -18,7 +18,7 @@ from collections import Counter
 from collections.abc import Iterable, Iterator, Mapping
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
-from itertools import islice
+from itertools import chain, islice
 from pathlib import Path
 from typing import Any, Callable, TextIO, TypeVar
 
@@ -61,6 +61,10 @@ _REFERENCE_PREFETCH_SKIPPED_REASONS = {
 
 
 class _ManifestCollisionError(RuntimeError):
+    pass
+
+
+class _DatasetSchemaError(RuntimeError):
     pass
 
 
@@ -258,8 +262,7 @@ class _MediaValidationCache:
             batch_rows=batch_rows,
         )
         self._prefetched_signatures[kind] = {
-            canonical_path: signature
-            for canonical_path, signature in zip(unique_paths, signatures, strict=True)
+            canonical_path: signature for canonical_path, signature in zip(unique_paths, signatures, strict=True)
         }
         if kind == "image":
             self.peak_active_image_signatures = max(
@@ -345,14 +348,10 @@ class _MediaValidationCache:
         canonical_path = str(path)
         signature = self._prefetched_signatures[kind].get(canonical_path)
         if signature is None:
-            raise RuntimeError(
-                f"Media validation cache miss after batch prefetch: kind={kind}, path={canonical_path}"
-            )
+            raise RuntimeError(f"Media validation cache miss after batch prefetch: kind={kind}, path={canonical_path}")
         result = self.get(kind, signature, count_stats=False)
         if result is None:
-            raise RuntimeError(
-                f"Media validation cache miss after batch prefetch: kind={kind}, path={signature.path}"
-            )
+            raise RuntimeError(f"Media validation cache miss after batch prefetch: kind={kind}, path={signature.path}")
         return result
 
     def require_image(self, path: str) -> tuple[int, int]:
@@ -436,17 +435,19 @@ class _ManifestProgress:
             self.dataset_reject_reasons.items(),
             key=lambda item: (-item[1], item[0]),
         )[:5]
+        dataset_failed = event == "dataset_failed"
         fields = {
             "event": event,
             "dataset_name": self.dataset_name or "unknown",
             "task": self.task or "unknown",
+            "processed": self.dataset_processed,
             "dataset_processed": self.dataset_processed,
             "dataset_total": self.dataset_total if self.dataset_total is not None else "unknown",
             "global_processed": self.global_processed,
             "global_total": self.total_rows if self.total_rows is not None else "unknown",
-            "accepted": self.global_accepted,
-            "rejected": self.global_rejected,
-            "duplicates": self.global_duplicates,
+            "accepted": self.dataset_accepted if dataset_failed else self.global_accepted,
+            "rejected": self.dataset_rejected if dataset_failed else self.global_rejected,
+            "duplicates": self.dataset_duplicates if dataset_failed else self.global_duplicates,
             "dataset_accepted": self.dataset_accepted,
             "dataset_rejected": self.dataset_rejected,
             "dataset_duplicates": self.dataset_duplicates,
@@ -472,8 +473,7 @@ class _ManifestProgress:
             "reference_probes_skipped_due_video_reject": (
                 self.validation_cache.reference_probes_skipped_due_video_reject
             ),
-            "top_reject_reasons": ",".join(f"{reason}:{count}" for reason, count in top_rejects)
-            or "none",
+            "top_reject_reasons": ",".join(f"{reason}:{count}" for reason, count in top_rejects) or "none",
         }
         print(
             "[manifest] " + " ".join(f"{key}={value}" for key, value in fields.items()),
@@ -642,6 +642,98 @@ def _collect_i2i_media_paths(
     except Exception:
         pass
     return paths
+
+
+def _field_exists(row: Mapping[str, Any], field_path: str) -> bool:
+    current: Any = row
+    for component in field_path.split("."):
+        if not isinstance(current, Mapping) or component not in current:
+            return False
+        current = current[component]
+    return True
+
+
+def _required_dataset_fields(
+    *,
+    task: str,
+    dataset_type: str,
+    adapter_config: Mapping[str, Any] | None,
+    i2i_target_field: str,
+    i2i_reference_field: str,
+    i2i_caption_field: str,
+) -> list[str]:
+    if task == IMAGE_TASK:
+        return list(dict.fromkeys((i2i_target_field, i2i_reference_field, i2i_caption_field)))
+    if task != VIDEO_TASK:
+        return []
+    if dataset_type == "OpenS2VDataset":
+        return ["video_path", "text", "crop", "face_cut", "ref_images"]
+    if dataset_type == "PhantomDataset":
+        config = dict(adapter_config or {})
+        required = [
+            str(config.get("video_field", "video_path")),
+            str(config.get("caption_field", "metadata.video_caption")),
+            str(config.get("reference_field", "cropped_ref_paths")),
+        ]
+        if bool(config.get("require_cross_pair", False)):
+            required.append("cross_pair")
+        return list(dict.fromkeys(required))
+    raise ValueError(
+        f"Unsupported R2V dataset_type={dataset_type!r} for schema preflight; "
+        "expected 'OpenS2VDataset' or 'PhantomDataset'"
+    )
+
+
+def _schema_preflight(
+    rows: Iterable[tuple[str, dict[str, Any]]],
+    *,
+    dataset_name: str,
+    annotation_path: str | Path,
+    required_fields: list[str],
+) -> Iterator[tuple[str, dict[str, Any]]]:
+    iterator = iter(rows)
+    try:
+        first_item = next(iterator)
+    except StopIteration:
+        first_item = None
+        first_row: Mapping[str, Any] = {}
+    else:
+        first_row = first_item[1]
+
+    available_fields = sorted(str(field) for field in first_row)
+    missing_fields = [field for field in required_fields if not _field_exists(first_row, field)]
+    if first_item is None or missing_fields:
+        details = {
+            "dataset_name": dataset_name,
+            "annotation_path": str(annotation_path),
+            "required_fields": required_fields,
+            "available_fields": available_fields,
+            "missing_fields": missing_fields or required_fields,
+        }
+        raise _DatasetSchemaError(
+            "Dataset schema preflight failed: " + json.dumps(details, ensure_ascii=False, sort_keys=True)
+        )
+
+    typer.echo(
+        "[manifest] event=schema_preflight_pass "
+        f"dataset_name={dataset_name} annotation_path={annotation_path} "
+        f"required_fields={json.dumps(required_fields, ensure_ascii=False)} "
+        f"available_fields={json.dumps(available_fields, ensure_ascii=False)}",
+        err=True,
+    )
+    return chain((first_item,), iterator)
+
+
+def _finish_dataset(progress: _ManifestProgress) -> None:
+    if progress.dataset_accepted == 0 and progress.dataset_duplicates == 0:
+        progress.maybe_emit(force=True, event="dataset_failed")
+        raise RuntimeError(
+            "Dataset produced no accepted or duplicate records: "
+            f"dataset_name={progress.dataset_name} task={progress.task} "
+            f"processed={progress.dataset_processed} accepted={progress.dataset_accepted} "
+            f"rejected={progress.dataset_rejected} duplicates={progress.dataset_duplicates}"
+        )
+    progress.maybe_emit(force=True, event="dataset_complete")
 
 
 def _record_skipped_reference_probes(
@@ -838,8 +930,7 @@ def main(  # noqa: PLR0913, PLR0915
             )
         if total is None and not count_failed:
             print(
-                f"[manifest] event=warning dataset_name={dataset_name} "
-                "message=annotation_row_count_unknown",
+                f"[manifest] event=warning dataset_name={dataset_name} message=annotation_row_count_unknown",
                 file=sys.stderr,
                 flush=True,
             )
@@ -886,6 +977,7 @@ def main(  # noqa: PLR0913, PLR0915
             output_temporary.open("w", encoding="utf-8") as accepted_handle,
             reject_temporary.open("w", encoding="utf-8") as reject_handle,
         ):
+
             def accept_record(record: dict[str, Any]) -> bool:
                 nonlocal accepted_rows, duplicate_rows
                 sample_key = str(record["sample_key"])
@@ -945,19 +1037,36 @@ def main(  # noqa: PLR0913, PLR0915
                     task=task,
                     total_rows=dataset_row_totals[dataset_index],
                 )
-                annotation_path = dataset.get("ann_path") or dataset.get("parquet") or dataset.get("path")
-                if annotation_path is None:
-                    raise ValueError(f"Dataset {dataset_name!r} has no ann_path/parquet/path")
-                rows: Iterable[tuple[str, dict[str, Any]]] = iter_annotation_items(
-                    annotation_path,
-                    batch_size=annotation_batch_size,
-                )
-                max_samples = dataset.get("max_samples")
-                if max_samples is not None:
-                    rows = islice(rows, int(max_samples))
-                data_root = dataset.get("data_root", config.get("data_root"))
-                dataset_type = str(dataset.get("dataset_type", ""))
-                adapter_config = dataset.get("adapter")
+                try:
+                    annotation_path = dataset.get("ann_path") or dataset.get("parquet") or dataset.get("path")
+                    if annotation_path is None:
+                        raise ValueError(f"Dataset {dataset_name!r} has no ann_path/parquet/path")
+                    rows: Iterable[tuple[str, dict[str, Any]]] = iter_annotation_items(
+                        annotation_path,
+                        batch_size=annotation_batch_size,
+                    )
+                    max_samples = dataset.get("max_samples")
+                    if max_samples is not None:
+                        rows = islice(rows, int(max_samples))
+                    data_root = dataset.get("data_root", config.get("data_root"))
+                    dataset_type = str(dataset.get("dataset_type", ""))
+                    adapter_config = dataset.get("adapter")
+                    rows = _schema_preflight(
+                        rows,
+                        dataset_name=dataset_name,
+                        annotation_path=annotation_path,
+                        required_fields=_required_dataset_fields(
+                            task=task,
+                            dataset_type=dataset_type,
+                            adapter_config=adapter_config,
+                            i2i_target_field=i2i_target_field,
+                            i2i_reference_field=i2i_reference_field,
+                            i2i_caption_field=i2i_caption_field,
+                        ),
+                    )
+                except Exception:
+                    progress.maybe_emit(force=True, event="dataset_failed")
+                    raise
 
                 if task == VIDEO_TASK:
                     probed_rows = _iter_canonical_rows_with_bounded_probes(
@@ -1000,7 +1109,7 @@ def main(  # noqa: PLR0913, PLR0915
                             )
                             progress.record_rejected(reason)
                         progress.maybe_emit()
-                    progress.maybe_emit(force=True, event="dataset_complete")
+                    _finish_dataset(progress)
                     continue
 
                 if task != IMAGE_TASK:
@@ -1055,7 +1164,7 @@ def main(  # noqa: PLR0913, PLR0915
                             progress.record_rejected(reason)
                         progress.maybe_emit()
                         row_index += 1
-                progress.maybe_emit(force=True, event="dataset_complete")
+                _finish_dataset(progress)
             connection.commit()
             _flush_and_sync(accepted_handle)
             _flush_and_sync(reject_handle)
@@ -1079,6 +1188,7 @@ def main(  # noqa: PLR0913, PLR0915
             "task_counts": dict(sorted(task_counts.items())),
             "dataset_counts": dict(sorted(dataset_counts.items())),
             "reject_reason_counts": dict(sorted(reject_reason_counts.items())),
+            "top_reject_reasons": dict(sorted(reject_reason_counts.items(), key=lambda item: (-item[1], item[0]))[:5]),
             "elapsed_seconds": time.perf_counter() - started,
             "rows_per_second": raw_rows / max(time.perf_counter() - started, 1e-9),
             "total_rows": global_total_rows,
@@ -1102,15 +1212,11 @@ def main(  # noqa: PLR0913, PLR0915
             "active_video_signatures": validation_cache.active_video_signatures,
             "peak_active_image_signatures": validation_cache.peak_active_image_signatures,
             "peak_active_video_signatures": validation_cache.peak_active_video_signatures,
-            "reference_probes_skipped_due_video_reject": (
-                validation_cache.reference_probes_skipped_due_video_reject
-            ),
+            "reference_probes_skipped_due_video_reject": (validation_cache.reference_probes_skipped_due_video_reject),
         }
         _atomic_write_json(summary_path, summary)
         missing_artifacts = [
-            str(path)
-            for path in (output_path, reject_path, index_path, summary_path)
-            if not path.is_file()
+            str(path) for path in (output_path, reject_path, index_path, summary_path) if not path.is_file()
         ]
         if missing_artifacts:
             raise RuntimeError(f"Manifest publish did not create required artifacts: {missing_artifacts}")

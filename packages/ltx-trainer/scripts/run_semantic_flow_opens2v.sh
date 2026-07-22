@@ -49,6 +49,14 @@ ACCELERATE_PREPARE_SMOKE_RESULT="$ACCELERATE_PREPARE_SMOKE_ROOT/result.json"
 MANIFEST_MEDIA_WORKERS="${MANIFEST_MEDIA_WORKERS:-32}"
 MANIFEST_MEDIA_BATCH_SIZE="${MANIFEST_MEDIA_BATCH_SIZE:-2048}"
 MANIFEST_PROGRESS_INTERVAL_SECONDS="${MANIFEST_PROGRESS_INTERVAL_SECONDS:-10}"
+I2I_TARGET_FIELD="${I2I_TARGET_FIELD:-image}"
+I2I_REFERENCE_FIELD="${I2I_REFERENCE_FIELD:-edit_image}"
+I2I_CAPTION_FIELD="${I2I_CAPTION_FIELD:-prompt}"
+MANIFEST_GATE_SAMPLES=1000
+MANIFEST_GATE_CONFIG="$R2V_ROOT/manifests/multitask_online_480p121_opens2v_gate_1000.yaml"
+MANIFEST_GATE_OUTPUT="$R2V_ROOT/manifests/train_i2i_opens2v_gate_1000.jsonl"
+MANIFEST_GATE_SUMMARY="$R2V_ROOT/manifests/train_i2i_opens2v_gate_1000_summary.json"
+MANIFEST_OUTPUT="$R2V_ROOT/manifests/train_i2i_opens2v.jsonl"
 
 semantic_flow_train_preflight() {
   local mode="$1"
@@ -227,20 +235,97 @@ latest_smoke_checkpoint() {
   printf '%s\n' "$checkpoint"
 }
 
+build_online_manifest() {
+  local data_config="$1"
+  local output="$2"
+  python "$REPO_ROOT/packages/ltx-trainer/scripts/build_multitask_online_manifest.py" \
+    --train-data-config "$data_config" \
+    --output "$output" \
+    --i2i-target-field "$I2I_TARGET_FIELD" \
+    --i2i-reference-field "$I2I_REFERENCE_FIELD" \
+    --i2i-caption-field "$I2I_CAPTION_FIELD" \
+    --media-workers "$MANIFEST_MEDIA_WORKERS" \
+    --media-batch-size "$MANIFEST_MEDIA_BATCH_SIZE" \
+    --progress-interval-seconds "$MANIFEST_PROGRESS_INTERVAL_SECONDS"
+}
+
+write_manifest_gate_config() {
+  python3 - "$DATA_CONFIG" "$MANIFEST_GATE_CONFIG" "$MANIFEST_GATE_SAMPLES" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+import yaml
+
+source_path = Path(sys.argv[1])
+gate_path = Path(sys.argv[2])
+sample_limit = int(sys.argv[3])
+config = yaml.safe_load(source_path.read_text(encoding="utf-8")) or {}
+datasets = []
+tasks = set()
+for raw_dataset in config.get("datasets", []):
+    dataset = dict(raw_dataset)
+    task = str(dataset.get("task", ""))
+    if task not in {"i2i", "r2v"}:
+        continue
+    dataset["max_samples"] = sample_limit
+    datasets.append(dataset)
+    tasks.add(task)
+if tasks != {"i2i", "r2v"}:
+    raise RuntimeError(f"Gate config must contain i2i and r2v datasets; found {sorted(tasks)}")
+config["datasets"] = datasets
+gate_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+print(
+    json.dumps(
+        {
+            "event": "real_data_gate_configured",
+            "config": str(gate_path),
+            "samples_per_dataset": sample_limit,
+            "tasks": sorted(tasks),
+        },
+        sort_keys=True,
+    )
+)
+PY
+}
+
+verify_manifest_gate() {
+  python3 - "$MANIFEST_GATE_SUMMARY" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+summary_path = Path(sys.argv[1])
+summary = json.loads(summary_path.read_text(encoding="utf-8"))
+task_counts = summary.get("task_counts", {})
+missing = [task for task in ("i2i", "r2v") if int(task_counts.get(task, 0)) <= 0]
+if missing:
+    raise RuntimeError(f"Real-data manifest gate has no accepted rows for tasks: {missing}")
+print(
+    json.dumps(
+        {
+            "event": "real_data_gate_complete",
+            "task_counts": task_counts,
+            "dataset_counts": summary.get("dataset_counts", {}),
+            "accepted": summary.get("accepted_rows", 0),
+            "rejected": summary.get("rejected_rows", 0),
+            "top_reject_reasons": summary.get("top_reject_reasons", {}),
+        },
+        sort_keys=True,
+    )
+)
+PY
+}
+
 case "${1:-}" in
   build-manifest)
     cp "$REPO_ROOT/packages/ltx-trainer/configs/multitask_online_480p121_opens2v.yaml" "$DATA_CONFIG"
-    python "$REPO_ROOT/packages/ltx-trainer/scripts/build_multitask_online_manifest.py" \
-      --train-data-config \
-      "$DATA_CONFIG" \
-      --output \
-      "$R2V_ROOT/manifests/train_i2i_opens2v.jsonl" \
-      --i2i-target-field video \
-      --i2i-reference-field reference_images \
-      --i2i-caption-field caption \
-      --media-workers "$MANIFEST_MEDIA_WORKERS" \
-      --media-batch-size "$MANIFEST_MEDIA_BATCH_SIZE" \
-      --progress-interval-seconds "$MANIFEST_PROGRESS_INTERVAL_SECONDS"
+    printf '%s\n' \
+      "[manifest] event=i2i_field_mapping target=$I2I_TARGET_FIELD reference=$I2I_REFERENCE_FIELD caption=$I2I_CAPTION_FIELD"
+    write_manifest_gate_config
+    build_online_manifest "$MANIFEST_GATE_CONFIG" "$MANIFEST_GATE_OUTPUT"
+    verify_manifest_gate
+    build_online_manifest "$DATA_CONFIG" "$MANIFEST_OUTPUT"
     ;;
   smoke)
     semantic_flow_train_preflight smoke
