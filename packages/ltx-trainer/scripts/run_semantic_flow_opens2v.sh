@@ -60,6 +60,11 @@ from ltx_trainer.online_inference.runtime_lock import (
     collect_visible_cuda_hardware,
     validate_locked_gpu_hardware,
 )
+from ltx_trainer.online_inference.startup_memory import (
+    build_startup_host_ram_report,
+    enforce_startup_host_ram_report,
+    model_parameter_count,
+)
 
 train_config_path = Path(sys.argv[1]).expanduser().resolve()
 accelerate_config_path = Path(sys.argv[2]).expanduser().resolve()
@@ -111,7 +116,7 @@ model_config = train_config.get("model") or {}
 data_config = train_config.get("data") or {}
 online_config = data_config.get("online_encoding") or {}
 
-require_file("model.model_path", model_config.get("model_path"))
+model_path = require_file("model.model_path", model_config.get("model_path"))
 require_dir("model.text_encoder_path", model_config.get("text_encoder_path"))
 require_file("data.train_data_config", data_config.get("train_data_config"))
 manifest_path = require_file("data.manifest_path", data_config.get("manifest_path"))
@@ -146,8 +151,8 @@ if accelerate_config.get("distributed_type") != "FSDP":
     errors.append("Accelerate distributed_type must be FSDP")
 if accelerate_config.get("mixed_precision") != "bf16":
     errors.append("Accelerate mixed_precision must be bf16")
-if int(accelerate_config.get("num_processes", 0)) < 4:
-    errors.append("Real 22B semantic-flow smoke/training requires num_processes >= 4; 8 is recommended")
+if int(accelerate_config.get("num_processes", 0)) != 8:
+    errors.append("Real 22B semantic-flow smoke/training requires num_processes=8")
 if fsdp_config.get("fsdp_version") != 1:
     errors.append("Accelerate fsdp_version must be 1")
 if fsdp_config.get("fsdp_sharding_strategy") != "FULL_SHARD":
@@ -182,11 +187,23 @@ if mode == "train":
     except Exception as exc:
         errors.append(f"runtime lock GPU validation failed: {type(exc).__name__}: {exc}")
 
+startup_memory = None
+try:
+    startup_memory = build_startup_host_ram_report(
+        parameter_count=model_parameter_count(model_path),
+        num_processes=num_processes,
+        training_dtype=str(accelerate_config.get("mixed_precision", "")),
+    )
+    enforce_startup_host_ram_report(startup_memory)
+except Exception as exc:
+    errors.append(f"startup host RAM validation failed: {type(exc).__name__}: {exc}")
+
 report = {
     "ready": not errors,
     "accelerate_config": str(accelerate_config_path),
     "training_config": str(train_config_path),
     "gpu_hardware": gpu_hardware,
+    "startup_memory": startup_memory,
     "mode": mode,
     "errors": errors,
 }
@@ -278,6 +295,8 @@ case "${1:-}" in
       --runtime-lock "$RUNTIME_LOCK" \
       --fsdp-smoke-result "$FSDP_SMOKE_RESULT" \
       --accelerate-prepare-smoke-result "$ACCELERATE_PREPARE_SMOKE_RESULT" \
+      --i2i-smoke-result "$SMOKE_ROOT/i2i/result.json" \
+      --r2v-smoke-result "$SMOKE_ROOT/r2v/result.json" \
       --refresh-runtime-lock
     CODE_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD)"
     python3 "$REPO_ROOT/packages/ltx-trainer/scripts/semantic_flow_smoke_marker.py" write \
@@ -322,14 +341,16 @@ case "${1:-}" in
       --output "$TRAIN_RUNTIME_AUDIT" \
       --runtime-lock "$RUNTIME_LOCK" \
       --fsdp-smoke-result "$FSDP_SMOKE_RESULT" \
-      --accelerate-prepare-smoke-result "$ACCELERATE_PREPARE_SMOKE_RESULT"
+      --accelerate-prepare-smoke-result "$ACCELERATE_PREPARE_SMOKE_RESULT" \
+      --i2i-smoke-result "$SMOKE_ROOT/i2i/result.json" \
+      --r2v-smoke-result "$SMOKE_ROOT/r2v/result.json"
     accelerate launch --config_file "$ACCELERATE_CONFIG" \
       "$REPO_ROOT/packages/ltx-trainer/scripts/train.py" \
       "$TRAIN_CONFIG"
     ;;
   *)
     printf '%s\n' "Usage: $0 {build-manifest|smoke|train [--skip-smoke-guard]}"
-    printf '%s\n' "Required distributed mode: FSDP FULL_SHARD with at least 4 processes; 8 is recommended."
+    printf '%s\n' "Required distributed mode: FSDP FULL_SHARD with exactly 8 processes."
     exit 2
     ;;
 esac

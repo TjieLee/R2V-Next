@@ -27,11 +27,8 @@ def main(
     output_dir: str = typer.Option(..., "--output-dir"),
 ) -> None:
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    if world_size < 4:
-        raise RuntimeError(
-            "Real 22B semantic-flow smoke requires at least 4 processes; "
-            "8 is recommended"
-        )
+    if world_size != 8:
+        raise RuntimeError(f"Real 22B semantic-flow smoke requires exactly 8 processes, got {world_size}")
     run_one_step_training_smoke(
         config,
         task=_validate_task(task),

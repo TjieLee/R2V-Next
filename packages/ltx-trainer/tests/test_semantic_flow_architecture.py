@@ -52,6 +52,12 @@ from ltx_trainer.online_inference.smoke_marker import (
     validate_semantic_flow_smoke_marker,
     write_semantic_flow_smoke_marker,
 )
+from ltx_trainer.online_inference.startup_memory import (
+    SemanticFlowStartupMemoryError,
+    build_startup_host_ram_report,
+    enforce_startup_host_ram_report,
+    model_parameter_count,
+)
 from ltx_trainer.training_strategies.semantic_flow import SemanticFlowConfig, SemanticFlowStrategy
 from ltx_trainer.trainer import _enforce_semantic_flow_fsdp_runtime_safety
 
@@ -728,7 +734,23 @@ def test_semantic_flow_smoke_marker_binds_code_configs_checkpoints_and_real_infe
         (accelerate_config, "num_processes: 8\n"),
         (i2i_checkpoint, "i2i checkpoint\n"),
         (r2v_checkpoint, "r2v checkpoint\n"),
-        (runtime_audit, "{}\n"),
+        (
+            runtime_audit,
+            json.dumps(
+                {
+                    "real_smoke_memory": {
+                        task: {
+                            "world_size": 8,
+                            "memory": {
+                                "peak_host_ram_bytes": [100] * 8,
+                                "per_rank_peak_cuda_memory_bytes": [200] * 8,
+                            },
+                        }
+                        for task in ("i2i", "r2v")
+                    }
+                }
+            ),
+        ),
         (runtime_lock, "{}\n"),
     ):
         path.write_text(content, encoding="utf-8")
@@ -888,6 +910,16 @@ def test_semantic_flow_runtime_lock_requires_exact_environment_and_fsdp_roundtri
                 "state_dict_type": "FULL_STATE_DICT",
             }
         },
+        "real_smoke_memory": {
+            task: {
+                "world_size": 8,
+                "memory": {
+                    "peak_host_ram_bytes": [100] * 8,
+                    "per_rank_peak_cuda_memory_bytes": [200] * 8,
+                },
+            }
+            for task in ("i2i", "r2v")
+        },
     }
     fsdp_result = {"world_size": 2, "max_abs_tensor_diff_after_reload": 0.0}
     accelerate_result = {
@@ -921,6 +953,37 @@ def test_semantic_flow_runtime_lock_requires_exact_environment_and_fsdp_roundtri
             fsdp_result,
             {**accelerate_result, "accelerator_multimodel_prepare_passed": False},
         )
+
+
+def test_startup_host_ram_estimate_counts_safetensors_without_loading_model(tmp_path: Path) -> None:
+    model_path = tmp_path / "tiny.safetensors"
+    save_file(
+        {
+            "first": torch.zeros(2, 3),
+            "second": torch.zeros(4),
+        },
+        model_path,
+    )
+    assert model_parameter_count(model_path) == 10
+    safe = build_startup_host_ram_report(
+        parameter_count=10,
+        num_processes=2,
+        training_dtype="bf16",
+        available_bytes=1_000,
+    )
+    assert safe["estimated_startup_host_ram_bytes"] == 144
+    assert safe["startup_ram_safe"] is True
+    enforce_startup_host_ram_report(safe)
+
+    unsafe = build_startup_host_ram_report(
+        parameter_count=10,
+        num_processes=2,
+        training_dtype="bf16",
+        available_bytes=150,
+    )
+    assert unsafe["startup_ram_safe"] is False
+    with pytest.raises(SemanticFlowStartupMemoryError, match="exceeds 90%"):
+        enforce_startup_host_ram_report(unsafe)
 
 
 def test_accelerate_multimodel_smoke_matches_trainer_prepare_order() -> None:

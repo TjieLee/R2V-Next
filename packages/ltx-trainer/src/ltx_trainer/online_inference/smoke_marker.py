@@ -117,6 +117,10 @@ def write_semantic_flow_smoke_marker(
     i2i_checkpoint = _require_file("I2I checkpoint", i2i_checkpoint_path)
     r2v_checkpoint = _require_file("R2V checkpoint", r2v_checkpoint_path)
     runtime_audit = _require_file("runtime audit", runtime_audit_path)
+    runtime_audit_payload = _load_json_object(runtime_audit)
+    real_smoke_memory = runtime_audit_payload.get("real_smoke_memory")
+    if not isinstance(real_smoke_memory, dict) or set(real_smoke_memory) != {"i2i", "r2v"}:
+        raise SemanticFlowSmokeMarkerError("Runtime audit is missing I2I/R2V real-smoke memory evidence")
     runtime_lock = _require_file("runtime lock", runtime_lock_path)
     inference_summary = _require_file("non-dry-run inference summary", inference_summary_path)
     inference_result = validate_non_dry_run_i2i_summary(inference_summary)
@@ -146,6 +150,7 @@ def write_semantic_flow_smoke_marker(
         "r2v_checkpoint_sha256": sha256_file(r2v_checkpoint),
         "runtime_audit": str(runtime_audit),
         "runtime_audit_sha256": sha256_file(runtime_audit),
+        "real_smoke_memory": real_smoke_memory,
         "runtime_lock": str(runtime_lock),
         "runtime_lock_sha256": sha256_file(runtime_lock),
         "non_dry_run_inference_summary": str(inference_summary),

@@ -47,6 +47,7 @@ from ltx_trainer.model_loader import (
     load_transformer,
     load_video_vae_encoder,
 )
+from ltx_trainer.online_inference.startup_memory import host_memory_snapshot
 from ltx_trainer.progress import TrainingProgress
 from ltx_trainer.quantization import quantize_model
 from ltx_trainer.sigma_tracker import SigmaBucketTracker
@@ -200,6 +201,7 @@ class LtxvTrainer:
             print_config(trainer_config)
         self._training_strategy = get_training_strategy(self._config.training_strategy)
         self._setup_accelerator()
+        self._startup_host_memory = {"before_model_load": host_memory_snapshot()}
 
         # ValidationRunner loads its own models (text encoder, VAE encoder/decoder, etc.),
         # caches prompt embeddings and conditioning media, then unloads encoders.
@@ -211,11 +213,13 @@ class LtxvTrainer:
         )
 
         self._load_models()
+        self._startup_host_memory["after_model_load"] = host_memory_snapshot()
         self._setup_trainable_model_wrappers()
         self._loaded_checkpoint_path: Path | None = None
         self._load_checkpoint()
         self._collect_trainable_params()
         self._prepare_models_for_training()
+        self._startup_host_memory["after_fsdp_prepare"] = host_memory_snapshot()
         self._dataset = None
         self._global_step = -1
         self._checkpoint_paths: list[Path] = []

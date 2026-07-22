@@ -19,6 +19,11 @@ from ltx_trainer.online_inference.runtime_lock import (
     collect_visible_cuda_hardware,
     write_or_validate_semantic_flow_runtime_lock,
 )
+from ltx_trainer.online_inference.startup_memory import (
+    build_startup_host_ram_report,
+    enforce_startup_host_ram_report,
+    model_parameter_count,
+)
 
 
 def _package_version(name: str) -> dict[str, Any]:
@@ -231,6 +236,45 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
         raise
 
 
+def _real_smoke_memory(path: Path, *, task: str, expected_world_size: int) -> dict[str, Any]:
+    payload = json.loads(path.expanduser().resolve().read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or payload.get("task") != task:
+        raise ValueError(f"Expected {task} smoke result JSON: {path}")
+    memory = payload.get("memory")
+    required = {
+        "smoke_start_available_host_ram_bytes",
+        "smoke_start_process_rss_bytes",
+        "after_model_load_available_host_ram_bytes",
+        "after_model_load_process_rss_bytes",
+        "after_fsdp_prepare_available_host_ram_bytes",
+        "after_fsdp_prepare_process_rss_bytes",
+        "peak_host_ram_bytes",
+        "per_rank_peak_cuda_memory_bytes",
+    }
+    if not isinstance(memory, dict) or required - set(memory):
+        raise ValueError(f"{task} smoke result is missing memory fields: {sorted(required - set(memory or {}))}")
+    world_size = int(payload.get("world_size", 0))
+    if world_size != expected_world_size:
+        raise ValueError(
+            f"{task} real smoke world_size {world_size} does not match accelerate num_processes {expected_world_size}"
+        )
+    for field in required:
+        values = memory[field]
+        if not isinstance(values, list) or len(values) != world_size or any(int(value) < 0 for value in values):
+            raise ValueError(f"Invalid {task} memory field {field}: {values}")
+    available_at_start = min(int(value) for value in memory["smoke_start_available_host_ram_bytes"])
+    observed_peak = sum(int(value) for value in memory["peak_host_ram_bytes"])
+    if observed_peak > available_at_start * 0.9:
+        raise ValueError(
+            f"{task} observed peak host RAM {observed_peak} exceeds 90% of starting available RAM {available_at_start}"
+        )
+    return {
+        "result_path": str(path.expanduser().resolve()),
+        "world_size": world_size,
+        "memory": memory,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
@@ -239,6 +283,8 @@ def main() -> None:
     parser.add_argument("--runtime-lock", type=Path)
     parser.add_argument("--fsdp-smoke-result", type=Path)
     parser.add_argument("--accelerate-prepare-smoke-result", type=Path)
+    parser.add_argument("--i2i-smoke-result", type=Path)
+    parser.add_argument("--r2v-smoke-result", type=Path)
     parser.add_argument("--refresh-runtime-lock", action="store_true")
     args = parser.parse_args()
 
@@ -267,6 +313,17 @@ def main() -> None:
         if capability.get("passed") is not True:
             errors.append(f"{name}: {capability.get('error', 'capability check failed')}")
 
+    startup_memory = None
+    try:
+        startup_memory = build_startup_host_ram_report(
+            parameter_count=model_parameter_count((trainer_config.get("model") or {}).get("model_path")),
+            num_processes=int(accelerate_config.get("num_processes", 0)),
+            training_dtype=str(accelerate_config.get("mixed_precision", "")),
+        )
+        enforce_startup_host_ram_report(startup_memory)
+    except Exception as exc:
+        errors.append(f"startup_host_ram: {type(exc).__name__}: {exc}")
+
     report: dict[str, Any] = {
         "architecture": "semantic_flow_v1",
         "ready": not errors,
@@ -289,7 +346,23 @@ def main() -> None:
         "accelerate": _fsdp_config_report(accelerate_config, accelerate_config_error),
         "gemma": gemma,
         "capabilities": capabilities,
+        "startup_memory": startup_memory,
     }
+
+    real_smoke_memory = {}
+    expected_world_size = int((report.get("accelerate") or {}).get("num_processes") or 0)
+    for task, path in (("i2i", args.i2i_smoke_result), ("r2v", args.r2v_smoke_result)):
+        if path is not None:
+            try:
+                real_smoke_memory[task] = _real_smoke_memory(
+                    path,
+                    task=task,
+                    expected_world_size=expected_world_size,
+                )
+            except Exception as exc:
+                errors.append(f"{task}_smoke_memory: {type(exc).__name__}: {exc}")
+    if real_smoke_memory:
+        report["real_smoke_memory"] = real_smoke_memory
 
     if args.refresh_runtime_lock and args.runtime_lock is None:
         errors.append("--refresh-runtime-lock requires --runtime-lock")
@@ -299,6 +372,8 @@ def main() -> None:
                 raise ValueError("--runtime-lock requires --fsdp-smoke-result")
             if args.accelerate_prepare_smoke_result is None:
                 raise ValueError("--runtime-lock requires --accelerate-prepare-smoke-result")
+            if args.i2i_smoke_result is None or args.r2v_smoke_result is None:
+                raise ValueError("--runtime-lock requires both --i2i-smoke-result and --r2v-smoke-result")
             smoke_path = args.fsdp_smoke_result.expanduser().resolve()
             smoke_result = json.loads(smoke_path.read_text(encoding="utf-8"))
             if not isinstance(smoke_result, dict):

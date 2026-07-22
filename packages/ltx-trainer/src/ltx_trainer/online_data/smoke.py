@@ -17,6 +17,8 @@ from ltx_trainer.config import LtxTrainerConfig
 from ltx_trainer.online_data.constants import IMAGE_TASK, VIDEO_TASK
 from ltx_trainer.online_data.multitask_dataset import SampleLoadError, collate_online_raw_batch
 from ltx_trainer.online_data.path_safety import assert_write_path_allowed
+from ltx_trainer.online_inference.output_artifacts import atomic_write_json
+from ltx_trainer.online_inference.startup_memory import host_memory_snapshot
 from ltx_trainer.trainer import LtxvTrainer
 
 
@@ -85,6 +87,7 @@ def run_one_step_training_smoke(
     output_dir: str | Path,
     init_checkpoint: str | Path | None = None,
 ) -> dict[str, Any]:
+    smoke_start_memory = host_memory_snapshot()
     config, generated_config = make_one_step_smoke_config(
         config_path,
         task=task,
@@ -97,9 +100,29 @@ def run_one_step_training_smoke(
     trainer = LtxvTrainer(config)
     try:
         checkpoint, stats = trainer.train(disable_progress_bars=True, finalize_accelerator=False)
+        final_memory = host_memory_snapshot()
+        memory_snapshots = {
+            "smoke_start": smoke_start_memory,
+            **trainer._startup_host_memory,
+        }
+
+        def gather_int(value: int) -> list[int]:
+            tensor = torch.tensor([int(value)], device=trainer._accelerator.device, dtype=torch.int64)
+            return [int(item) for item in trainer._accelerator.gather(tensor).detach().cpu().tolist()]
+
+        memory = {
+            f"{name}_{field}": gather_int(snapshot[field])
+            for name, snapshot in memory_snapshots.items()
+            for field in ("available_host_ram_bytes", "process_rss_bytes")
+        }
+        memory["peak_host_ram_bytes"] = gather_int(final_memory["process_peak_rss_bytes"])
+        memory["per_rank_peak_cuda_memory_bytes"] = gather_int(
+            torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0
+        )
         report = {
             "architecture": "semantic_flow_v1",
             "task": task,
+            "world_size": trainer._accelerator.num_processes,
             "generated_config": str(generated_config),
             "checkpoint": str(checkpoint) if checkpoint is not None else None,
             "global_step": trainer._global_step,
@@ -107,8 +130,10 @@ def run_one_step_training_smoke(
             "timings_ms": trainer._last_online_metrics,
             "elapsed_seconds": time.perf_counter() - started,
             "peak_vram_gb": torch.cuda.max_memory_allocated() / (1024**3) if torch.cuda.is_available() else 0.0,
+            "memory": memory,
         }
         if trainer._accelerator.is_main_process:
+            atomic_write_json(Path(output_dir).expanduser().resolve() / "result.json", report)
             typer.echo(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True, default=str))
         return report
     finally:

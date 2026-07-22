@@ -110,6 +110,24 @@ def build_semantic_flow_runtime_lock(
         raise SemanticFlowRuntimeLockError(
             f"Production Gemma sliding_window must be 1024, got {gemma.get('sliding_window')}"
         )
+    real_smoke_memory = runtime_report.get("real_smoke_memory") or {}
+    if set(real_smoke_memory) != {"i2i", "r2v"}:
+        raise SemanticFlowRuntimeLockError("Runtime lock requires I2I and R2V real-smoke memory evidence")
+    locked_smoke_memory = {}
+    for task in ("i2i", "r2v"):
+        task_evidence = real_smoke_memory[task]
+        memory = task_evidence.get("memory") or {}
+        peak_host = list(memory.get("peak_host_ram_bytes") or [])
+        peak_cuda = list(memory.get("per_rank_peak_cuda_memory_bytes") or [])
+        if not peak_host or not peak_cuda:
+            raise SemanticFlowRuntimeLockError(f"Runtime lock requires complete {task} peak memory evidence")
+        if int(task_evidence.get("world_size", 0)) != num_processes:
+            raise SemanticFlowRuntimeLockError(f"Runtime lock requires {task} smoke on {num_processes} ranks")
+        locked_smoke_memory[task] = {
+            "world_size": int(task_evidence.get("world_size", 0)),
+            "peak_host_ram_bytes": peak_host,
+            "per_rank_peak_cuda_memory_bytes": peak_cuda,
+        }
     return {
         "runtime_lock_version": 1,
         "python": str((runtime_report.get("python") or {}).get("runtime_version")),
@@ -126,6 +144,7 @@ def build_semantic_flow_runtime_lock(
         "checkpoint_roundtrip_world_size": 2,
         "checkpoint_roundtrip_max_abs_tensor_diff": 0.0,
         "accelerator_multimodel_prepare_passed": True,
+        "real_smoke_memory": locked_smoke_memory,
         "gpu_count": num_processes,
         **selected_hardware,
     }
@@ -143,7 +162,7 @@ def write_or_validate_semantic_flow_runtime_lock(
         return "refreshed"
     if not resolved.is_file():
         raise SemanticFlowRuntimeLockError(
-            f"Runtime lock is missing: {resolved}; run smoke or pass --refresh-runtime-lock explicitly"
+            f"Runtime lock is missing: {resolved}; run the complete semantic-flow smoke workflow"
         )
     try:
         locked = json.loads(resolved.read_text(encoding="utf-8"))
