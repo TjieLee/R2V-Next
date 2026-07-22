@@ -503,8 +503,20 @@ def main(  # noqa: PLR0913, PLR0915
     summary_output: str | None = typer.Option(None, "--summary-output"),
     manifest_seed: int = typer.Option(42, "--manifest-seed"),
     annotation_batch_size: int = typer.Option(4096, "--annotation-batch-size", min=1),
-    probe_workers: int = typer.Option(8, "--probe-workers", min=1),
-    probe_batch_size: int = typer.Option(256, "--probe-batch-size", min=1),
+    media_workers: int = typer.Option(
+        32,
+        "--media-workers",
+        "--probe-workers",
+        min=1,
+        help="Persistent image/video validation workers; --probe-workers is a legacy alias.",
+    ),
+    media_batch_size: int = typer.Option(
+        2048,
+        "--media-batch-size",
+        "--probe-batch-size",
+        min=1,
+        help="Rows per media prefetch batch; --probe-batch-size is a legacy alias.",
+    ),
     progress_interval_seconds: float = typer.Option(10.0, "--progress-interval-seconds", min=0.5),
     progress_every_rows: int = typer.Option(10_000, "--progress-every-rows", min=1),
     count_total_rows: bool = typer.Option(True, "--count-total-rows/--no-count-total-rows"),
@@ -599,7 +611,7 @@ def main(  # noqa: PLR0913, PLR0915
 
         with (
             ThreadPoolExecutor(
-                max_workers=probe_workers,
+                max_workers=media_workers,
                 thread_name_prefix="manifest-media",
             ) as executor,
             output_temporary.open("w", encoding="utf-8") as accepted_handle,
@@ -687,7 +699,7 @@ def main(  # noqa: PLR0913, PLR0915
                         adapter_config=adapter_config,
                         manifest_seed=manifest_seed,
                         executor=executor,
-                        batch_size=probe_batch_size,
+                        batch_size=media_batch_size,
                         validation_cache=validation_cache,
                     )
                     for row_index, (source_record_id, canonical, video_header, probe_error) in enumerate(probed_rows):
@@ -728,7 +740,7 @@ def main(  # noqa: PLR0913, PLR0915
                     raise ValueError(f"Unsupported task {task!r} in dataset {dataset_name!r}")
 
                 row_index = 0
-                for row_batch in _batched(rows, probe_batch_size):
+                for row_batch in _batched(rows, media_batch_size):
                     image_paths = [
                         path
                         for _source_record_id, row in row_batch

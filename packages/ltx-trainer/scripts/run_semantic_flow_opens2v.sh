@@ -46,6 +46,9 @@ FSDP_SMOKE_ROOT="$SMOKE_ROOT/fsdp_checkpoint"
 FSDP_SMOKE_RESULT="$FSDP_SMOKE_ROOT/result.json"
 ACCELERATE_PREPARE_SMOKE_ROOT="$SMOKE_ROOT/accelerate_prepare"
 ACCELERATE_PREPARE_SMOKE_RESULT="$ACCELERATE_PREPARE_SMOKE_ROOT/result.json"
+MANIFEST_MEDIA_WORKERS="${MANIFEST_MEDIA_WORKERS:-32}"
+MANIFEST_MEDIA_BATCH_SIZE="${MANIFEST_MEDIA_BATCH_SIZE:-2048}"
+MANIFEST_PROGRESS_INTERVAL_SECONDS="${MANIFEST_PROGRESS_INTERVAL_SECONDS:-10}"
 
 semantic_flow_train_preflight() {
   local mode="$1"
@@ -235,8 +238,9 @@ case "${1:-}" in
       --i2i-target-field video \
       --i2i-reference-field reference_images \
       --i2i-caption-field caption \
-      --probe-workers 16 \
-      --probe-batch-size 512
+      --media-workers "$MANIFEST_MEDIA_WORKERS" \
+      --media-batch-size "$MANIFEST_MEDIA_BATCH_SIZE" \
+      --progress-interval-seconds "$MANIFEST_PROGRESS_INTERVAL_SECONDS"
     ;;
   smoke)
     semantic_flow_train_preflight smoke
