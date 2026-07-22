@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 import torch
+import yaml
 from safetensors.torch import save_file
 from torch import nn
 
@@ -23,6 +24,7 @@ from ltx_trainer.online_inference.checkpoint_runtime import (
     audit_checkpoint,
     resolve_checkpoint,
 )
+from ltx_trainer.config import LtxTrainerConfig
 from ltx_trainer.training_strategies.semantic_flow import SemanticFlowConfig, SemanticFlowStrategy
 
 
@@ -65,6 +67,55 @@ def test_semantic_dropout_keeps_at_least_56_tokens_per_frame() -> None:
     )
     assert mask.shape == (8, 12, 64)
     assert (mask.sum(dim=-1) >= 56).all()
+
+
+def test_production_semantic_flow_config_uses_opens2v_only_litengjie_paths() -> None:
+    root = Path(__file__).resolve().parents[1]
+    training_path = root / "configs" / "semantic_flow_multitask_480p121.yaml"
+    data_path = root / "configs" / "multitask_online_480p121_data.yaml"
+    opens2v_path = root / "configs" / "multitask_online_480p121_opens2v.yaml"
+
+    training_text = training_path.read_text(encoding="utf-8")
+    data_text = data_path.read_text(encoding="utf-8")
+    opens2v_text = opens2v_path.read_text(encoding="utf-8")
+    assert "/path/to/" not in training_text
+
+    training_config = yaml.safe_load(training_text)
+    data_config = yaml.safe_load(data_text)
+    opens2v_config = yaml.safe_load(opens2v_text)
+    parsed = LtxTrainerConfig.model_validate(training_config)
+
+    assert parsed.model.model_path == "/mnt/workspace/litengjie/LTX-2/models/LTX-2.3/ltx-2.3-22b-dev.safetensors"
+    assert (
+        parsed.model.text_encoder_path
+        == "/mnt/workspace/litengjie/LTX-2/models/gemma-3-12b-it-qat-q4_0-unquantized"
+    )
+    assert parsed.output_dir.startswith("/mnt/workspace/litengjie/")
+    assert parsed.data.manifest_path.startswith("/mnt/workspace/litengjie/")
+    assert parsed.data.online_encoding is not None
+    assert parsed.data.online_encoding.runtime_reject_log_dir.startswith("/mnt/workspace/litengjie/")
+    assert parsed.checkpoints.save_training_state == "minimal"
+    assert parsed.text_encoder_lora.enabled is False
+
+    for config in (data_config, opens2v_config):
+        dataset_names = {dataset["name"] for dataset in config["datasets"]}
+        dataset_types = {dataset["dataset_type"] for dataset in config["datasets"]}
+        assert "r2v_phantom" not in dataset_names
+        assert "PhantomDataset" not in dataset_types
+        assert config["online_sampling"]["video_source_ratios"] == {"r2v_opens2v": 1.0}
+
+    lora_config = dict(training_config)
+    lora_config["model"] = {**training_config["model"], "training_mode": "lora"}
+    with pytest.raises(ValueError, match="semantic_flow requires full DiT training"):
+        LtxTrainerConfig.model_validate(lora_config)
+
+    gemma_lora_config = dict(training_config)
+    gemma_lora_config["text_encoder_lora"] = {"enabled": True}
+    with pytest.raises(ValueError, match="forbids text-encoder LoRA"):
+        LtxTrainerConfig.model_validate(gemma_lora_config)
+
+    strategy = SemanticFlowStrategy(SemanticFlowConfig())
+    assert strategy.train_embeddings_processor() is False
 
 
 class _VelocityRecorder(nn.Module):

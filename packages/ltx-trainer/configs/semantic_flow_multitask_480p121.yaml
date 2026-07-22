@@ -1,8 +1,8 @@
 # Full-DiT reference-aware semantic/video flow training.
-# Replace the absolute paths below with local model, manifest, and output paths.
+# Production writes must stay under /mnt/workspace/litengjie.
 model:
-  model_path: "/path/to/ltx-2.3-22b-dev.safetensors"
-  text_encoder_path: "/path/to/gemma-3-12b-it"
+  model_path: "/mnt/workspace/litengjie/LTX-2/models/LTX-2.3/ltx-2.3-22b-dev.safetensors"
+  text_encoder_path: "/mnt/workspace/litengjie/LTX-2/models/gemma-3-12b-it-qat-q4_0-unquantized"
   training_mode: "full"
   load_checkpoint: null
 
@@ -48,8 +48,8 @@ acceleration:
 
 data:
   encoding_mode: "online"
-  train_data_config: "/path/to/multitask_online_480p121_data.yaml"
-  manifest_path: "/path/to/train_unique.jsonl"
+  train_data_config: "/mnt/workspace/litengjie/jd_ltx_multitask_online_480p121/semantic_flow_v2/manifests/multitask_online_480p121_opens2v.yaml"
+  manifest_path: "/mnt/workspace/litengjie/jd_ltx_multitask_online_480p121/semantic_flow_v2/manifests/train_i2i_opens2v.jsonl"
   num_dataloader_workers: 2
   online_encoding:
     width: 832
@@ -73,7 +73,7 @@ data:
     image_ratio: 0.30
     video_ratio: 0.70
     runtime_max_retries: 8
-    runtime_reject_log_dir: null
+    runtime_reject_log_dir: "/mnt/workspace/litengjie/jd_ltx_multitask_online_480p121/semantic_flow_v2/logs/runtime_rejects"
 
 validation:
   interval: null
@@ -86,7 +86,7 @@ checkpoints:
   keep_last_n: 2
   precision: "bfloat16"
   no_resume: false
-  save_training_state: "full"
+  save_training_state: "minimal"
 
 hub:
   push_to_hub: false
@@ -104,4 +104,4 @@ wandb:
   log_validation_videos: false
 
 seed: 42
-output_dir: "/path/to/semantic_flow_output"
+output_dir: "/mnt/workspace/litengjie/jd_ltx_multitask_online_480p121/semantic_flow_v2/train"
