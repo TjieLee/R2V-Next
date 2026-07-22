@@ -836,6 +836,120 @@ def test_media_signature_recomputed_per_batch_but_probe_reuses_sqlite_cache(
     assert cache.image_probe_submitted == 1
 
 
+@pytest.mark.parametrize(
+    ("kind", "peak_attribute"),
+    [
+        ("image", "peak_active_image_signatures"),
+        ("video", "peak_active_video_signatures"),
+    ],
+)
+def test_prefetched_signatures_are_bounded_to_current_batch(
+    kind: str,
+    peak_attribute: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_online_manifest_builder_module()
+    connection = sqlite3.connect(":memory:")
+    cache = builder._MediaValidationCache(connection)
+
+    def fake_signature(path: str):
+        return builder._MediaSignature(path, len(path), len(path) * 10)
+
+    def fake_image_probe(_path: str):
+        return builder._ValidationResult({"width": 64, "height": 48})
+
+    def fake_video_probe(_path: str):
+        return builder._ValidationResult(
+            {"fps": 24.0, "frame_count": 300, "width": 64, "height": 48}
+        )
+
+    monkeypatch.setattr(builder, "_media_signature", fake_signature)
+    monkeypatch.setattr(builder, "_probe_resolved_image", fake_image_probe)
+    monkeypatch.setattr(builder, "_probe_resolved_video", fake_video_probe)
+    prefetch = cache.prefetch_images if kind == "image" else cache.prefetch_videos
+    require = cache.require_image if kind == "image" else cache.require_video
+    try:
+        with ThreadPoolExecutor(max_workers=16, thread_name_prefix="manifest-media") as executor:
+            for batch_index in range(100):
+                paths = [f"/{kind}/batch-{batch_index}/media-{index}" for index in range(100)]
+                prefetch(paths, executor=executor)
+                for path in paths:
+                    require(path)
+                assert len(cache._prefetched_signatures[kind]) == 100
+    finally:
+        connection.close()
+
+    assert getattr(cache, peak_attribute) == 100
+
+
+def test_prefetched_signature_map_fails_closed_after_next_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_online_manifest_builder_module()
+    connection = sqlite3.connect(":memory:")
+    cache = builder._MediaValidationCache(connection)
+
+    monkeypatch.setattr(
+        builder,
+        "_media_signature",
+        lambda path: builder._MediaSignature(path, len(path), len(path) * 10),
+    )
+    monkeypatch.setattr(
+        builder,
+        "_probe_resolved_image",
+        lambda _path: builder._ValidationResult({"width": 64, "height": 48}),
+    )
+    try:
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="manifest-media") as executor:
+            cache.prefetch_images(["/image-a.png"], executor=executor)
+            assert cache.require_image("/image-a.png") == (64, 48)
+            cache.prefetch_images(["/image-b.png"], executor=executor)
+            assert cache.require_image("/image-b.png") == (64, 48)
+            with pytest.raises(RuntimeError, match="cache miss after batch prefetch"):
+                cache.require_image("/image-a.png")
+    finally:
+        connection.close()
+
+
+def test_media_probe_cache_reuses_first_batch_after_intervening_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_online_manifest_builder_module()
+    connection = sqlite3.connect(":memory:")
+    cache = builder._MediaValidationCache(connection)
+    signature_calls = 0
+    probe_calls = 0
+
+    def fake_signature(path: str):
+        nonlocal signature_calls
+        signature_calls += 1
+        return builder._MediaSignature(path, len(path), len(path) * 10)
+
+    def fake_probe(_path: str):
+        nonlocal probe_calls
+        probe_calls += 1
+        return builder._ValidationResult({"width": 64, "height": 48})
+
+    monkeypatch.setattr(builder, "_media_signature", fake_signature)
+    monkeypatch.setattr(builder, "_probe_resolved_image", fake_probe)
+    try:
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="manifest-media") as executor:
+            cache.prefetch_images(["/repeated.png"], executor=executor)
+            cache.require_image("/repeated.png")
+            cache.prefetch_images(["/other.png"], executor=executor)
+            cache.require_image("/other.png")
+            cache.prefetch_images(["/repeated.png"], executor=executor)
+            cache.require_image("/repeated.png")
+    finally:
+        connection.close()
+
+    assert signature_calls == 3
+    assert probe_calls == 2
+    assert cache.image_cache_hits == 1
+    assert cache.image_cache_misses == 2
+    assert cache.peak_active_image_signatures == 1
+
+
 def test_media_cache_runtime_writes_use_dedicated_writer_thread(tmp_path: Path) -> None:
     image = tmp_path / "cached.png"
     _write_image(image, (9, 8, 7))

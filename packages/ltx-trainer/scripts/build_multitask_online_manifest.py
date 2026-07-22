@@ -124,7 +124,12 @@ class _MediaValidationCache:
         self.image_require_calls = 0
         self.video_require_calls = 0
         self.reference_probes_skipped_due_video_reject = 0
-        self._prefetched_signatures: dict[tuple[str, str], _MediaSignature] = {}
+        self.peak_active_image_signatures = 0
+        self.peak_active_video_signatures = 0
+        self._prefetched_signatures: dict[str, dict[str, _MediaSignature]] = {
+            "image": {},
+            "video": {},
+        }
         connection.execute(
             """
             CREATE TABLE media_validation_cache (
@@ -148,6 +153,14 @@ class _MediaValidationCache:
     @property
     def misses(self) -> int:
         return self.image_cache_misses + self.video_cache_misses
+
+    @property
+    def active_image_signatures(self) -> int:
+        return len(self._prefetched_signatures["image"])
+
+    @property
+    def active_video_signatures(self) -> int:
+        return len(self._prefetched_signatures["video"])
 
     def _assert_owner_thread(self) -> None:
         if threading.get_ident() != self.owner_thread_id:
@@ -244,8 +257,20 @@ class _MediaValidationCache:
             phase="signature",
             batch_rows=batch_rows,
         )
-        for canonical_path, signature in zip(unique_paths, signatures, strict=True):
-            self._prefetched_signatures[(kind, canonical_path)] = signature
+        self._prefetched_signatures[kind] = {
+            canonical_path: signature
+            for canonical_path, signature in zip(unique_paths, signatures, strict=True)
+        }
+        if kind == "image":
+            self.peak_active_image_signatures = max(
+                self.peak_active_image_signatures,
+                self.active_image_signatures,
+            )
+        else:
+            self.peak_active_video_signatures = max(
+                self.peak_active_video_signatures,
+                self.active_video_signatures,
+            )
 
         missing: list[_MediaSignature] = []
         for signature in signatures:
@@ -318,7 +343,7 @@ class _MediaValidationCache:
         else:
             self.video_require_calls += 1
         canonical_path = str(path)
-        signature = self._prefetched_signatures.get((kind, canonical_path))
+        signature = self._prefetched_signatures[kind].get(canonical_path)
         if signature is None:
             raise RuntimeError(
                 f"Media validation cache miss after batch prefetch: kind={kind}, path={canonical_path}"
@@ -440,6 +465,10 @@ class _ManifestProgress:
             "video_unique_paths": self.validation_cache.video_unique_paths,
             "image_require_calls": self.validation_cache.image_require_calls,
             "video_require_calls": self.validation_cache.video_require_calls,
+            "active_image_signatures": self.validation_cache.active_image_signatures,
+            "active_video_signatures": self.validation_cache.active_video_signatures,
+            "peak_active_image_signatures": self.validation_cache.peak_active_image_signatures,
+            "peak_active_video_signatures": self.validation_cache.peak_active_video_signatures,
             "reference_probes_skipped_due_video_reject": (
                 self.validation_cache.reference_probes_skipped_due_video_reject
             ),
@@ -489,6 +518,8 @@ class _ManifestProgress:
             "video_probe_submitted": self.validation_cache.video_probe_submitted,
             "image_cache_hits": self.validation_cache.image_cache_hits,
             "video_cache_hits": self.validation_cache.video_cache_hits,
+            "peak_active_image_signatures": self.validation_cache.peak_active_image_signatures,
+            "peak_active_video_signatures": self.validation_cache.peak_active_video_signatures,
         }
         print(
             "[manifest] " + " ".join(f"{key}={value}" for key, value in fields.items()),
@@ -1063,6 +1094,10 @@ def main(  # noqa: PLR0913, PLR0915
             "video_unique_paths": validation_cache.video_unique_paths,
             "image_require_calls": validation_cache.image_require_calls,
             "video_require_calls": validation_cache.video_require_calls,
+            "active_image_signatures": validation_cache.active_image_signatures,
+            "active_video_signatures": validation_cache.active_video_signatures,
+            "peak_active_image_signatures": validation_cache.peak_active_image_signatures,
+            "peak_active_video_signatures": validation_cache.peak_active_video_signatures,
             "reference_probes_skipped_due_video_reject": (
                 validation_cache.reference_probes_skipped_due_video_reject
             ),
