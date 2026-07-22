@@ -29,6 +29,7 @@ from ltx_trainer.online_data.parallel_manifest import (
     validate_done_marker,
 )
 from ltx_trainer.online_data.path_safety import assert_write_path_allowed
+from ltx_trainer.online_data import path_safety
 
 
 def _load_online_manifest_builder_module():
@@ -526,8 +527,47 @@ def test_probe_timeout_terminates_isolated_process(monkeypatch: pytest.MonkeyPat
     assert state == {"terminated": True, "joined": True}
 
 
-def test_write_policy_explicitly_rejects_both_read_only_source_roots() -> None:
+def test_write_policy_explicitly_rejects_read_only_source_roots() -> None:
     with pytest.raises(ValueError, match="liutao"):
         assert_write_path_allowed("/mnt/workspace/liutao/output.jsonl")
+    with pytest.raises(ValueError, match="public"):
+        assert_write_path_allowed("/mnt/workspace/public/output.jsonl")
     with pytest.raises(ValueError, match="jiangyuxiang2"):
         assert_write_path_allowed("/mnt/workspace/jiangyuxiang2/output.jsonl")
+
+
+def test_write_policy_uses_resolved_paths_and_allows_only_litengjie_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "mnt" / "workspace"
+    allowed = workspace / "litengjie"
+    liutao = workspace / "liutao"
+    public = workspace / "public"
+    jiangyuxiang2 = workspace / "jiangyuxiang2"
+    outside = tmp_path / "outside"
+    for root in (allowed, liutao, public, jiangyuxiang2, outside):
+        root.mkdir(parents=True)
+    external_target = outside / "target"
+    external_target.mkdir()
+    symlink = allowed / "link_to_external"
+    symlink.symlink_to(external_target, target_is_directory=True)
+
+    monkeypatch.setattr(path_safety, "_ALLOWED_WRITE_ROOT", allowed)
+    monkeypatch.setattr(path_safety, "_FORBIDDEN_WRITE_ROOTS", (liutao, public, jiangyuxiang2))
+    monkeypatch.chdir(tmp_path)
+
+    permitted = allowed / "subdir" / "file.jsonl"
+    assert path_safety.assert_write_path_allowed(permitted) == permitted.resolve()
+
+    rejected_paths = [
+        liutao / "file.jsonl",
+        public / "file.jsonl",
+        jiangyuxiang2 / "file.jsonl",
+        tmp_path / "tmp-output.jsonl",
+        Path("outside") / "relative.jsonl",
+        symlink / "escaped.jsonl",
+    ]
+    for path in rejected_paths:
+        with pytest.raises(ValueError):
+            path_safety.assert_write_path_allowed(path)

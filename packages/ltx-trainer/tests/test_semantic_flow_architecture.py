@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 import yaml
+from accelerate import DistributedType
 from safetensors.torch import save_file
 from torch import nn
 
@@ -28,6 +29,7 @@ from ltx_trainer.online_inference.checkpoint_runtime import (
     resolve_checkpoint,
 )
 from ltx_trainer.config import LtxTrainerConfig
+from ltx_trainer.trainer import _enforce_semantic_flow_fsdp_runtime_safety
 from ltx_trainer.training_strategies.semantic_flow import SemanticFlowConfig, SemanticFlowStrategy
 
 
@@ -208,6 +210,43 @@ def test_production_semantic_flow_config_uses_opens2v_only_litengjie_paths() -> 
 
     strategy = SemanticFlowStrategy(SemanticFlowConfig())
     assert strategy.train_embeddings_processor() is False
+
+
+def _fake_trainer_config(*, strategy_name: str = "semantic_flow", training_mode: str = "full") -> SimpleNamespace:
+    return SimpleNamespace(
+        training_strategy=SimpleNamespace(name=strategy_name),
+        model=SimpleNamespace(training_mode=training_mode),
+    )
+
+
+def _fake_accelerator(distributed_type: DistributedType, *, sharding_strategy: str | None = None) -> SimpleNamespace:
+    fsdp_plugin = SimpleNamespace(
+        sharding_strategy=None if sharding_strategy is None else SimpleNamespace(name=sharding_strategy)
+    )
+    return SimpleNamespace(distributed_type=distributed_type, state=SimpleNamespace(fsdp_plugin=fsdp_plugin))
+
+
+def test_semantic_flow_full_training_requires_fsdp_full_shard() -> None:
+    config = _fake_trainer_config()
+    _enforce_semantic_flow_fsdp_runtime_safety(
+        config,
+        _fake_accelerator(DistributedType.FSDP, sharding_strategy="FULL_SHARD"),
+    )
+
+    with pytest.raises(RuntimeError, match="requires Accelerate FSDP FULL_SHARD"):
+        _enforce_semantic_flow_fsdp_runtime_safety(config, _fake_accelerator(DistributedType.MULTI_GPU))
+    with pytest.raises(RuntimeError, match="requires Accelerate FSDP FULL_SHARD"):
+        _enforce_semantic_flow_fsdp_runtime_safety(config, _fake_accelerator(DistributedType.NO))
+    with pytest.raises(RuntimeError, match="Configured FSDP sharding strategy"):
+        _enforce_semantic_flow_fsdp_runtime_safety(
+            config,
+            _fake_accelerator(DistributedType.FSDP, sharding_strategy="SHARD_GRAD_OP"),
+        )
+
+    _enforce_semantic_flow_fsdp_runtime_safety(
+        _fake_trainer_config(strategy_name="text_to_video", training_mode="lora"),
+        _fake_accelerator(DistributedType.NO),
+    )
 
 
 class _VelocityRecorder(nn.Module):

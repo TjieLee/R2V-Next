@@ -74,6 +74,34 @@ StepCallback = Callable[[int, int, list[Path]], None]  # (step, total, list[samp
 
 MEMORY_CHECK_INTERVAL = 200
 
+
+def _read_fsdp_sharding_strategy_name(accelerator: Accelerator) -> str | None:
+    plugin = getattr(getattr(accelerator, "state", None), "fsdp_plugin", None)
+    for attribute in ("sharding_strategy", "reshard_after_forward"):
+        strategy = getattr(plugin, attribute, None)
+        if strategy is None or isinstance(strategy, bool):
+            continue
+        name = getattr(strategy, "name", None) or str(strategy)
+        return str(name).split(".")[-1].upper()
+    return None
+
+
+def _enforce_semantic_flow_fsdp_runtime_safety(config: LtxTrainerConfig, accelerator: Accelerator) -> None:
+    if not (config.training_strategy.name == "semantic_flow" and config.model.training_mode == "full"):
+        return
+    if accelerator.distributed_type != DistributedType.FSDP:
+        raise RuntimeError(
+            "Full-DiT semantic-flow training requires Accelerate FSDP FULL_SHARD. "
+            "Plain DDP and single-process full training are disabled to prevent OOM."
+        )
+    sharding_strategy = _read_fsdp_sharding_strategy_name(accelerator)
+    if sharding_strategy is not None and sharding_strategy != "FULL_SHARD":
+        raise RuntimeError(
+            "Full-DiT semantic-flow training requires Accelerate FSDP FULL_SHARD. "
+            f"Configured FSDP sharding strategy is {sharding_strategy!r}."
+        )
+
+
 def normalize_peft_adapter_key(key: str) -> str:
     """Normalize PEFT adapter keys across saved and in-memory naming variants."""
     normalized = key
@@ -1816,6 +1844,7 @@ class LtxvTrainer:
             step_scheduler_with_optimizer=False,
             kwargs_handlers=[ddp_kwargs],
         )
+        _enforce_semantic_flow_fsdp_runtime_safety(self._config, self._accelerator)
 
         if self._accelerator.num_processes > 1:
             logger.info(

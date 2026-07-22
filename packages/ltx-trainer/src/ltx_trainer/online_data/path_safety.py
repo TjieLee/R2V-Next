@@ -7,6 +7,7 @@ from pathlib import Path
 _ALLOWED_WRITE_ROOT = Path("/mnt/workspace/litengjie")
 _FORBIDDEN_WRITE_ROOTS = (
     Path("/mnt/workspace/liutao"),
+    Path("/mnt/workspace/public"),
     Path("/mnt/workspace/jiangyuxiang2"),
 )
 
