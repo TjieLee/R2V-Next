@@ -1,0 +1,38 @@
+name: Semantic Flow CPU Unit Tests
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/semantic-flow-unit-tests.yml"
+      - "packages/ltx-core/**"
+      - "packages/ltx-trainer/**"
+  push:
+    paths:
+      - ".github/workflows/semantic-flow-unit-tests.yml"
+      - "packages/ltx-core/**"
+      - "packages/ltx-trainer/**"
+
+jobs:
+  semantic-flow-unit-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install CPU test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu \
+            torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1
+          python -m pip install -e packages/ltx-core -e packages/ltx-trainer pytest
+
+      - name: Run semantic-flow CPU tests
+        run: |
+          pytest -q \
+            packages/ltx-trainer/tests/test_semantic_flow_architecture.py \
+            packages/ltx-trainer/tests/test_parallel_manifest_builder.py \
+            packages/ltx-trainer/tests/test_gemma3_attention_masks.py

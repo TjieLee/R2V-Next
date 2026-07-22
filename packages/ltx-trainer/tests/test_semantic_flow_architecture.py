@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import math
@@ -326,7 +327,7 @@ def test_semantic_flow_reports_actual_kept_prefix_and_latent_metrics(monkeypatch
     assert float(metrics["train/semantic_token_count_kept"]) == 80.0
 
 
-def test_production_semantic_flow_config_uses_opens2v_only_litengjie_paths() -> None:
+def test_production_semantic_flow_config_uses_opens2v_only_litengjie_paths(tmp_path: Path) -> None:
     root = Path(__file__).resolve().parents[1]
     training_path = root / "configs" / "semantic_flow_multitask_480p121.yaml"
     data_path = root / "configs" / "multitask_online_480p121_data.yaml"
@@ -340,15 +341,39 @@ def test_production_semantic_flow_config_uses_opens2v_only_litengjie_paths() -> 
     training_config = yaml.safe_load(training_text)
     data_config = yaml.safe_load(data_text)
     opens2v_config = yaml.safe_load(opens2v_text)
-    parsed = LtxTrainerConfig.model_validate(training_config)
 
-    assert parsed.model.model_path == "/mnt/workspace/litengjie/LTX-2/models/LTX-2.3/ltx-2.3-22b-dev.safetensors"
+    assert training_config["model"]["model_path"] == (
+        "/mnt/workspace/litengjie/LTX-2/models/LTX-2.3/ltx-2.3-22b-dev.safetensors"
+    )
     assert (
-        parsed.model.text_encoder_path
+        training_config["model"]["text_encoder_path"]
         == "/mnt/workspace/litengjie/LTX-2/models/gemma-3-12b-it-qat-q4_0-unquantized"
     )
+    assert training_config["output_dir"].startswith("/mnt/workspace/litengjie/")
+    assert training_config["data"]["manifest_path"].startswith("/mnt/workspace/litengjie/")
+    assert training_config["data"]["online_encoding"]["runtime_reject_log_dir"].startswith(
+        "/mnt/workspace/litengjie/"
+    )
+
+    model_path = tmp_path / "ltx-2.3-22b-dev.safetensors"
+    model_path.write_bytes(b"fake safetensors placeholder")
+    gemma_dir = tmp_path / "gemma-3-12b-it"
+    gemma_dir.mkdir()
+    (gemma_dir / "config.json").write_text(json.dumps({"sliding_window": 1024}), encoding="utf-8")
+    train_data_path = tmp_path / "multitask_online_480p121_opens2v.yaml"
+    train_data_path.write_text(yaml.safe_dump(opens2v_config), encoding="utf-8")
+    manifest_path = tmp_path / "train_i2i_opens2v.jsonl"
+    manifest_path.write_text("", encoding="utf-8")
+
+    schema_config = copy.deepcopy(training_config)
+    schema_config["model"]["model_path"] = str(model_path)
+    schema_config["model"]["text_encoder_path"] = str(gemma_dir)
+    schema_config["data"]["train_data_config"] = str(train_data_path)
+    schema_config["data"]["manifest_path"] = str(manifest_path)
+    parsed = LtxTrainerConfig.model_validate(schema_config)
+
     assert parsed.output_dir.startswith("/mnt/workspace/litengjie/")
-    assert parsed.data.manifest_path.startswith("/mnt/workspace/litengjie/")
+    assert parsed.data.manifest_path == str(manifest_path.resolve())
     assert parsed.data.online_encoding is not None
     assert parsed.data.online_encoding.runtime_reject_log_dir.startswith("/mnt/workspace/litengjie/")
     assert parsed.checkpoints.save_training_state == "minimal"
@@ -361,12 +386,12 @@ def test_production_semantic_flow_config_uses_opens2v_only_litengjie_paths() -> 
         assert "PhantomDataset" not in dataset_types
         assert config["online_sampling"]["video_source_ratios"] == {"r2v_opens2v": 1.0}
 
-    lora_config = dict(training_config)
-    lora_config["model"] = {**training_config["model"], "training_mode": "lora"}
+    lora_config = copy.deepcopy(schema_config)
+    lora_config["model"] = {**schema_config["model"], "training_mode": "lora"}
     with pytest.raises(ValueError, match="semantic_flow requires full DiT training"):
         LtxTrainerConfig.model_validate(lora_config)
 
-    gemma_lora_config = dict(training_config)
+    gemma_lora_config = copy.deepcopy(schema_config)
     gemma_lora_config["text_encoder_lora"] = {"enabled": True}
     with pytest.raises(ValueError, match="forbids text-encoder LoRA"):
         LtxTrainerConfig.model_validate(gemma_lora_config)

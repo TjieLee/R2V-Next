@@ -35,6 +35,10 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 DATA_CONFIG="$R2V_ROOT/manifests/multitask_online_480p121_opens2v.yaml"
 TRAIN_CONFIG="$REPO_ROOT/packages/ltx-trainer/configs/semantic_flow_multitask_480p121.yaml"
 ACCELERATE_CONFIG="${ACCELERATE_CONFIG:-$REPO_ROOT/packages/ltx-trainer/configs/accelerate_semantic_flow_fsdp_full_shard.yaml}"
+SMOKE_ROOT="$R2V_ROOT/smoke"
+INFERENCE_SMOKE_ROOT="/mnt/workspace/litengjie/jd_ltx_multitask_online_480p121/inference/semantic_flow_v2_smoke"
+RUNTIME_AUDIT="$R2V_ROOT/train/runtime_audit.json"
+SMOKE_SUCCESS_MARKER="$R2V_ROOT/train/semantic_flow_smoke_success.json"
 
 semantic_flow_train_preflight() {
   python3 - "$TRAIN_CONFIG" "$ACCELERATE_CONFIG" "$R2V_ROOT" <<'PY'
@@ -157,6 +161,44 @@ if errors:
 PY
 }
 
+latest_smoke_checkpoint() {
+  local output_dir="$1"
+  local checkpoint
+  checkpoint="$(find "$output_dir/checkpoints" -type f -name '*step_*.safetensors' | sort | tail -n 1)"
+  if [[ -z "$checkpoint" ]]; then
+    printf 'No smoke checkpoint found under %s/checkpoints\n' "$output_dir" >&2
+    exit 1
+  fi
+  printf '%s\n' "$checkpoint"
+}
+
+write_smoke_success_marker() {
+  python3 - "$SMOKE_SUCCESS_MARKER" "$RUNTIME_AUDIT" "$1" "$2" <<'PY'
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+marker = Path(sys.argv[1])
+payload = {
+    "architecture": "semantic_flow_v1",
+    "completed_at_unix": time.time(),
+    "runtime_audit": str(Path(sys.argv[2]).resolve()),
+    "i2i_checkpoint": str(Path(sys.argv[3]).resolve()),
+    "r2v_checkpoint": str(Path(sys.argv[4]).resolve()),
+}
+temporary = Path(f"{marker}.tmp.{os.getpid()}")
+with temporary.open("w", encoding="utf-8") as handle:
+    json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+temporary.replace(marker)
+print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+PY
+}
+
 case "${1:-}" in
   build-manifest)
     cp "$REPO_ROOT/packages/ltx-trainer/configs/multitask_online_480p121_opens2v.yaml" "$DATA_CONFIG"
@@ -171,14 +213,64 @@ case "${1:-}" in
       --probe-workers 16 \
       --probe-batch-size 512
     ;;
+  smoke)
+    semantic_flow_train_preflight
+    python3 "$REPO_ROOT/packages/ltx-trainer/scripts/semantic_flow_runtime_audit.py" \
+      --config "$TRAIN_CONFIG" \
+      --accelerate-config "$ACCELERATE_CONFIG" \
+      --output "$RUNTIME_AUDIT"
+    accelerate launch --config_file "$ACCELERATE_CONFIG" \
+      "$REPO_ROOT/packages/ltx-trainer/scripts/check_multitask_online_ddp.py" \
+      --config "$TRAIN_CONFIG" \
+      --task i2i \
+      --output-dir "$SMOKE_ROOT/i2i"
+    I2I_CHECKPOINT="$(latest_smoke_checkpoint "$SMOKE_ROOT/i2i")"
+    accelerate launch --config_file "$ACCELERATE_CONFIG" \
+      "$REPO_ROOT/packages/ltx-trainer/scripts/check_multitask_online_ddp.py" \
+      --config "$TRAIN_CONFIG" \
+      --task r2v \
+      --init-checkpoint "$I2I_CHECKPOINT" \
+      --output-dir "$SMOKE_ROOT/r2v"
+    R2V_CHECKPOINT="$(latest_smoke_checkpoint "$SMOKE_ROOT/r2v")"
+    python3 "$REPO_ROOT/packages/ltx-trainer/scripts/select_multitask_online_train_samples.py" \
+      --manifest "$R2V_ROOT/manifests/train_i2i_opens2v.jsonl" \
+      --output-dir "$INFERENCE_SMOKE_ROOT/selection" \
+      --tasks i2i,r2v \
+      --samples-per-task 1 \
+      --overwrite
+    python3 "$REPO_ROOT/packages/ltx-trainer/scripts/infer_multitask_online_train_samples.py" \
+      --config "$TRAIN_CONFIG" \
+      --samples "$INFERENCE_SMOKE_ROOT/selection/selected_samples.jsonl" \
+      --output-root "$INFERENCE_SMOKE_ROOT/run" \
+      --latest-ready-dir "$SMOKE_ROOT/r2v/checkpoints" \
+      --task both \
+      --limit 2 \
+      --dry-run \
+      --overwrite
+    write_smoke_success_marker "$I2I_CHECKPOINT" "$R2V_CHECKPOINT"
+    ;;
   train)
     semantic_flow_train_preflight
+    if [[ "${2:-}" == "--skip-smoke-guard" ]]; then
+      printf '%s\n' "Skipping semantic-flow smoke guard by explicit request."
+    elif [[ -n "${2:-}" ]]; then
+      printf 'Unknown train option: %s\n' "$2" >&2
+      exit 2
+    elif [[ ! -f "$SMOKE_SUCCESS_MARKER" ]]; then
+      printf 'Missing semantic-flow smoke success marker: %s\n' "$SMOKE_SUCCESS_MARKER" >&2
+      printf '%s\n' "Run: bash $0 smoke" >&2
+      exit 1
+    fi
+    python3 "$REPO_ROOT/packages/ltx-trainer/scripts/semantic_flow_runtime_audit.py" \
+      --config "$TRAIN_CONFIG" \
+      --accelerate-config "$ACCELERATE_CONFIG" \
+      --output "$RUNTIME_AUDIT"
     accelerate launch --config_file "$ACCELERATE_CONFIG" \
       "$REPO_ROOT/packages/ltx-trainer/scripts/train.py" \
       "$TRAIN_CONFIG"
     ;;
   *)
-    printf '%s\n' "Usage: $0 {build-manifest|train}"
+    printf '%s\n' "Usage: $0 {build-manifest|smoke|train [--skip-smoke-guard]}"
     printf '%s\n' "Required distributed mode: FSDP FULL_SHARD"
     printf '%s\n' "Plain DDP is unsupported for full 22B DiT semantic-flow training."
     exit 2
