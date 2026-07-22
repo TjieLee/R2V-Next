@@ -30,6 +30,11 @@ jobs:
             torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1
           python -m pip install -e packages/ltx-core -e packages/ltx-trainer pytest
 
+      - name: Require Gemma3 full/sliding mask compatibility
+        run: |
+          pytest -q \
+            packages/ltx-trainer/tests/test_gemma3_attention_masks.py::test_small_transformers_gemma3_forward_accepts_full_sliding_mask_mapping
+
       - name: Run semantic-flow CPU tests
         run: |
           pytest -q \

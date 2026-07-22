@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import pytest
 import torch
+import transformers
 
 from ltx_core.multicond.gemma3_attention import build_gemma3_attention_masks
 from ltx_core.multicond.semantic_tokens import (
@@ -144,24 +144,20 @@ def test_prefix_and_teacher_use_identical_full_sliding_prefix_masks() -> None:
 
 
 def test_small_transformers_gemma3_forward_accepts_full_sliding_mask_mapping() -> None:
-    transformers = pytest.importorskip("transformers")
     torch.manual_seed(3)
-    try:
-        config = transformers.Gemma3TextConfig(
-            vocab_size=32,
-            hidden_size=16,
-            intermediate_size=32,
-            num_hidden_layers=2,
-            num_attention_heads=4,
-            num_key_value_heads=4,
-            head_dim=4,
-            sliding_window=4,
-            layer_types=["full_attention", "sliding_attention"],
-            use_cache=False,
-        )
-        model = transformers.Gemma3TextModel(config).eval()
-    except Exception as exc:  # pragma: no cover - depends on installed transformers API
-        pytest.skip(f"Installed transformers Gemma3 API is not compatible with this tiny config: {exc}")
+    config = transformers.Gemma3TextConfig(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        head_dim=4,
+        sliding_window=4,
+        layer_types=["full_attention", "sliding_attention"],
+        use_cache=False,
+    )
+    model = transformers.Gemma3TextModel(config).eval()
 
     inputs = torch.randn(1, 8, config.hidden_size)
     valid = torch.ones(1, 8, dtype=torch.bool)
