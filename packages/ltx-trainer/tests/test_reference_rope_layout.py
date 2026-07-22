@@ -151,6 +151,7 @@ def test_training_and_inference_reference_positions_are_identical() -> None:
         reference_latents=references,
         target_shape=VideoLatentShape(batch=1, channels=4, frames=1, height=2, width=2),
         semantic_frame_count=1,
+        fps=24.0,
         seed=7,
     )
     assert training.sequence_offsets is not None

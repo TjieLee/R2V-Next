@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, replace
 from typing import Any, Literal
 
@@ -587,11 +588,14 @@ class SemanticFlowStrategy(TrainingStrategy):
         reference_latents: dict[str, Tensor],
         target_shape: VideoLatentShape,
         semantic_frame_count: int,
+        fps: float,
         seed: int,
     ) -> SemanticInferenceState:
         """Initialize strict-no-GT joint state from references, context, and noise only."""
         if semantic_frame_count < 1:
             raise ValueError("semantic_frame_count must be positive")
+        if not math.isfinite(fps) or fps <= 0:
+            raise ValueError(f"fps must be finite and positive, got {fps!r}")
         if self._semantic_dim is None:
             raise RuntimeError("semantic modules are not initialized; attach_models must run first")
         reference_latent_tensor = reference_latents["latents"]
@@ -622,7 +626,7 @@ class SemanticFlowStrategy(TrainingStrategy):
             height=target_shape.height,
             width=target_shape.width,
             batch_size=batch_size,
-            fps=float(DEFAULT_FPS),
+            fps=float(fps),
             device=device,
         )
         normalized_timestamps = torch.linspace(

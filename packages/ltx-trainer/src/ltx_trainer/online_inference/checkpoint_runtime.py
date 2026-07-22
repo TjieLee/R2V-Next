@@ -269,6 +269,7 @@ class OnlineInferenceRuntime:
             reference_latents=encoded["reference_latents"],
             target_shape=target_shape,
             semantic_frame_count=semantic_frames,
+            fps=float(fps),
             seed=seed,
         )
         return self.strategy.denoise_joint(

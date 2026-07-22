@@ -106,6 +106,7 @@ def run_online_sample(
         "reference_velocity": 0.0,
         "shared_semantic_video_sigma": True,
         "seed": seed,
+        "fps": float(sample["fps"]),
         "num_inference_steps": num_inference_steps,
         "checkpoint": str(runtime.checkpoint_path),
         "checkpoint_sha256": runtime.checkpoint_audit["checkpoint_sha256"],
