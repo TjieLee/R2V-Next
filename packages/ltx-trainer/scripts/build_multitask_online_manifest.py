@@ -16,7 +16,7 @@ import threading
 import time
 from collections import Counter
 from collections.abc import Iterable, Iterator, Mapping
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from itertools import islice
 from pathlib import Path
@@ -214,6 +214,9 @@ class _MediaValidationCache:
         paths: Iterable[str],
         *,
         executor: ThreadPoolExecutor,
+        progress: "_ManifestProgress | None" = None,
+        phase: str = "media_probe",
+        batch_rows: int = 0,
     ) -> None:
         self._assert_owner_thread()
         if kind not in {"image", "video"}:  # pragma: no cover - internal programming error
@@ -233,7 +236,14 @@ class _MediaValidationCache:
             self.video_unique_paths += len(unique_paths)
 
         self.signature_submitted += len(unique_paths)
-        signatures = list(executor.map(_media_signature, unique_paths))
+        signatures = _run_worker_batch_in_order(
+            executor,
+            _media_signature,
+            unique_paths,
+            progress=progress,
+            phase="signature",
+            batch_rows=batch_rows,
+        )
         for canonical_path, signature in zip(unique_paths, signatures, strict=True):
             self._prefetched_signatures[(kind, canonical_path)] = signature
 
@@ -244,10 +254,24 @@ class _MediaValidationCache:
 
         if kind == "image":
             self.image_probe_submitted += len(missing)
-            results = executor.map(_probe_resolved_image, [item.path for item in missing])
+            results = _run_worker_batch_in_order(
+                executor,
+                _probe_resolved_image,
+                [item.path for item in missing],
+                progress=progress,
+                phase=phase,
+                batch_rows=batch_rows,
+            )
         else:
             self.video_probe_submitted += len(missing)
-            results = executor.map(_probe_resolved_video, [item.path for item in missing])
+            results = _run_worker_batch_in_order(
+                executor,
+                _probe_resolved_video,
+                [item.path for item in missing],
+                progress=progress,
+                phase=phase,
+                batch_rows=batch_rows,
+            )
         for signature, result in zip(missing, results, strict=True):
             self.put(kind, signature, result)
 
@@ -256,16 +280,36 @@ class _MediaValidationCache:
         paths: Iterable[str],
         *,
         executor: ThreadPoolExecutor,
+        progress: "_ManifestProgress | None" = None,
+        phase: str = "image_probe",
+        batch_rows: int = 0,
     ) -> None:
-        self._prefetch("image", paths, executor=executor)
+        self._prefetch(
+            "image",
+            paths,
+            executor=executor,
+            progress=progress,
+            phase=phase,
+            batch_rows=batch_rows,
+        )
 
     def prefetch_videos(
         self,
         paths: Iterable[str],
         *,
         executor: ThreadPoolExecutor,
+        progress: "_ManifestProgress | None" = None,
+        phase: str = "video_probe",
+        batch_rows: int = 0,
     ) -> None:
-        self._prefetch("video", paths, executor=executor)
+        self._prefetch(
+            "video",
+            paths,
+            executor=executor,
+            progress=progress,
+            phase=phase,
+            batch_rows=batch_rows,
+        )
 
     def _require(self, kind: str, path: str) -> _ValidationResult:
         self._assert_owner_thread()
@@ -410,6 +454,50 @@ class _ManifestProgress:
         self.last_emitted_at = now
         self.last_emitted_rows = self.global_processed
 
+    def maybe_emit_probe_heartbeat(
+        self,
+        *,
+        phase: str,
+        batch_rows: int,
+        submitted: int,
+        completed: int,
+        pending: int,
+    ) -> None:
+        now = self.clock()
+        if now - self.last_emitted_at < self.progress_interval_seconds:
+            return
+
+        elapsed = max(0.0, now - self.started_at)
+        rows_per_second = self.global_processed / elapsed if elapsed > 0 else 0.0
+        fields = {
+            "event": "probe_progress",
+            "phase": phase,
+            "dataset_name": self.dataset_name or "unknown",
+            "task": self.task or "unknown",
+            "batch_rows": batch_rows,
+            "submitted": submitted,
+            "completed": completed,
+            "pending": pending,
+            "global_processed": self.global_processed,
+            "accepted": self.global_accepted,
+            "rejected": self.global_rejected,
+            "duplicates": self.global_duplicates,
+            "elapsed_seconds": f"{elapsed:.1f}",
+            "rows_per_second": f"{rows_per_second:.1f}",
+            "signature_submitted": self.validation_cache.signature_submitted,
+            "image_probe_submitted": self.validation_cache.image_probe_submitted,
+            "video_probe_submitted": self.validation_cache.video_probe_submitted,
+            "image_cache_hits": self.validation_cache.image_cache_hits,
+            "video_cache_hits": self.validation_cache.video_cache_hits,
+        }
+        print(
+            "[manifest] " + " ".join(f"{key}={value}" for key, value in fields.items()),
+            file=self.stream,
+            flush=True,
+        )
+        self.last_emitted_at = now
+        self.last_emitted_rows = self.global_processed
+
 
 def _temporary_path(path: Path) -> Path:
     return Path(f"{path}.tmp.{os.getpid()}")
@@ -437,6 +525,49 @@ def _batched(rows: Iterable[_T], batch_size: int) -> Iterator[list[_T]]:
     iterator = iter(rows)
     while batch := list(islice(iterator, batch_size)):
         yield batch
+
+
+def _run_worker_batch_in_order(
+    executor: ThreadPoolExecutor,
+    worker: Callable[[_T], Any],
+    items: list[_T],
+    *,
+    progress: "_ManifestProgress | None",
+    phase: str,
+    batch_rows: int,
+) -> list[Any]:
+    if not items:
+        return []
+    futures: list[Future[Any]] = [executor.submit(worker, item) for item in items]
+    future_indices = {future: index for index, future in enumerate(futures)}
+    pending = set(futures)
+    results: list[Any] = [None] * len(futures)
+    completed = 0
+    timeout = progress.progress_interval_seconds if progress is not None else None
+    while pending:
+        done, pending = wait(pending, timeout=timeout, return_when=FIRST_COMPLETED)
+        if not done:
+            if progress is not None:
+                progress.maybe_emit_probe_heartbeat(
+                    phase=phase,
+                    batch_rows=batch_rows,
+                    submitted=len(futures),
+                    completed=completed,
+                    pending=len(pending),
+                )
+            continue
+        for future in done:
+            results[future_indices[future]] = future.result()
+            completed += 1
+        if progress is not None and pending:
+            progress.maybe_emit_probe_heartbeat(
+                phase=phase,
+                batch_rows=batch_rows,
+                submitted=len(futures),
+                completed=completed,
+                pending=len(pending),
+            )
+    return results
 
 
 def _probe_resolved_image(path: str) -> _ValidationResult:
@@ -503,6 +634,7 @@ def _iter_canonical_rows_with_bounded_probes(
     executor: ThreadPoolExecutor,
     batch_size: int,
     validation_cache: _MediaValidationCache,
+    progress: _ManifestProgress | None = None,
 ) -> Iterator[tuple[str, PreparedCanonicalR2VRecord | None, ManifestReject | None]]:
     """Normalize R2V rows, probe canonical paths in bounded parallel batches, and preserve order."""
     for row_batch in _batched(rows, batch_size):
@@ -529,6 +661,9 @@ def _iter_canonical_rows_with_bounded_probes(
         validation_cache.prefetch_videos(
             (canonical.video_path for canonical in canonicals if canonical is not None),
             executor=executor,
+            progress=progress,
+            phase="video_probe",
+            batch_rows=len(row_batch),
         )
 
         prepared_rows: list[PreparedCanonicalR2VRecord | None] = []
@@ -572,7 +707,13 @@ def _iter_canonical_rows_with_bounded_probes(
             row_errors.append(None)
             reference_paths_to_probe.extend(prepared.reference_paths)
 
-        validation_cache.prefetch_images(reference_paths_to_probe, executor=executor)
+        validation_cache.prefetch_images(
+            reference_paths_to_probe,
+            executor=executor,
+            progress=progress,
+            phase="reference_image_probe",
+            batch_rows=len(row_batch),
+        )
 
         for (source_record_id, _row), prepared, error in zip(
             row_batch,
@@ -799,6 +940,7 @@ def main(  # noqa: PLR0913, PLR0915
                         executor=executor,
                         batch_size=media_batch_size,
                         validation_cache=validation_cache,
+                        progress=progress,
                     )
                     for row_index, (source_record_id, prepared, probe_error) in enumerate(probed_rows):
                         raw_rows += 1
@@ -845,7 +987,13 @@ def main(  # noqa: PLR0913, PLR0915
                             reference_field=i2i_reference_field,
                         )
                     ]
-                    validation_cache.prefetch_images(image_paths, executor=executor)
+                    validation_cache.prefetch_images(
+                        image_paths,
+                        executor=executor,
+                        progress=progress,
+                        phase="i2i_image_probe",
+                        batch_rows=len(row_batch),
+                    )
                     for source_record_id, row in row_batch:
                         raw_rows += 1
                         try:

@@ -5,6 +5,8 @@ import io
 import json
 import sqlite3
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -136,6 +138,59 @@ def test_progress_defaults_to_stderr_and_never_writes_stdout(
     assert "dataset_total=unknown" in captured.err
     assert "global_total=unknown" in captured.err
     assert "eta_seconds=unknown" in captured.err
+
+
+def test_probe_heartbeat_emits_before_slow_batch_completes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = sqlite3.connect(":memory:")
+    cache = manifest_builder._MediaValidationCache(connection)
+    stream = io.StringIO()
+    started = time.perf_counter()
+    progress = manifest_builder._ManifestProgress(
+        started_at=started,
+        last_emitted_at=started,
+        last_emitted_rows=0,
+        total_rows=20,
+        progress_interval_seconds=0.05,
+        progress_every_rows=10_000,
+        validation_cache=cache,
+        stream=stream,
+    )
+    progress.start_dataset(dataset_name="slow_images", task="i2i", total_rows=20)
+    stream.seek(0)
+    stream.truncate(0)
+    paths = [str(tmp_path / f"slow_{index}.png") for index in range(20)]
+
+    def fake_signature(path: str):
+        return manifest_builder._MediaSignature(path, len(path), len(path) * 10)
+
+    def slow_probe(_path: str):
+        time.sleep(0.2)
+        return manifest_builder._ValidationResult({"width": 64, "height": 48})
+
+    monkeypatch.setattr(manifest_builder, "_media_signature", fake_signature)
+    monkeypatch.setattr(manifest_builder, "_probe_resolved_image", slow_probe)
+    try:
+        with ThreadPoolExecutor(max_workers=10, thread_name_prefix="manifest-media") as executor:
+            cache.prefetch_images(
+                paths,
+                executor=executor,
+                progress=progress,
+                phase="i2i_image_probe",
+                batch_rows=20,
+            )
+    finally:
+        connection.close()
+
+    probe_lines = [
+        line for line in stream.getvalue().splitlines()
+        if "event=probe_progress" in line
+    ]
+    assert len(probe_lines) >= 2
+    assert any("phase=i2i_image_probe" in line for line in probe_lines)
+    assert any("pending=0" not in line for line in probe_lines)
 
 
 def test_annotation_row_count_handles_streaming_and_in_memory_formats(tmp_path: Path) -> None:
