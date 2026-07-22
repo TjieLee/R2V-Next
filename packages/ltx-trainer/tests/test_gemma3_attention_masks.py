@@ -52,43 +52,58 @@ def test_gemma3_full_and_sliding_masks_preserve_image_blocks_and_padding() -> No
     assert not sliding[0, :, 14].any()
 
 
-def test_teacher_custom_visibility_keeps_queries_local_and_prefix_blind_to_suffix() -> None:
+def test_teacher_masks_keep_evidence_bidirectional_and_queries_local() -> None:
     prefix = torch.ones(1, 10, dtype=torch.bool)
     image = torch.zeros_like(prefix)
     image[:, 2:5] = True
-    custom = build_semantic_teacher_attention_mask(prefix, frame_count=1, image_token_mask=image)
+    frame_count = 2
+    frame_span = EVIDENCE_TOKENS_PER_FRAME + SEMANTIC_TOKENS_PER_FRAME
+    custom = build_semantic_teacher_attention_mask(prefix, frame_count=frame_count, image_token_mask=image)
     prefix_length = prefix.shape[1]
-    evidence_start = prefix_length
-    query_start = prefix_length + EVIDENCE_TOKENS_PER_FRAME
-    first_query = query_start
+    frame0_evidence_start = prefix_length
+    frame0_query_start = frame0_evidence_start + EVIDENCE_TOKENS_PER_FRAME
+    frame1_evidence_start = prefix_length + frame_span
+    first_query = frame0_query_start
 
     assert not custom[0, :prefix_length, prefix_length:].any()
     assert custom[0, first_query, :prefix_length].all()
     visible_evidence = torch.nonzero(
-        custom[0, first_query, evidence_start : evidence_start + EVIDENCE_TOKENS_PER_FRAME],
+        custom[0, first_query, frame0_evidence_start : frame0_evidence_start + EVIDENCE_TOKENS_PER_FRAME],
         as_tuple=False,
     ).flatten()
     assert visible_evidence.tolist() == [0, 1, 16, 17]
     assert custom[0, first_query, first_query]
     assert not custom[0, first_query, first_query + 1 :].any()
 
+    frame_image = torch.cat(
+        [
+            torch.ones(EVIDENCE_TOKENS_PER_FRAME, dtype=torch.bool),
+            torch.zeros(SEMANTIC_TOKENS_PER_FRAME, dtype=torch.bool),
+        ]
+    )
+    teacher_image = torch.cat([image, frame_image.repeat(frame_count).unsqueeze(0)], dim=1)
     masks = build_gemma3_attention_masks(
         valid_token_mask=torch.ones(1, custom.shape[1], dtype=torch.bool),
-        image_token_mask=torch.cat(
-            [
-                image,
-                torch.zeros(1, EVIDENCE_TOKENS_PER_FRAME + SEMANTIC_TOKENS_PER_FRAME, dtype=torch.bool),
-            ],
-            dim=1,
-        ),
+        image_token_mask=teacher_image,
         custom_visibility=custom,
         sliding_window=1024,
         dtype=torch.float32,
     )
-    assert torch.equal(
-        _visible(masks.full_attention)[:, :prefix_length, :prefix_length],
-        _visible(masks.sliding_attention)[:, :prefix_length, :prefix_length],
-    )
+    full = _visible(masks.full_attention)
+    sliding = _visible(masks.sliding_attention)
+
+    for visibility in (full, sliding):
+        assert visibility[0, frame0_evidence_start, frame0_evidence_start + 255]
+        assert visibility[0, frame0_evidence_start + 255, frame0_evidence_start]
+        assert not visibility[0, frame0_evidence_start, frame1_evidence_start]
+        assert not visibility[0, frame1_evidence_start, frame0_evidence_start]
+        assert visibility[0, first_query, frame0_evidence_start]
+        assert not visibility[0, first_query, frame0_evidence_start + 2]
+        assert not visibility[0, first_query, first_query + 1]
+        assert not visibility[0, first_query, frame1_evidence_start]
+
+    assert not teacher_image[0, frame0_query_start]
+    assert not teacher_image[0, frame0_query_start:frame0_query_start + SEMANTIC_TOKENS_PER_FRAME].any()
 
 
 def test_prefix_and_teacher_use_identical_full_sliding_prefix_masks() -> None:

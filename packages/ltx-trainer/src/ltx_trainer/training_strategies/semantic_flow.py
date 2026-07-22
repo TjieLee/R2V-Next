@@ -281,7 +281,23 @@ class SemanticFlowStrategy(TrainingStrategy):
         if prefix_image_token_mask is None:
             prefix_image_token_mask = torch.zeros_like(prefix_attention_mask)
         prefix_image_token_mask = prefix_image_token_mask.to(device=prefix_attention_mask.device, dtype=torch.bool)
-        image_token_mask = torch.cat([prefix_image_token_mask, torch.zeros_like(suffix_valid)], dim=1)
+        frame_image_mask = torch.cat(
+            [
+                torch.ones(
+                    EVIDENCE_TOKENS_PER_FRAME,
+                    dtype=torch.bool,
+                    device=prefix_attention_mask.device,
+                ),
+                torch.zeros(
+                    SEMANTIC_TOKENS_PER_FRAME,
+                    dtype=torch.bool,
+                    device=prefix_attention_mask.device,
+                ),
+            ],
+            dim=0,
+        )
+        suffix_image_token_mask = frame_image_mask.repeat(frame_count).unsqueeze(0).expand(batch_size, -1)
+        image_token_mask = torch.cat([prefix_image_token_mask, suffix_image_token_mask], dim=1)
         position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device, dtype=torch.long)
         position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
 
