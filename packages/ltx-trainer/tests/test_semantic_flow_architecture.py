@@ -6,6 +6,7 @@ import json
 import math
 import runpy
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -988,6 +989,78 @@ def test_production_train_cannot_refresh_runtime_lock() -> None:
     assert "--refresh-runtime-lock)" not in train_block
     assert "Usage: $0 {build-manifest|smoke|train [--skip-smoke-guard]}" in script
     assert "WARNING: --skip-smoke-guard bypasses" in train_block
+
+
+def _semantic_flow_tmpdir_script_and_preflight() -> tuple[str, str]:
+    script = (
+        Path(__file__).resolve().parents[1] / "scripts" / "run_semantic_flow_opens2v.sh"
+    ).read_text(encoding="utf-8")
+    marker = """python3 - "$TMPDIR" <<'PY'\n"""
+    preflight = script.split(marker, maxsplit=1)[1].split("\nPY\n", maxsplit=1)[0]
+    return script, preflight + "\n"
+
+
+def test_semantic_flow_launcher_uses_short_safe_tmpdir() -> None:
+    script, _preflight = _semantic_flow_tmpdir_script_and_preflight()
+
+    assert 'SEMANTIC_FLOW_TMPDIR="${SEMANTIC_FLOW_TMPDIR:-/mnt/workspace/litengjie/t}"' in script
+    assert 'export TMPDIR="$SEMANTIC_FLOW_TMPDIR"' in script
+    assert 'export TMPDIR="$R2V_ROOT/tmp"' not in script
+    assert 'Path("/mnt/workspace/litengjie")' in script
+    assert "AF_UNIX sockets" in script
+    assert "maximum=64" in script
+    assert script.index("""python3 - "$TMPDIR" <<'PY'""") < script.index("mkdir -p")
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/mnt/workspace/litengjie/t",
+        "/mnt/workspace/litengjie/x",
+    ],
+)
+def test_semantic_flow_tmpdir_preflight_accepts_safe_short_paths(path: str) -> None:
+    _script, preflight = _semantic_flow_tmpdir_script_and_preflight()
+
+    completed = subprocess.run(
+        [sys.executable, "-", path],
+        input=preflight,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("path", "expected_error"),
+    [
+        ("/tmp/r2v", "must be under /mnt/workspace/litengjie"),
+        (
+            "/mnt/workspace/litengjie/" + ("a" * 80),
+            "AF_UNIX sockets",
+        ),
+    ],
+)
+def test_semantic_flow_tmpdir_preflight_rejects_unsafe_paths(
+    path: str,
+    expected_error: str,
+) -> None:
+    _script, preflight = _semantic_flow_tmpdir_script_and_preflight()
+
+    completed = subprocess.run(
+        [sys.executable, "-", path],
+        input=preflight,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert expected_error in completed.stderr
+    if "AF_UNIX" in expected_error:
+        assert "too long" in completed.stderr
 
 
 def test_inference_git_commit_is_resolved_from_repository_root(

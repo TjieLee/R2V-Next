@@ -89,6 +89,13 @@ def _to_pil(image: Tensor) -> Image.Image:
     return Image.fromarray(image.cpu().numpy(), mode="RGB")
 
 
+def _materialize_frozen_tensor(value: Tensor) -> Tensor:
+    """Return a normal detached tensor safe to consume in a training graph."""
+    if torch.is_inference(value):
+        value = value.clone()
+    return value.detach()
+
+
 def _build_messages(
     system_prompt: str,
     user_prompt: str,
@@ -337,6 +344,7 @@ class OnlineBatchEncoder:
         video = video.permute(0, 4, 1, 2, 3).div_(127.5).sub_(1.0)
         with torch.inference_mode(), self._frozen_encode_autocast():
             encoded = self.vae_encoder(video)
+        encoded = _materialize_frozen_tensor(encoded)
         if encoded.ndim != 5:
             raise RuntimeError(
                 "VAE target encoder must return [B,C,F,H,W], "
@@ -390,8 +398,10 @@ class OnlineBatchEncoder:
         pixels = pixels.permute(0, 3, 1, 2).unsqueeze(2).div_(127.5).sub_(1.0)
         with torch.inference_mode(), self._frozen_encode_autocast():
             encoded = self.vae_encoder(pixels)
+        encoded = _materialize_frozen_tensor(encoded)
         encoded = encoded.reshape(batch_size, max_refs, *encoded.shape[1:])
-        encoded *= valid_mask[:, :, None, None, None, None].to(dtype=encoded.dtype)
+        mask = valid_mask[:, :, None, None, None, None].to(dtype=encoded.dtype)
+        encoded = encoded * mask
         return {
             "latents": encoded,
             "ref_valid_mask": valid_mask,
@@ -465,6 +475,9 @@ class OnlineBatchEncoder:
             )
             hidden_states = self._align_hidden_states(outputs.hidden_states, feature_extractor)
             video_features, audio_features = feature_extractor(hidden_states, attention_mask, "right")
+        video_features = _materialize_frozen_tensor(video_features)
+        if audio_features is not None:
+            audio_features = _materialize_frozen_tensor(audio_features)
         conditions = {
             "video_prompt_embeds": video_features,
             "prompt_attention_mask": attention_mask,
@@ -504,12 +517,13 @@ class OnlineBatchEncoder:
                 image_counts=torch.tensor([len(indices)], device=self.device, dtype=torch.long),
                 dtype_diagnostics=self.last_dtype_diagnostics,
             )
-        if visual.tokens.shape[1] != len(indices) * EVIDENCE_TOKENS_PER_FRAME:
+        evidence_tokens = _materialize_frozen_tensor(visual.tokens)
+        if evidence_tokens.shape[1] != len(indices) * EVIDENCE_TOKENS_PER_FRAME:
             raise ValueError(
                 "Gemma native visual evidence shape mismatch: "
-                f"frames={len(indices)}, tokens={visual.tokens.shape[1]}"
+                f"frames={len(indices)}, tokens={evidence_tokens.shape[1]}"
             )
-        evidence = visual.tokens.reshape(1, len(indices), EVIDENCE_TOKENS_PER_FRAME, -1).detach()
+        evidence = evidence_tokens.reshape(1, len(indices), EVIDENCE_TOKENS_PER_FRAME, -1)
         normalized = normalized_anchor_timestamps(
             frame_count=frame_count,
             anchor_count=len(indices),

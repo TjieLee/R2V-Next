@@ -3,7 +3,32 @@ set -euo pipefail
 
 R2V_ROOT="/mnt/workspace/litengjie/jd_ltx_multitask_online_480p121/semantic_flow_v2"
 
-export TMPDIR="$R2V_ROOT/tmp"
+SEMANTIC_FLOW_TMPDIR="${SEMANTIC_FLOW_TMPDIR:-/mnt/workspace/litengjie/t}"
+export TMPDIR="$SEMANTIC_FLOW_TMPDIR"
+
+python3 - "$TMPDIR" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1]).expanduser().resolve(strict=False)
+allowed = Path("/mnt/workspace/litengjie").resolve()
+
+try:
+    path.relative_to(allowed)
+except ValueError as exc:
+    raise SystemExit(
+        f"SEMANTIC_FLOW_TMPDIR must be under {allowed}: {path}"
+    ) from exc
+
+encoded_length = len(os.fsencode(path))
+if encoded_length > 64:
+    raise SystemExit(
+        "SEMANTIC_FLOW_TMPDIR is too long for Python multiprocessing "
+        f"AF_UNIX sockets: path={path}, bytes={encoded_length}, maximum=64"
+    )
+PY
+
 export XDG_CACHE_HOME="$R2V_ROOT/cache/xdg"
 export HF_HOME="$R2V_ROOT/cache/huggingface"
 export TRANSFORMERS_CACHE="$R2V_ROOT/cache/huggingface/transformers"
