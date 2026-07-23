@@ -61,7 +61,11 @@ from ltx_trainer.online_inference.startup_memory import (
     model_parameter_count,
 )
 from ltx_trainer.training_strategies.semantic_flow import SemanticFlowConfig, SemanticFlowStrategy
-from ltx_trainer.trainer import LtxvTrainer, _enforce_semantic_flow_fsdp_runtime_safety
+from ltx_trainer.trainer import (
+    LtxvTrainer,
+    _enforce_semantic_flow_fsdp_runtime_safety,
+    _find_scalar_trainable_parameters,
+)
 
 
 def test_local_queries_and_reconstruction_targets_preserve_spatial_neighborhoods() -> None:
@@ -74,6 +78,56 @@ def test_local_queries_and_reconstruction_targets_preserve_spatial_neighborhoods
     initializer = SemanticQueryInitializer(gemma_dim=4)
     queries = initializer(torch.randn(2, 3, 256, 4), torch.tensor([[0.0, 0.5, 1.0]]).expand(2, -1))
     assert queries.shape == (2, 3, 64, 4)
+
+
+def test_semantic_modules_use_no_scalar_trainable_parameters() -> None:
+    query = SemanticQueryInitializer(gemma_dim=4, position_gate_init=0.25)
+    encoder = SemanticEncoder(gemma_dim=4, semantic_dim=3, hidden_dim=5)
+    reconstruction_decoder = SemanticReconstructionDecoder(semantic_dim=3, gemma_dim=4, hidden_dim=5)
+
+    assert query.position_gate.shape == (1,)
+    assert query.position_gate.ndim == 1
+    assert query.position_gate.numel() == 1
+    assert encoder.global_scale.shape == (1,)
+    assert encoder.global_scale.ndim == 1
+    assert encoder.global_scale.numel() == 1
+    for module in (query, encoder, reconstruction_decoder):
+        for name, parameter in module.named_parameters():
+            if parameter.requires_grad:
+                assert parameter.ndim > 0, (name, tuple(parameter.shape))
+
+
+def test_semantic_single_value_parameters_receive_finite_gradients_and_optimizer_updates() -> None:
+    torch.manual_seed(7)
+    query = SemanticQueryInitializer(gemma_dim=4)
+    encoder = SemanticEncoder(gemma_dim=4, semantic_dim=3, hidden_dim=5)
+    optimizer = torch.optim.SGD(
+        [query.position_gate, encoder.global_scale],
+        lr=0.1,
+    )
+    initial_position_gate = query.position_gate.detach().clone()
+    initial_global_scale = encoder.global_scale.detach().clone()
+
+    evidence = torch.randn(2, 2, EVIDENCE_TOKENS_PER_FRAME, 4)
+    timestamps = torch.tensor([[0.25, 0.75], [0.1, 0.9]])
+    semantic_latents = encoder(query(evidence, timestamps))
+    semantic_latents.square().mean().backward()
+
+    assert query.position_gate.grad is not None
+    assert torch.isfinite(query.position_gate.grad).all()
+    assert torch.count_nonzero(query.position_gate.grad) > 0
+    assert encoder.global_scale.grad is not None
+    assert torch.isfinite(encoder.global_scale.grad).all()
+    optimizer.step()
+    assert not torch.equal(query.position_gate, initial_position_gate)
+    assert not torch.equal(encoder.global_scale, initial_global_scale)
+
+
+def test_single_value_vector_broadcast_matches_legacy_scalar_math() -> None:
+    values = torch.randn(2, 3, 4)
+    old_scalar_value = torch.tensor(0.25)
+    new_vector_value = torch.tensor([0.25])
+    torch.testing.assert_close(old_scalar_value * values, new_vector_value * values)
 
 
 def test_teacher_mask_blocks_prefix_from_gt_and_queries_from_nonlocal_evidence() -> None:
@@ -1228,3 +1282,69 @@ def test_semantic_strategy_load_rejects_missing_or_mismatched_modules() -> None:
         strategy.load_extra_checkpoint_state_dict(mismatched)
 
     strategy.load_extra_checkpoint_state_dict(full_state)
+
+
+@pytest.mark.parametrize("legacy_scalar_shape", [True, False])
+def test_semantic_strategy_loads_legacy_and_new_single_value_parameters(
+    legacy_scalar_shape: bool,
+) -> None:
+    strategy = SemanticFlowStrategy(SemanticFlowConfig())
+    query = SemanticQueryInitializer(4)
+    encoder = SemanticEncoder(4, 3, hidden_dim=5)
+    modules = {
+        "semantic_query": query,
+        "semantic_encoder": encoder,
+        "semantic_reconstruction_decoder": SemanticReconstructionDecoder(3, 4, hidden_dim=5),
+    }
+    strategy.set_trainable_modules(modules)
+    full_state = {
+        f"training_strategy.{name}.{key}": value.detach().clone()
+        for name, module in modules.items()
+        for key, value in module.state_dict().items()
+    }
+    position_gate = torch.tensor(0.25) if legacy_scalar_shape else torch.tensor([0.25])
+    global_scale = torch.tensor(1.5) if legacy_scalar_shape else torch.tensor([1.5])
+    full_state["training_strategy.semantic_query.position_gate"] = position_gate
+    full_state["training_strategy.semantic_encoder.global_scale"] = global_scale
+
+    strategy.load_extra_checkpoint_state_dict(full_state)
+
+    assert query.position_gate.shape == (1,)
+    assert encoder.global_scale.shape == (1,)
+    torch.testing.assert_close(query.position_gate, torch.tensor([0.25]))
+    torch.testing.assert_close(encoder.global_scale, torch.tensor([1.5]))
+
+
+def test_semantic_single_value_checkpoint_migration_keeps_unrelated_shapes_strict() -> None:
+    strategy = SemanticFlowStrategy(SemanticFlowConfig())
+    modules = {
+        "semantic_query": SemanticQueryInitializer(4),
+        "semantic_encoder": SemanticEncoder(4, 3, hidden_dim=5),
+        "semantic_reconstruction_decoder": SemanticReconstructionDecoder(3, 4, hidden_dim=5),
+    }
+    strategy.set_trainable_modules(modules)
+    full_state = {
+        f"training_strategy.{name}.{key}": value.detach().clone()
+        for name, module in modules.items()
+        for key, value in module.state_dict().items()
+    }
+    full_state["training_strategy.semantic_encoder.network.1.weight"] = torch.ones(1)
+
+    with pytest.raises(RuntimeError, match="shape mismatch"):
+        strategy.load_extra_checkpoint_state_dict(full_state)
+
+
+def test_fsdp_scalar_parameter_preflight_reports_all_trainable_scalars() -> None:
+    first = nn.Module()
+    first.register_parameter("scalar", nn.Parameter(torch.tensor(1.0)))
+    first.register_parameter("vector", nn.Parameter(torch.tensor([1.0])))
+    first.register_parameter("frozen_scalar", nn.Parameter(torch.tensor(1.0), requires_grad=False))
+    second = nn.Module()
+    second.register_parameter("another_scalar", nn.Parameter(torch.tensor(2.0)))
+
+    assert _find_scalar_trainable_parameters(
+        [("strategy.first", first), ("strategy.second", second)]
+    ) == [
+        "strategy.first.scalar: shape=()",
+        "strategy.second.another_scalar: shape=()",
+    ]

@@ -31,7 +31,7 @@ class SemanticQueryInitializer(nn.Module):
         self.gemma_dim = int(gemma_dim)
         self.content_norm = nn.RMSNorm(self.gemma_dim, elementwise_affine=True)
         self.query_type_embedding = nn.Parameter(torch.zeros(self.gemma_dim))
-        self.position_gate = nn.Parameter(torch.tensor(float(position_gate_init)))
+        self.position_gate = nn.Parameter(torch.tensor([float(position_gate_init)]))
         self.temporal_mlp = nn.Sequential(
             nn.Linear(1, self.gemma_dim),
             nn.SiLU(),
@@ -101,7 +101,7 @@ class SemanticEncoder(nn.Module):
             nn.Linear(hidden_dim, semantic_dim),
             nn.RMSNorm(semantic_dim, elementwise_affine=True),
         )
-        self.global_scale = nn.Parameter(torch.ones(()))
+        self.global_scale = nn.Parameter(torch.ones(1))
 
     def forward(self, query_hidden: Tensor) -> Tensor:
         return self.global_scale.to(dtype=query_hidden.dtype) * self.network(query_hidden)
