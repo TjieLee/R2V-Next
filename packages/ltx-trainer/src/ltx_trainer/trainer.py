@@ -22,7 +22,7 @@ from peft.utils import ModulesToSaveWrapper
 from pydantic import BaseModel
 from safetensors import safe_open
 from safetensors.torch import load_file, save_file
-from torch import Tensor
+from torch import Tensor, nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import (
     CosineAnnealingLR,
@@ -158,6 +158,19 @@ def _enforce_semantic_flow_fsdp_runtime_safety(config: LtxTrainerConfig, acceler
             "Full-DiT semantic-flow training requires FSDP FULL_STATE_DICT checkpoint collection. "
             f"Configured FSDP state-dict type is {state_dict_type!r}."
         )
+
+
+def _find_scalar_trainable_parameters(
+    models_to_prepare: list[tuple[str, nn.Module]],
+) -> list[str]:
+    scalar_parameters: list[str] = []
+    for model_name, module in models_to_prepare:
+        for parameter_name, parameter in module.named_parameters():
+            if parameter.requires_grad and parameter.ndim == 0:
+                scalar_parameters.append(
+                    f"{model_name}.{parameter_name}: shape={tuple(parameter.shape)}"
+                )
+    return scalar_parameters
 
 
 def normalize_peft_adapter_key(key: str) -> str:
@@ -1442,6 +1455,14 @@ class LtxvTrainer:
 
         if not models_to_prepare:
             raise RuntimeError("No trainable modules were provided to accelerator.prepare()")
+
+        if self._accelerator.distributed_type == DistributedType.FSDP:
+            scalar_parameters = _find_scalar_trainable_parameters(models_to_prepare)
+            if scalar_parameters:
+                raise RuntimeError(
+                    "FSDP does not support scalar trainable parameters: "
+                    + ", ".join(scalar_parameters)
+                )
 
         prepared_models = self._accelerator.prepare(*(module for _, module in models_to_prepare))
         if len(models_to_prepare) == 1:

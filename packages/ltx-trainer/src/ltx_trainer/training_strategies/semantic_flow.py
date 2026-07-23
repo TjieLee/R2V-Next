@@ -48,6 +48,10 @@ REQUIRED_SEMANTIC_CHECKPOINT_MODULES = (
     "semantic_encoder",
     "semantic_reconstruction_decoder",
 )
+SINGLE_VALUE_CHECKPOINT_PARAMETERS = {
+    ("semantic_query", "position_gate"),
+    ("semantic_encoder", "global_scale"),
+}
 
 
 @dataclass(frozen=True)
@@ -233,6 +237,16 @@ class SemanticFlowStrategy(TrainingStrategy):
                 continue
 
             expected_state = modules[name].state_dict()
+            for key, value in module_state.items():
+                expected = expected_state.get(key)
+                if (
+                    (name, key) in SINGLE_VALUE_CHECKPOINT_PARAMETERS
+                    and expected is not None
+                    and value.numel() == 1
+                    and expected.numel() == 1
+                    and tuple(value.shape) != tuple(expected.shape)
+                ):
+                    module_state[key] = value.reshape(expected.shape)
             missing_keys = sorted(set(expected_state) - set(module_state))
             unexpected_keys = sorted(set(module_state) - set(expected_state))
             shape_errors = [
