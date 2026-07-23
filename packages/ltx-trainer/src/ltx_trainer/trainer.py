@@ -1939,6 +1939,15 @@ class LtxvTrainer:
         )
         _enforce_semantic_flow_fsdp_runtime_safety(self._config, self._accelerator)
 
+        logger.info(
+            "Training runtime configuration:\n"
+            f"Sharing strategy: {torch.multiprocessing.get_sharing_strategy()}\n"
+            f"Visible GPU count: {torch.cuda.device_count()}\n"
+            f"World size: {self._accelerator.num_processes}\n"
+            f"Checkpoint interval: {self._config.checkpoints.interval}\n"
+            f"Checkpoint keep_last_n: {self._config.checkpoints.keep_last_n}"
+        )
+
         if self._accelerator.num_processes > 1:
             logger.info(
                 f"{self._accelerator.distributed_type.value} distributed training enabled "

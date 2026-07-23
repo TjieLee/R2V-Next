@@ -59,14 +59,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 DATA_CONFIG="$R2V_ROOT/manifests/multitask_online_480p121_opens2v.yaml"
 TRAIN_CONFIG="$REPO_ROOT/packages/ltx-trainer/configs/semantic_flow_multitask_480p121.yaml"
-ACCELERATE_CONFIG="${ACCELERATE_CONFIG:-$REPO_ROOT/packages/ltx-trainer/configs/accelerate_semantic_flow_fsdp_train_8gpu.yaml}"
+ACCELERATE_CONFIG="${ACCELERATE_CONFIG:-$REPO_ROOT/packages/ltx-trainer/configs/accelerate_semantic_flow_fsdp_train_7gpu.yaml}"
 FSDP_SMOKE_ACCELERATE_CONFIG="${FSDP_SMOKE_ACCELERATE_CONFIG:-$REPO_ROOT/packages/ltx-trainer/configs/accelerate_semantic_flow_fsdp_smoke_2gpu.yaml}"
-SMOKE_ROOT="$R2V_ROOT/smoke"
-INFERENCE_SMOKE_ROOT="/mnt/workspace/litengjie/jd_ltx_multitask_online_480p121/inference/semantic_flow_v2_smoke"
-RUNTIME_AUDIT="$R2V_ROOT/train/runtime_audit.json"
-TRAIN_RUNTIME_AUDIT="$R2V_ROOT/train/runtime_audit_train.json"
-RUNTIME_LOCK="$R2V_ROOT/train/runtime_lock.json"
-SMOKE_SUCCESS_MARKER="$R2V_ROOT/train/semantic_flow_smoke_success.json"
+PRODUCTION_CUDA_VISIBLE_DEVICES="${PRODUCTION_CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6}"
+CHECKPOINT_TEST_CUDA_VISIBLE_DEVICES="${CHECKPOINT_TEST_CUDA_VISIBLE_DEVICES:-7}"
+SMOKE_ROOT="$R2V_ROOT/smoke/7gpu"
+INFERENCE_SMOKE_ROOT="/mnt/workspace/litengjie/jd_ltx_multitask_online_480p121/inference/semantic_flow_v2_smoke_7gpu"
+RUNTIME_AUDIT="$R2V_ROOT/train/runtime_audit_7gpu.json"
+TRAIN_RUNTIME_AUDIT="$R2V_ROOT/train/runtime_audit_train_7gpu.json"
+RUNTIME_LOCK="$R2V_ROOT/train/runtime_lock_7gpu.json"
+SMOKE_SUCCESS_MARKER="$R2V_ROOT/train/semantic_flow_smoke_success_7gpu.json"
 FSDP_SMOKE_ROOT="$SMOKE_ROOT/fsdp_checkpoint"
 FSDP_SMOKE_RESULT="$FSDP_SMOKE_ROOT/result.json"
 ACCELERATE_PREPARE_SMOKE_ROOT="$SMOKE_ROOT/accelerate_prepare"
@@ -187,8 +189,9 @@ if accelerate_config.get("distributed_type") != "FSDP":
     errors.append("Accelerate distributed_type must be FSDP")
 if accelerate_config.get("mixed_precision") != "bf16":
     errors.append("Accelerate mixed_precision must be bf16")
-if int(accelerate_config.get("num_processes", 0)) != 8:
-    errors.append("Real 22B semantic-flow smoke/training requires num_processes=8")
+num_processes = int(accelerate_config.get("num_processes", 0))
+if num_processes <= 0:
+    errors.append("Accelerate num_processes must be a positive integer")
 if fsdp_config.get("fsdp_version") != 1:
     errors.append("Accelerate fsdp_version must be 1")
 if fsdp_config.get("fsdp_sharding_strategy") != "FULL_SHARD":
@@ -206,11 +209,10 @@ if fsdp_config.get("fsdp_sync_module_states") is not True:
 if fsdp_config.get("fsdp_cpu_ram_efficient_loading") is not False:
     errors.append("Accelerate fsdp_cpu_ram_efficient_loading must be false")
 
-num_processes = int(accelerate_config.get("num_processes", 0))
 gpu_hardware = collect_visible_cuda_hardware()
-if int(gpu_hardware["gpu_count"]) < num_processes:
+if int(gpu_hardware["gpu_count"]) != num_processes:
     errors.append(
-        f"Visible GPU count {gpu_hardware['gpu_count']} is smaller than accelerate num_processes {num_processes}"
+        f"Visible GPU count {gpu_hardware['gpu_count']} does not match accelerate num_processes {num_processes}"
     )
 if mode == "train":
     try:
@@ -238,6 +240,7 @@ report = {
     "ready": not errors,
     "accelerate_config": str(accelerate_config_path),
     "training_config": str(train_config_path),
+    "accelerate_num_processes": num_processes,
     "gpu_hardware": gpu_hardware,
     "startup_memory": startup_memory,
     "mode": mode,
@@ -352,7 +355,8 @@ case "${1:-}" in
     verify_manifest_gate
     build_online_manifest "$DATA_CONFIG" "$MANIFEST_OUTPUT"
     ;;
-  smoke)
+  smoke|smoke-7gpu)
+    export CUDA_VISIBLE_DEVICES="$PRODUCTION_CUDA_VISIBLE_DEVICES"
     semantic_flow_train_preflight smoke
     python3 "$REPO_ROOT/packages/ltx-trainer/scripts/semantic_flow_runtime_audit.py" \
       --config "$TRAIN_CONFIG" \
@@ -383,7 +387,8 @@ case "${1:-}" in
       --tasks i2i,r2v \
       --samples-per-task 1 \
       --overwrite
-    python3 "$REPO_ROOT/packages/ltx-trainer/scripts/infer_multitask_online_train_samples.py" \
+    CUDA_VISIBLE_DEVICES="$CHECKPOINT_TEST_CUDA_VISIBLE_DEVICES" \
+      python3 "$REPO_ROOT/packages/ltx-trainer/scripts/infer_multitask_online_train_samples.py" \
       --config "$TRAIN_CONFIG" \
       --samples "$INFERENCE_SMOKE_ROOT/selection/selected_samples.jsonl" \
       --output-root "$INFERENCE_SMOKE_ROOT/run/dry" \
@@ -392,7 +397,8 @@ case "${1:-}" in
       --limit 2 \
       --dry-run \
       --overwrite
-    python3 "$REPO_ROOT/packages/ltx-trainer/scripts/infer_multitask_online_train_samples.py" \
+    CUDA_VISIBLE_DEVICES="$CHECKPOINT_TEST_CUDA_VISIBLE_DEVICES" \
+      python3 "$REPO_ROOT/packages/ltx-trainer/scripts/infer_multitask_online_train_samples.py" \
       --config "$TRAIN_CONFIG" \
       --samples "$INFERENCE_SMOKE_ROOT/selection/selected_samples.jsonl" \
       --output-root "$INFERENCE_SMOKE_ROOT/run/i2i" \
@@ -402,6 +408,7 @@ case "${1:-}" in
       --num-inference-steps 2 \
       --no-dry-run \
       --overwrite
+    export CUDA_VISIBLE_DEVICES="$PRODUCTION_CUDA_VISIBLE_DEVICES"
     python3 "$REPO_ROOT/packages/ltx-trainer/scripts/semantic_flow_runtime_audit.py" \
       --config "$TRAIN_CONFIG" \
       --accelerate-config "$ACCELERATE_CONFIG" \
@@ -425,6 +432,7 @@ case "${1:-}" in
       --inference-summary "$INFERENCE_SMOKE_ROOT/run/i2i/run_summary.json"
     ;;
   train)
+    export CUDA_VISIBLE_DEVICES="$PRODUCTION_CUDA_VISIBLE_DEVICES"
     semantic_flow_train_preflight train
     SKIP_SMOKE_GUARD=false
     for option in "${@:2}"; do
@@ -463,8 +471,8 @@ case "${1:-}" in
       "$TRAIN_CONFIG"
     ;;
   *)
-    printf '%s\n' "Usage: $0 {build-manifest|smoke|train [--skip-smoke-guard]}"
-    printf '%s\n' "Required distributed mode: FSDP FULL_SHARD with exactly 8 processes."
+    printf '%s\n' "Usage: $0 {build-manifest|smoke|smoke-7gpu|train [--skip-smoke-guard]}"
+    printf '%s\n' "Distributed process count is read from the selected Accelerate config."
     exit 2
     ;;
 esac

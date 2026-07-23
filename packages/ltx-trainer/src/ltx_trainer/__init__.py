@@ -4,7 +4,10 @@ import sys
 from logging import getLogger
 from pathlib import Path
 
+import torch
 from rich.logging import RichHandler
+
+torch.multiprocessing.set_sharing_strategy("file_system")
 
 # Get the process rank
 IS_MULTI_GPU = os.environ.get("LOCAL_RANK") is not None

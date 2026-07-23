@@ -524,6 +524,8 @@ def test_production_semantic_flow_config_uses_opens2v_only_litengjie_paths(tmp_p
     assert parsed.data.manifest_path == str(manifest_path.resolve())
     assert parsed.data.online_encoding is not None
     assert parsed.data.online_encoding.runtime_reject_log_dir.startswith("/mnt/workspace/litengjie/")
+    assert parsed.checkpoints.interval == 1000
+    assert parsed.checkpoints.keep_last_n == 3
     assert parsed.checkpoints.save_training_state == "minimal"
     assert parsed.text_encoder_lora.enabled is False
 
@@ -613,6 +615,7 @@ def test_semantic_flow_full_training_requires_fsdp_full_shard() -> None:
     ("filename", "expected_processes"),
     [
         ("accelerate_semantic_flow_fsdp_smoke_2gpu.yaml", 2),
+        ("accelerate_semantic_flow_fsdp_train_7gpu.yaml", 7),
         ("accelerate_semantic_flow_fsdp_train_8gpu.yaml", 8),
     ],
 )
@@ -987,8 +990,62 @@ def test_production_train_cannot_refresh_runtime_lock() -> None:
     ).read_text(encoding="utf-8")
     train_block = script.split("  train)", maxsplit=1)[1]
     assert "--refresh-runtime-lock)" not in train_block
-    assert "Usage: $0 {build-manifest|smoke|train [--skip-smoke-guard]}" in script
+    assert "Usage: $0 {build-manifest|smoke|smoke-7gpu|train [--skip-smoke-guard]}" in script
     assert "WARNING: --skip-smoke-guard bypasses" in train_block
+
+
+def test_semantic_flow_launcher_uses_seven_gpu_production_profile() -> None:
+    script = (
+        Path(__file__).resolve().parents[1] / "scripts" / "run_semantic_flow_opens2v.sh"
+    ).read_text(encoding="utf-8")
+
+    assert "accelerate_semantic_flow_fsdp_train_7gpu.yaml" in script
+    assert 'PRODUCTION_CUDA_VISIBLE_DEVICES="${PRODUCTION_CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6}"' in script
+    assert 'CHECKPOINT_TEST_CUDA_VISIBLE_DEVICES="${CHECKPOINT_TEST_CUDA_VISIBLE_DEVICES:-7}"' in script
+    assert "  smoke|smoke-7gpu)" in script
+    assert 'export CUDA_VISIBLE_DEVICES="$PRODUCTION_CUDA_VISIBLE_DEVICES"' in script
+    assert 'CUDA_VISIBLE_DEVICES="$CHECKPOINT_TEST_CUDA_VISIBLE_DEVICES"' in script
+    assert "runtime_lock_7gpu.json" in script
+    assert "runtime_audit_7gpu.json" in script
+    assert "semantic_flow_smoke_success_7gpu.json" in script
+    assert "requires num_processes=8" not in script
+    assert "does not match accelerate num_processes" in script
+    assert '"accelerate_num_processes": num_processes' in script
+    distributed_smoke = (
+        Path(__file__).resolve().parents[1] / "scripts" / "check_multitask_online_distributed.py"
+    ).read_text(encoding="utf-8")
+    assert "world_size != 8" not in distributed_smoke
+    assert "world_size < 2" in distributed_smoke
+    smoke_matrix = (
+        Path(__file__).resolve().parents[1] / "scripts" / "run_multitask_online_distributed_smoke_matrix.py"
+    ).read_text(encoding="utf-8")
+    assert "accelerate_semantic_flow_fsdp_train_7gpu.yaml" in smoke_matrix
+    assert 'typer.Option("0,1,2,3,4,5,6", "--gpu-devices")' in smoke_matrix
+    assert "configured_processes = int(accelerate_payload.get" in smoke_matrix
+    assert "does not match selected Accelerate config" in smoke_matrix
+
+
+def test_training_runtime_sets_and_logs_process_safety_settings() -> None:
+    package_init = (
+        Path(__file__).resolve().parents[1] / "src" / "ltx_trainer" / "__init__.py"
+    ).read_text(encoding="utf-8")
+    trainer_source = (
+        Path(__file__).resolve().parents[1] / "src" / "ltx_trainer" / "trainer.py"
+    ).read_text(encoding="utf-8")
+
+    assert 'torch.multiprocessing.set_sharing_strategy("file_system")' in package_init
+    assert package_init.index('torch.multiprocessing.set_sharing_strategy("file_system")') < package_init.index(
+        "# Get the process rank"
+    )
+    assert torch.multiprocessing.get_sharing_strategy() == "file_system"
+    for field in (
+        "Sharing strategy:",
+        "Visible GPU count:",
+        "World size:",
+        "Checkpoint interval:",
+        "Checkpoint keep_last_n:",
+    ):
+        assert field in trainer_source
 
 
 def _semantic_flow_tmpdir_script_and_preflight() -> tuple[str, str]:

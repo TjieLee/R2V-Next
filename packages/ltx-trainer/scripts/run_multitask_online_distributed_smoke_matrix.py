@@ -7,6 +7,7 @@ import subprocess
 from pathlib import Path
 
 import typer
+import yaml
 
 from ltx_trainer.online_data.constants import IMAGE_TASK, VIDEO_TASK
 from ltx_trainer.online_data.path_safety import assert_write_path_allowed
@@ -33,10 +34,10 @@ def main(
         "--output-root",
     ),
     tasks: str = typer.Option("i2i,r2v", "--tasks"),
-    num_processes: int = typer.Option(8, "--num-processes", min=4),
-    gpu_devices: str = typer.Option("0,1,2,3,4,5,6,7", "--gpu-devices"),
+    num_processes: int | None = typer.Option(None, "--num-processes"),
+    gpu_devices: str = typer.Option("0,1,2,3,4,5,6", "--gpu-devices"),
     accelerate_config: str = typer.Option(
-        "configs/accelerate_semantic_flow_fsdp_train_8gpu.yaml",
+        "configs/accelerate_semantic_flow_fsdp_train_7gpu.yaml",
         "--accelerate-config",
     ),
     accelerate_executable: str = typer.Option("accelerate", "--accelerate-executable"),
@@ -44,6 +45,20 @@ def main(
     root = assert_write_path_allowed(output_root)
     root.mkdir(parents=True, exist_ok=True)
     worker_script = Path(__file__).with_name("check_multitask_online_distributed.py")
+    accelerate_payload = yaml.safe_load(Path(accelerate_config).expanduser().resolve().read_text(encoding="utf-8"))
+    configured_processes = int(accelerate_payload.get("num_processes", 0))
+    if configured_processes < 2:
+        raise typer.BadParameter("Selected Accelerate config must use at least two processes")
+    if num_processes is not None and num_processes != configured_processes:
+        raise typer.BadParameter(
+            f"--num-processes {num_processes} does not match selected Accelerate config {configured_processes}"
+        )
+    visible_devices = [device.strip() for device in gpu_devices.split(",") if device.strip()]
+    if len(visible_devices) != configured_processes:
+        raise typer.BadParameter(
+            f"--gpu-devices exposes {len(visible_devices)} devices but selected Accelerate config "
+            f"uses {configured_processes} processes"
+        )
     environment = os.environ.copy()
     environment["CUDA_VISIBLE_DEVICES"] = gpu_devices
     environment["TOKENIZERS_PARALLELISM"] = "false"
@@ -56,7 +71,7 @@ def main(
             "--config_file",
             accelerate_config,
             "--num_processes",
-            str(num_processes),
+            str(configured_processes),
             str(worker_script),
             "--config",
             config,

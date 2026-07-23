@@ -83,8 +83,8 @@ validation:
   generate_video: true
 
 checkpoints:
-  interval: 2500
-  keep_last_n: 2
+  interval: 1000
+  keep_last_n: 3
   precision: "bfloat16"
   no_resume: false
   save_training_state: "minimal"
