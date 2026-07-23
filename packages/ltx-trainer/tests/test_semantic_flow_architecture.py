@@ -1075,7 +1075,77 @@ def test_accelerate_multimodel_smoke_matches_trainer_prepare_order() -> None:
     assert "class BasicAVTransformerBlock" in script
     assert "accelerator.get_state_dict(module)" in script
     assert "if accelerator.is_main_process and not state:" in script
+    assert "FSDP.summon_full_params(" in script
+    assert "with_grads=True" in script
+    assert '"gradient_reports": gradient_reports' in script
+    assert '"optimizer_update_checks": optimizer_update_checks' in script
     assert '"accelerator_multimodel_prepare_passed": True' in script
+
+
+def _accelerate_prepare_gradient_report(module: nn.Module) -> dict[str, Any]:
+    script = Path(__file__).resolve().parents[1] / "scripts" / "smoke_semantic_flow_accelerate_prepare.py"
+    gradient_report = runpy.run_path(str(script))["_module_gradient_report"]
+    return gradient_report(module)
+
+
+def test_accelerate_prepare_gradient_report_accepts_finite_gradients() -> None:
+    module = nn.Linear(4, 3)
+    module(torch.ones(2, 4)).sum().backward()
+
+    report = _accelerate_prepare_gradient_report(module)
+
+    assert report == {
+        "passed": True,
+        "trainable_parameter_count": 2,
+        "gradient_parameter_count": 2,
+        "missing_gradient_parameters": [],
+        "nonfinite_gradient_parameters": [],
+    }
+
+
+def test_accelerate_prepare_gradient_report_names_missing_gradient() -> None:
+    module = nn.Linear(4, 3)
+    module(torch.ones(2, 4)).sum().backward()
+    module.bias.grad = None
+
+    report = _accelerate_prepare_gradient_report(module)
+
+    assert report["passed"] is False
+    assert report["trainable_parameter_count"] == 2
+    assert report["gradient_parameter_count"] == 1
+    assert report["missing_gradient_parameters"] == ["bias"]
+    assert report["nonfinite_gradient_parameters"] == []
+
+
+@pytest.mark.parametrize("nonfinite_value", [float("nan"), float("inf")])
+def test_accelerate_prepare_gradient_report_names_nonfinite_gradient(
+    nonfinite_value: float,
+) -> None:
+    module = nn.Linear(4, 3)
+    module(torch.ones(2, 4)).sum().backward()
+    module.weight.grad[0, 0] = nonfinite_value
+
+    report = _accelerate_prepare_gradient_report(module)
+
+    assert report["passed"] is False
+    assert report["gradient_parameter_count"] == 2
+    assert report["missing_gradient_parameters"] == []
+    assert report["nonfinite_gradient_parameters"] == ["weight"]
+
+
+def test_accelerate_prepare_gradient_report_rejects_no_trainable_parameters() -> None:
+    module = nn.Linear(4, 3)
+    module.requires_grad_(False)
+
+    report = _accelerate_prepare_gradient_report(module)
+
+    assert report == {
+        "passed": False,
+        "trainable_parameter_count": 0,
+        "gradient_parameter_count": 0,
+        "missing_gradient_parameters": [],
+        "nonfinite_gradient_parameters": [],
+    }
 
 
 def test_runtime_lock_validates_selected_gpu_hardware_and_allows_extras() -> None:
