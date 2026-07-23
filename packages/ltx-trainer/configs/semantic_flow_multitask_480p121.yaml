@@ -19,12 +19,14 @@ training_strategy:
   vlm_prefix_max_length: 2560
   vlm_teacher_max_length: 6656
   semantic_hidden_dim: 512
+  semantic_alignment_hidden_dim: 1024
   semantic_position_gate_init: 0.0
   semantic_maximum_drop_rate: 0.25
   semantic_minimum_tokens_per_frame: 48
   video_flow_weight: 1.0
   semantic_flow_weight: 1.0
   semantic_reconstruction_weight: 1.0
+  semantic_alignment_weight: 1.0
   condition_full_p: 0.70
   condition_drop_text_p: 0.10
   condition_drop_reference_all_p: 0.15

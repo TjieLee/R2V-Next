@@ -9,6 +9,7 @@ from ltx_core.multicond.gemma3_attention import (
 from ltx_core.multicond.semantic_tokens import (
     EVIDENCE_TOKENS_PER_FRAME,
     SEMANTIC_TOKENS_PER_FRAME,
+    SemanticAlignmentHead,
     SemanticEncoder,
     SemanticKeepMaskSample,
     SemanticQueryInitializer,
@@ -19,6 +20,7 @@ from ltx_core.multicond.semantic_tokens import (
     round_up_prefix_length,
     sample_semantic_keep_mask,
     sample_semantic_keep_mask_with_stats,
+    semantic_alignment_loss,
     semantic_reconstruction_loss,
 )
 from ltx_core.multicond.visual_tokens import (
@@ -30,8 +32,9 @@ from ltx_core.multicond.visual_tokens import (
 
 __all__ = [
     "EVIDENCE_TOKENS_PER_FRAME",
-    "Gemma3AttentionMasks",
     "SEMANTIC_TOKENS_PER_FRAME",
+    "Gemma3AttentionMasks",
+    "SemanticAlignmentHead",
     "SemanticEncoder",
     "SemanticKeepMaskSample",
     "SemanticQueryInitializer",
@@ -49,5 +52,6 @@ __all__ = [
     "sample_semantic_keep_mask",
     "sample_semantic_keep_mask_with_stats",
     "scatter_visual_tokens_into_embeddings",
+    "semantic_alignment_loss",
     "semantic_reconstruction_loss",
 ]

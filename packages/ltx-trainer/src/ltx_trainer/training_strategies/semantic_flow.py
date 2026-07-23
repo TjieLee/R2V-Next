@@ -11,18 +11,20 @@ import torch.utils.checkpoint
 from pydantic import Field, model_validator
 from torch import Tensor, nn
 
-from ltx_core.multicond.gemma3_attention import build_gemma3_attention_masks, resolve_gemma3_sliding_window
 from ltx_core.model.transformer.modality import Modality
+from ltx_core.multicond.gemma3_attention import build_gemma3_attention_masks, resolve_gemma3_sliding_window
 from ltx_core.multicond.semantic_tokens import (
     EVIDENCE_TOKENS_PER_FRAME,
     SEMANTIC_GRID_SIZE,
     SEMANTIC_TOKENS_PER_FRAME,
+    SemanticAlignmentHead,
     SemanticEncoder,
     SemanticQueryInitializer,
     SemanticReconstructionDecoder,
     build_semantic_teacher_attention_mask,
     gather_local_evidence,
     sample_semantic_keep_mask_with_stats,
+    semantic_alignment_loss,
     semantic_reconstruction_loss,
 )
 from ltx_core.types import VideoLatentShape
@@ -47,10 +49,10 @@ REQUIRED_SEMANTIC_CHECKPOINT_MODULES = (
     "semantic_query",
     "semantic_encoder",
     "semantic_reconstruction_decoder",
+    "semantic_alignment_head",
 )
 SINGLE_VALUE_CHECKPOINT_PARAMETERS = {
     ("semantic_query", "position_gate"),
-    ("semantic_encoder", "global_scale"),
 }
 
 
@@ -81,6 +83,7 @@ class SemanticFlowConfig(TrainingStrategyConfigBase):
     vlm_teacher_max_length: int = Field(default=6656, ge=320)
 
     semantic_hidden_dim: int = Field(default=512, ge=1)
+    semantic_alignment_hidden_dim: int = Field(default=1024, ge=1)
     semantic_position_gate_init: float = Field(default=0.0, ge=0.0, le=0.01)
     semantic_maximum_drop_rate: float = Field(default=0.25, ge=0.0, le=1.0)
     semantic_minimum_tokens_per_frame: int = Field(default=48, ge=1, le=SEMANTIC_TOKENS_PER_FRAME)
@@ -88,6 +91,7 @@ class SemanticFlowConfig(TrainingStrategyConfigBase):
     video_flow_weight: float = Field(default=1.0, ge=0.0)
     semantic_flow_weight: float = Field(default=1.0, ge=0.0)
     semantic_reconstruction_weight: float = Field(default=1.0, ge=0.0)
+    semantic_alignment_weight: float = Field(default=1.0, ge=0.0)
 
     condition_full_p: float = Field(default=0.70, ge=0.0)
     condition_drop_text_p: float = Field(default=0.10, ge=0.0)
@@ -127,10 +131,12 @@ class SemanticFlowStrategy(TrainingStrategy):
         self._query_initializer: SemanticQueryInitializer | None = None
         self._semantic_encoder: SemanticEncoder | None = None
         self._reconstruction_decoder: SemanticReconstructionDecoder | None = None
+        self._semantic_alignment_head: SemanticAlignmentHead | None = None
         self._semantic_dim: int | None = None
         self._gemma_dim: int | None = None
         self._last_training_metrics: dict[str, Tensor] = {}
         self._geometry_logged_tasks: set[str] = set()
+        self.checkpoint_loaded_as_warm_start = False
         self.teacher_checkpointed_layer_count = 0
         self.teacher_checkpoint_forward_calls = 0
 
@@ -183,6 +189,11 @@ class SemanticFlowStrategy(TrainingStrategy):
             self._gemma_dim,
             hidden_dim=self.config.semantic_hidden_dim,
         ).to(device=device, dtype=dtype)
+        self._semantic_alignment_head = SemanticAlignmentHead(
+            self._semantic_dim,
+            self._gemma_dim,
+            hidden_dim=self.config.semantic_alignment_hidden_dim,
+        ).to(device=device, dtype=dtype)
 
         enable_semantic_flow = getattr(transformer, "enable_semantic_flow_conditioning", None)
         if not callable(enable_semantic_flow):
@@ -199,6 +210,7 @@ class SemanticFlowStrategy(TrainingStrategy):
             "semantic_query": self._query_initializer,
             "semantic_encoder": self._semantic_encoder,
             "semantic_reconstruction_decoder": self._reconstruction_decoder,
+            "semantic_alignment_head": self._semantic_alignment_head,
         }
         return {name: module for name, module in modules.items() if module is not None}
 
@@ -209,13 +221,37 @@ class SemanticFlowStrategy(TrainingStrategy):
             self._semantic_encoder = modules["semantic_encoder"]  # type: ignore[assignment]
         if "semantic_reconstruction_decoder" in modules:
             self._reconstruction_decoder = modules["semantic_reconstruction_decoder"]  # type: ignore[assignment]
+        if "semantic_alignment_head" in modules:
+            self._semantic_alignment_head = modules["semantic_alignment_head"]  # type: ignore[assignment]
 
-    def load_extra_checkpoint_state_dict(self, state_dict: dict[str, Tensor]) -> None:
-        """Load semantic-flow adapters only from a complete, shape-compatible checkpoint."""
+    def load_extra_checkpoint_state_dict(
+        self,
+        state_dict: dict[str, Tensor],
+        *,
+        checkpoint_metadata: dict[str, str] | None = None,
+    ) -> None:
+        """Strictly load v2 modules or explicitly warm-migrate a v1 checkpoint."""
         modules = self.get_trainable_modules()
+        architecture = (checkpoint_metadata or {}).get("architecture")
+        if architecture is None:
+            has_alignment = any(
+                key.startswith("training_strategy.semantic_alignment_head.")
+                for key in state_dict
+            )
+            has_legacy_scale = "training_strategy.semantic_encoder.global_scale" in state_dict
+            architecture = "semantic_flow_v1" if has_legacy_scale and not has_alignment else "semantic_flow_v2"
+        if architecture not in {"semantic_flow_v1", "semantic_flow_v2"}:
+            raise RuntimeError(f"Unsupported semantic-flow checkpoint architecture: {architecture!r}")
+        self.checkpoint_loaded_as_warm_start = architecture == "semantic_flow_v1"
+
+        required_modules = (
+            REQUIRED_SEMANTIC_CHECKPOINT_MODULES[:-1]
+            if architecture == "semantic_flow_v1"
+            else REQUIRED_SEMANTIC_CHECKPOINT_MODULES
+        )
         missing_modules = [
             name
-            for name in REQUIRED_SEMANTIC_CHECKPOINT_MODULES
+            for name in required_modules
             if name not in modules
         ]
         if missing_modules:
@@ -225,7 +261,7 @@ class SemanticFlowStrategy(TrainingStrategy):
 
         errors: list[str] = []
         module_states: dict[str, dict[str, Tensor]] = {}
-        for name in REQUIRED_SEMANTIC_CHECKPOINT_MODULES:
+        for name in required_modules:
             prefix = f"training_strategy.{name}."
             module_state = {
                 key.removeprefix(prefix): value
@@ -236,6 +272,8 @@ class SemanticFlowStrategy(TrainingStrategy):
                 errors.append(f"{name}: missing prefix {prefix}")
                 continue
 
+            if architecture == "semantic_flow_v1" and name == "semantic_encoder":
+                module_state.pop("global_scale", None)
             expected_state = modules[name].state_dict()
             for key, value in module_state.items():
                 expected = expected_state.get(key)
@@ -267,10 +305,19 @@ class SemanticFlowStrategy(TrainingStrategy):
 
         for name, module_state in module_states.items():
             modules[name].load_state_dict(module_state, strict=True)
+        if architecture == "semantic_flow_v1":
+            logger.warning(
+                "Warm-migrating semantic_flow_v1 checkpoint to semantic_flow_v2: "
+                "discarded semantic_encoder.global_scale, left semantic_alignment_head "
+                "at its new initialization, and changed the representation gradient contract. "
+                "Use a new output directory; this is not an exact resume."
+            )
 
     def build_semantic_teacher_outputs(self, teacher_inputs: dict[str, Tensor]) -> dict[str, Tensor]:
         """Run frozen Gemma with the prefix plus native evidence/local-query suffix."""
-        query_initializer, semantic_encoder, reconstruction_decoder = self._require_semantic_modules()
+        query_initializer, semantic_encoder, reconstruction_decoder, alignment_head = (
+            self._require_semantic_modules()
+        )
         prefix_embeddings = teacher_inputs["prefix_inputs_embeds"].detach()
         prefix_attention_mask = teacher_inputs["prefix_attention_mask"].to(dtype=torch.bool)
         prefix_image_token_mask = teacher_inputs.get(
@@ -350,6 +397,8 @@ class SemanticFlowStrategy(TrainingStrategy):
         semantic_clean = semantic_encoder(query_hidden)
         reconstruction_prediction = reconstruction_decoder(semantic_clean)
         reconstruction_target = gather_local_evidence(evidence_hidden).detach()
+        alignment_prediction = alignment_head(semantic_clean)
+        alignment_target = reconstruction_target.mean(dim=-2).detach()
         return {
             "prefix_hidden": final_hidden[:, :prefix_length],
             "query_hidden": query_hidden,
@@ -357,6 +406,8 @@ class SemanticFlowStrategy(TrainingStrategy):
             "semantic_clean": semantic_clean,
             "reconstruction_prediction": reconstruction_prediction,
             "reconstruction_target": reconstruction_target,
+            "alignment_prediction": alignment_prediction,
+            "alignment_target": alignment_target,
         }
 
     def prepare_training_inputs(
@@ -368,6 +419,8 @@ class SemanticFlowStrategy(TrainingStrategy):
         semantic_clean = teacher["semantic_clean"]
         reconstruction_prediction = teacher["reconstruction_prediction"]
         reconstruction_target = teacher["reconstruction_target"]
+        alignment_prediction = teacher["alignment_prediction"]
+        alignment_target = teacher["alignment_target"]
 
         latents = batch["latents"]
         target_latents = latents["latents"]
@@ -412,17 +465,18 @@ class SemanticFlowStrategy(TrainingStrategy):
                 f"metadata_width={latents['width'].tolist()}"
             )
 
+        semantic_for_dit = semantic_clean.detach()
         keep_sample = sample_semantic_keep_mask_with_stats(
-            semantic_clean,
+            semantic_for_dit,
             maximum_drop_rate=self.config.semantic_maximum_drop_rate,
             minimum_tokens_per_frame=self.config.semantic_minimum_tokens_per_frame,
         )
         keep_mask = keep_sample.keep_mask
-        semantic_noise = torch.randn_like(semantic_clean)
-        semantic_noisy_all = (1.0 - sigma[:, None, None, None]) * semantic_clean + (
+        semantic_noise = torch.randn_like(semantic_for_dit)
+        semantic_noisy_all = (1.0 - sigma[:, None, None, None]) * semantic_for_dit + (
             sigma[:, None, None, None] * semantic_noise
         )
-        semantic_flow_target_all = semantic_noise - semantic_clean.detach()
+        semantic_flow_target_all = semantic_noise - semantic_for_dit
         normalized_timestamps = batch["semantic_teacher_inputs"]["normalized_timestamps"]
         semantic_positions, semantic_bounds = self._semantic_positions(
             target_positions,
@@ -438,7 +492,9 @@ class SemanticFlowStrategy(TrainingStrategy):
             )
         )
         prefix_attention_mask = batch["semantic_teacher_inputs"]["prefix_attention_mask"].to(device=device)
-        query_initializer, semantic_encoder, _reconstruction_decoder = self._require_semantic_modules()
+        query_initializer, _semantic_encoder, _reconstruction_decoder, _alignment_head = (
+            self._require_semantic_modules()
+        )
         semantic_token_count_before_dropout = torch.full(
             (batch_size,),
             semantic_clean.shape[1] * semantic_clean.shape[2],
@@ -466,7 +522,6 @@ class SemanticFlowStrategy(TrainingStrategy):
             ),
             "train/semantic_latent_rms": semantic_clean.detach().float().pow(2).mean().sqrt(),
             "train/query_position_gate": self._module_scalar(query_initializer, "position_gate", device),
-            "train/semantic_global_scale": self._module_scalar(semantic_encoder, "global_scale", device),
         }
 
         ref_tokens, ref_positions, ref_valid, ref_entities = self._reference_sequence(
@@ -589,6 +644,8 @@ class SemanticFlowStrategy(TrainingStrategy):
             semantic_loss_mask=semantic_valid,
             semantic_reconstruction_prediction=reconstruction_prediction,
             semantic_reconstruction_target=reconstruction_target,
+            semantic_alignment_prediction=alignment_prediction,
+            semantic_alignment_target=alignment_target,
             sequence_offsets={
                 "reference_end": ref_length,
                 "semantic_end": ref_length + semantic_length,
@@ -620,16 +677,22 @@ class SemanticFlowStrategy(TrainingStrategy):
             inputs.semantic_reconstruction_prediction,
             inputs.semantic_reconstruction_target,
         )
+        alignment_loss = semantic_alignment_loss(
+            inputs.semantic_alignment_prediction,
+            inputs.semantic_alignment_target,
+        )
         total = (
             self.config.video_flow_weight * video_loss
             + self.config.semantic_flow_weight * semantic_loss
             + self.config.semantic_reconstruction_weight * reconstruction_loss
+            + self.config.semantic_alignment_weight * alignment_loss
         )
         self._last_training_metrics = {
             **self._last_training_metrics,
             "train/loss_video_flow": video_loss.detach().mean(),
             "train/loss_semantic_flow": semantic_loss.detach().mean(),
             "train/loss_semantic_reconstruction": reconstruction_loss.detach().mean(),
+            "train/loss_semantic_alignment": alignment_loss.detach().mean(),
         }
         return total
 
@@ -827,9 +890,13 @@ class SemanticFlowStrategy(TrainingStrategy):
     def get_checkpoint_metadata(self) -> dict[str, Any]:
         appended = self.config.reference_rope_mode == "appended_time_shifted_width"
         return {
-            "architecture": "semantic_flow_v1",
+            "architecture": "semantic_flow_v2",
             "semantic_dim": self._semantic_dim,
             "gemma_dim": self._gemma_dim,
+            "semantic_encoder_dit_gradient": "detached",
+            "semantic_alignment_target": "pooled_contextual_local_2x2",
+            "semantic_alignment_head": "tokenwise_mlp",
+            "semantic_velocity_head_init": "zero",
             "token_sequence": ["reference", "semantic", "target"],
             "reference_rope_layout_version": 2,
             "reference_rope_mode": self.config.reference_rope_mode,
@@ -840,10 +907,25 @@ class SemanticFlowStrategy(TrainingStrategy):
 
     def _require_semantic_modules(
         self,
-    ) -> tuple[SemanticQueryInitializer, SemanticEncoder, SemanticReconstructionDecoder]:
-        if self._query_initializer is None or self._semantic_encoder is None or self._reconstruction_decoder is None:
+    ) -> tuple[
+        SemanticQueryInitializer,
+        SemanticEncoder,
+        SemanticReconstructionDecoder,
+        SemanticAlignmentHead,
+    ]:
+        if (
+            self._query_initializer is None
+            or self._semantic_encoder is None
+            or self._reconstruction_decoder is None
+            or self._semantic_alignment_head is None
+        ):
             raise RuntimeError("semantic modules are not initialized; attach_models must run first")
-        return self._query_initializer, self._semantic_encoder, self._reconstruction_decoder
+        return (
+            self._query_initializer,
+            self._semantic_encoder,
+            self._reconstruction_decoder,
+            self._semantic_alignment_head,
+        )
 
     def _get_language_model(self) -> nn.Module:
         if self._text_encoder is None:

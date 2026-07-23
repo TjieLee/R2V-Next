@@ -128,9 +128,16 @@ def run(output_dir: Path) -> dict[str, Any] | None:
     semantic_query = nn.Linear(hidden_dim, hidden_dim)
     semantic_encoder = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.SiLU())
     semantic_reconstruction_decoder = nn.Linear(hidden_dim, hidden_dim)
+    semantic_alignment_head = nn.Linear(hidden_dim, hidden_dim)
     original_parameters = [
         parameter
-        for module in (transformer, semantic_query, semantic_encoder, semantic_reconstruction_decoder)
+        for module in (
+            transformer,
+            semantic_query,
+            semantic_encoder,
+            semantic_reconstruction_decoder,
+            semantic_alignment_head,
+        )
         for parameter in module.parameters()
     ]
 
@@ -139,8 +146,9 @@ def run(output_dir: Path) -> dict[str, Any] | None:
         semantic_query,
         semantic_encoder,
         semantic_reconstruction_decoder,
+        semantic_alignment_head,
     )
-    transformer, semantic_query, semantic_encoder, semantic_reconstruction_decoder = prepared
+    transformer, semantic_query, semantic_encoder, semantic_reconstruction_decoder, semantic_alignment_head = prepared
     optimizer = torch.optim.AdamW(original_parameters, lr=1.0e-3)
     optimizer = accelerator.prepare(optimizer)
 
@@ -149,7 +157,8 @@ def run(output_dir: Path) -> dict[str, Any] | None:
     hidden = hidden + semantic_query(hidden)
     semantic = semantic_encoder(hidden)
     reconstruction = semantic_reconstruction_decoder(semantic)
-    loss = reconstruction.float().square().mean()
+    alignment = semantic_alignment_head(semantic)
+    loss = reconstruction.float().square().mean() + alignment.float().square().mean()
     accelerator.backward(loss)
 
     modules = {
@@ -157,6 +166,7 @@ def run(output_dir: Path) -> dict[str, Any] | None:
         "semantic_query": semantic_query,
         "semantic_encoder": semantic_encoder,
         "semantic_reconstruction_decoder": semantic_reconstruction_decoder,
+        "semantic_alignment_head": semantic_alignment_head,
     }
     gradient_reports = {name: _module_gradient_report(module) for name, module in modules.items()}
     gradient_checks = {name: bool(report["passed"]) for name, report in gradient_reports.items()}

@@ -101,10 +101,25 @@ class SemanticEncoder(nn.Module):
             nn.Linear(hidden_dim, semantic_dim),
             nn.RMSNorm(semantic_dim, elementwise_affine=True),
         )
-        self.global_scale = nn.Parameter(torch.ones(1))
 
     def forward(self, query_hidden: Tensor) -> Tensor:
-        return self.global_scale.to(dtype=query_hidden.dtype) * self.network(query_hidden)
+        return self.network(query_hidden)
+
+
+class SemanticAlignmentHead(nn.Module):
+    """Project each semantic token independently into frozen Gemma hidden space."""
+
+    def __init__(self, semantic_dim: int, gemma_dim: int, *, hidden_dim: int = 1024) -> None:
+        super().__init__()
+        self.network = nn.Sequential(
+            nn.RMSNorm(semantic_dim, elementwise_affine=True),
+            nn.Linear(semantic_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, gemma_dim),
+        )
+
+    def forward(self, semantic_latent: Tensor) -> Tensor:
+        return self.network(semantic_latent)
 
 
 class SemanticReconstructionDecoder(nn.Module):
@@ -159,6 +174,18 @@ def semantic_reconstruction_loss(prediction: Tensor, target: Tensor) -> Tensor:
     cosine = 1.0 - F.cosine_similarity(prediction, target, dim=-1)
     cosine = cosine.flatten(1).mean(dim=1)
     return smooth_l1 + 0.1 * cosine
+
+
+def semantic_alignment_loss(prediction: Tensor, target: Tensor) -> Tensor:
+    """Return per-sample float32 cosine distance to pooled contextual evidence."""
+    if prediction.shape != target.shape:
+        raise ValueError(
+            f"semantic alignment shapes differ: prediction={tuple(prediction.shape)}, target={tuple(target.shape)}"
+        )
+    prediction_normalized = F.normalize(prediction.float(), dim=-1)
+    target_normalized = F.normalize(target.detach().float(), dim=-1)
+    cosine_distance = 1.0 - (prediction_normalized * target_normalized).sum(dim=-1)
+    return cosine_distance.flatten(1).mean(dim=1)
 
 
 def build_semantic_teacher_attention_mask(

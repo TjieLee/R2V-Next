@@ -120,7 +120,7 @@ def run_one_step_training_smoke(
             torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0
         )
         report = {
-            "architecture": "semantic_flow_v1",
+            "architecture": "semantic_flow_v2",
             "task": task,
             "world_size": trainer._accelerator.num_processes,
             "generated_config": str(generated_config),
@@ -175,6 +175,6 @@ def run_real_encode_check(
                     "condition_mode": encoded["condition_mode"],
                 }
             )
-    report = {"architecture": "semantic_flow_v1", "samples": reports}
+    report = {"architecture": "semantic_flow_v2", "samples": reports}
     typer.echo(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
     return report

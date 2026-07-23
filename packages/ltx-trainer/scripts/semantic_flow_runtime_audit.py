@@ -325,7 +325,7 @@ def main() -> None:
         errors.append(f"startup_host_ram: {type(exc).__name__}: {exc}")
 
     report: dict[str, Any] = {
-        "architecture": "semantic_flow_v1",
+        "architecture": "semantic_flow_v2",
         "ready": not errors,
         "errors": errors,
         "python": {

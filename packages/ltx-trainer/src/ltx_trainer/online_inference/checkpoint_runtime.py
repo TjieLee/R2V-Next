@@ -37,7 +37,9 @@ SEMANTIC_STRATEGY_CHECKPOINT_PREFIXES = (
     "training_strategy.semantic_query.",
     "training_strategy.semantic_encoder.",
     "training_strategy.semantic_reconstruction_decoder.",
+    "training_strategy.semantic_alignment_head.",
 )
+SEMANTIC_V1_STRATEGY_CHECKPOINT_PREFIXES = SEMANTIC_STRATEGY_CHECKPOINT_PREFIXES[:-1]
 SEMANTIC_TRANSFORMER_CHECKPOINT_PREFIXES = (
     "semantic_token_type_embedding.",
     "semantic_entity_embedding.",
@@ -140,10 +142,20 @@ def audit_checkpoint(path: Path) -> dict[str, Any]:
             shapes = {key: list(handle.get_slice(key).get_shape()) for key in keys}
     except Exception as exc:
         raise CheckpointAuditError(f"Invalid safetensors checkpoint {resolved}: {exc}") from exc
-    semantic_prefixes = SEMANTIC_STRATEGY_CHECKPOINT_PREFIXES + SEMANTIC_TRANSFORMER_CHECKPOINT_PREFIXES
+    strategy_prefixes = (
+        SEMANTIC_V1_STRATEGY_CHECKPOINT_PREFIXES
+        if metadata.get("architecture") == "semantic_flow_v1"
+        else SEMANTIC_STRATEGY_CHECKPOINT_PREFIXES
+    )
+    semantic_prefixes = strategy_prefixes + SEMANTIC_TRANSFORMER_CHECKPOINT_PREFIXES
     missing = [prefix for prefix in semantic_prefixes if not any(key.startswith(prefix) for key in keys)]
     if missing:
         raise CheckpointAuditError(f"Checkpoint is missing semantic modules: {missing}")
+    if (
+        metadata.get("architecture") == "semantic_flow_v2"
+        and "training_strategy.semantic_encoder.global_scale" in keys
+    ):
+        raise CheckpointAuditError("semantic_flow_v2 checkpoint contains removed semantic_encoder.global_scale")
     return {
         "checkpoint_path": str(resolved),
         "checkpoint_step": checkpoint_step(resolved),
@@ -151,7 +163,7 @@ def audit_checkpoint(path: Path) -> dict[str, Any]:
         "checkpoint_keys": keys,
         "checkpoint_shapes": shapes,
         "metadata": metadata,
-        "semantic_module_prefixes": list(SEMANTIC_STRATEGY_CHECKPOINT_PREFIXES),
+        "semantic_module_prefixes": list(strategy_prefixes),
         "semantic_transformer_prefixes": list(SEMANTIC_TRANSFORMER_CHECKPOINT_PREFIXES),
         "required_missing_keys": [],
         "unexpected_checkpoint_keys": [],
@@ -219,6 +231,35 @@ def validate_reference_rope_checkpoint_metadata(
     }
     if mismatches:
         raise CheckpointAuditError(f"Semantic-flow Reference RoPE metadata mismatch: {mismatches}")
+
+
+def validate_semantic_flow_checkpoint_architecture(
+    metadata: dict[str, str],
+    *,
+    allow_v1_warm_start: bool,
+) -> str:
+    """Validate the representation contract before checkpoint tensors are loaded."""
+    architecture = metadata.get("architecture")
+    if architecture == "semantic_flow_v1":
+        if not allow_v1_warm_start:
+            raise CheckpointAuditError("semantic_flow_v1 is allowed only as an explicit warm start")
+        return architecture
+    if architecture != "semantic_flow_v2":
+        raise CheckpointAuditError(f"Unsupported semantic-flow checkpoint architecture: {architecture!r}")
+    required = {
+        "semantic_encoder_dit_gradient": "detached",
+        "semantic_alignment_target": "pooled_contextual_local_2x2",
+        "semantic_alignment_head": "tokenwise_mlp",
+        "semantic_velocity_head_init": "zero",
+    }
+    mismatches = {
+        key: {"expected": expected, "actual": metadata.get(key)}
+        for key, expected in required.items()
+        if metadata.get(key) != expected
+    }
+    if mismatches:
+        raise CheckpointAuditError(f"semantic_flow_v2 representation metadata mismatch: {mismatches}")
+    return architecture
 
 
 @dataclass
@@ -355,6 +396,10 @@ def load_online_inference_runtime(
         expected_mode=strategy.config.reference_rope_mode,
         allow_legacy=allow_legacy_reference_rope,
     )
+    validate_semantic_flow_checkpoint_architecture(
+        audit["metadata"],
+        allow_v1_warm_start=True,
+    )
     if ready_marker is not None:
         expected_sha = ready_marker.get("checkpoint_sha256")
         if expected_sha and snapshot.sha256 != str(expected_sha):
@@ -374,7 +419,10 @@ def load_online_inference_runtime(
         text_encoder=text_encoder,
     )
     state = load_file(checkpoint_path, device="cpu")
-    strategy.load_extra_checkpoint_state_dict(state)
+    strategy.load_extra_checkpoint_state_dict(
+        state,
+        checkpoint_metadata=audit["metadata"],
+    )
     transformer_state = {
         key: value
         for key, value in state.items()
@@ -448,4 +496,5 @@ __all__ = [
     "read_checkpoint_metadata",
     "resolve_checkpoint",
     "validate_reference_rope_checkpoint_metadata",
+    "validate_semantic_flow_checkpoint_architecture",
 ]

@@ -116,13 +116,16 @@ def _build_strategy_modules(device: torch.device) -> tuple[SemanticFlowStrategy,
     semantic_query = nn.Linear(8, 8, bias=False)
     semantic_encoder = nn.Sequential(nn.Linear(8, 4), nn.SiLU(), nn.Linear(4, 6))
     semantic_reconstruction_decoder = nn.Sequential(nn.Linear(6, 4), nn.SiLU(), nn.Linear(4, 8))
+    semantic_alignment_head = nn.Sequential(nn.Linear(6, 4), nn.SiLU(), nn.Linear(4, 8))
     _fill_deterministic(semantic_query, offset=20.0)
     _fill_deterministic(semantic_encoder, offset=30.0)
     _fill_deterministic(semantic_reconstruction_decoder, offset=40.0)
+    _fill_deterministic(semantic_alignment_head, offset=50.0)
     modules: dict[str, FSDP] = {
         "semantic_query": _wrap(semantic_query, device),
         "semantic_encoder": _wrap(semantic_encoder, device),
         "semantic_reconstruction_decoder": _wrap(semantic_reconstruction_decoder, device),
+        "semantic_alignment_head": _wrap(semantic_alignment_head, device),
     }
     strategy.set_trainable_modules(modules)
     return strategy, modules
@@ -189,7 +192,14 @@ def run(output_dir: Path) -> dict[str, Any] | None:
     flat_state.update(transformer_state)
     dist.barrier()
     if rank == 0:
-        metadata = {"architecture": "semantic_flow_v1", "global_step": "1"}
+        metadata = {
+            "architecture": "semantic_flow_v2",
+            "global_step": "1",
+            "semantic_encoder_dit_gradient": "detached",
+            "semantic_alignment_target": "pooled_contextual_local_2x2",
+            "semantic_alignment_head": "tokenwise_mlp",
+            "semantic_velocity_head_init": "zero",
+        }
         save_file(flat_state, checkpoint_path, metadata=metadata)
         checkpoint_sha256 = _sha256_file(checkpoint_path)
         ready_marker_path.write_text(

@@ -74,6 +74,8 @@ class ModelInputs:
     semantic_loss_mask: Tensor | None = None
     semantic_reconstruction_prediction: Tensor | None = None
     semantic_reconstruction_target: Tensor | None = None
+    semantic_alignment_prediction: Tensor | None = None
+    semantic_alignment_target: Tensor | None = None
     sequence_offsets: dict[str, int] | None = None
 
 
@@ -155,8 +157,14 @@ class TrainingStrategy(ABC):
             )
         return state_dict
 
-    def load_extra_checkpoint_state_dict(self, state_dict: dict[str, Tensor]) -> None:
+    def load_extra_checkpoint_state_dict(
+        self,
+        state_dict: dict[str, Tensor],
+        *,
+        checkpoint_metadata: dict[str, str] | None = None,
+    ) -> None:
         """Load extra strategy-owned weights from a checkpoint if present."""
+        del checkpoint_metadata
         for name, module in self.get_trainable_modules().items():
             prefix = f"training_strategy.{name}."
             module_state = {

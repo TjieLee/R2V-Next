@@ -51,6 +51,7 @@ from ltx_trainer.online_inference.checkpoint_runtime import (
     checkpoint_contains_semantic_flow_modules,
     read_checkpoint_metadata,
     validate_reference_rope_checkpoint_metadata,
+    validate_semantic_flow_checkpoint_architecture,
 )
 from ltx_trainer.online_inference.startup_memory import host_memory_snapshot
 from ltx_trainer.progress import TrainingProgress
@@ -492,10 +493,14 @@ class LtxvTrainer:
                         reconstruction_text = self._format_optional_metric(
                             strategy_metrics, "train/loss_semantic_reconstruction"
                         )
+                        alignment_text = self._format_optional_metric(
+                            strategy_metrics, "train/loss_semantic_alignment"
+                        )
                         logger.info(
                             f"Step {self._global_step}/{cfg.optimization.steps} - "
                             f"Total: {step_loss:.4f}, Video flow: {video_text}, Semantic flow: {semantic_text}, "
-                            f"Reconstruction: {reconstruction_text}, LR: {current_lr:.2e}, "
+                            f"Reconstruction: {reconstruction_text}, Alignment: {alignment_text}, "
+                            f"LR: {current_lr:.2e}, "
                             f"Time/Step: {step_time:.2f}s, Total Time: {total_time}",
                         )
 
@@ -892,9 +897,12 @@ class LtxvTrainer:
 
     def _load_full_checkpoint(self, checkpoint_path: Path) -> None:
         """Load full model checkpoint."""
-        self._validate_full_checkpoint_metadata(checkpoint_path)
+        checkpoint_metadata = self._validate_full_checkpoint_metadata(checkpoint_path)
         state_dict = load_file(checkpoint_path)
-        self._load_auxiliary_checkpoint_state(state_dict)
+        self._load_auxiliary_checkpoint_state(
+            state_dict,
+            checkpoint_metadata=checkpoint_metadata,
+        )
 
         transformer_state = self._filter_auxiliary_checkpoint_state(state_dict)
         if transformer_state:
@@ -904,17 +912,22 @@ class LtxvTrainer:
 
         logger.info("✅ Full model checkpoint loaded successfully")
 
-    def _validate_full_checkpoint_metadata(self, checkpoint_path: Path) -> None:
+    def _validate_full_checkpoint_metadata(self, checkpoint_path: Path) -> dict[str, str]:
         if self._config.training_strategy.name != "semantic_flow":
-            return
+            return read_checkpoint_metadata(checkpoint_path)
         if not checkpoint_contains_semantic_flow_modules(checkpoint_path):
-            return
+            return read_checkpoint_metadata(checkpoint_path)
         metadata = read_checkpoint_metadata(checkpoint_path)
         validate_reference_rope_checkpoint_metadata(
             metadata,
             expected_mode=self._training_strategy.config.reference_rope_mode,
             allow_legacy=False,
         )
+        validate_semantic_flow_checkpoint_architecture(
+            metadata,
+            allow_v1_warm_start=True,
+        )
+        return metadata
 
     @staticmethod
     def _index_peft_adapter_state(
@@ -1073,11 +1086,20 @@ class LtxvTrainer:
 
     def _load_lora_checkpoint(self, checkpoint_path: Path) -> None:
         """Load LoRA checkpoint with DDP/FSDP compatibility."""
+        checkpoint_metadata = read_checkpoint_metadata(checkpoint_path)
+        if self._config.training_strategy.name == "semantic_flow":
+            validate_semantic_flow_checkpoint_architecture(
+                checkpoint_metadata,
+                allow_v1_warm_start=True,
+            )
         state_dict = load_file(checkpoint_path)
         validate_initial = getattr(self._training_strategy, "validate_initial_checkpoint_state_dict", None)
         if callable(validate_initial):
             validate_initial(state_dict)
-        self._load_auxiliary_checkpoint_state(state_dict)
+        self._load_auxiliary_checkpoint_state(
+            state_dict,
+            checkpoint_metadata=checkpoint_metadata,
+        )
 
         # Adjust layer names to match internal format.
         # (Weights are saved in ComfyUI-compatible format, with "diffusion_model." prefix)
@@ -1112,8 +1134,16 @@ class LtxvTrainer:
             and not key.startswith("text_encoder.")
         }
 
-    def _load_auxiliary_checkpoint_state(self, state_dict: dict[str, Tensor]) -> None:
-        self._training_strategy.load_extra_checkpoint_state_dict(state_dict)
+    def _load_auxiliary_checkpoint_state(
+        self,
+        state_dict: dict[str, Tensor],
+        *,
+        checkpoint_metadata: dict[str, str] | None = None,
+    ) -> None:
+        self._training_strategy.load_extra_checkpoint_state_dict(
+            state_dict,
+            checkpoint_metadata=checkpoint_metadata,
+        )
 
         processor_state = {
             key.removeprefix("embeddings_processor."): value
@@ -1199,6 +1229,12 @@ class LtxvTrainer:
         If no_resume config is set, no checkpoint loaded, or no state file found: returns (0, None).
         """
         if self._config.checkpoints.no_resume or self._loaded_checkpoint_path is None:
+            return 0, None
+        if getattr(self._training_strategy, "checkpoint_loaded_as_warm_start", False):
+            logger.warning(
+                "Checkpoint weights were warm-migrated to a new architecture; "
+                "optimizer, scheduler, RNG, and global-step state will not be resumed."
+            )
             return 0, None
 
         strict_legacy_resume = self._is_strict_legacy_resume()

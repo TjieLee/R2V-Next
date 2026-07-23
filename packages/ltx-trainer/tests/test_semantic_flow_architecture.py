@@ -24,6 +24,7 @@ import ltx_trainer.training_strategies.semantic_flow as semantic_flow_module
 from ltx_core.multicond.semantic_tokens import (
     EVIDENCE_TOKENS_PER_FRAME,
     SEMANTIC_TOKENS_PER_FRAME,
+    SemanticAlignmentHead,
     SemanticEncoder,
     SemanticKeepMaskSample,
     SemanticQueryInitializer,
@@ -33,7 +34,10 @@ from ltx_core.multicond.semantic_tokens import (
     gather_local_evidence,
     sample_semantic_keep_mask,
     sample_semantic_keep_mask_with_stats,
+    semantic_alignment_loss,
+    semantic_reconstruction_loss,
 )
+from ltx_core.model.transformer.model import LTXModel
 from ltx_core.types import VideoLatentShape
 from ltx_trainer.config import LtxTrainerConfig
 from ltx_trainer.online_inference.checkpoint_runtime import (
@@ -43,6 +47,7 @@ from ltx_trainer.online_inference.checkpoint_runtime import (
     read_checkpoint_metadata,
     resolve_checkpoint,
     validate_reference_rope_checkpoint_metadata,
+    validate_semantic_flow_checkpoint_architecture,
 )
 from ltx_trainer.online_inference.runtime_lock import (
     SemanticFlowRuntimeLockError,
@@ -81,6 +86,25 @@ def test_local_queries_and_reconstruction_targets_preserve_spatial_neighborhoods
     assert queries.shape == (2, 3, 64, 4)
 
 
+def test_semantic_alignment_head_target_shape_and_cosine_loss() -> None:
+    semantic = torch.randn(2, 3, SEMANTIC_TOKENS_PER_FRAME, 5)
+    evidence_hidden = torch.randn(2, 3, EVIDENCE_TOKENS_PER_FRAME, 7)
+    target = gather_local_evidence(evidence_hidden).mean(dim=-2).detach()
+    prediction = SemanticAlignmentHead(5, 7, hidden_dim=11)(semantic)
+
+    assert target.shape == (2, 3, SEMANTIC_TOKENS_PER_FRAME, 7)
+    assert prediction.shape == target.shape
+    assert semantic_alignment_loss(prediction, target).shape == (2,)
+    torch.testing.assert_close(
+        semantic_alignment_loss(target.clone(), target),
+        torch.zeros(2),
+        atol=1.0e-6,
+        rtol=0.0,
+    )
+    with pytest.raises(ValueError, match="semantic alignment shapes differ"):
+        semantic_alignment_loss(prediction[..., :-1], target)
+
+
 def test_semantic_modules_use_no_scalar_trainable_parameters() -> None:
     query = SemanticQueryInitializer(gemma_dim=4, position_gate_init=0.25)
     encoder = SemanticEncoder(gemma_dim=4, semantic_dim=3, hidden_dim=5)
@@ -89,25 +113,24 @@ def test_semantic_modules_use_no_scalar_trainable_parameters() -> None:
     assert query.position_gate.shape == (1,)
     assert query.position_gate.ndim == 1
     assert query.position_gate.numel() == 1
-    assert encoder.global_scale.shape == (1,)
-    assert encoder.global_scale.ndim == 1
-    assert encoder.global_scale.numel() == 1
+    assert "global_scale" not in encoder.state_dict()
     for module in (query, encoder, reconstruction_decoder):
         for name, parameter in module.named_parameters():
             if parameter.requires_grad:
                 assert parameter.ndim > 0, (name, tuple(parameter.shape))
 
 
-def test_semantic_single_value_parameters_receive_finite_gradients_and_optimizer_updates() -> None:
+def test_semantic_position_gate_and_encoder_receive_finite_gradients_and_optimizer_updates() -> None:
     torch.manual_seed(7)
     query = SemanticQueryInitializer(gemma_dim=4)
     encoder = SemanticEncoder(gemma_dim=4, semantic_dim=3, hidden_dim=5)
+    encoder_weight = encoder.network[1].weight
     optimizer = torch.optim.SGD(
-        [query.position_gate, encoder.global_scale],
+        [query.position_gate, encoder_weight],
         lr=0.1,
     )
     initial_position_gate = query.position_gate.detach().clone()
-    initial_global_scale = encoder.global_scale.detach().clone()
+    initial_encoder_weight = encoder_weight.detach().clone()
 
     evidence = torch.randn(2, 2, EVIDENCE_TOKENS_PER_FRAME, 4)
     timestamps = torch.tensor([[0.25, 0.75], [0.1, 0.9]])
@@ -117,11 +140,11 @@ def test_semantic_single_value_parameters_receive_finite_gradients_and_optimizer
     assert query.position_gate.grad is not None
     assert torch.isfinite(query.position_gate.grad).all()
     assert torch.count_nonzero(query.position_gate.grad) > 0
-    assert encoder.global_scale.grad is not None
-    assert torch.isfinite(encoder.global_scale.grad).all()
+    assert encoder_weight.grad is not None
+    assert torch.isfinite(encoder_weight.grad).all()
     optimizer.step()
     assert not torch.equal(query.position_gate, initial_position_gate)
-    assert not torch.equal(encoder.global_scale, initial_global_scale)
+    assert not torch.equal(encoder_weight, initial_encoder_weight)
 
 
 def test_single_value_vector_broadcast_matches_legacy_scalar_math() -> None:
@@ -263,6 +286,7 @@ def test_frozen_gemma_teacher_backpropagates_only_to_semantic_modules() -> None:
     strategy._query_initializer = SemanticQueryInitializer(gemma_dim=8)
     strategy._semantic_encoder = SemanticEncoder(gemma_dim=8, semantic_dim=4, hidden_dim=8)
     strategy._reconstruction_decoder = SemanticReconstructionDecoder(semantic_dim=4, gemma_dim=8, hidden_dim=8)
+    strategy._semantic_alignment_head = SemanticAlignmentHead(semantic_dim=4, gemma_dim=8, hidden_dim=8)
 
     mode = strategy._enable_frozen_teacher_gradient_checkpointing(language_model)
     assert mode == "manual_non_reentrant"
@@ -280,18 +304,26 @@ def test_frozen_gemma_teacher_backpropagates_only_to_semantic_modules() -> None:
             "normalized_timestamps": torch.tensor([[0.25]]),
         }
     )
-    loss = teacher["semantic_clean"].pow(2).mean() + teacher["reconstruction_prediction"].pow(2).mean()
+    loss = semantic_reconstruction_loss(
+        teacher["reconstruction_prediction"],
+        teacher["reconstruction_target"],
+    ).mean() + semantic_alignment_loss(
+        teacher["alignment_prediction"],
+        teacher["alignment_target"],
+    ).mean()
     loss.backward()
 
     assert _has_nonzero_grad(strategy._query_initializer)
     assert _has_nonzero_grad(strategy._semantic_encoder)
     assert _has_nonzero_grad(strategy._reconstruction_decoder)
+    assert _has_nonzero_grad(strategy._semantic_alignment_head)
     assert strategy.teacher_checkpoint_forward_calls > 0
     assert language_model.training is False
     assert all(parameter.grad is None for parameter in language_model.parameters())
     assert prefix_embeddings.grad is None
     assert evidence.grad is None
     assert teacher["reconstruction_target"].requires_grad is False
+    assert teacher["alignment_target"].requires_grad is False
 
 
 def test_frozen_gemma_checkpointing_falls_back_to_manual_layers() -> None:
@@ -344,6 +376,11 @@ def test_eval_tiny_gemma_teacher_executes_manual_checkpointing_and_backpropagate
         gemma_dim=config.hidden_size,
         hidden_dim=16,
     )
+    strategy._semantic_alignment_head = SemanticAlignmentHead(
+        semantic_dim=8,
+        gemma_dim=config.hidden_size,
+        hidden_dim=16,
+    )
 
     checkpoint_calls = 0
     real_checkpoint = torch.utils.checkpoint.checkpoint
@@ -365,7 +402,13 @@ def test_eval_tiny_gemma_teacher_executes_manual_checkpointing_and_backpropagate
             "normalized_timestamps": torch.tensor([[0.25]]),
         }
     )
-    loss = teacher["semantic_clean"].pow(2).mean() + teacher["reconstruction_prediction"].pow(2).mean()
+    loss = semantic_reconstruction_loss(
+        teacher["reconstruction_prediction"],
+        teacher["reconstruction_target"],
+    ).mean() + semantic_alignment_loss(
+        teacher["alignment_prediction"],
+        teacher["alignment_target"],
+    ).mean()
     loss.backward()
 
     assert checkpoint_calls > 0
@@ -377,6 +420,7 @@ def test_eval_tiny_gemma_teacher_executes_manual_checkpointing_and_backpropagate
     assert _has_nonzero_grad(strategy._query_initializer)
     assert _has_nonzero_grad(strategy._semantic_encoder)
     assert _has_nonzero_grad(strategy._reconstruction_decoder)
+    assert _has_nonzero_grad(strategy._semantic_alignment_head)
 
 
 def test_semantic_dropout_uses_exact_counts_between_48_and_64_tokens_per_frame() -> None:
@@ -411,12 +455,15 @@ def test_semantic_flow_reports_actual_kept_prefix_and_latent_metrics(monkeypatch
     strategy._query_initializer = SemanticQueryInitializer(4)
     strategy._semantic_encoder = SemanticEncoder(4, 4)
     strategy._reconstruction_decoder = SemanticReconstructionDecoder(4, 4)
+    strategy._semantic_alignment_head = SemanticAlignmentHead(4, 4)
 
     semantic_clean = torch.ones(1, 2, SEMANTIC_TOKENS_PER_FRAME, 4)
     teacher = {
         "semantic_clean": semantic_clean,
         "reconstruction_prediction": torch.zeros(1, 2, SEMANTIC_TOKENS_PER_FRAME, 4, 4),
         "reconstruction_target": torch.zeros(1, 2, SEMANTIC_TOKENS_PER_FRAME, 4, 4),
+        "alignment_prediction": torch.zeros(1, 2, SEMANTIC_TOKENS_PER_FRAME, 4),
+        "alignment_target": torch.zeros(1, 2, SEMANTIC_TOKENS_PER_FRAME, 4),
     }
     strategy.build_semantic_teacher_outputs = lambda _teacher_inputs: teacher  # type: ignore[method-assign]
     keep_mask = torch.zeros(1, 2, SEMANTIC_TOKENS_PER_FRAME, dtype=torch.bool)
@@ -466,12 +513,117 @@ def test_semantic_flow_reports_actual_kept_prefix_and_latent_metrics(monkeypatch
     assert float(metrics["train/anchor_frame_count"]) == 2.0
     assert float(metrics["train/semantic_latent_rms"]) == pytest.approx(1.0)
     assert float(metrics["train/query_position_gate"]) == pytest.approx(0.0)
-    assert float(metrics["train/semantic_global_scale"]) == pytest.approx(1.0)
 
     strategy.compute_loss(torch.zeros_like(inputs.video.latent), None, inputs)
     metrics = strategy.get_last_training_metrics()
     assert "train/loss_semantic_flow" in metrics
+    assert "train/loss_semantic_alignment" in metrics
     assert float(metrics["train/semantic_token_count_kept"]) == 80.0
+
+
+def test_joint_flow_losses_do_not_backpropagate_into_semantic_representation() -> None:
+    torch.manual_seed(11)
+    strategy = SemanticFlowStrategy(
+        SemanticFlowConfig(
+            semantic_maximum_drop_rate=0.0,
+            semantic_minimum_tokens_per_frame=SEMANTIC_TOKENS_PER_FRAME,
+        )
+    )
+    strategy._semantic_dim = 4
+    strategy._gemma_dim = 4
+    strategy._query_initializer = SemanticQueryInitializer(4)
+    strategy._semantic_encoder = SemanticEncoder(4, 4, hidden_dim=8)
+    strategy._reconstruction_decoder = SemanticReconstructionDecoder(4, 4, hidden_dim=8)
+    strategy._semantic_alignment_head = SemanticAlignmentHead(4, 4, hidden_dim=8)
+
+    evidence = torch.randn(1, 2, EVIDENCE_TOKENS_PER_FRAME, 4)
+    timestamps = torch.tensor([[0.0, 1.0]])
+
+    def build_teacher(_teacher_inputs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        queries = strategy._query_initializer(evidence, timestamps)
+        semantic_clean = strategy._semantic_encoder(queries)
+        reconstruction_target = gather_local_evidence(evidence).detach()
+        return {
+            "semantic_clean": semantic_clean,
+            "reconstruction_prediction": strategy._reconstruction_decoder(semantic_clean),
+            "reconstruction_target": reconstruction_target,
+            "alignment_prediction": strategy._semantic_alignment_head(semantic_clean),
+            "alignment_target": reconstruction_target.mean(dim=-2).detach(),
+        }
+
+    strategy.build_semantic_teacher_outputs = build_teacher  # type: ignore[method-assign]
+    batch = {
+        "semantic_teacher_inputs": {
+            "prefix_attention_mask": torch.ones(1, 3, dtype=torch.bool),
+            "normalized_timestamps": timestamps,
+        },
+        "latents": {
+            "latents": torch.randn(1, 4, 1, 1, 1),
+            "num_frames": torch.tensor([1]),
+            "height": torch.tensor([1]),
+            "width": torch.tensor([1]),
+            "fps": torch.tensor([24.0]),
+        },
+        "reference_latents": {
+            "latents": torch.randn(1, 1, 4, 1, 1, 1),
+            "ref_valid_mask": torch.tensor([[True]]),
+        },
+        "conditions": {
+            "video_prompt_embeds": torch.zeros(1, 3, 4),
+            "prompt_attention_mask": torch.ones(1, 3, dtype=torch.bool),
+        },
+    }
+    sampler = SimpleNamespace(sample_for=lambda tokens: torch.full((tokens.shape[0],), 0.5))
+    inputs = strategy.prepare_training_inputs(batch, sampler)
+
+    dit = nn.Linear(4, 4, bias=False)
+    joint_hidden = inputs.video.latent + inputs.video.latent.mean(dim=1, keepdim=True)
+    prediction = dit(joint_hidden)
+    reference_end = inputs.sequence_offsets["reference_end"]
+    semantic_end = inputs.sequence_offsets["semantic_end"]
+    target_end = inputs.sequence_offsets["target_end"]
+    flow_loss = strategy._masked_token_mse(
+        prediction[:, reference_end:semantic_end],
+        inputs.semantic_targets,
+        inputs.semantic_loss_mask,
+    ).mean() + strategy._masked_token_mse(
+        prediction[:, semantic_end:target_end],
+        inputs.video_targets,
+        inputs.video_loss_mask,
+    ).mean()
+    flow_loss.backward()
+
+    for module in (strategy._query_initializer, strategy._semantic_encoder):
+        assert all(parameter.grad is None for parameter in module.parameters())
+    assert _has_nonzero_grad(dit)
+
+
+def test_semantic_velocity_head_zero_initialization_and_first_backward() -> None:
+    model = object.__new__(LTXModel)
+    nn.Module.__init__(model)
+    model.patchify_proj = nn.Linear(4, 6)
+    model.inner_dim = 6
+    model.semantic_proj_out = None
+
+    model.enable_semantic_flow_conditioning(semantic_dim=4)
+    assert torch.count_nonzero(model.semantic_proj_out.weight) == 0
+    assert torch.count_nonzero(model.semantic_proj_out.bias) == 0
+
+    hidden = torch.randn(2, 3, 6, requires_grad=True)
+    semantic_velocity = model.semantic_proj_out(model.semantic_norm_out(hidden))
+    semantic_velocity.square().mean().add(semantic_velocity.mean()).backward()
+    assert model.semantic_proj_out.weight.grad is not None
+    assert torch.isfinite(model.semantic_proj_out.weight.grad).all()
+    assert torch.count_nonzero(model.semantic_proj_out.weight.grad) > 0
+    assert hidden.grad is not None
+    assert torch.count_nonzero(hidden.grad) == 0
+
+    with torch.no_grad():
+        model.semantic_proj_out.weight.fill_(0.25)
+        model.semantic_proj_out.bias.fill_(0.5)
+    model.enable_semantic_flow_conditioning(semantic_dim=4)
+    torch.testing.assert_close(model.semantic_proj_out.weight, torch.full_like(model.semantic_proj_out.weight, 0.25))
+    torch.testing.assert_close(model.semantic_proj_out.bias, torch.full_like(model.semantic_proj_out.bias, 0.5))
 
 
 def test_production_semantic_flow_config_uses_opens2v_only_litengjie_paths(tmp_path: Path) -> None:
@@ -524,6 +676,11 @@ def test_production_semantic_flow_config_uses_opens2v_only_litengjie_paths(tmp_p
     assert parsed.data.manifest_path == str(manifest_path.resolve())
     assert parsed.data.online_encoding is not None
     assert parsed.data.online_encoding.runtime_reject_log_dir.startswith("/mnt/workspace/litengjie/")
+    assert parsed.training_strategy.semantic_alignment_hidden_dim == 1024
+    assert parsed.training_strategy.semantic_alignment_weight == 1.0
+    assert parsed.training_strategy.video_flow_weight == 1.0
+    assert parsed.training_strategy.semantic_flow_weight == 1.0
+    assert parsed.training_strategy.semantic_reconstruction_weight == 1.0
     assert parsed.checkpoints.interval == 1000
     assert parsed.checkpoints.keep_last_n == 3
     assert parsed.checkpoints.save_training_state == "minimal"
@@ -746,6 +903,34 @@ def test_checkpoint_audit_and_ready_resolution_require_semantic_modules(tmp_path
         audit_checkpoint(missing_transformer)
 
 
+def test_checkpoint_audit_enforces_v2_alignment_and_removed_global_scale(tmp_path: Path) -> None:
+    metadata = {
+        key: str(value)
+        for key, value in SemanticFlowStrategy(SemanticFlowConfig()).get_checkpoint_metadata().items()
+    }
+    tensors = {
+        "semantic_token_type_embedding.weight": torch.ones(3, 4),
+        "semantic_entity_embedding.weight": torch.ones(5, 4),
+        "semantic_position_adapter.0.weight": torch.ones(4, 6),
+        "semantic_norm_out.weight": torch.ones(4),
+        "semantic_proj_out.weight": torch.ones(2, 4),
+        "training_strategy.semantic_query.weight": torch.ones(1),
+        "training_strategy.semantic_encoder.weight": torch.ones(1),
+        "training_strategy.semantic_reconstruction_decoder.weight": torch.ones(1),
+    }
+    missing_alignment = tmp_path / "v2_missing_alignment.safetensors"
+    save_file(tensors, missing_alignment, metadata=metadata)
+    with pytest.raises(CheckpointAuditError, match="semantic_alignment_head"):
+        audit_checkpoint(missing_alignment)
+
+    stale_global = tmp_path / "v2_stale_global.safetensors"
+    tensors["training_strategy.semantic_alignment_head.weight"] = torch.ones(1)
+    tensors["training_strategy.semantic_encoder.global_scale"] = torch.ones(1)
+    save_file(tensors, stale_global, metadata=metadata)
+    with pytest.raises(CheckpointAuditError, match="removed semantic_encoder.global_scale"):
+        audit_checkpoint(stale_global)
+
+
 def test_trainer_validates_reference_rope_metadata_before_loading_tensors(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -790,6 +975,7 @@ def test_base_checkpoint_header_is_not_treated_as_reference_rope_metadata(
     strategy._query_initializer = SemanticQueryInitializer(4)
     strategy._semantic_encoder = SemanticEncoder(4, 4)
     strategy._reconstruction_decoder = SemanticReconstructionDecoder(4, 4)
+    strategy._semantic_alignment_head = SemanticAlignmentHead(4, 4)
     with pytest.raises(RuntimeError, match="semantic_flow checkpoint is incomplete"):
         trainer._load_full_checkpoint(checkpoint)
 
@@ -797,9 +983,13 @@ def test_base_checkpoint_header_is_not_treated_as_reference_rope_metadata(
 def test_reference_rope_checkpoint_metadata_is_complete_and_fail_closed() -> None:
     metadata = SemanticFlowStrategy(SemanticFlowConfig()).get_checkpoint_metadata()
     assert metadata == {
-        "architecture": "semantic_flow_v1",
+        "architecture": "semantic_flow_v2",
         "semantic_dim": None,
         "gemma_dim": None,
+        "semantic_encoder_dit_gradient": "detached",
+        "semantic_alignment_target": "pooled_contextual_local_2x2",
+        "semantic_alignment_head": "tokenwise_mlp",
+        "semantic_velocity_head_init": "zero",
         "token_sequence": ["reference", "semantic", "target"],
         "reference_rope_layout_version": 2,
         "reference_rope_mode": "appended_time_shifted_width",
@@ -1254,6 +1444,7 @@ def test_accelerate_multimodel_smoke_matches_trainer_prepare_order() -> None:
         semantic_query,
         semantic_encoder,
         semantic_reconstruction_decoder,
+        semantic_alignment_head,
     )"""
     assert expected_prepare in script
     assert "class BasicAVTransformerBlock" in script
@@ -1362,6 +1553,7 @@ def test_strategy_checkpoint_state_uses_precollected_full_states() -> None:
         "semantic_query": nn.Linear(2, 2, bias=False),
         "semantic_encoder": nn.Linear(2, 3, bias=False),
         "semantic_reconstruction_decoder": nn.Linear(3, 2, bias=False),
+        "semantic_alignment_head": nn.Linear(3, 4, bias=False),
     }
     strategy.set_trainable_modules(modules)
     precollected = {
@@ -1383,6 +1575,7 @@ def test_strategy_checkpoint_state_uses_precollected_full_states() -> None:
         "training_strategy.semantic_query.weight",
         "training_strategy.semantic_encoder.weight",
         "training_strategy.semantic_reconstruction_decoder.weight",
+        "training_strategy.semantic_alignment_head.weight",
     }
     assert torch.equal(state["training_strategy.semantic_query.weight"], precollected["semantic_query"]["weight"])
 
@@ -1393,6 +1586,7 @@ def test_semantic_strategy_load_rejects_missing_or_mismatched_modules() -> None:
         "semantic_query": nn.Linear(2, 2, bias=False),
         "semantic_encoder": nn.Linear(2, 3, bias=False),
         "semantic_reconstruction_decoder": nn.Linear(3, 2, bias=False),
+        "semantic_alignment_head": nn.Linear(3, 4, bias=False),
     }
     strategy.set_trainable_modules(modules)
     full_state = {
@@ -1415,16 +1609,19 @@ def test_semantic_strategy_load_rejects_missing_or_mismatched_modules() -> None:
 
 
 @pytest.mark.parametrize("legacy_scalar_shape", [True, False])
-def test_semantic_strategy_loads_legacy_and_new_single_value_parameters(
+def test_semantic_strategy_warm_migrates_v1_global_scale(
     legacy_scalar_shape: bool,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     strategy = SemanticFlowStrategy(SemanticFlowConfig())
     query = SemanticQueryInitializer(4)
     encoder = SemanticEncoder(4, 3, hidden_dim=5)
+    alignment_head = SemanticAlignmentHead(3, 4, hidden_dim=5)
     modules = {
         "semantic_query": query,
         "semantic_encoder": encoder,
         "semantic_reconstruction_decoder": SemanticReconstructionDecoder(3, 4, hidden_dim=5),
+        "semantic_alignment_head": alignment_head,
     }
     strategy.set_trainable_modules(modules)
     full_state = {
@@ -1436,13 +1633,35 @@ def test_semantic_strategy_loads_legacy_and_new_single_value_parameters(
     global_scale = torch.tensor(1.5) if legacy_scalar_shape else torch.tensor([1.5])
     full_state["training_strategy.semantic_query.position_gate"] = position_gate
     full_state["training_strategy.semantic_encoder.global_scale"] = global_scale
+    full_state = {
+        key: value
+        for key, value in full_state.items()
+        if not key.startswith("training_strategy.semantic_alignment_head.")
+    }
+    initial_alignment = {
+        key: value.detach().clone()
+        for key, value in alignment_head.state_dict().items()
+    }
 
-    strategy.load_extra_checkpoint_state_dict(full_state)
+    strategy.load_extra_checkpoint_state_dict(
+        full_state,
+        checkpoint_metadata={"architecture": "semantic_flow_v1"},
+    )
 
     assert query.position_gate.shape == (1,)
-    assert encoder.global_scale.shape == (1,)
     torch.testing.assert_close(query.position_gate, torch.tensor([0.25]))
-    torch.testing.assert_close(encoder.global_scale, torch.tensor([1.5]))
+    assert "global_scale" not in encoder.state_dict()
+    for key, value in alignment_head.state_dict().items():
+        torch.testing.assert_close(value, initial_alignment[key])
+    assert strategy.checkpoint_loaded_as_warm_start is True
+    assert "Warm-migrating semantic_flow_v1" in caplog.text
+    assert "not an exact resume" in caplog.text
+
+    trainer = object.__new__(LtxvTrainer)
+    trainer._config = SimpleNamespace(checkpoints=SimpleNamespace(no_resume=False))
+    trainer._loaded_checkpoint_path = Path("legacy.safetensors")
+    trainer._training_strategy = strategy
+    assert trainer._resolve_resume_state() == (0, None)
 
 
 def test_semantic_single_value_checkpoint_migration_keeps_unrelated_shapes_strict() -> None:
@@ -1451,6 +1670,7 @@ def test_semantic_single_value_checkpoint_migration_keeps_unrelated_shapes_stric
         "semantic_query": SemanticQueryInitializer(4),
         "semantic_encoder": SemanticEncoder(4, 3, hidden_dim=5),
         "semantic_reconstruction_decoder": SemanticReconstructionDecoder(3, 4, hidden_dim=5),
+        "semantic_alignment_head": SemanticAlignmentHead(3, 4, hidden_dim=5),
     }
     strategy.set_trainable_modules(modules)
     full_state = {
@@ -1461,7 +1681,103 @@ def test_semantic_single_value_checkpoint_migration_keeps_unrelated_shapes_stric
     full_state["training_strategy.semantic_encoder.network.1.weight"] = torch.ones(1)
 
     with pytest.raises(RuntimeError, match="shape mismatch"):
-        strategy.load_extra_checkpoint_state_dict(full_state)
+        strategy.load_extra_checkpoint_state_dict(
+            full_state,
+            checkpoint_metadata={"architecture": "semantic_flow_v2"},
+        )
+
+
+def test_semantic_flow_v2_checkpoint_requires_alignment_and_rejects_global_scale() -> None:
+    strategy = SemanticFlowStrategy(SemanticFlowConfig())
+    modules = {
+        "semantic_query": SemanticQueryInitializer(4),
+        "semantic_encoder": SemanticEncoder(4, 3, hidden_dim=5),
+        "semantic_reconstruction_decoder": SemanticReconstructionDecoder(3, 4, hidden_dim=5),
+        "semantic_alignment_head": SemanticAlignmentHead(3, 4, hidden_dim=5),
+    }
+    strategy.set_trainable_modules(modules)
+    full_state = {
+        f"training_strategy.{name}.{key}": value.detach().clone()
+        for name, module in modules.items()
+        for key, value in module.state_dict().items()
+    }
+
+    missing_alignment = {
+        key: value
+        for key, value in full_state.items()
+        if not key.startswith("training_strategy.semantic_alignment_head.")
+    }
+    with pytest.raises(RuntimeError, match="semantic_alignment_head"):
+        strategy.load_extra_checkpoint_state_dict(
+            missing_alignment,
+            checkpoint_metadata={"architecture": "semantic_flow_v2"},
+        )
+
+    stale_global_scale = dict(full_state)
+    stale_global_scale["training_strategy.semantic_encoder.global_scale"] = torch.ones(1)
+    with pytest.raises(RuntimeError, match="unexpected keys.*global_scale"):
+        strategy.load_extra_checkpoint_state_dict(
+            stale_global_scale,
+            checkpoint_metadata={"architecture": "semantic_flow_v2"},
+        )
+
+
+def test_semantic_flow_v2_alignment_checkpoint_roundtrip() -> None:
+    source = SemanticFlowStrategy(SemanticFlowConfig())
+    target = SemanticFlowStrategy(SemanticFlowConfig())
+    source_modules = {
+        "semantic_query": SemanticQueryInitializer(4),
+        "semantic_encoder": SemanticEncoder(4, 3, hidden_dim=5),
+        "semantic_reconstruction_decoder": SemanticReconstructionDecoder(3, 4, hidden_dim=5),
+        "semantic_alignment_head": SemanticAlignmentHead(3, 4, hidden_dim=5),
+    }
+    target_modules = {
+        "semantic_query": SemanticQueryInitializer(4),
+        "semantic_encoder": SemanticEncoder(4, 3, hidden_dim=5),
+        "semantic_reconstruction_decoder": SemanticReconstructionDecoder(3, 4, hidden_dim=5),
+        "semantic_alignment_head": SemanticAlignmentHead(3, 4, hidden_dim=5),
+    }
+    source.set_trainable_modules(source_modules)
+    target.set_trainable_modules(target_modules)
+    with torch.no_grad():
+        for parameter in source_modules["semantic_alignment_head"].parameters():
+            parameter.add_(0.75)
+    state = {
+        f"training_strategy.{name}.{key}": value.detach().clone()
+        for name, module in source_modules.items()
+        for key, value in module.state_dict().items()
+    }
+
+    target.load_extra_checkpoint_state_dict(
+        state,
+        checkpoint_metadata={"architecture": "semantic_flow_v2"},
+    )
+
+    for key, value in source_modules["semantic_alignment_head"].state_dict().items():
+        torch.testing.assert_close(target_modules["semantic_alignment_head"].state_dict()[key], value)
+
+
+def test_semantic_flow_checkpoint_architecture_metadata_is_strict() -> None:
+    metadata = {
+        key: str(value)
+        for key, value in SemanticFlowStrategy(SemanticFlowConfig()).get_checkpoint_metadata().items()
+    }
+    assert validate_semantic_flow_checkpoint_architecture(
+        metadata,
+        allow_v1_warm_start=False,
+    ) == "semantic_flow_v2"
+    with pytest.raises(CheckpointAuditError, match="explicit warm start"):
+        validate_semantic_flow_checkpoint_architecture(
+            {"architecture": "semantic_flow_v1"},
+            allow_v1_warm_start=False,
+        )
+    broken = dict(metadata)
+    broken.pop("semantic_alignment_head")
+    with pytest.raises(CheckpointAuditError, match="representation metadata mismatch"):
+        validate_semantic_flow_checkpoint_architecture(
+            broken,
+            allow_v1_warm_start=True,
+        )
 
 
 def test_fsdp_scalar_parameter_preflight_reports_all_trainable_scalars() -> None:

@@ -7,6 +7,7 @@ import torch
 
 from ltx_core.multicond.semantic_tokens import (
     SEMANTIC_TOKENS_PER_FRAME,
+    SemanticAlignmentHead,
     SemanticEncoder,
     SemanticQueryInitializer,
     SemanticReconstructionDecoder,
@@ -129,6 +130,7 @@ def _prepare_training_and_inference_states(
     strategy._query_initializer = SemanticQueryInitializer(feature_dim)
     strategy._semantic_encoder = SemanticEncoder(feature_dim, feature_dim)
     strategy._reconstruction_decoder = SemanticReconstructionDecoder(feature_dim, feature_dim)
+    strategy._semantic_alignment_head = SemanticAlignmentHead(feature_dim, feature_dim)
     semantic_clean = torch.ones(1, semantic_frame_count, SEMANTIC_TOKENS_PER_FRAME, feature_dim)
     strategy.build_semantic_teacher_outputs = lambda _inputs: {  # type: ignore[method-assign]
         "semantic_clean": semantic_clean,
@@ -137,6 +139,12 @@ def _prepare_training_and_inference_states(
         ),
         "reconstruction_target": torch.zeros(
             1, semantic_frame_count, SEMANTIC_TOKENS_PER_FRAME, 4, 4
+        ),
+        "alignment_prediction": torch.zeros(
+            1, semantic_frame_count, SEMANTIC_TOKENS_PER_FRAME, feature_dim
+        ),
+        "alignment_target": torch.zeros(
+            1, semantic_frame_count, SEMANTIC_TOKENS_PER_FRAME, feature_dim
         ),
     }
     reference_valid_mask = reference_valid_mask or [True, True]

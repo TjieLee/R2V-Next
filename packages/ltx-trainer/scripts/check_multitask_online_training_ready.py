@@ -87,7 +87,7 @@ def main(
 
     report = {
         "ready": not errors,
-        "architecture": "semantic_flow_v1",
+        "architecture": "semantic_flow_v2",
         "world_size": world_size,
         "errors": errors,
         "task_counts": (

@@ -142,7 +142,7 @@ def write_semantic_flow_smoke_marker(
         raise SemanticFlowSmokeMarkerError("Non-dry-run inference checkpoint SHA256 does not match the I2I checkpoint")
 
     payload = {
-        "architecture": "semantic_flow_v1",
+        "architecture": "semantic_flow_v2",
         "completed_at_unix": time.time(),
         "code_commit": code_commit,
         "training_config": str(training_config),
