@@ -20,6 +20,7 @@ from ltx_trainer.online_inference.semantic_guidance import (
     rescale_guided_denoised,
 )
 from ltx_trainer.training_strategies.semantic_flow import (
+    ENTITY_GLOBAL,
     SemanticFlowConfig,
     SemanticFlowStrategy,
 )
@@ -28,29 +29,37 @@ from ltx_trainer.training_strategies.semantic_flow import (
 def test_guidance_formula_and_forward_counts() -> None:
     positive = torch.tensor([[[5.0, 7.0]]])
     negative = torch.tensor([[[1.0, 2.0]]])
-    ref = torch.tensor([[[4.0, 8.0]]])
-    no_ref = torch.tensor([[[3.0, 3.0]]])
+    no_reference = torch.tensor([[[3.0, 3.0]]])
     stg = torch.tensor([[[2.0, 6.0]]])
     config = SemanticGuidanceConfig(
         guidance_scale=4.0,
-        ref_guidance_scale=2.0,
+        ref_guidance_scale=1.0,
         guidance_rescale=0.0,
         stg_scale=0.5,
     )
     actual = combine_guided_denoised(
         positive=positive,
         negative=negative,
-        no_prompt_ref=ref,
-        no_prompt_no_ref=no_ref,
+        no_reference=no_reference,
         stg=stg,
         config=config,
     )
-    expected = negative + 4.0 * (positive - negative) + 2.0 * (ref - no_ref)
+    expected = negative + 4.0 * (positive - negative) + (positive - no_reference)
     expected = expected + 0.5 * (positive - stg)
     assert torch.equal(actual, expected)
-    assert config.transformer_forwards_per_step == 5
-    assert config.enabled_branches == ("P", "N", "R", "U", "S")
-    assert SemanticGuidanceConfig(stg_scale=0.0).transformer_forwards_per_step == 4
+    assert config.transformer_forwards_per_step == 4
+    assert config.enabled_branches == ("P", "N", "Q", "S")
+    assert SemanticGuidanceConfig(stg_scale=0.0).transformer_forwards_per_step == 3
+    metadata = SemanticGuidanceConfig().metadata(negative_prompt="negative")
+    assert metadata["enabled_guidance_branches"] == ["P", "N", "Q"]
+    assert metadata["transformer_forwards_per_step"] == 3
+    assert metadata["ref_formula"] == "ref*(P-Q)"
+    assert metadata["reference_guidance_training_match"] == "drop_reference_all"
+    assert metadata["Q_prompt"] == "positive"
+    assert metadata["Q_reference_vlm_images"] == "absent"
+    assert metadata["Q_reference_latents"] == "absent"
+    assert "R" not in metadata["enabled_guidance_branches"]
+    assert "U" not in metadata["enabled_guidance_branches"]
     assert (
         SemanticGuidanceConfig(
             guidance_scale=1.0,
@@ -79,11 +88,8 @@ def test_guidance_formula_and_forward_counts() -> None:
                 ref_guidance_scale=2.0,
                 guidance_rescale=0.0,
             ),
-            {
-                "no_prompt_ref": torch.tensor([[[4.0]]]),
-                "no_prompt_no_ref": torch.tensor([[[1.0]]]),
-            },
-            torch.tensor([[[8.0]]]),
+            {"no_reference": torch.tensor([[[1.0]]])},
+            torch.tensor([[[4.0]]]),
         ),
         (
             SemanticGuidanceConfig(
@@ -211,24 +217,15 @@ def _state_bundle(
         positive.modality.latent[:, offsets["semantic_end"] : offsets["target_end"]],
     )
     negative = prepare(-1.0, references, noise) if config.need_negative else None
-    no_prompt_ref = prepare(0.0, references, noise) if config.need_no_prompt else None
-    no_prompt_no_ref = None
-    if config.need_no_prompt:
+    no_reference = None
+    if config.need_reference:
         no_refs = dict(references)
         no_refs["ref_valid_mask"] = torch.zeros_like(references["ref_valid_mask"])
-        no_prompt_no_ref = prepare(0.0, no_refs, noise)
-        no_prompt_no_ref = replace(
-            no_prompt_no_ref,
-            modality=replace(
-                no_prompt_no_ref.modality,
-                entity_ids=no_prompt_ref.modality.entity_ids,
-            ),
-        )
+        no_reference = prepare(0.0, no_refs, noise)
     return strategy, SemanticGuidanceStateBundle(
         positive=positive,
         negative=negative,
-        no_prompt_ref=no_prompt_ref,
-        no_prompt_no_ref=no_prompt_no_ref,
+        no_reference=no_reference,
     )
 
 
@@ -266,7 +263,7 @@ class _CountingBranchTransformer(nn.Module):
 @pytest.mark.parametrize(
     ("config", "forward_count"),
     [
-        (SemanticGuidanceConfig(guidance_rescale=0.0), 4),
+        (SemanticGuidanceConfig(guidance_rescale=0.0), 3),
         (
             SemanticGuidanceConfig(
                 guidance_scale=1.0,
@@ -275,7 +272,21 @@ class _CountingBranchTransformer(nn.Module):
             ),
             1,
         ),
-        (SemanticGuidanceConfig(guidance_rescale=0.0, stg_scale=0.5), 5),
+        (
+            SemanticGuidanceConfig(
+                ref_guidance_scale=0.0,
+                guidance_rescale=0.0,
+            ),
+            2,
+        ),
+        (
+            SemanticGuidanceConfig(
+                guidance_scale=1.0,
+                guidance_rescale=0.0,
+            ),
+            2,
+        ),
+        (SemanticGuidanceConfig(guidance_rescale=0.0, stg_scale=0.5), 4),
     ],
 )
 def test_joint_guidance_forward_count_and_shared_trajectory(
@@ -298,7 +309,7 @@ def test_joint_guidance_forward_count_and_shared_trajectory(
         torch.equal(call["generated"], transformer.calls[0]["generated"])
         for call in transformer.calls
     )
-    if config.need_no_prompt:
+    if config.need_reference:
         assert any(call["reference_nonzero"] is False for call in transformer.calls)
     if config.need_stg:
         assert sum(call["perturbed"] is True for call in transformer.calls) == 1
@@ -337,7 +348,7 @@ def test_runtime_builds_isolated_branches_from_one_reference_and_noise_set() -> 
         "task": "r2v",
         "positive_conditions": condition(1.0),
         "negative_conditions": condition(-1.0),
-        "no_prompt_conditions": condition(0.0),
+        "no_reference_conditions": condition(0.0),
         "reference_latents": {
             "latents": torch.ones(1, 1, 128, 1, 2, 2),
             "ref_valid_mask": torch.ones(1, 1, dtype=torch.bool),
@@ -355,25 +366,30 @@ def test_runtime_builds_isolated_branches_from_one_reference_and_noise_set() -> 
         negative_prompt="negative",
     )
     assert states.negative is not None
-    assert states.no_prompt_ref is not None
-    assert states.no_prompt_no_ref is not None
+    assert states.no_reference is not None
     offsets = states.positive.sequence_offsets
     ref_end = offsets["reference_end"]
     generated = states.positive.modality.latent[:, ref_end:]
-    for branch in (states.negative, states.no_prompt_ref, states.no_prompt_no_ref):
+    for branch in (states.negative, states.no_reference):
         assert torch.equal(branch.modality.latent[:, ref_end:], generated)
         assert branch.sequence_offsets == offsets
-        assert torch.equal(branch.modality.entity_ids, states.positive.modality.entity_ids)
+        assert torch.equal(
+            branch.modality.entity_ids[:, ref_end:],
+            states.positive.modality.entity_ids[:, ref_end:],
+        )
     assert torch.equal(
         states.positive.modality.latent[:, :ref_end],
         states.negative.modality.latent[:, :ref_end],
     )
-    assert torch.equal(
-        states.no_prompt_ref.modality.context,
-        states.no_prompt_no_ref.modality.context,
+    assert torch.count_nonzero(states.no_reference.modality.latent[:, :ref_end]) == 0
+    assert torch.all(
+        states.no_reference.modality.entity_ids[:, :ref_end] == ENTITY_GLOBAL
     )
-    assert torch.count_nonzero(states.no_prompt_no_ref.modality.latent[:, :ref_end]) == 0
-    assert not states.no_prompt_no_ref.modality.attention_mask[:, ref_end:, :ref_end].any()
+    assert not torch.equal(
+        states.no_reference.modality.entity_ids[:, :ref_end],
+        states.positive.modality.entity_ids[:, :ref_end],
+    )
+    assert not states.no_reference.modality.attention_mask[:, ref_end:, :ref_end].any()
 
 
 def test_all_guidance_disabled_is_bitwise_legacy_denoise() -> None:
@@ -445,7 +461,7 @@ def test_guidance_condition_bundle_encodes_references_once_and_each_prompt_once(
         positive_prompt="positive",
         negative_prompt="negative",
         need_negative=True,
-        need_no_prompt=True,
+        need_no_reference=True,
         reference_pixels_vae=[torch.zeros(1)],
         reference_images_vlm=[torch.zeros(1)],
         width=64,
@@ -454,8 +470,15 @@ def test_guidance_condition_bundle_encodes_references_once_and_each_prompt_once(
         fps=24.0,
     )
     assert len(vae_calls) == 1
-    assert [caption for caption, _ in prefix_calls] == ["positive", "negative", ""]
-    assert all(images is shared_images for _, images in prefix_calls)
+    assert [caption for caption, _ in prefix_calls] == [
+        "positive",
+        "negative",
+        "positive",
+    ]
+    assert prefix_calls[0][1] is shared_images
+    assert prefix_calls[1][1] is shared_images
+    assert prefix_calls[2][1] == []
     assert bundle["negative_conditions"] is not None
-    assert bundle["no_prompt_conditions"] is not None
+    assert bundle["no_reference_conditions"] is not None
+    assert "no_prompt_conditions" not in bundle
     assert bundle["strict_no_gt_checks"]["uses_target_latents"] is False

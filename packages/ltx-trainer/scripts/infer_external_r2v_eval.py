@@ -98,7 +98,7 @@ def main(
     num_inference_steps: int = typer.Option(50, "--num-inference-steps"),
     negative_prompt: str | None = typer.Option(None, "--negative-prompt"),
     guidance_scale: float = typer.Option(4.0, "--guidance-scale"),
-    ref_guidance_scale: float = typer.Option(2.0, "--ref-guidance-scale"),
+    ref_guidance_scale: float = typer.Option(1.0, "--ref-guidance-scale"),
     guidance_rescale: float = typer.Option(0.7, "--guidance-rescale"),
     stg_scale: float = typer.Option(0.0, "--stg-scale"),
     stg_blocks: str = typer.Option("28", "--stg-blocks"),

@@ -300,7 +300,7 @@ class OnlineBatchEncoder:
             positive_prompt=caption,
             negative_prompt=None,
             need_negative=False,
-            need_no_prompt=False,
+            need_no_reference=False,
             reference_pixels_vae=reference_pixels_vae,
             reference_images_vlm=reference_images_vlm,
             width=width,
@@ -322,7 +322,7 @@ class OnlineBatchEncoder:
         positive_prompt: str,
         negative_prompt: str | None,
         need_negative: bool,
-        need_no_prompt: bool,
+        need_no_reference: bool,
         reference_pixels_vae: list[Tensor],
         reference_images_vlm: list[Tensor],
         width: int,
@@ -330,7 +330,7 @@ class OnlineBatchEncoder:
         num_frames: int,
         fps: float,
     ) -> dict[str, Any]:
-        """Encode cached P/N/R conditions and one shared reference latent set."""
+        """Encode cached P/N/Q conditions and one shared reference latent set."""
         if task not in {IMAGE_TASK, VIDEO_TASK}:
             raise ValueError(f"Unsupported online inference task {task!r}")
         expected_geometry = (
@@ -370,20 +370,20 @@ class OnlineBatchEncoder:
                 task=task,
                 sample_key="inference-negative",
             )
-        no_prompt_conditions = None
-        if need_no_prompt:
-            no_prompt_conditions, _ = self._encode_prefix(
-                caption="",
-                reference_images=references,
+        no_reference_conditions = None
+        if need_no_reference:
+            no_reference_conditions, _ = self._encode_prefix(
+                caption=positive_prompt,
+                reference_images=[],
                 task=task,
-                sample_key="inference-no-prompt",
+                sample_key="inference-no-reference",
             )
         result = {
             "task": task,
             "reference_latents": reference_latents,
             "positive_conditions": positive_conditions,
             "negative_conditions": negative_conditions,
-            "no_prompt_conditions": no_prompt_conditions,
+            "no_reference_conditions": no_reference_conditions,
             "reference_metadata": {
                 "reference_count": len(references),
                 "reference_order": list(range(len(references))),

@@ -22,7 +22,7 @@ class SemanticGuidanceConfig:
     """Guidance controls shared by semantic and target-video tokens."""
 
     guidance_scale: float = 4.0
-    ref_guidance_scale: float = 2.0
+    ref_guidance_scale: float = 1.0
     guidance_rescale: float = 0.7
     stg_scale: float = 0.0
     stg_blocks: tuple[int, ...] = (28,)
@@ -57,7 +57,7 @@ class SemanticGuidanceConfig:
         return self.guidance_scale != 1.0
 
     @property
-    def need_no_prompt(self) -> bool:
+    def need_reference(self) -> bool:
         return self.ref_guidance_scale != 0.0
 
     @property
@@ -66,15 +66,15 @@ class SemanticGuidanceConfig:
 
     @property
     def transformer_forwards_per_step(self) -> int:
-        return 1 + int(self.need_negative) + 2 * int(self.need_no_prompt) + int(self.need_stg)
+        return 1 + int(self.need_negative) + int(self.need_reference) + int(self.need_stg)
 
     @property
     def enabled_branches(self) -> tuple[str, ...]:
         branches = ["P"]
         if self.need_negative:
             branches.append("N")
-        if self.need_no_prompt:
-            branches.extend(("R", "U"))
+        if self.need_reference:
+            branches.append("Q")
         if self.need_stg:
             branches.append("S")
         return tuple(branches)
@@ -95,10 +95,11 @@ class SemanticGuidanceConfig:
             "rescale_statistics_segment": "target_video",
             "rescale_application_segment": "semantic_and_target",
             "cfg_formula": "N + cfg*(P-N), P/N share reference images and reference latents",
-            "ref_formula": (
-                "ref*(R-U), R/U share empty-text reference-image VLM context; "
-                "only ref latents differ"
-            ),
+            "ref_formula": "ref*(P-Q)",
+            "Q_prompt": "positive",
+            "Q_reference_vlm_images": "absent",
+            "Q_reference_latents": "absent",
+            "reference_guidance_training_match": "drop_reference_all",
             "stg_formula": (
                 "stg*(P-S), S skips video self-attention at zero-based block "
                 + ",".join(str(block) for block in self.stg_blocks)
@@ -112,8 +113,7 @@ class SemanticGuidanceStateBundle:
 
     positive: Any
     negative: Any | None = None
-    no_prompt_ref: Any | None = None
-    no_prompt_no_ref: Any | None = None
+    no_reference: Any | None = None
 
 
 def parse_stg_blocks(value: str | Iterable[int]) -> tuple[int, ...]:
@@ -203,16 +203,14 @@ def combine_guided_denoised(
     positive: Tensor,
     config: SemanticGuidanceConfig,
     negative: Tensor | None = None,
-    no_prompt_ref: Tensor | None = None,
-    no_prompt_no_ref: Tensor | None = None,
+    no_reference: Tensor | None = None,
     stg: Tensor | None = None,
 ) -> Tensor:
     """Apply CFG, reference-latent guidance, and STG in denoised space."""
     expected = positive.shape
     supplied = {
         "negative": negative,
-        "no_prompt_ref": no_prompt_ref,
-        "no_prompt_no_ref": no_prompt_no_ref,
+        "no_reference": no_reference,
         "stg": stg,
     }
     mismatched = {
@@ -228,10 +226,10 @@ def combine_guided_denoised(
         guided = negative + config.guidance_scale * (positive - negative)
     else:
         guided = positive
-    if config.need_no_prompt:
-        if no_prompt_ref is None or no_prompt_no_ref is None:
-            raise ValueError("R and U denoised predictions are required for reference guidance")
-        guided = guided + config.ref_guidance_scale * (no_prompt_ref - no_prompt_no_ref)
+    if config.need_reference:
+        if no_reference is None:
+            raise ValueError("Q denoised prediction is required for reference guidance")
+        guided = guided + config.ref_guidance_scale * (positive - no_reference)
     if config.need_stg:
         if stg is None:
             raise ValueError("STG denoised prediction is required when STG is enabled")

@@ -154,8 +154,8 @@ def test_external_dry_run_records_all_guidance_metadata_without_decoder(
         code_commit="commit",
     )
     assert result["status"] == "dry_run_success"
-    assert result["transformer_forwards_per_step"] == 4
-    assert result["enabled_guidance_branches"] == ["P", "N", "R", "U"]
+    assert result["transformer_forwards_per_step"] == 3
+    assert result["enabled_guidance_branches"] == ["P", "N", "Q"]
     assert result["joint_guided_span"] == "semantic_and_target"
     assert result["has_target"] is False
     sample_dir = tmp_path / "outputs" / "opens2v_open_domain" / "sample_1"

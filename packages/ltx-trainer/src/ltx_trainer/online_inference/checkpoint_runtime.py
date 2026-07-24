@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -358,7 +358,7 @@ class OnlineInferenceRuntime:
         guidance: SemanticGuidanceConfig,
         negative_prompt: str | None,
     ) -> SemanticGuidanceStateBundle:
-        """Build and validate P/N/R/U states with one shared generated-noise pair."""
+        """Build and validate P/N/Q states with one shared generated-noise pair."""
         self.last_generation_geometry = {}
         forbidden = {"target_pixels", "latents", "semantic_teacher_inputs", "evidence_tokens"}
         leaked = sorted(forbidden & encoded.keys())
@@ -429,35 +429,24 @@ class OnlineInferenceRuntime:
                 raise ValueError("CFG is enabled but the negative prompt is empty")
             negative = branch_state(self.connector_conditions(raw_negative))
 
-        no_prompt_ref = None
-        no_prompt_no_ref = None
-        if guidance.need_no_prompt:
-            raw_no_prompt = encoded.get("no_prompt_conditions")
-            if raw_no_prompt is None:
-                raise ValueError("Reference guidance is enabled but no-prompt conditions were not encoded")
-            no_prompt_conditions = self.connector_conditions(raw_no_prompt)
-            no_prompt_ref = branch_state(no_prompt_conditions)
+        no_reference = None
+        if guidance.need_reference:
+            raw_no_reference = encoded.get("no_reference_conditions")
+            if raw_no_reference is None:
+                raise ValueError("Reference guidance is enabled but Q conditions were not encoded")
             no_ref_latents = dict(encoded["reference_latents"])
             no_ref_latents["ref_valid_mask"] = torch.zeros_like(
                 encoded["reference_latents"]["ref_valid_mask"],
                 dtype=torch.bool,
             )
-            no_prompt_no_ref = branch_state(
-                no_prompt_conditions,
+            no_reference = branch_state(
+                self.connector_conditions(raw_no_reference),
                 reference_latents=no_ref_latents,
-            )
-            no_prompt_no_ref = replace(
-                no_prompt_no_ref,
-                modality=replace(
-                    no_prompt_no_ref.modality,
-                    entity_ids=no_prompt_ref.modality.entity_ids,
-                ),
             )
         states = SemanticGuidanceStateBundle(
             positive=positive,
             negative=negative,
-            no_prompt_ref=no_prompt_ref,
-            no_prompt_no_ref=no_prompt_no_ref,
+            no_reference=no_reference,
         )
         self.strategy.validate_guidance_state_bundle(states, guidance)
 
