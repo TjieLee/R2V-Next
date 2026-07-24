@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -25,6 +25,11 @@ from ltx_trainer.model_loader import (
     load_video_vae_encoder,
 )
 from ltx_trainer.online_data.constants import IMAGE_TASK
+from ltx_trainer.online_inference.semantic_guidance import (
+    SemanticGuidanceConfig,
+    SemanticGuidanceStateBundle,
+    validate_stg_blocks,
+)
 from ltx_trainer.training_strategies import get_training_strategy
 from ltx_trainer.training_strategies.semantic_flow import SemanticFlowStrategy
 
@@ -315,8 +320,45 @@ class OnlineInferenceRuntime:
         fps: float,
         seed: int,
         num_inference_steps: int,
+        guidance: SemanticGuidanceConfig | None = None,
+        negative_prompt: str | None = None,
     ) -> tuple[Tensor, Tensor]:
         """Generate semantic and video latents without accepting any target-derived input."""
+        guidance = guidance or SemanticGuidanceConfig(
+            guidance_scale=1.0,
+            ref_guidance_scale=0.0,
+            guidance_rescale=0.0,
+        )
+        states = self.prepare_guidance_states(
+            encoded,
+            width=width,
+            height=height,
+            num_frames=num_frames,
+            fps=fps,
+            seed=seed,
+            guidance=guidance,
+            negative_prompt=negative_prompt,
+        )
+        return self.strategy.denoise_joint_guided(
+            transformer=self.transformer,
+            states=states,
+            guidance=guidance,
+            num_inference_steps=num_inference_steps,
+        )
+
+    def prepare_guidance_states(
+        self,
+        encoded: dict[str, Any],
+        *,
+        width: int,
+        height: int,
+        num_frames: int,
+        fps: float,
+        seed: int,
+        guidance: SemanticGuidanceConfig,
+        negative_prompt: str | None,
+    ) -> SemanticGuidanceStateBundle:
+        """Build and validate P/N/R/U states with one shared generated-noise pair."""
         self.last_generation_geometry = {}
         forbidden = {"target_pixels", "latents", "semantic_teacher_inputs", "evidence_tokens"}
         leaked = sorted(forbidden & encoded.keys())
@@ -335,8 +377,19 @@ class OnlineInferenceRuntime:
             1,
             round(int(num_frames) * self.strategy.config.anchor_frame_ratio),
         )
-        state = self.strategy.prepare_inference_state(
-            conditions=self.connector_conditions(encoded["conditions"]),
+        blocks = getattr(self.transformer, "transformer_blocks", None)
+        if blocks is None and guidance.need_stg:
+            raise ValueError("Semantic guidance requires transformer.transformer_blocks")
+        if blocks is not None:
+            validate_stg_blocks(
+                guidance.stg_blocks,
+                transformer_block_count=len(blocks),
+            )
+        positive_conditions = encoded.get("positive_conditions", encoded.get("conditions"))
+        if positive_conditions is None:
+            raise ValueError("Encoded inference bundle is missing positive conditions")
+        positive = self.strategy.prepare_inference_state(
+            conditions=self.connector_conditions(positive_conditions),
             reference_latents=encoded["reference_latents"],
             target_shape=target_shape,
             semantic_frame_count=semantic_frames,
@@ -344,20 +397,85 @@ class OnlineInferenceRuntime:
             fps=float(fps),
             seed=seed,
         )
-        target_start = state.sequence_offsets["semantic_end"]
-        target_end = state.sequence_offsets["target_end"]
+        ref_end = positive.sequence_offsets["reference_end"]
+        semantic_end = positive.sequence_offsets["semantic_end"]
+        target_end = positive.sequence_offsets["target_end"]
+        semantic_noise = positive.modality.latent[:, ref_end:semantic_end]
+        target_noise = positive.modality.latent[:, semantic_end:target_end]
+
+        def branch_state(
+            conditions: dict[str, Tensor],
+            *,
+            reference_latents: dict[str, Tensor] | None = None,
+        ) -> Any:
+            return self.strategy.prepare_inference_state(
+                conditions=conditions,
+                reference_latents=reference_latents or encoded["reference_latents"],
+                target_shape=target_shape,
+                semantic_frame_count=semantic_frames,
+                pixel_frame_count=int(num_frames),
+                fps=float(fps),
+                seed=seed,
+                semantic_noise=semantic_noise,
+                target_noise=target_noise,
+            )
+
+        negative = None
+        if guidance.need_negative:
+            raw_negative = encoded.get("negative_conditions")
+            if raw_negative is None:
+                raise ValueError("CFG is enabled but negative conditions were not encoded")
+            if not str(negative_prompt or "").strip():
+                raise ValueError("CFG is enabled but the negative prompt is empty")
+            negative = branch_state(self.connector_conditions(raw_negative))
+
+        no_prompt_ref = None
+        no_prompt_no_ref = None
+        if guidance.need_no_prompt:
+            raw_no_prompt = encoded.get("no_prompt_conditions")
+            if raw_no_prompt is None:
+                raise ValueError("Reference guidance is enabled but no-prompt conditions were not encoded")
+            no_prompt_conditions = self.connector_conditions(raw_no_prompt)
+            no_prompt_ref = branch_state(no_prompt_conditions)
+            no_ref_latents = dict(encoded["reference_latents"])
+            no_ref_latents["ref_valid_mask"] = torch.zeros_like(
+                encoded["reference_latents"]["ref_valid_mask"],
+                dtype=torch.bool,
+            )
+            no_prompt_no_ref = branch_state(
+                no_prompt_conditions,
+                reference_latents=no_ref_latents,
+            )
+            no_prompt_no_ref = replace(
+                no_prompt_no_ref,
+                modality=replace(
+                    no_prompt_no_ref.modality,
+                    entity_ids=no_prompt_ref.modality.entity_ids,
+                ),
+            )
+        states = SemanticGuidanceStateBundle(
+            positive=positive,
+            negative=negative,
+            no_prompt_ref=no_prompt_ref,
+            no_prompt_no_ref=no_prompt_no_ref,
+        )
+        self.strategy.validate_guidance_state_bundle(states, guidance)
+
+        target_start = semantic_end
         self.last_generation_geometry = {
             "fps": float(fps),
-            "target_latent_shape": list(state.target_shape.to_torch_shape()),
+            "target_latent_shape": list(positive.target_shape.to_torch_shape()),
             "target_token_count": target_end - target_start,
-            "target_position_count": int(state.modality.positions[:, :, target_start:target_end].shape[2]),
+            "target_position_count": int(
+                positive.modality.positions[:, :, target_start:target_end].shape[2]
+            ),
             "reference_rope_mode": self.strategy.config.reference_rope_mode,
+            "guidance_branch_sequence_offsets_identical": True,
+            "guidance_branch_generated_noise_identical": True,
+            "guidance_branch_count": len(guidance.enabled_branches),
+            **guidance.metadata(negative_prompt=negative_prompt),
         }
-        return self.strategy.denoise_joint(
-            transformer=self.transformer,
-            state=state,
-            num_inference_steps=num_inference_steps,
-        )
+        return states
 
 
 def _load_config(path: Path) -> LtxTrainerConfig:

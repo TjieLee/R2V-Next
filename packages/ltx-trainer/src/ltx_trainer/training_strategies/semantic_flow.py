@@ -30,6 +30,16 @@ from ltx_core.multicond.semantic_tokens import (
 from ltx_core.types import VideoLatentShape
 from ltx_trainer import logger
 from ltx_trainer.online_data.anchor_geometry import normalized_anchor_timestamps
+from ltx_trainer.online_inference.semantic_guidance import (
+    SemanticGuidanceConfig,
+    SemanticGuidanceStateBundle,
+    build_stg_perturbation,
+    combine_guided_denoised,
+    denoised_to_velocity,
+    rescale_guided_denoised,
+    validate_stg_blocks,
+    velocity_to_denoised,
+)
 from ltx_trainer.timestep_samplers import TimestepSampler
 from ltx_trainer.training_strategies.base_strategy import (
     DEFAULT_FPS,
@@ -709,6 +719,8 @@ class SemanticFlowStrategy(TrainingStrategy):
         pixel_frame_count: int,
         fps: float,
         seed: int,
+        semantic_noise: Tensor | None = None,
+        target_noise: Tensor | None = None,
     ) -> SemanticInferenceState:
         """Initialize strict-no-GT joint state from references, context, and noise only."""
         if semantic_frame_count < 1:
@@ -735,19 +747,42 @@ class SemanticFlowStrategy(TrainingStrategy):
             )
         target_template = torch.zeros(target_shape.to_torch_shape(), device=device, dtype=dtype)
         target_template_tokens = self._video_patchifier.patchify(target_template)
-        generator = torch.Generator(device=device).manual_seed(int(seed))
-        target_noise = torch.randn(
-            target_template_tokens.shape,
-            generator=generator,
-            device=device,
-            dtype=dtype,
+        if (semantic_noise is None) != (target_noise is None):
+            raise ValueError("semantic_noise and target_noise must be supplied together")
+        semantic_shape = (
+            batch_size,
+            semantic_frame_count * SEMANTIC_TOKENS_PER_FRAME,
+            self._semantic_dim,
         )
-        semantic_noise = torch.randn(
-            (batch_size, semantic_frame_count * SEMANTIC_TOKENS_PER_FRAME, self._semantic_dim),
-            generator=generator,
-            device=device,
-            dtype=dtype,
-        )
+        if semantic_noise is None or target_noise is None:
+            generator = torch.Generator(device=device).manual_seed(int(seed))
+            target_noise = torch.randn(
+                target_template_tokens.shape,
+                generator=generator,
+                device=device,
+                dtype=dtype,
+            )
+            semantic_noise = torch.randn(
+                semantic_shape,
+                generator=generator,
+                device=device,
+                dtype=dtype,
+            )
+        else:
+            self._validate_inference_noise(
+                semantic_noise,
+                name="semantic_noise",
+                expected_shape=semantic_shape,
+                device=device,
+                dtype=dtype,
+            )
+            self._validate_inference_noise(
+                target_noise,
+                name="target_noise",
+                expected_shape=tuple(target_template_tokens.shape),
+                device=device,
+                dtype=dtype,
+            )
 
         target_positions = self._get_video_positions(
             num_frames=target_shape.frames,
@@ -848,6 +883,26 @@ class SemanticFlowStrategy(TrainingStrategy):
             semantic_frame_count=semantic_frame_count,
         )
 
+    @staticmethod
+    def _validate_inference_noise(
+        value: Tensor,
+        *,
+        name: str,
+        expected_shape: tuple[int, ...],
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> None:
+        if tuple(value.shape) != expected_shape:
+            raise ValueError(
+                f"{name} shape {tuple(value.shape)} does not match expected {expected_shape}"
+            )
+        if value.device != device:
+            raise ValueError(f"{name} device {value.device} does not match {device}")
+        if value.dtype != dtype:
+            raise ValueError(f"{name} dtype {value.dtype} does not match {dtype}")
+        if not torch.isfinite(value).all():
+            raise ValueError(f"{name} must contain only finite values")
+
     @torch.inference_mode()
     def denoise_joint(
         self,
@@ -886,6 +941,196 @@ class SemanticFlowStrategy(TrainingStrategy):
         semantic = latent[:, ref_end:semantic_end]
         target = latent[:, semantic_end:target_end]
         return semantic, self._video_patchifier.unpatchify(target, state.target_shape)
+
+    @torch.inference_mode()
+    def denoise_joint_guided(
+        self,
+        *,
+        transformer: nn.Module,
+        states: SemanticGuidanceStateBundle,
+        guidance: SemanticGuidanceConfig,
+        num_inference_steps: int,
+    ) -> tuple[Tensor, Tensor]:
+        """Guide one canonical semantic/video trajectory with cached condition branches."""
+        if (
+            guidance.guidance_scale == 1.0
+            and guidance.ref_guidance_scale == 0.0
+            and guidance.stg_scale == 0.0
+            and guidance.guidance_rescale == 0.0
+        ):
+            return self.denoise_joint(
+                transformer=transformer,
+                state=states.positive,
+                num_inference_steps=num_inference_steps,
+            )
+        if num_inference_steps < 1:
+            raise ValueError("num_inference_steps must be positive")
+        self.validate_guidance_state_bundle(states, guidance)
+        positive = states.positive
+        offsets = positive.sequence_offsets
+        ref_end = offsets["reference_end"]
+        semantic_end = offsets["semantic_end"]
+        target_end = offsets["target_end"]
+        semantic_length = semantic_end - ref_end
+        latent = positive.modality.latent
+        perturbations = None
+        if guidance.need_stg:
+            blocks = getattr(transformer, "transformer_blocks", None)
+            if blocks is None:
+                raise ValueError("STG requires transformer.transformer_blocks")
+            validate_stg_blocks(
+                guidance.stg_blocks,
+                transformer_block_count=len(blocks),
+            )
+            perturbations = build_stg_perturbation(
+                guidance.stg_blocks,
+                batch_size=latent.shape[0],
+            )
+
+        schedule = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=latent.device)
+        for sigma_value, next_sigma in zip(schedule[:-1], schedule[1:], strict=True):
+            sigma_scalar = float(sigma_value.item())
+            if not math.isfinite(sigma_scalar) or sigma_scalar <= 0.0:
+                raise RuntimeError(f"Guided denoising requires positive sigma, got {sigma_scalar}")
+            sigma = torch.full(
+                (latent.shape[0],),
+                sigma_scalar,
+                device=latent.device,
+                dtype=torch.float32,
+            )
+            current_generated = latent[:, ref_end:target_end]
+
+            def predict(
+                branch: SemanticInferenceState,
+                *,
+                branch_perturbations: Any = None,
+            ) -> Tensor:
+                branch_latent = torch.cat(
+                    [branch.modality.latent[:, :ref_end], current_generated],
+                    dim=1,
+                )
+                timesteps = torch.zeros_like(branch.modality.timesteps)
+                timesteps[:, ref_end:target_end] = sigma[:, None]
+                modality = replace(
+                    branch.modality,
+                    latent=branch_latent,
+                    sigma=sigma,
+                    timesteps=timesteps,
+                )
+                velocity, _ = transformer(
+                    video=modality,
+                    audio=None,
+                    perturbations=branch_perturbations,
+                )
+                if velocity is None:
+                    raise RuntimeError("transformer returned no video velocity")
+                return velocity_to_denoised(
+                    current_generated,
+                    velocity[:, ref_end:target_end],
+                    sigma,
+                )
+
+            denoised_positive = predict(positive)
+            denoised_negative = predict(states.negative) if guidance.need_negative else None
+            denoised_ref = predict(states.no_prompt_ref) if guidance.need_no_prompt else None
+            denoised_no_ref = (
+                predict(states.no_prompt_no_ref) if guidance.need_no_prompt else None
+            )
+            denoised_stg = (
+                predict(positive, branch_perturbations=perturbations)
+                if guidance.need_stg
+                else None
+            )
+            guided = combine_guided_denoised(
+                positive=denoised_positive,
+                negative=denoised_negative,
+                no_prompt_ref=denoised_ref,
+                no_prompt_no_ref=denoised_no_ref,
+                stg=denoised_stg,
+                config=guidance,
+            )
+            guided, _factor = rescale_guided_denoised(
+                positive_generated=denoised_positive,
+                guided_generated=guided,
+                semantic_token_count=semantic_length,
+                guidance_rescale=guidance.guidance_rescale,
+            )
+            velocity = denoised_to_velocity(current_generated, guided, sigma)
+            delta = (next_sigma - sigma_value).to(device=latent.device, dtype=latent.dtype)
+            updated = current_generated + delta * velocity
+            latent = torch.cat([latent[:, :ref_end], updated], dim=1)
+
+        semantic = latent[:, ref_end:semantic_end]
+        target = latent[:, semantic_end:target_end]
+        return semantic, self._video_patchifier.unpatchify(target, positive.target_shape)
+
+    @staticmethod
+    def validate_guidance_state_bundle(
+        states: SemanticGuidanceStateBundle,
+        guidance: SemanticGuidanceConfig,
+    ) -> None:
+        required = [states.positive]
+        if guidance.need_negative:
+            if states.negative is None:
+                raise ValueError("CFG requires a negative inference state")
+            required.append(states.negative)
+        if guidance.need_no_prompt:
+            if states.no_prompt_ref is None or states.no_prompt_no_ref is None:
+                raise ValueError("Reference guidance requires both R and U inference states")
+            required.extend((states.no_prompt_ref, states.no_prompt_no_ref))
+        positive = states.positive
+        offsets = positive.sequence_offsets
+        ref_end = offsets["reference_end"]
+        generated = positive.modality.latent[:, ref_end:]
+        for branch in required[1:]:
+            if branch.sequence_offsets != offsets:
+                raise ValueError("Guidance branches have different sequence offsets")
+            if branch.target_shape != positive.target_shape:
+                raise ValueError("Guidance branches have different target shapes")
+            if not torch.equal(branch.modality.latent[:, ref_end:], generated):
+                raise ValueError("Guidance branches must share bitwise-identical generated noise")
+            for name in (
+                "positions",
+                "attention_mask",
+                "token_type_ids",
+                "entity_ids",
+                "semantic_position_bounds",
+                "timesteps",
+            ):
+                if not torch.equal(
+                    getattr(branch.modality, name),
+                    getattr(positive.modality, name),
+                ):
+                    if (
+                        guidance.need_no_prompt
+                        and branch is states.no_prompt_no_ref
+                        and name == "attention_mask"
+                    ):
+                        continue
+                    raise ValueError(f"Guidance branches differ in {name}")
+        if states.negative is not None and not torch.equal(
+            states.negative.modality.latent[:, :ref_end],
+            positive.modality.latent[:, :ref_end],
+        ):
+            raise ValueError("P and N must share reference latents")
+        if guidance.need_no_prompt:
+            assert states.no_prompt_ref is not None
+            assert states.no_prompt_no_ref is not None
+            if not torch.equal(
+                states.no_prompt_ref.modality.context,
+                states.no_prompt_no_ref.modality.context,
+            ) or not torch.equal(
+                states.no_prompt_ref.modality.context_mask,
+                states.no_prompt_no_ref.modality.context_mask,
+            ):
+                raise ValueError("R and U must share the same no-prompt VLM condition")
+            if torch.count_nonzero(
+                states.no_prompt_no_ref.modality.latent[:, :ref_end]
+            ).item():
+                raise ValueError("U reference tokens must be zero")
+            attention = states.no_prompt_no_ref.modality.attention_mask
+            if attention[:, ref_end:, :ref_end].any():
+                raise ValueError("U generated tokens must not attend to reference tokens")
 
     def get_checkpoint_metadata(self) -> dict[str, Any]:
         appended = self.config.reference_rope_mode == "appended_time_shifted_width"

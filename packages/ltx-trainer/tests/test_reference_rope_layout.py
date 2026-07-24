@@ -325,13 +325,18 @@ def test_online_runtime_records_real_i2i_and_r2v_geometry() -> None:
             seed=7,
             num_inference_steps=1,
         )
-        assert runtime.last_generation_geometry == {
+        expected_geometry = {
             "fps": fps,
             "target_latent_shape": expected_shape,
             "target_token_count": expected_tokens,
             "target_position_count": expected_tokens,
             "reference_rope_mode": "appended_time_shifted_width",
         }
+        assert {
+            key: runtime.last_generation_geometry[key]
+            for key in expected_geometry
+        } == expected_geometry
+        assert runtime.last_generation_geometry["joint_guided_span"] == "semantic_and_target"
 
 
 @pytest.mark.parametrize("fps", [0.0, -1.0, float("inf"), float("nan")])

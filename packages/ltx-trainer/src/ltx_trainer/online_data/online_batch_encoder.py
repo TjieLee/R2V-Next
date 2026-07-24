@@ -295,6 +295,42 @@ class OnlineBatchEncoder:
         fps: float,
     ) -> dict[str, Any]:
         """Encode only text/reference conditions; inference never creates teacher inputs."""
+        bundle = self.encode_inference_guidance_bundle_from_references(
+            task=task,
+            positive_prompt=caption,
+            negative_prompt=None,
+            need_negative=False,
+            need_no_prompt=False,
+            reference_pixels_vae=reference_pixels_vae,
+            reference_images_vlm=reference_images_vlm,
+            width=width,
+            height=height,
+            num_frames=num_frames,
+            fps=fps,
+        )
+        return {
+            "task": bundle["task"],
+            "reference_latents": bundle["reference_latents"],
+            "conditions": bundle["positive_conditions"],
+            "reference_metadata": bundle["reference_metadata"],
+        }
+
+    def encode_inference_guidance_bundle_from_references(
+        self,
+        *,
+        task: str,
+        positive_prompt: str,
+        negative_prompt: str | None,
+        need_negative: bool,
+        need_no_prompt: bool,
+        reference_pixels_vae: list[Tensor],
+        reference_images_vlm: list[Tensor],
+        width: int,
+        height: int,
+        num_frames: int,
+        fps: float,
+    ) -> dict[str, Any]:
+        """Encode cached P/N/R conditions and one shared reference latent set."""
         if task not in {IMAGE_TASK, VIDEO_TASK}:
             raise ValueError(f"Unsupported online inference task {task!r}")
         expected_geometry = (
@@ -305,8 +341,10 @@ class OnlineBatchEncoder:
         )
         if (int(width), int(height), int(num_frames), float(fps)) != expected_geometry:
             raise ValueError(f"Task {task} requires geometry {expected_geometry}")
-        if not caption.strip():
+        if not positive_prompt.strip():
             raise ValueError("Online inference caption must not be empty")
+        if need_negative and not str(negative_prompt or "").strip():
+            raise ValueError("CFG requires a non-empty negative prompt")
         if len(reference_pixels_vae) != len(reference_images_vlm):
             raise ValueError("Reference VAE/VLM counts differ")
         if not 1 <= len(reference_pixels_vae) <= int(self.config.max_ref_images or 4):
@@ -318,19 +356,44 @@ class OnlineBatchEncoder:
             fallback_height=height,
             fallback_width=width,
         )
-        conditions, _prefix_inputs = self._encode_prefix(
-            caption=caption,
+        positive_conditions, _prefix_inputs = self._encode_prefix(
+            caption=positive_prompt,
             reference_images=references,
             task=task,
-            sample_key="inference",
+            sample_key="inference-positive",
         )
+        negative_conditions = None
+        if need_negative:
+            negative_conditions, _ = self._encode_prefix(
+                caption=str(negative_prompt),
+                reference_images=references,
+                task=task,
+                sample_key="inference-negative",
+            )
+        no_prompt_conditions = None
+        if need_no_prompt:
+            no_prompt_conditions, _ = self._encode_prefix(
+                caption="",
+                reference_images=references,
+                task=task,
+                sample_key="inference-no-prompt",
+            )
         result = {
             "task": task,
             "reference_latents": reference_latents,
-            "conditions": conditions,
+            "positive_conditions": positive_conditions,
+            "negative_conditions": negative_conditions,
+            "no_prompt_conditions": no_prompt_conditions,
             "reference_metadata": {
                 "reference_count": len(references),
                 "reference_order": list(range(len(references))),
+            },
+            "strict_no_gt_checks": {
+                "target_path_passed_to_condition_encoder": False,
+                "target_path_passed_to_denoiser": False,
+                "uses_target_latents": False,
+                "uses_gt_teacher_evidence": False,
+                "semantic_initialization": "noise",
             },
         }
         forbidden = {"target_pixels", "latents", "semantic_teacher_inputs", "evidence_tokens"}

@@ -25,6 +25,7 @@ from ltx_trainer.online_inference.media_identity import (
     TargetReferenceAliasError,
     assert_references_do_not_alias_target,
 )
+from ltx_trainer.online_inference.semantic_guidance import SemanticGuidanceConfig
 
 if TYPE_CHECKING:
     from ltx_trainer.online_data.online_batch_encoder import OnlineBatchEncoder
@@ -111,16 +112,27 @@ def load_reference_inputs(
 def encode_selected_sample_conditions(
     encoder: OnlineBatchEncoder,
     sample: dict[str, Any],
+    *,
+    guidance: SemanticGuidanceConfig | None = None,
+    negative_prompt: str | None = None,
 ) -> dict[str, Any]:
     """Create online semantic-flow conditions without touching target-derived tensors."""
+    guidance = guidance or SemanticGuidanceConfig(
+        guidance_scale=1.0,
+        ref_guidance_scale=0.0,
+        guidance_rescale=0.0,
+    )
     references = load_reference_inputs(
         sample,
         vlm_reference_preprocess=encoder.config.vlm_reference_preprocess,
         chunk_frames=encoder.config.cpu_transform_chunk_frames,
     )
-    conditions = encoder.encode_inference_conditions_from_references(
+    conditions = encoder.encode_inference_guidance_bundle_from_references(
         task=str(sample["task"]),
-        caption=str(sample["caption"]),
+        positive_prompt=str(sample["caption"]),
+        negative_prompt=negative_prompt,
+        need_negative=guidance.need_negative,
+        need_no_prompt=guidance.need_no_prompt,
         reference_pixels_vae=references.reference_pixels_vae,
         reference_images_vlm=references.reference_images_vlm,
         width=int(sample["width"]),
@@ -128,6 +140,7 @@ def encode_selected_sample_conditions(
         num_frames=int(sample["num_frames"]),
         fps=float(sample["fps"]),
     )
+    conditions["conditions"] = conditions["positive_conditions"]
     conditions["reference_metadata"] = {
         **conditions["reference_metadata"],
         "reference_paths": [str(path) for path in references.reference_paths],
@@ -150,8 +163,16 @@ def encode_selected_sample_conditions(
 def encode_external_reference_only_conditions(
     encoder: OnlineBatchEncoder,
     sample: dict[str, Any],
+    *,
+    guidance: SemanticGuidanceConfig | None = None,
+    negative_prompt: str | None = None,
 ) -> dict[str, Any]:
     """Encode an external benchmark sample that has references and no target by design."""
+    guidance = guidance or SemanticGuidanceConfig(
+        guidance_scale=1.0,
+        ref_guidance_scale=0.0,
+        guidance_rescale=0.0,
+    )
     validate_selected_geometry(sample)
     paths = [
         Path(value).expanduser().resolve()
@@ -185,9 +206,12 @@ def encode_external_reference_only_conditions(
             "vlm_reference_preprocess must be 'original' or 'target_crop', "
             f"got {encoder.config.vlm_reference_preprocess!r}"
         )
-    conditions = encoder.encode_inference_conditions_from_references(
+    conditions = encoder.encode_inference_guidance_bundle_from_references(
         task=str(sample["task"]),
-        caption=str(sample["caption"]),
+        positive_prompt=str(sample["caption"]),
+        negative_prompt=negative_prompt,
+        need_negative=guidance.need_negative,
+        need_no_prompt=guidance.need_no_prompt,
         reference_pixels_vae=vae_references,
         reference_images_vlm=vlm_references,
         width=int(sample["width"]),
@@ -195,6 +219,7 @@ def encode_external_reference_only_conditions(
         num_frames=int(sample["num_frames"]),
         fps=float(sample["fps"]),
     )
+    conditions["conditions"] = conditions["positive_conditions"]
     conditions["reference_metadata"] = {
         **conditions["reference_metadata"],
         "reference_paths": [str(path) for path in paths],

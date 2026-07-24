@@ -23,7 +23,11 @@ from ltx_trainer.online_inference.output_artifacts import (
     save_reference_montage,
     tensor_frame_to_pil,
 )
-from ltx_trainer.online_inference.raw_condition_encoder import encode_selected_sample_conditions
+from ltx_trainer.online_inference.raw_condition_encoder import (
+    encode_external_reference_only_conditions,
+    encode_selected_sample_conditions,
+)
+from ltx_trainer.online_inference.semantic_guidance import SemanticGuidanceConfig
 from ltx_trainer.online_inference.vae_decode import decode_video_latents
 
 
@@ -79,16 +83,38 @@ def run_online_sample(
     seed: int,
     num_inference_steps: int,
     decode_tile: bool,
+    guidance: SemanticGuidanceConfig | None = None,
+    negative_prompt: str | None = None,
+    external_eval: bool = False,
     code_commit: str | None = None,
 ) -> dict[str, Any]:
     """Encode references/text and jointly generate semantics/video; target pixels are never read."""
+    guidance = guidance or SemanticGuidanceConfig(
+        guidance_scale=1.0,
+        ref_guidance_scale=0.0,
+        guidance_rescale=0.0,
+    )
     started = time.perf_counter()
-    sample_dir = sample_output_dir(output_root, sample)
+    sample_dir = (
+        output_root / str(sample["dataset_name"]) / str(sample["output_id"])
+        if external_eval
+        else sample_output_dir(output_root, sample)
+    )
     if output_is_complete(sample_dir) and not overwrite:
         return {"status": "skipped_existing", "sample_dir": str(sample_dir)}
     sample_dir.mkdir(parents=True, exist_ok=True)
 
-    encoded = encode_selected_sample_conditions(runtime.online_encoder, sample)
+    condition_encoder = (
+        encode_external_reference_only_conditions
+        if external_eval
+        else encode_selected_sample_conditions
+    )
+    encoded = condition_encoder(
+        runtime.online_encoder,
+        sample,
+        guidance=guidance,
+        negative_prompt=negative_prompt,
+    )
     strict_checks = encoded["strict_no_gt_checks"]
     if strict_checks.get("target_path_passed_to_condition_encoder") is not False:
         raise RuntimeError("Strict-no-GT guard failed before denoising")
@@ -112,10 +138,36 @@ def run_online_sample(
         "checkpoint_sha256": runtime.checkpoint_audit["checkpoint_sha256"],
         "code_commit": code_commit,
         "dry_run": dry_run,
+        **guidance.metadata(negative_prompt=negative_prompt),
     }
+    if external_eval:
+        metadata.update(
+            {
+                "dataset_name": sample["dataset_name"],
+                "source_json": sample["source_json"],
+                "source_record_id": sample["source_record_id"],
+                "output_id": sample["output_id"],
+                "dataset_metadata": sample["dataset_metadata"],
+                "external_eval": True,
+                "has_target": False,
+            }
+        )
     atomic_write_text(sample_dir / "prompt.txt", f"{sample['caption']}\n")
+    if guidance.need_negative:
+        atomic_write_text(sample_dir / "negative_prompt.txt", f"{negative_prompt}\n")
     save_reference_montage(list(sample["reference_paths"]), sample_dir / "references.png")
     reference_outputs = save_reference_images(list(sample["reference_paths"]), sample_dir)
+    states = runtime.prepare_guidance_states(
+        encoded,
+        width=int(sample["width"]),
+        height=int(sample["height"]),
+        num_frames=int(sample["num_frames"]),
+        fps=float(sample["fps"]),
+        seed=seed,
+        guidance=guidance,
+        negative_prompt=negative_prompt,
+    )
+    metadata.update(runtime.last_generation_geometry)
     if dry_run:
         metadata["elapsed_seconds"] = time.perf_counter() - started
         metadata["peak_vram_gib"] = _peak_memory_gib(runtime.device)
@@ -124,13 +176,10 @@ def run_online_sample(
 
     if runtime.vae_decoder is None:
         raise RuntimeError("Generation requires a loaded VAE decoder")
-    semantic, generated_latents = runtime.generate_latents(
-        encoded,
-        width=int(sample["width"]),
-        height=int(sample["height"]),
-        num_frames=int(sample["num_frames"]),
-        fps=float(sample["fps"]),
-        seed=seed,
+    semantic, generated_latents = runtime.strategy.denoise_joint_guided(
+        transformer=runtime.transformer,
+        states=states,
+        guidance=guidance,
         num_inference_steps=num_inference_steps,
     )
     if not torch.isfinite(semantic).all().item():
@@ -154,6 +203,8 @@ def run_online_sample(
         raise RuntimeError(f"Decoded output shape {tuple(decoded.shape)} != expected {expected_shape}")
 
     artifacts = ["prompt.txt", "references.png", *reference_outputs, "metadata.json"]
+    if guidance.need_negative:
+        artifacts.append("negative_prompt.txt")
     if sample["task"] == IMAGE_TASK:
         atomic_save_png(tensor_frame_to_pil(decoded[0]), sample_dir / "generated.png")
         artifacts.append("generated.png")
