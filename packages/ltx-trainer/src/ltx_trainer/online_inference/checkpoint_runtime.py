@@ -346,7 +346,7 @@ class OnlineInferenceRuntime:
             num_inference_steps=num_inference_steps,
         )
 
-    def prepare_guidance_states(
+    def prepare_guidance_states(  # noqa: PLR0915
         self,
         encoded: dict[str, Any],
         *,
@@ -358,7 +358,7 @@ class OnlineInferenceRuntime:
         guidance: SemanticGuidanceConfig,
         negative_prompt: str | None,
     ) -> SemanticGuidanceStateBundle:
-        """Build and validate P/N/Q states with one shared generated-noise pair."""
+        """Build and validate active guidance states with shared generated noise."""
         self.last_generation_geometry = {}
         forbidden = {"target_pixels", "latents", "semantic_teacher_inputs", "evidence_tokens"}
         leaked = sorted(forbidden & encoded.keys())
@@ -420,6 +420,15 @@ class OnlineInferenceRuntime:
                 target_noise=target_noise,
             )
 
+        no_ref_latents = None
+        if guidance.guidance_mode == "multimodal_ref" and (
+            guidance.need_negative or guidance.need_reference
+        ):
+            no_ref_latents = dict(encoded["reference_latents"])
+            no_ref_latents["ref_valid_mask"] = torch.zeros_like(
+                encoded["reference_latents"]["ref_valid_mask"],
+                dtype=torch.bool,
+            )
         negative = None
         if guidance.need_negative:
             raw_negative = encoded.get("negative_conditions")
@@ -427,10 +436,15 @@ class OnlineInferenceRuntime:
                 raise ValueError("CFG is enabled but negative conditions were not encoded")
             if not str(negative_prompt or "").strip():
                 raise ValueError("CFG is enabled but the negative prompt is empty")
-            negative = branch_state(self.connector_conditions(raw_negative))
+            negative = branch_state(
+                self.connector_conditions(raw_negative),
+                reference_latents=no_ref_latents,
+            )
 
         no_reference = None
-        if guidance.need_reference:
+        empty_reference = None
+        empty_no_reference = None
+        if guidance.need_reference and guidance.guidance_mode == "positive_ref":
             raw_no_reference = encoded.get("no_reference_conditions")
             if raw_no_reference is None:
                 raise ValueError("Reference guidance is enabled but Q conditions were not encoded")
@@ -443,10 +457,27 @@ class OnlineInferenceRuntime:
                 self.connector_conditions(raw_no_reference),
                 reference_latents=no_ref_latents,
             )
+        elif guidance.need_reference:
+            raw_empty_reference = encoded.get("empty_reference_conditions")
+            raw_empty_no_reference = encoded.get("empty_no_reference_conditions")
+            if raw_empty_reference is None or raw_empty_no_reference is None:
+                raise ValueError(
+                    "Multimodal reference guidance is enabled but R/U conditions were not encoded"
+                )
+            assert no_ref_latents is not None
+            empty_reference = branch_state(
+                self.connector_conditions(raw_empty_reference),
+            )
+            empty_no_reference = branch_state(
+                self.connector_conditions(raw_empty_no_reference),
+                reference_latents=no_ref_latents,
+            )
         states = SemanticGuidanceStateBundle(
             positive=positive,
             negative=negative,
             no_reference=no_reference,
+            empty_reference=empty_reference,
+            empty_no_reference=empty_no_reference,
         )
         self.strategy.validate_guidance_state_bundle(states, guidance)
 

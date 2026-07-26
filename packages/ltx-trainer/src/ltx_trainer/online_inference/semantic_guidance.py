@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any, Iterable, Literal
 
 import torch
 from torch import Tensor
@@ -16,11 +16,14 @@ from ltx_core.guidance.perturbations import (
     PerturbationType,
 )
 
+GuidanceMode = Literal["positive_ref", "multimodal_ref"]
+
 
 @dataclass(frozen=True)
 class SemanticGuidanceConfig:
     """Guidance controls shared by semantic and target-video tokens."""
 
+    guidance_mode: GuidanceMode = "positive_ref"
     guidance_scale: float = 4.0
     ref_guidance_scale: float = 1.0
     guidance_rescale: float = 0.7
@@ -28,6 +31,11 @@ class SemanticGuidanceConfig:
     stg_blocks: tuple[int, ...] = (28,)
 
     def __post_init__(self) -> None:
+        if self.guidance_mode not in {"positive_ref", "multimodal_ref"}:
+            raise ValueError(
+                "guidance_mode must be 'positive_ref' or 'multimodal_ref', "
+                f"got {self.guidance_mode!r}"
+            )
         values = {
             "guidance_scale": self.guidance_scale,
             "ref_guidance_scale": self.ref_guidance_scale,
@@ -66,7 +74,10 @@ class SemanticGuidanceConfig:
 
     @property
     def transformer_forwards_per_step(self) -> int:
-        return 1 + int(self.need_negative) + int(self.need_reference) + int(self.need_stg)
+        reference_forwards = 0
+        if self.need_reference:
+            reference_forwards = 1 if self.guidance_mode == "positive_ref" else 2
+        return 1 + int(self.need_negative) + reference_forwards + int(self.need_stg)
 
     @property
     def enabled_branches(self) -> tuple[str, ...]:
@@ -74,13 +85,14 @@ class SemanticGuidanceConfig:
         if self.need_negative:
             branches.append("N")
         if self.need_reference:
-            branches.append("Q")
+            branches.extend(("Q",) if self.guidance_mode == "positive_ref" else ("R", "U"))
         if self.need_stg:
             branches.append("S")
         return tuple(branches)
 
     def metadata(self, *, negative_prompt: str | None) -> dict[str, Any]:
-        return {
+        metadata = {
+            "guidance_mode": self.guidance_mode,
             "guidance_enabled": self.transformer_forwards_per_step > 1 or self.guidance_rescale > 0.0,
             "negative_prompt": negative_prompt if self.need_negative else None,
             "guidance_scale": self.guidance_scale,
@@ -94,17 +106,52 @@ class SemanticGuidanceConfig:
             "joint_guided_span": "semantic_and_target",
             "rescale_statistics_segment": "target_video",
             "rescale_application_segment": "semantic_and_target",
-            "cfg_formula": "N + cfg*(P-N), P/N share reference images and reference latents",
-            "ref_formula": "ref*(P-Q)",
-            "Q_prompt": "positive",
-            "Q_reference_vlm_images": "absent",
-            "Q_reference_latents": "absent",
-            "reference_guidance_training_match": "drop_reference_all",
-            "stg_formula": (
-                "stg*(P-S), S skips video self-attention at zero-based block "
-                + ",".join(str(block) for block in self.stg_blocks)
-            ),
         }
+        if self.guidance_mode == "positive_ref":
+            metadata.update(
+                {
+                    "cfg_formula": "N + cfg*(P-N), P/N share reference images and reference latents",
+                    "ref_formula": "ref*(P-Q)",
+                    "stg_formula": (
+                        "stg*(P-S), S skips video self-attention at zero-based block "
+                        + ",".join(str(block) for block in self.stg_blocks)
+                    ),
+                    "P_text": "positive",
+                    "P_vlm_references": "present",
+                    "P_reference_latents": "present",
+                    "N_text": "negative",
+                    "N_vlm_references": "present",
+                    "N_reference_latents": "present",
+                    "Q_text": "positive",
+                    "Q_vlm_references": "absent",
+                    "Q_reference_latents": "absent",
+                    "Q_prompt": "positive",
+                    "Q_reference_vlm_images": "absent",
+                    "reference_guidance_training_match": "drop_reference_all",
+                }
+            )
+        else:
+            metadata.update(
+                {
+                    "cfg_formula": "N + cfg*(P-N)",
+                    "ref_formula": "ref*(R-U)",
+                    "stg_formula": "stg*(P-S)",
+                    "P_text": "positive",
+                    "P_vlm_references": "present",
+                    "P_reference_latents": "present",
+                    "N_text": "negative",
+                    "N_vlm_references": "absent",
+                    "N_reference_latents": "absent",
+                    "R_text": "empty",
+                    "R_vlm_references": "present",
+                    "R_reference_latents": "present",
+                    "U_text": "empty",
+                    "U_vlm_references": "absent",
+                    "U_reference_latents": "absent",
+                    "reference_guidance_training_match": "drop_text_vs_drop_all",
+                }
+            )
+        return metadata
 
 
 @dataclass(frozen=True)
@@ -114,6 +161,8 @@ class SemanticGuidanceStateBundle:
     positive: Any
     negative: Any | None = None
     no_reference: Any | None = None
+    empty_reference: Any | None = None
+    empty_no_reference: Any | None = None
 
 
 def parse_stg_blocks(value: str | Iterable[int]) -> tuple[int, ...]:
@@ -204,6 +253,8 @@ def combine_guided_denoised(
     config: SemanticGuidanceConfig,
     negative: Tensor | None = None,
     no_reference: Tensor | None = None,
+    empty_reference: Tensor | None = None,
+    empty_no_reference: Tensor | None = None,
     stg: Tensor | None = None,
 ) -> Tensor:
     """Apply CFG, reference-latent guidance, and STG in denoised space."""
@@ -211,6 +262,8 @@ def combine_guided_denoised(
     supplied = {
         "negative": negative,
         "no_reference": no_reference,
+        "empty_reference": empty_reference,
+        "empty_no_reference": empty_no_reference,
         "stg": stg,
     }
     mismatched = {
@@ -227,9 +280,15 @@ def combine_guided_denoised(
     else:
         guided = positive
     if config.need_reference:
-        if no_reference is None:
-            raise ValueError("Q denoised prediction is required for reference guidance")
-        guided = guided + config.ref_guidance_scale * (positive - no_reference)
+        if config.guidance_mode == "positive_ref":
+            if no_reference is None:
+                raise ValueError("Q denoised prediction is required for reference guidance")
+            reference_delta = positive - no_reference
+        else:
+            if empty_reference is None or empty_no_reference is None:
+                raise ValueError("R and U denoised predictions are required for reference guidance")
+            reference_delta = empty_reference - empty_no_reference
+        guided = guided + config.ref_guidance_scale * reference_delta
     if config.need_stg:
         if stg is None:
             raise ValueError("STG denoised prediction is required when STG is enabled")
@@ -268,6 +327,7 @@ def rescale_guided_denoised(
 
 
 __all__ = [
+    "GuidanceMode",
     "SemanticGuidanceConfig",
     "SemanticGuidanceStateBundle",
     "build_stg_perturbation",

@@ -943,7 +943,7 @@ class SemanticFlowStrategy(TrainingStrategy):
         return semantic, self._video_patchifier.unpatchify(target, state.target_shape)
 
     @torch.inference_mode()
-    def denoise_joint_guided(
+    def denoise_joint_guided(  # noqa: PLR0915
         self,
         *,
         transformer: nn.Module,
@@ -1032,9 +1032,15 @@ class SemanticFlowStrategy(TrainingStrategy):
 
             denoised_positive = predict(positive)
             denoised_negative = predict(states.negative) if guidance.need_negative else None
-            denoised_no_reference = (
-                predict(states.no_reference) if guidance.need_reference else None
-            )
+            denoised_no_reference = None
+            denoised_empty_reference = None
+            denoised_empty_no_reference = None
+            if guidance.need_reference:
+                if guidance.guidance_mode == "positive_ref":
+                    denoised_no_reference = predict(states.no_reference)
+                else:
+                    denoised_empty_reference = predict(states.empty_reference)
+                    denoised_empty_no_reference = predict(states.empty_no_reference)
             denoised_stg = (
                 predict(positive, branch_perturbations=perturbations)
                 if guidance.need_stg
@@ -1044,6 +1050,8 @@ class SemanticFlowStrategy(TrainingStrategy):
                 positive=denoised_positive,
                 negative=denoised_negative,
                 no_reference=denoised_no_reference,
+                empty_reference=denoised_empty_reference,
+                empty_no_reference=denoised_empty_no_reference,
                 stg=denoised_stg,
                 config=guidance,
             )
@@ -1063,7 +1071,7 @@ class SemanticFlowStrategy(TrainingStrategy):
         return semantic, self._video_patchifier.unpatchify(target, positive.target_shape)
 
     @staticmethod
-    def validate_guidance_state_bundle(
+    def validate_guidance_state_bundle(  # noqa: PLR0912, PLR0915
         states: SemanticGuidanceStateBundle,
         guidance: SemanticGuidanceConfig,
     ) -> None:
@@ -1073,9 +1081,14 @@ class SemanticFlowStrategy(TrainingStrategy):
                 raise ValueError("CFG requires a negative inference state")
             required.append(states.negative)
         if guidance.need_reference:
-            if states.no_reference is None:
-                raise ValueError("Reference guidance requires a Q inference state")
-            required.append(states.no_reference)
+            if guidance.guidance_mode == "positive_ref":
+                if states.no_reference is None:
+                    raise ValueError("Reference guidance requires a Q inference state")
+                required.append(states.no_reference)
+            else:
+                if states.empty_reference is None or states.empty_no_reference is None:
+                    raise ValueError("Multimodal reference guidance requires R and U inference states")
+                required.extend((states.empty_reference, states.empty_no_reference))
         positive = states.positive
         offsets = positive.sequence_offsets
         ref_end = offsets["reference_end"]
@@ -1103,25 +1116,52 @@ class SemanticFlowStrategy(TrainingStrategy):
                 positive.modality.attention_mask[:, ref_end:, ref_end:],
             ):
                 raise ValueError("Guidance branches differ in generated-span attention layout")
-        if states.negative is not None and not torch.equal(
+        if guidance.guidance_mode == "positive_ref" and states.negative is not None and not torch.equal(
             states.negative.modality.latent[:, :ref_end],
             positive.modality.latent[:, :ref_end],
         ):
             raise ValueError("P and N must share reference latents")
-        if states.negative is not None:
+        if guidance.guidance_mode == "positive_ref" and states.negative is not None:
             for name in ("attention_mask", "entity_ids"):
                 if not torch.equal(
                     getattr(states.negative.modality, name),
                     getattr(positive.modality, name),
                 ):
                     raise ValueError(f"P and N must share {name}")
-        if guidance.need_reference:
+        if guidance.need_reference and guidance.guidance_mode == "positive_ref":
             assert states.no_reference is not None
             if torch.count_nonzero(states.no_reference.modality.latent[:, :ref_end]).item():
                 raise ValueError("Q reference tokens must be zero")
             attention = states.no_reference.modality.attention_mask
             if attention[:, ref_end:, :ref_end].any():
                 raise ValueError("Q generated tokens must not attend to reference tokens")
+        if guidance.guidance_mode == "multimodal_ref":
+            no_reference_states = [
+                ("N", states.negative),
+                ("U", states.empty_no_reference),
+            ]
+            for name, branch in no_reference_states:
+                if branch is None:
+                    continue
+                if torch.count_nonzero(branch.modality.latent[:, :ref_end]).item():
+                    raise ValueError(f"{name} reference tokens must be zero")
+                if branch.modality.attention_mask[:, ref_end:, :ref_end].any():
+                    raise ValueError(
+                        f"{name} generated tokens must not attend to reference tokens"
+                    )
+            if guidance.need_reference:
+                assert states.empty_reference is not None
+                if not torch.equal(
+                    states.empty_reference.modality.latent[:, :ref_end],
+                    positive.modality.latent[:, :ref_end],
+                ):
+                    raise ValueError("P and R must share reference latents")
+                for name in ("attention_mask", "entity_ids"):
+                    if not torch.equal(
+                        getattr(states.empty_reference.modality, name),
+                        getattr(positive.modality, name),
+                    ):
+                        raise ValueError(f"P and R must share {name}")
 
     def get_checkpoint_metadata(self) -> dict[str, Any]:
         appended = self.config.reference_rope_mode == "appended_time_shifted_width"

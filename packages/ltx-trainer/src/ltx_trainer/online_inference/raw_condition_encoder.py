@@ -139,6 +139,7 @@ def encode_selected_sample_conditions(
         height=int(sample["height"]),
         num_frames=int(sample["num_frames"]),
         fps=float(sample["fps"]),
+        guidance_mode=guidance.guidance_mode,
     )
     conditions["conditions"] = conditions["positive_conditions"]
     conditions["reference_metadata"] = {
@@ -218,6 +219,7 @@ def encode_external_reference_only_conditions(
         height=int(sample["height"]),
         num_frames=int(sample["num_frames"]),
         fps=float(sample["fps"]),
+        guidance_mode=guidance.guidance_mode,
     )
     conditions["conditions"] = conditions["positive_conditions"]
     conditions["reference_metadata"] = {

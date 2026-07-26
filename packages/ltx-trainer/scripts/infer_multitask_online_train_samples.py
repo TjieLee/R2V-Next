@@ -99,6 +99,11 @@ def main(
     seed: int = typer.Option(42, "--seed"),
     num_inference_steps: int = typer.Option(50, "--num-inference-steps"),
     negative_prompt: str | None = typer.Option(None, "--negative-prompt"),
+    guidance_mode: str = typer.Option(
+        "positive_ref",
+        "--guidance-mode",
+        help="Reference guidance mode: positive_ref or multimodal_ref.",
+    ),
     guidance_scale: float = typer.Option(4.0, "--guidance-scale"),
     ref_guidance_scale: float = typer.Option(1.0, "--ref-guidance-scale"),
     guidance_rescale: float = typer.Option(0.7, "--guidance-rescale"),
@@ -123,6 +128,7 @@ def main(
         raise typer.BadParameter("--num-inference-steps must be >= 1")
     try:
         guidance = SemanticGuidanceConfig(
+            guidance_mode=guidance_mode,
             guidance_scale=guidance_scale,
             ref_guidance_scale=ref_guidance_scale,
             guidance_rescale=guidance_rescale,

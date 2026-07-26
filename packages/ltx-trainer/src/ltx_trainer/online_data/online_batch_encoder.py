@@ -36,6 +36,7 @@ from ltx_trainer.online_data.transforms import (
     augment_target_frames,
     augmentation_seed,
 )
+from ltx_trainer.online_inference.semantic_guidance import GuidanceMode
 
 
 class OnlineSampleEncodeError(RuntimeError):
@@ -315,7 +316,7 @@ class OnlineBatchEncoder:
             "reference_metadata": bundle["reference_metadata"],
         }
 
-    def encode_inference_guidance_bundle_from_references(
+    def encode_inference_guidance_bundle_from_references(  # noqa: PLR0912, PLR0913
         self,
         *,
         task: str,
@@ -329,10 +330,13 @@ class OnlineBatchEncoder:
         height: int,
         num_frames: int,
         fps: float,
+        guidance_mode: GuidanceMode = "positive_ref",
     ) -> dict[str, Any]:
-        """Encode cached P/N/Q conditions and one shared reference latent set."""
+        """Encode guidance conditions and one shared reference latent set."""
         if task not in {IMAGE_TASK, VIDEO_TASK}:
             raise ValueError(f"Unsupported online inference task {task!r}")
+        if guidance_mode not in {"positive_ref", "multimodal_ref"}:
+            raise ValueError(f"Unsupported guidance mode {guidance_mode!r}")
         expected_geometry = (
             self.config.width,
             self.config.height,
@@ -366,24 +370,42 @@ class OnlineBatchEncoder:
         if need_negative:
             negative_conditions, _ = self._encode_prefix(
                 caption=str(negative_prompt),
-                reference_images=references,
+                reference_images=references if guidance_mode == "positive_ref" else [],
                 task=task,
-                sample_key="inference-negative",
+                sample_key=(
+                    "inference-negative"
+                    if guidance_mode == "positive_ref"
+                    else "inference-negative-no-reference"
+                ),
             )
         no_reference_conditions = None
-        if need_no_reference:
+        empty_reference_conditions = None
+        empty_no_reference_conditions = None
+        if need_no_reference and guidance_mode == "positive_ref":
             no_reference_conditions, _ = self._encode_prefix(
                 caption=positive_prompt,
                 reference_images=[],
                 task=task,
                 sample_key="inference-no-reference",
             )
+        elif need_no_reference:
+            empty_reference_conditions, _ = self._encode_prefix(
+                caption="",
+                reference_images=references,
+                task=task,
+                sample_key="inference-empty-reference",
+            )
+            empty_no_reference_conditions, _ = self._encode_prefix(
+                caption="",
+                reference_images=[],
+                task=task,
+                sample_key="inference-empty-no-reference",
+            )
         result = {
             "task": task,
             "reference_latents": reference_latents,
             "positive_conditions": positive_conditions,
             "negative_conditions": negative_conditions,
-            "no_reference_conditions": no_reference_conditions,
             "reference_metadata": {
                 "reference_count": len(references),
                 "reference_order": list(range(len(references))),
@@ -396,6 +418,15 @@ class OnlineBatchEncoder:
                 "semantic_initialization": "noise",
             },
         }
+        if guidance_mode == "positive_ref":
+            result["no_reference_conditions"] = no_reference_conditions
+        else:
+            result.update(
+                {
+                    "empty_reference_conditions": empty_reference_conditions,
+                    "empty_no_reference_conditions": empty_no_reference_conditions,
+                }
+            )
         forbidden = {"target_pixels", "latents", "semantic_teacher_inputs", "evidence_tokens"}
         leaked = sorted(forbidden & result.keys())
         if leaked:
