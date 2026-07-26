@@ -97,6 +97,14 @@ def _materialize_frozen_tensor(value: Tensor) -> Tensor:
     return value.detach()
 
 
+def _zero_condition_tensors(conditions: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy with every tensor condition replaced by zeros."""
+    return {
+        key: torch.zeros_like(value) if isinstance(value, Tensor) else value
+        for key, value in conditions.items()
+    }
+
+
 def _build_messages(
     system_prompt: str,
     user_prompt: str,
@@ -258,10 +266,7 @@ class OnlineBatchEncoder:
 
         evidence_started = time.perf_counter()
         if condition_mode == "drop_all":
-            conditions = {
-                key: torch.zeros_like(value) if isinstance(value, Tensor) else value
-                for key, value in conditions.items()
-            }
+            conditions = _zero_condition_tensors(conditions)
         evidence = self._encode_gt_evidence(raw_batch)
         metrics["gemma_evidence_ms"] = (time.perf_counter() - evidence_started) * 1000.0
         semantic_teacher_inputs = {**prefix_inputs, **evidence}
@@ -400,6 +405,9 @@ class OnlineBatchEncoder:
                 reference_images=[],
                 task=task,
                 sample_key="inference-empty-no-reference",
+            )
+            empty_no_reference_conditions = _zero_condition_tensors(
+                empty_no_reference_conditions
             )
         result = {
             "task": task,

@@ -11,7 +11,10 @@ from torch import nn
 
 from ltx_core.guidance.perturbations import PerturbationType
 from ltx_core.types import VideoLatentShape
-from ltx_trainer.online_data.online_batch_encoder import OnlineBatchEncoder
+from ltx_trainer.online_data.online_batch_encoder import (
+    OnlineBatchEncoder,
+    _zero_condition_tensors,
+)
 from ltx_trainer.online_inference.checkpoint_runtime import OnlineInferenceRuntime
 from ltx_trainer.online_inference.semantic_guidance import (
     GuidanceMode,
@@ -117,6 +120,23 @@ def test_guidance_mode_defaults_and_validation() -> None:
     assert SemanticGuidanceConfig().guidance_mode == "positive_ref"
     with pytest.raises(ValueError, match="guidance_mode"):
         SemanticGuidanceConfig(guidance_mode="unknown")  # type: ignore[arg-type]
+
+
+def test_zero_condition_tensors_preserves_source_and_non_tensors() -> None:
+    source = {
+        "embeds": torch.ones(1, 2, 8),
+        "mask": torch.ones(1, 2, dtype=torch.bool),
+        "metadata": "unchanged",
+    }
+
+    zeroed = _zero_condition_tensors(source)
+
+    assert zeroed is not source
+    assert torch.count_nonzero(zeroed["embeds"]) == 0
+    assert torch.count_nonzero(zeroed["mask"]) == 0
+    assert zeroed["metadata"] == "unchanged"
+    assert torch.count_nonzero(source["embeds"]) > 0
+    assert torch.count_nonzero(source["mask"]) > 0
 
 
 @pytest.mark.parametrize(
@@ -779,5 +799,15 @@ def test_multimodal_guidance_bundle_encodes_exact_branch_sequence() -> None:
     ]
     assert [images is shared_images for _, images, _ in prefix_calls] == [True, False, True, False]
     assert "no_reference_conditions" not in bundle
-    assert bundle["empty_reference_conditions"] is not None
-    assert bundle["empty_no_reference_conditions"] is not None
+    r_conditions = bundle["empty_reference_conditions"]
+    u_conditions = bundle["empty_no_reference_conditions"]
+    assert r_conditions
+    assert u_conditions
+    assert any(
+        isinstance(value, torch.Tensor)
+        and torch.count_nonzero(value).item() > 0
+        for value in r_conditions.values()
+    )
+    for key, value in u_conditions.items():
+        if isinstance(value, torch.Tensor):
+            assert torch.count_nonzero(value).item() == 0, key
