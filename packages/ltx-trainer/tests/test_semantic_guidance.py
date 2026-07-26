@@ -77,14 +77,14 @@ def test_guidance_formula_and_forward_counts() -> None:
     )
 
 
-def test_multimodal_reference_guidance_formula_counts_and_metadata() -> None:
+def test_debiased_reference_guidance_formula_counts_and_metadata() -> None:
     positive = torch.tensor([[[5.0, 7.0]]])
     negative = torch.tensor([[[1.0, 2.0]]])
     empty_reference = torch.tensor([[[4.0, 6.0]]])
     empty_no_reference = torch.tensor([[[2.0, 1.0]]])
     stg = torch.tensor([[[2.0, 6.0]]])
     config = SemanticGuidanceConfig(
-        guidance_mode="multimodal_ref",
+        guidance_mode="debiased_ref",
         guidance_scale=4.0,
         ref_guidance_scale=1.5,
         guidance_rescale=0.0,
@@ -98,28 +98,63 @@ def test_multimodal_reference_guidance_formula_counts_and_metadata() -> None:
         stg=stg,
         config=config,
     )
-    expected = negative + 4.0 * (positive - negative)
-    expected = expected + 1.5 * (empty_reference - empty_no_reference)
+    control_delta = empty_reference - empty_no_reference
+    semantic_delta = positive - negative - control_delta
+    expected = positive + 3.0 * semantic_delta
+    expected = expected + 1.5 * control_delta
     expected = expected + 0.5 * (positive - stg)
     assert torch.equal(actual, expected)
     assert config.transformer_forwards_per_step == 5
     assert config.enabled_branches == ("P", "N", "R", "U", "S")
     metadata = config.metadata(negative_prompt="negative")
-    assert metadata["guidance_mode"] == "multimodal_ref"
-    assert metadata["cfg_formula"] == "N + cfg*(P-N)"
+    assert metadata["guidance_mode"] == "debiased_ref"
+    assert metadata["cfg_formula"] == "P + (cfg-1)*((P-N)-(R-U))"
+    assert metadata["semantic_delta_formula"] == "(P-N)-(R-U)"
+    assert metadata["control_delta_formula"] == "R-U"
     assert metadata["ref_formula"] == "ref*(R-U)"
     assert metadata["stg_formula"] == "stg*(P-S)"
     assert metadata["N_vlm_references"] == "absent"
     assert metadata["R_text"] == "empty"
     assert metadata["R_reference_latents"] == "present"
+    assert metadata["U_text"] == "drop_all_zero_conditions"
     assert metadata["U_reference_latents"] == "absent"
+    assert metadata["control_main_effect_in_cfg"] == "subtracted"
     assert metadata["reference_guidance_training_match"] == "drop_text_vs_drop_all"
+
+
+@pytest.mark.parametrize("guidance_scale", [2.0, 4.0, 8.0])
+def test_debiased_cfg_does_not_repeat_control_main_effect(
+    guidance_scale: float,
+) -> None:
+    empty_no_reference = torch.tensor([[[1.0, 2.0]]])
+    empty_reference = torch.tensor([[[3.0, 5.0]]])
+    negative = torch.tensor([[[4.0, 6.0]]])
+    control_delta = empty_reference - empty_no_reference
+    positive = negative + control_delta
+    config = SemanticGuidanceConfig(
+        guidance_mode="debiased_ref",
+        guidance_scale=guidance_scale,
+        ref_guidance_scale=0.0,
+        guidance_rescale=0.0,
+    )
+    actual = combine_guided_denoised(
+        positive=positive,
+        negative=negative,
+        empty_reference=empty_reference,
+        empty_no_reference=empty_no_reference,
+        config=config,
+    )
+    assert torch.equal(actual, positive)
+    assert config.enabled_branches == ("P", "N", "R", "U")
+    assert config.transformer_forwards_per_step == 4
 
 
 def test_guidance_mode_defaults_and_validation() -> None:
     assert SemanticGuidanceConfig().guidance_mode == "positive_ref"
     with pytest.raises(ValueError, match="guidance_mode"):
         SemanticGuidanceConfig(guidance_mode="unknown")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="guidance_mode"):
+        SemanticGuidanceConfig(guidance_mode="multimodal_ref")  # type: ignore[arg-type]
 
 
 def test_zero_condition_tensors_preserves_source_and_non_tensors() -> None:
@@ -137,6 +172,51 @@ def test_zero_condition_tensors_preserves_source_and_non_tensors() -> None:
     assert zeroed["metadata"] == "unchanged"
     assert torch.count_nonzero(source["embeds"]) > 0
     assert torch.count_nonzero(source["mask"]) > 0
+
+
+def test_training_drop_all_reuses_zero_condition_helper() -> None:
+    source_path = (
+        Path(__file__).parents[1]
+        / "src"
+        / "ltx_trainer"
+        / "online_data"
+        / "online_batch_encoder.py"
+    )
+    module = ast.parse(source_path.read_text(encoding="utf-8"))
+    encoder_class = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.ClassDef) and node.name == "OnlineBatchEncoder"
+    )
+    encode_for_strategy = next(
+        node
+        for node in encoder_class.body
+        if isinstance(node, ast.FunctionDef) and node.name == "encode_for_strategy"
+    )
+    drop_all_blocks = [
+        node
+        for node in ast.walk(encode_for_strategy)
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Compare)
+        and isinstance(node.test.left, ast.Name)
+        and node.test.left.id == "condition_mode"
+        and len(node.test.ops) == 1
+        and isinstance(node.test.ops[0], ast.Eq)
+        and len(node.test.comparators) == 1
+        and isinstance(node.test.comparators[0], ast.Constant)
+        and node.test.comparators[0].value == "drop_all"
+    ]
+    assert len(drop_all_blocks) == 1
+    helper_calls = [
+        node
+        for statement in drop_all_blocks[0].body
+        for node in ast.walk(statement)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_zero_condition_tensors"
+    ]
+    assert len(helper_calls) == 1
+    assert ast.unparse(helper_calls[0]) == "_zero_condition_tensors(conditions)"
 
 
 @pytest.mark.parametrize(
@@ -169,6 +249,9 @@ def test_cli_guidance_mode_defaults_to_positive_ref(script_name: str) -> None:
         isinstance(argument, ast.Constant) and argument.value == "--guidance-mode"
         for argument in option.args
     )
+    source = script.read_text(encoding="utf-8")
+    assert "positive_ref or debiased_ref" in source
+    assert "multimodal_ref" not in source
 
 
 @pytest.mark.parametrize(
@@ -326,7 +409,7 @@ def _state_bundle(
     empty_no_reference = None
     if config.need_reference and config.guidance_mode == "positive_ref":
         no_reference = prepare(0.0, no_refs, noise)
-    elif config.need_reference:
+    elif config.need_control_pair:
         empty_reference = prepare(0.0, references, noise)
         empty_no_reference = prepare(0.0, no_refs, noise)
     return strategy, SemanticGuidanceStateBundle(
@@ -398,14 +481,14 @@ class _CountingBranchTransformer(nn.Module):
         (SemanticGuidanceConfig(guidance_rescale=0.0, stg_scale=0.5), 4),
         (
             SemanticGuidanceConfig(
-                guidance_mode="multimodal_ref",
+                guidance_mode="debiased_ref",
                 guidance_rescale=0.0,
             ),
             4,
         ),
         (
             SemanticGuidanceConfig(
-                guidance_mode="multimodal_ref",
+                guidance_mode="debiased_ref",
                 guidance_scale=1.0,
                 ref_guidance_scale=0.0,
                 guidance_rescale=0.0,
@@ -414,7 +497,7 @@ class _CountingBranchTransformer(nn.Module):
         ),
         (
             SemanticGuidanceConfig(
-                guidance_mode="multimodal_ref",
+                guidance_mode="debiased_ref",
                 guidance_scale=1.0,
                 guidance_rescale=0.0,
             ),
@@ -422,15 +505,15 @@ class _CountingBranchTransformer(nn.Module):
         ),
         (
             SemanticGuidanceConfig(
-                guidance_mode="multimodal_ref",
+                guidance_mode="debiased_ref",
                 ref_guidance_scale=0.0,
                 guidance_rescale=0.0,
             ),
-            2,
+            4,
         ),
         (
             SemanticGuidanceConfig(
-                guidance_mode="multimodal_ref",
+                guidance_mode="debiased_ref",
                 guidance_rescale=0.0,
                 stg_scale=0.5,
             ),
@@ -458,7 +541,7 @@ def test_joint_guidance_forward_count_and_shared_trajectory(
         torch.equal(call["generated"], transformer.calls[0]["generated"])
         for call in transformer.calls
     )
-    if config.need_reference:
+    if config.need_reference_comparison:
         assert any(call["reference_nonzero"] is False for call in transformer.calls)
     if config.need_stg:
         assert sum(call["perturbed"] is True for call in transformer.calls) == 1
@@ -573,7 +656,7 @@ def test_runtime_builds_isolated_branches_from_one_reference_and_noise_set() -> 
     assert not states.no_reference.modality.attention_mask[:, ref_end:, :ref_end].any()
 
 
-def test_runtime_builds_multimodal_reference_states_from_one_noise_set() -> None:
+def test_runtime_builds_debiased_reference_states_from_one_noise_set() -> None:
     strategy = SemanticFlowStrategy(SemanticFlowConfig(max_ref_images_per_sample=1))
     strategy._semantic_dim = 128
     runtime = object.__new__(OnlineInferenceRuntime)
@@ -599,7 +682,7 @@ def test_runtime_builds_multimodal_reference_states_from_one_noise_set() -> None
         },
     }
     guidance = SemanticGuidanceConfig(
-        guidance_mode="multimodal_ref",
+        guidance_mode="debiased_ref",
         guidance_rescale=0.0,
     )
     states = runtime.prepare_guidance_states(
@@ -633,12 +716,12 @@ def test_runtime_builds_multimodal_reference_states_from_one_noise_set() -> None
     for branch in (states.negative, states.empty_no_reference):
         assert torch.count_nonzero(branch.modality.latent[:, :ref_end]) == 0
         assert not branch.modality.attention_mask[:, ref_end:, :ref_end].any()
-    assert runtime.last_generation_geometry["guidance_mode"] == "multimodal_ref"
+    assert runtime.last_generation_geometry["guidance_mode"] == "debiased_ref"
     assert runtime.last_generation_geometry["guidance_branch_count"] == 4
     assert runtime.last_generation_geometry["transformer_forwards_per_step"] == 4
 
 
-@pytest.mark.parametrize("guidance_mode", ["positive_ref", "multimodal_ref"])
+@pytest.mark.parametrize("guidance_mode", ["positive_ref", "debiased_ref"])
 def test_all_guidance_disabled_is_bitwise_legacy_denoise(guidance_mode: GuidanceMode) -> None:
     config = SemanticGuidanceConfig(
         guidance_mode=guidance_mode,
@@ -732,7 +815,7 @@ def test_guidance_condition_bundle_encodes_references_once_and_each_prompt_once(
     assert bundle["strict_no_gt_checks"]["uses_target_latents"] is False
 
 
-def test_multimodal_guidance_bundle_encodes_exact_branch_sequence() -> None:
+def test_debiased_guidance_bundle_encodes_exact_branch_sequence() -> None:
     encoder = object.__new__(OnlineBatchEncoder)
     encoder.config = SimpleNamespace(
         width=64,
@@ -776,19 +859,25 @@ def test_multimodal_guidance_bundle_encodes_exact_branch_sequence() -> None:
     encoder._reference_images = reference_images  # type: ignore[method-assign]
     encoder._encode_reference_latents = encode_latents  # type: ignore[method-assign]
     encoder._encode_prefix = encode_prefix  # type: ignore[method-assign]
+    guidance = SemanticGuidanceConfig(
+        guidance_mode="debiased_ref",
+        guidance_scale=4.0,
+        ref_guidance_scale=0.0,
+        guidance_rescale=0.0,
+    )
     bundle = encoder.encode_inference_guidance_bundle_from_references(
         task="r2v",
         positive_prompt="positive",
         negative_prompt="negative",
-        need_negative=True,
-        need_no_reference=True,
+        need_negative=guidance.need_negative,
+        need_no_reference=guidance.need_reference_comparison,
         reference_pixels_vae=[torch.zeros(1)],
         reference_images_vlm=[torch.zeros(1)],
         width=64,
         height=64,
         num_frames=9,
         fps=24.0,
-        guidance_mode="multimodal_ref",
+        guidance_mode=guidance.guidance_mode,
     )
     assert len(vae_calls) == 1
     assert [(caption, key) for caption, _, key in prefix_calls] == [

@@ -1035,12 +1035,12 @@ class SemanticFlowStrategy(TrainingStrategy):
             denoised_no_reference = None
             denoised_empty_reference = None
             denoised_empty_no_reference = None
-            if guidance.need_reference:
-                if guidance.guidance_mode == "positive_ref":
+            if guidance.guidance_mode == "positive_ref":
+                if guidance.need_reference:
                     denoised_no_reference = predict(states.no_reference)
-                else:
-                    denoised_empty_reference = predict(states.empty_reference)
-                    denoised_empty_no_reference = predict(states.empty_no_reference)
+            elif guidance.need_control_pair:
+                denoised_empty_reference = predict(states.empty_reference)
+                denoised_empty_no_reference = predict(states.empty_no_reference)
             denoised_stg = (
                 predict(positive, branch_perturbations=perturbations)
                 if guidance.need_stg
@@ -1080,15 +1080,15 @@ class SemanticFlowStrategy(TrainingStrategy):
             if states.negative is None:
                 raise ValueError("CFG requires a negative inference state")
             required.append(states.negative)
-        if guidance.need_reference:
-            if guidance.guidance_mode == "positive_ref":
+        if guidance.guidance_mode == "positive_ref":
+            if guidance.need_reference:
                 if states.no_reference is None:
                     raise ValueError("Reference guidance requires a Q inference state")
                 required.append(states.no_reference)
-            else:
-                if states.empty_reference is None or states.empty_no_reference is None:
-                    raise ValueError("Multimodal reference guidance requires R and U inference states")
-                required.extend((states.empty_reference, states.empty_no_reference))
+        elif guidance.need_control_pair:
+            if states.empty_reference is None or states.empty_no_reference is None:
+                raise ValueError("Debiased reference guidance requires R and U inference states")
+            required.extend((states.empty_reference, states.empty_no_reference))
         positive = states.positive
         offsets = positive.sequence_offsets
         ref_end = offsets["reference_end"]
@@ -1135,7 +1135,7 @@ class SemanticFlowStrategy(TrainingStrategy):
             attention = states.no_reference.modality.attention_mask
             if attention[:, ref_end:, :ref_end].any():
                 raise ValueError("Q generated tokens must not attend to reference tokens")
-        if guidance.guidance_mode == "multimodal_ref":
+        if guidance.guidance_mode == "debiased_ref":
             no_reference_states = [
                 ("N", states.negative),
                 ("U", states.empty_no_reference),
@@ -1149,7 +1149,7 @@ class SemanticFlowStrategy(TrainingStrategy):
                     raise ValueError(
                         f"{name} generated tokens must not attend to reference tokens"
                     )
-            if guidance.need_reference:
+            if guidance.need_control_pair:
                 assert states.empty_reference is not None
                 if not torch.equal(
                     states.empty_reference.modality.latent[:, :ref_end],

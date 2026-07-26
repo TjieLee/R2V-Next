@@ -16,7 +16,7 @@ from ltx_core.guidance.perturbations import (
     PerturbationType,
 )
 
-GuidanceMode = Literal["positive_ref", "multimodal_ref"]
+GuidanceMode = Literal["positive_ref", "debiased_ref"]
 
 
 @dataclass(frozen=True)
@@ -31,9 +31,9 @@ class SemanticGuidanceConfig:
     stg_blocks: tuple[int, ...] = (28,)
 
     def __post_init__(self) -> None:
-        if self.guidance_mode not in {"positive_ref", "multimodal_ref"}:
+        if self.guidance_mode not in {"positive_ref", "debiased_ref"}:
             raise ValueError(
-                "guidance_mode must be 'positive_ref' or 'multimodal_ref', "
+                "guidance_mode must be 'positive_ref' or 'debiased_ref', "
                 f"got {self.guidance_mode!r}"
             )
         values = {
@@ -73,19 +73,44 @@ class SemanticGuidanceConfig:
         return self.stg_scale != 0.0
 
     @property
+    def need_control_pair(self) -> bool:
+        return (
+            self.guidance_mode == "debiased_ref"
+            and (self.need_negative or self.need_reference)
+        )
+
+    @property
+    def need_reference_comparison(self) -> bool:
+        if self.guidance_mode == "positive_ref":
+            return self.need_reference
+        return self.need_control_pair
+
+    @property
     def transformer_forwards_per_step(self) -> int:
-        reference_forwards = 0
-        if self.need_reference:
-            reference_forwards = 1 if self.guidance_mode == "positive_ref" else 2
-        return 1 + int(self.need_negative) + reference_forwards + int(self.need_stg)
+        if self.guidance_mode == "positive_ref":
+            return (
+                1
+                + int(self.need_negative)
+                + int(self.need_reference)
+                + int(self.need_stg)
+            )
+        return (
+            1
+            + int(self.need_negative)
+            + 2 * int(self.need_control_pair)
+            + int(self.need_stg)
+        )
 
     @property
     def enabled_branches(self) -> tuple[str, ...]:
         branches = ["P"]
         if self.need_negative:
             branches.append("N")
-        if self.need_reference:
-            branches.extend(("Q",) if self.guidance_mode == "positive_ref" else ("R", "U"))
+        if self.guidance_mode == "positive_ref":
+            if self.need_reference:
+                branches.append("Q")
+        elif self.need_control_pair:
+            branches.extend(("R", "U"))
         if self.need_stg:
             branches.append("S")
         return tuple(branches)
@@ -133,9 +158,12 @@ class SemanticGuidanceConfig:
         else:
             metadata.update(
                 {
-                    "cfg_formula": "N + cfg*(P-N)",
+                    "cfg_formula": "P + (cfg-1)*((P-N)-(R-U))",
+                    "semantic_delta_formula": "(P-N)-(R-U)",
+                    "control_delta_formula": "R-U",
                     "ref_formula": "ref*(R-U)",
                     "stg_formula": "stg*(P-S)",
+                    "control_main_effect_in_cfg": "subtracted",
                     "P_text": "positive",
                     "P_vlm_references": "present",
                     "P_reference_latents": "present",
@@ -145,7 +173,7 @@ class SemanticGuidanceConfig:
                     "R_text": "empty",
                     "R_vlm_references": "present",
                     "R_reference_latents": "present",
-                    "U_text": "empty",
+                    "U_text": "drop_all_zero_conditions",
                     "U_vlm_references": "absent",
                     "U_reference_latents": "absent",
                     "reference_guidance_training_match": "drop_text_vs_drop_all",
@@ -273,22 +301,44 @@ def combine_guided_denoised(
     }
     if mismatched:
         raise ValueError(f"Guidance branch shapes differ from positive {tuple(expected)}: {mismatched}")
+    if config.guidance_mode == "positive_ref":
+        if config.need_negative:
+            if negative is None:
+                raise ValueError("negative denoised prediction is required when CFG is enabled")
+            guided = negative + config.guidance_scale * (positive - negative)
+        else:
+            guided = positive
+        if config.need_reference:
+            if no_reference is None:
+                raise ValueError("Q denoised prediction is required for reference guidance")
+            guided = guided + config.ref_guidance_scale * (positive - no_reference)
+        if config.need_stg:
+            if stg is None:
+                raise ValueError("STG denoised prediction is required when STG is enabled")
+            guided = guided + config.stg_scale * (positive - stg)
+        return guided
+
+    guided = positive
+    control_delta = None
+    if config.need_control_pair:
+        if empty_reference is None or empty_no_reference is None:
+            raise ValueError(
+                "R and U denoised predictions are required "
+                "for debiased reference guidance"
+            )
+        control_delta = empty_reference - empty_no_reference
+
     if config.need_negative:
         if negative is None:
             raise ValueError("negative denoised prediction is required when CFG is enabled")
-        guided = negative + config.guidance_scale * (positive - negative)
-    else:
-        guided = positive
+        assert control_delta is not None
+        semantic_delta = positive - negative - control_delta
+        guided = guided + (config.guidance_scale - 1.0) * semantic_delta
+
     if config.need_reference:
-        if config.guidance_mode == "positive_ref":
-            if no_reference is None:
-                raise ValueError("Q denoised prediction is required for reference guidance")
-            reference_delta = positive - no_reference
-        else:
-            if empty_reference is None or empty_no_reference is None:
-                raise ValueError("R and U denoised predictions are required for reference guidance")
-            reference_delta = empty_reference - empty_no_reference
-        guided = guided + config.ref_guidance_scale * reference_delta
+        assert control_delta is not None
+        guided = guided + config.ref_guidance_scale * control_delta
+
     if config.need_stg:
         if stg is None:
             raise ValueError("STG denoised prediction is required when STG is enabled")

@@ -421,9 +421,7 @@ class OnlineInferenceRuntime:
             )
 
         no_ref_latents = None
-        if guidance.guidance_mode == "multimodal_ref" and (
-            guidance.need_negative or guidance.need_reference
-        ):
+        if guidance.need_control_pair:
             no_ref_latents = dict(encoded["reference_latents"])
             no_ref_latents["ref_valid_mask"] = torch.zeros_like(
                 encoded["reference_latents"]["ref_valid_mask"],
@@ -457,12 +455,12 @@ class OnlineInferenceRuntime:
                 self.connector_conditions(raw_no_reference),
                 reference_latents=no_ref_latents,
             )
-        elif guidance.need_reference:
+        elif guidance.need_control_pair:
             raw_empty_reference = encoded.get("empty_reference_conditions")
             raw_empty_no_reference = encoded.get("empty_no_reference_conditions")
             if raw_empty_reference is None or raw_empty_no_reference is None:
                 raise ValueError(
-                    "Multimodal reference guidance is enabled but R/U conditions were not encoded"
+                    "Debiased reference guidance is enabled but R/U conditions were not encoded"
                 )
             assert no_ref_latents is not None
             empty_reference = branch_state(

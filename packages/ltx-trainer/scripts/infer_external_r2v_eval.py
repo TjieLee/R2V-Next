@@ -100,7 +100,7 @@ def main(
     guidance_mode: str = typer.Option(
         "positive_ref",
         "--guidance-mode",
-        help="Reference guidance mode: positive_ref or multimodal_ref.",
+        help="Guidance mode: positive_ref or debiased_ref.",
     ),
     guidance_scale: float = typer.Option(4.0, "--guidance-scale"),
     ref_guidance_scale: float = typer.Option(1.0, "--ref-guidance-scale"),

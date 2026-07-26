@@ -340,7 +340,7 @@ class OnlineBatchEncoder:
         """Encode guidance conditions and one shared reference latent set."""
         if task not in {IMAGE_TASK, VIDEO_TASK}:
             raise ValueError(f"Unsupported online inference task {task!r}")
-        if guidance_mode not in {"positive_ref", "multimodal_ref"}:
+        if guidance_mode not in {"positive_ref", "debiased_ref"}:
             raise ValueError(f"Unsupported guidance mode {guidance_mode!r}")
         expected_geometry = (
             self.config.width,
