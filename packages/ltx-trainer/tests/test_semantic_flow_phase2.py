@@ -1111,6 +1111,100 @@ def test_phase2_custom_distributed_optimizer_state_roundtrip_restores_adam_and_r
     assert runtime_audit["passed"] is True
 
 
+def test_phase2_cpu_accelerator_does_not_use_host_cuda(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer, _ = _optimizer_state_audit_trainer(tmp_path)
+    trainer._config = SimpleNamespace(
+        checkpoints=SimpleNamespace(save_training_state="minimal"),
+        data=SimpleNamespace(encoding_mode="online"),
+        optimization=SimpleNamespace(optimizer_type="adamw"),
+    )
+    trainer._global_step = 1
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+    def _unexpected_cuda_call(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise AssertionError("CPU accelerator must not call a CUDA device API")
+
+    for name in (
+        "empty_cache",
+        "get_rng_state",
+        "memory_allocated",
+        "synchronize",
+    ):
+        monkeypatch.setattr(torch.cuda, name, _unexpected_cuda_call)
+
+    assert trainer._accelerator_cuda_device() is None
+    trainer._log_phase2_gpu_allocated("CPU test")
+    state_dir = trainer._save_phase2_accelerator_state(
+        tmp_path / "checkpoints"
+    )
+    assert state_dir is not None
+    payload = torch.load(
+        state_dir / "optimizer_rank_00000.pt",
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert payload["cuda_rng_state"] is None
+
+
+def test_accelerator_cuda_device_accepts_mocked_cuda_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = object.__new__(LtxvTrainer)
+    trainer._accelerator = SimpleNamespace(device=torch.device("cuda:3"))
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    assert trainer._accelerator_cuda_device() == torch.device("cuda:3")
+
+    trainer._accelerator.device = torch.device("cpu")
+    assert trainer._accelerator_cuda_device() is None
+
+
+def test_phase2_cuda_rng_restore_fails_closed_for_cpu_accelerator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer, _ = _optimizer_state_audit_trainer(
+        tmp_path,
+        restore_state=False,
+    )
+    checkpoint = tmp_path / "model_weights_step_00001.safetensors"
+    checkpoint.touch()
+    trainer._loaded_checkpoint_path = checkpoint
+    trainer._lr_scheduler = AcceleratedScheduler(
+        torch.optim.lr_scheduler.LambdaLR(
+            trainer._optimizer,
+            lr_lambda=lambda _: 1.0,
+        ),
+        trainer._optimizer,
+    )
+    training_state = _training_state(1)
+    scheduler_state = trainer._lr_scheduler.state_dict()
+    scheduler_state["last_epoch"] = 1
+    training_state.lr_scheduler_state_dict = scheduler_state
+    payload = {
+        "optimizer_state_dict": trainer._optimizer.state_dict(),
+        "grad_scaler_state": None,
+        "torch_rng_state": torch.random.get_rng_state(),
+        "cuda_rng_state": torch.zeros(1, dtype=torch.uint8),
+        "python_rng_state": random.getstate(),
+        "numpy_rng_state": np.random.get_state(),
+    }
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        "ltx_trainer.trainer.load_phase2_rank_state",
+        lambda *args, **kwargs: payload,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="accelerator has no CUDA device",
+    ):
+        trainer._restore_phase2_accelerator_state(training_state)
+
+
 def test_phase2_cpu_optimizer_state_roundtrip_runs_next_real_adamw_step(
     tmp_path: Path,
 ) -> None:

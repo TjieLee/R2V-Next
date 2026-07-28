@@ -473,8 +473,9 @@ class LtxvTrainer:
                             offloaded_bytes = (
                                 self._offload_phase2_optimizer_state_to_cpu()
                             )
-                            if torch.cuda.is_available():
-                                torch.cuda.synchronize(self._accelerator.device)
+                            cuda_device = self._accelerator_cuda_device()
+                            if cuda_device is not None:
+                                torch.cuda.synchronize(cuda_device)
                                 torch.cuda.empty_cache()
                             if self._accelerator.is_main_process:
                                 logger.info(
@@ -741,7 +742,7 @@ class LtxvTrainer:
 
         # Accelerator is initialized before model loading, so every rank resolves to its
         # assigned device before Gemma, VAE, and connector weights are materialized.
-        init_device = self._accelerator.device if torch.cuda.is_available() else torch.device("cpu")
+        init_device = self._accelerator_cuda_device() or torch.device("cpu")
 
         logger.debug("Loading embeddings processor...")
         self._embeddings_processor = load_embeddings_processor(
@@ -912,6 +913,16 @@ class LtxvTrainer:
             and getattr(optimization_config, "optimizer_type", None) == "adamw"
         )
 
+    def _accelerator_cuda_device(self) -> torch.device | None:
+        if not torch.cuda.is_available():
+            return None
+        device = getattr(self._accelerator, "device", None)
+        try:
+            device = torch.device(device)
+        except (TypeError, RuntimeError):
+            return None
+        return device if device.type == "cuda" else None
+
     def _iter_phase2_optimizer_moments(
         self,
     ) -> Iterator[tuple[Tensor, dict[str, Any], str, Tensor]]:
@@ -987,10 +998,12 @@ class LtxvTrainer:
         if (
             not self._phase2_optimizer_state_cpu_offload_enabled()
             or not self._accelerator.is_main_process
-            or not torch.cuda.is_available()
         ):
             return
-        allocated_bytes = torch.cuda.memory_allocated(self._accelerator.device)
+        cuda_device = self._accelerator_cuda_device()
+        if cuda_device is None:
+            return
+        allocated_bytes = torch.cuda.memory_allocated(cuda_device)
         logger.info("%s: %.2f GiB", label, allocated_bytes / (1024**3))
 
     def enable_phase2_smoke_audit(self) -> None:
@@ -2417,14 +2430,15 @@ class LtxvTrainer:
             torch.random.set_rng_state(payload["torch_rng_state"])
             cuda_rng_state = payload.get("cuda_rng_state")
             if cuda_rng_state is not None:
-                if not torch.cuda.is_available():
+                cuda_device = self._accelerator_cuda_device()
+                if cuda_device is None:
                     raise RuntimeError(
                         "Phase 2 distributed state contains CUDA RNG state "
-                        "but CUDA is unavailable"
+                        "but the accelerator has no CUDA device"
                     )
                 torch.cuda.set_rng_state(
                     cuda_rng_state,
-                    device=self._accelerator.device,
+                    device=cuda_device,
                 )
             random.setstate(payload["python_rng_state"])
             np.random.set_state(payload["numpy_rng_state"])
@@ -2692,8 +2706,9 @@ class LtxvTrainer:
         else:
             if rng.torch_state is not None:
                 torch.random.set_rng_state(rng.torch_state)
-            if rng.cuda_state is not None and torch.cuda.is_available():
-                torch.cuda.set_rng_state(rng.cuda_state)
+            cuda_device = self._accelerator_cuda_device()
+            if rng.cuda_state is not None and cuda_device is not None:
+                torch.cuda.set_rng_state(rng.cuda_state, device=cuda_device)
             logger.debug("Restored RNG states")
 
         return True
@@ -2837,7 +2852,12 @@ class LtxvTrainer:
             raise RuntimeError("At least one trainable module is required for gradient accumulation")
 
         # Log GPU memory usage after model preparation
-        vram_usage_gb = torch.cuda.memory_allocated() / 1024**3
+        cuda_device = self._accelerator_cuda_device()
+        vram_usage_gb = (
+            torch.cuda.memory_allocated(cuda_device) / 1024**3
+            if cuda_device is not None
+            else 0.0
+        )
         logger.debug(f"GPU memory usage after models preparation: {vram_usage_gb:.2f} GB")
 
     @staticmethod
@@ -3920,10 +3940,11 @@ class LtxvTrainer:
         local_error = None
         try:
             scaler = getattr(self._accelerator, "scaler", None)
+            cuda_device = self._accelerator_cuda_device()
             if self._phase2_optimizer_state_cpu_offload_enabled():
                 self._offload_phase2_optimizer_state_to_cpu()
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize(self._accelerator.device)
+                if cuda_device is not None:
+                    torch.cuda.synchronize(cuda_device)
                     torch.cuda.empty_cache()
                 self._assert_phase2_optimizer_moments_on_cpu(
                     context="checkpoint serialization",
@@ -3951,8 +3972,8 @@ class LtxvTrainer:
                 "optimizer_state_dict": optimizer_state_dict,
                 "torch_rng_state": torch.random.get_rng_state(),
                 "cuda_rng_state": (
-                    torch.cuda.get_rng_state(self._accelerator.device)
-                    if torch.cuda.is_available()
+                    torch.cuda.get_rng_state(cuda_device)
+                    if cuda_device is not None
                     else None
                 ),
                 "python_rng_state": random.getstate(),
@@ -4333,6 +4354,7 @@ class LtxvTrainer:
             else:
                 optimizer_state = self._optimizer.state_dict()
 
+        cuda_device = self._accelerator_cuda_device()
         state = TrainingState(
             global_step=self._global_step,
             config_fingerprint=ConfigFingerprint(
@@ -4343,7 +4365,11 @@ class LtxvTrainer:
             ),
             rng_states=RngStates(
                 torch_state=torch.random.get_rng_state(),
-                cuda_state=torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+                cuda_state=(
+                    torch.cuda.get_rng_state(cuda_device)
+                    if cuda_device is not None
+                    else None
+                ),
             ),
             lr_scheduler_state_dict=self._lr_scheduler.state_dict() if self._lr_scheduler is not None else None,
             optimizer_state_dict=optimizer_state,
