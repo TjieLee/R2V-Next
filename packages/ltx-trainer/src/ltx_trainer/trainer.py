@@ -54,6 +54,7 @@ from ltx_trainer.online_inference.checkpoint_runtime import (
     validate_reference_rope_checkpoint_metadata,
     validate_semantic_flow_checkpoint_architecture,
 )
+from ltx_trainer.online_inference.output_artifacts import atomic_write_json
 from ltx_trainer.online_inference.startup_memory import host_memory_snapshot
 from ltx_trainer.progress import TrainingProgress
 from ltx_trainer.quantization import quantize_model
@@ -220,14 +221,15 @@ class LtxvTrainer:
         self._pending_online_data_state: dict[str, Any] | None = None
         self._resume_initial_step = 0
         self._last_online_metrics: dict[str, float] = {}
-        self._capture_gradient_audit = False
-        self._last_gradient_audit_by_parameter_id: dict[int, dict[str, bool]] = {}
         self._embeddings_processor_trainable_modules: dict[str, nn.Module] = {}
         self._optimizer_group_parameter_counts: dict[str, int] = {}
         self._last_optimizer_group_metrics: dict[str, float] = {}
         self._last_phase2_accelerator_state_path: Path | None = None
         self._last_bridge_checkpoint_key_count = 0
         self._phase2_runtime_trainability_checked = False
+        self._phase2_smoke_audit_enabled = False
+        self._phase2_gradient_audit_completed = False
+        self._phase2_accelerator_state_restored = False
         if IS_MAIN_PROCESS:
             print_config(trainer_config)
         self._training_strategy = get_training_strategy(self._config.training_strategy)
@@ -312,6 +314,8 @@ class LtxvTrainer:
         self._accelerator.wait_for_everyone()
 
         Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
+        if training_state is not None and self._is_semantic_flow_phase2():
+            self._write_phase2_resume_runtime_audit(training_state)
 
         # Save the training configuration as YAML
         self._save_config()
@@ -392,6 +396,8 @@ class LtxvTrainer:
                         self._last_online_metrics["backward_ms"] = (
                             time.perf_counter() - backward_started
                         ) * 1000.0
+                    if self._accelerator.sync_gradients:
+                        self._run_phase2_gradient_audit_once()
 
                     optimizer_started = time.perf_counter()
                     if self._accelerator.sync_gradients:
@@ -401,16 +407,6 @@ class LtxvTrainer:
                             self._trainable_params,
                             cfg.optimization.max_grad_norm,
                         )
-
-                    if self._accelerator.sync_gradients and self._capture_gradient_audit:
-                        self._last_gradient_audit_by_parameter_id = {
-                            id(parameter): {
-                                "finite": bool(torch.isfinite(parameter.grad).all()),
-                                "nonzero": bool(torch.count_nonzero(parameter.grad).item()),
-                            }
-                            for parameter in self._trainable_params
-                            if parameter.grad is not None
-                        }
 
                     self._optimizer.step()
                     self._optimizer.zero_grad()
@@ -830,6 +826,264 @@ class LtxvTrainer:
     def _is_semantic_flow_phase2(self) -> bool:
         strategy_config = getattr(self._training_strategy, "config", None)
         return getattr(strategy_config, "training_phase", "phase1") == "phase2"
+
+    def enable_phase2_smoke_audit(self) -> None:
+        if not self._is_semantic_flow_phase2():
+            raise RuntimeError("Phase 2 smoke gradient audit requires semantic_flow phase2")
+        self._phase2_smoke_audit_enabled = True
+
+    def _distributed_parameter_gradient_record(
+        self,
+        parameter: Tensor,
+    ) -> dict[str, bool | float]:
+        gradient = parameter.grad
+        has_local_gradient = gradient is not None and gradient.numel() > 0
+        local_finite = (
+            bool(torch.isfinite(gradient).all())
+            if has_local_gradient
+            else True
+        )
+        local_nonzero = (
+            bool(torch.count_nonzero(gradient).item())
+            if has_local_gradient
+            else False
+        )
+        local_gradient_square = (
+            gradient.detach().float().square().sum()
+            if has_local_gradient
+            else torch.zeros((), device=self._accelerator.device)
+        )
+        local_parameter_square = (
+            parameter.detach().float().square().sum()
+            if parameter.numel()
+            else torch.zeros((), device=self._accelerator.device)
+        )
+        flags = torch.tensor(
+            [
+                float(parameter.requires_grad),
+                float(has_local_gradient),
+                float(local_finite),
+                float(local_nonzero),
+            ],
+            device=self._accelerator.device,
+            dtype=torch.float32,
+        )
+        reduced_flags = self._accelerator.reduce(flags, reduction="sum")
+        reduced_gradient_square = self._accelerator.reduce(
+            local_gradient_square,
+            reduction="sum",
+        )
+        reduced_parameter_square = self._accelerator.reduce(
+            local_parameter_square,
+            reduction="sum",
+        )
+        world_size = int(self._accelerator.num_processes)
+        return {
+            "requires_grad": int(reduced_flags[0].item()) == world_size,
+            "grad_exists": bool(reduced_flags[1].item() > 0),
+            "grad_finite": int(reduced_flags[2].item()) == world_size,
+            "grad_nonzero": bool(reduced_flags[3].item() > 0),
+            "grad_norm": float(reduced_gradient_square.sqrt().item()),
+            "parameter_norm": float(reduced_parameter_square.sqrt().item()),
+        }
+
+    def _distributed_module_has_gradient(self, module: nn.Module | None) -> bool:
+        local_has_gradient = bool(
+            module is not None
+            and any(
+                parameter.grad is not None and parameter.grad.numel() > 0
+                for parameter in module.parameters()
+            )
+        )
+        value = torch.tensor(
+            float(local_has_gradient),
+            device=self._accelerator.device,
+        )
+        reduced = self._accelerator.reduce(value, reduction="sum")
+        return bool(reduced.item() > 0)
+
+    def _run_phase2_gradient_audit_once(self) -> None:
+        if (
+            not self._phase2_smoke_audit_enabled
+            or self._phase2_gradient_audit_completed
+        ):
+            return
+        if not self._is_semantic_flow_phase2():
+            raise RuntimeError("Phase 2 gradient audit reached a non-Phase 2 trainer")
+
+        bridge = phase2_bridge_parameters(self._embeddings_processor)
+        records = {
+            item.name: self._distributed_parameter_gradient_record(item.parameter)
+            for item in bridge
+        }
+        projection_names = [
+            name
+            for name in records
+            if name.startswith("feature_extractor.video_aggregate_embed.")
+            or name.startswith("feature_extractor.aggregate_embed.")
+        ]
+        register_name = "video_connector.learnable_registers"
+        errors: list[str] = []
+        missing_or_nonfinite = [
+            name
+            for name, record in records.items()
+            if not record["requires_grad"]
+            or not record["grad_exists"]
+            or not record["grad_finite"]
+        ]
+        if missing_or_nonfinite:
+            errors.append(
+                "bridge gradients missing, frozen, or non-finite: "
+                f"{missing_or_nonfinite[:20]}"
+            )
+        if not projection_names or not any(
+            bool(records[name]["grad_nonzero"])
+            for name in projection_names
+        ):
+            errors.append("video_aggregate_embed has no nonzero gradient")
+        if register_name not in records:
+            errors.append(f"missing required bridge parameter {register_name}")
+        elif not records[register_name]["grad_nonzero"]:
+            errors.append("video_connector.learnable_registers has zero gradient")
+
+        frozen_modules = {
+            "text_encoder": self._text_encoder,
+            "vae_encoder": self._online_vae_encoder,
+            "audio_connector": getattr(
+                self._embeddings_processor,
+                "audio_connector",
+                None,
+            ),
+        }
+        frozen_gradients = {
+            name: self._distributed_module_has_gradient(module)
+            for name, module in frozen_modules.items()
+        }
+        unexpected_frozen_gradients = [
+            name
+            for name, has_gradient in frozen_gradients.items()
+            if has_gradient
+        ]
+        if unexpected_frozen_gradients:
+            errors.append(
+                "frozen modules received gradients: "
+                f"{unexpected_frozen_gradients}"
+            )
+
+        optimizer_groups = [
+            {
+                "name": str(group.get("name", "")),
+                "learning_rate": float(group["lr"]),
+                "parameter_count": len(group["params"]),
+            }
+            for group in self._optimizer.param_groups
+        ]
+        group_names = [group["name"] for group in optimizer_groups]
+        if group_names != ["dit_semantic", "conditioning_bridge"]:
+            errors.append(f"invalid optimizer groups: {group_names}")
+        group_parameter_ids = [
+            {id(parameter) for parameter in group["params"]}
+            for group in self._optimizer.param_groups
+        ]
+        if len(group_parameter_ids) != 2 or group_parameter_ids[0] & group_parameter_ids[1]:
+            errors.append("optimizer parameter groups overlap")
+        expected_lrs = [
+            float(self._config.optimization.learning_rate),
+            float(
+                self._config.optimization.bridge_learning_rate
+                or self._config.optimization.learning_rate
+            ),
+        ]
+        actual_lrs = [float(group["lr"]) for group in self._optimizer.param_groups]
+        if actual_lrs != expected_lrs:
+            errors.append(
+                f"optimizer learning rates differ: expected={expected_lrs}, actual={actual_lrs}"
+            )
+
+        report = {
+            "global_step": int(self._global_step),
+            "world_size": int(self._accelerator.num_processes),
+            "parameters": records,
+            "frozen_module_gradients": frozen_gradients,
+            "optimizer_groups": optimizer_groups,
+            "errors": errors,
+            "passed": not errors,
+        }
+        if self._accelerator.is_main_process:
+            atomic_write_json(
+                Path(self._config.output_dir) / "phase2_gradient_audit.json",
+                report,
+            )
+        self._accelerator.wait_for_everyone()
+        if errors:
+            raise RuntimeError("Phase 2 smoke gradient audit failed: " + "; ".join(errors))
+        self._phase2_gradient_audit_completed = True
+
+    def _write_phase2_resume_runtime_audit(
+        self,
+        training_state: TrainingState,
+    ) -> None:
+        scheduler_epoch = (
+            int(getattr(self._lr_scheduler, "last_epoch", -1))
+            if self._lr_scheduler is not None
+            else -1
+        )
+        sampler_state = (
+            self._online_sampler.state_dict()
+            if self._online_sampler is not None
+            else {}
+        )
+        optimizer_groups = [
+            str(group.get("name", ""))
+            for group in self._optimizer.param_groups
+        ]
+        expected_step = int(training_state.global_step)
+        errors = []
+        if not self._phase2_accelerator_state_restored:
+            errors.append("Accelerate state was not restored")
+        if scheduler_epoch != expected_step:
+            errors.append(
+                f"scheduler last_epoch={scheduler_epoch} does not match step={expected_step}"
+            )
+        if sampler_state.get("task_schedule_cursor") != expected_step:
+            errors.append(
+                "sampler task_schedule_cursor does not match restored step"
+            )
+        if sampler_state.get("microstep_in_optimizer_step") != 0:
+            errors.append("sampler microstep_in_optimizer_step is not zero")
+        if optimizer_groups != ["dit_semantic", "conditioning_bridge"]:
+            errors.append(f"optimizer groups are invalid: {optimizer_groups}")
+        report = {
+            "initial_step": expected_step,
+            "scheduler_last_epoch": scheduler_epoch,
+            "sampler_task_schedule_cursor": sampler_state.get(
+                "task_schedule_cursor"
+            ),
+            "sampler_microstep_in_optimizer_step": sampler_state.get(
+                "microstep_in_optimizer_step"
+            ),
+            "optimizer_group_names": optimizer_groups,
+            "accelerator_state_restored": self._phase2_accelerator_state_restored,
+            "scheduler_restored": scheduler_epoch == expected_step,
+            "sampler_restored": (
+                sampler_state.get("task_schedule_cursor") == expected_step
+                and sampler_state.get("microstep_in_optimizer_step") == 0
+            ),
+            "optimizer_groups_restored": optimizer_groups
+            == ["dit_semantic", "conditioning_bridge"],
+            "errors": errors,
+            "passed": not errors,
+        }
+        if self._accelerator.is_main_process:
+            atomic_write_json(
+                Path(self._config.output_dir) / "phase2_resume_runtime_audit.json",
+                report,
+            )
+        self._accelerator.wait_for_everyone()
+        if errors:
+            raise RuntimeError(
+                "Phase 2 resume runtime audit failed: " + "; ".join(errors)
+            )
 
     def _validate_phase2_runtime_trainability_once(self) -> None:
         if (
@@ -1542,7 +1796,23 @@ class LtxvTrainer:
         """
         if self._config.checkpoints.no_resume or self._loaded_checkpoint_path is None:
             return 0, None
+        phase2_exact_resume = self._is_semantic_flow_phase2()
+        checkpoint_metadata: dict[str, str] | None = None
+        if phase2_exact_resume:
+            checkpoint_metadata = self._read_safetensors_metadata(
+                self._loaded_checkpoint_path
+            )
+            if checkpoint_metadata.get("training_phase") != "phase2":
+                raise RuntimeError(
+                    "Phase 2 exact resume requires a Phase 2 checkpoint; "
+                    "use checkpoints.no_resume=true for a Phase 1 warm start"
+                )
         if getattr(self._training_strategy, "checkpoint_loaded_as_warm_start", False):
+            if phase2_exact_resume:
+                raise RuntimeError(
+                    "Phase 2 exact resume cannot use a warm-migrated checkpoint; "
+                    "use checkpoints.no_resume=true only for an intentional warm start"
+                )
             logger.warning(
                 "Checkpoint weights were warm-migrated to a new architecture; "
                 "optimizer, scheduler, RNG, and global-step state will not be resumed."
@@ -1550,33 +1820,27 @@ class LtxvTrainer:
             return 0, None
 
         strict_legacy_resume = self._is_strict_legacy_resume()
-        checkpoint_metadata: dict[str, str] | None = None
         if strict_legacy_resume:
             checkpoint_metadata = self._read_safetensors_metadata(self._loaded_checkpoint_path)
             if checkpoint_metadata.get("legacy_phase") is None:
                 raise RuntimeError(self._legacy_resume_error_message())
 
-        state = self._load_training_state(self._loaded_checkpoint_path)
+        state = self._load_training_state(
+            self._loaded_checkpoint_path,
+            required=phase2_exact_resume,
+        )
         if state is None:
             if strict_legacy_resume:
                 raise RuntimeError(self._legacy_resume_error_message())
             return 0, None
 
-        if self._is_semantic_flow_phase2():
-            metadata = self._read_safetensors_metadata(self._loaded_checkpoint_path)
-            if metadata.get("training_phase") != "phase2":
-                raise RuntimeError(
-                    "Phase 2 exact resume requires a Phase 2 checkpoint; "
-                    "use checkpoints.no_resume=true for a Phase 1 warm start"
-                )
-            accelerator_state_path = self._phase2_accelerator_state_path(
-                self._loaded_checkpoint_path
+        if phase2_exact_resume:
+            assert checkpoint_metadata is not None
+            self._validate_phase2_resume_state(
+                checkpoint_path=self._loaded_checkpoint_path,
+                metadata=checkpoint_metadata,
+                state=state,
             )
-            if not accelerator_state_path.is_dir():
-                raise RuntimeError(
-                    "Phase 2 exact resume is missing its distributed Accelerate state: "
-                    f"{accelerator_state_path}"
-                )
 
         if strict_legacy_resume:
             assert checkpoint_metadata is not None
@@ -1603,6 +1867,10 @@ class LtxvTrainer:
         ):
             mismatches.append(f"lora_rank: {fp.lora_rank} → {cfg.lora.rank}")
         if mismatches:
+            if phase2_exact_resume:
+                raise RuntimeError(
+                    f"Phase 2 training state config mismatch: {', '.join(mismatches)}"
+                )
             if strict_legacy_resume:
                 raise RuntimeError(
                     f"Legacy training state config mismatch: {', '.join(mismatches)}"
@@ -1614,6 +1882,10 @@ class LtxvTrainer:
             return 0, None
 
         if state.global_step < 0:
+            if phase2_exact_resume:
+                raise RuntimeError(
+                    f"Phase 2 training state has invalid global_step={state.global_step!r}"
+                )
             if strict_legacy_resume:
                 raise RuntimeError(f"Legacy training state has invalid global_step={state.global_step!r}")
             logger.warning(
@@ -1659,11 +1931,84 @@ class LtxvTrainer:
             raise RuntimeError(
                 f"Phase 2 restored optimizer groups are invalid: {group_names}"
             )
+        self._phase2_accelerator_state_restored = True
         logger.info(
             "Restored exact Phase 2 distributed state from %s at local step %d",
             state_path,
             training_state.global_step,
         )
+
+    def _validate_phase2_resume_state(
+        self,
+        *,
+        checkpoint_path: Path,
+        metadata: dict[str, str],
+        state: TrainingState,
+    ) -> None:
+        filename_step = self._checkpoint_step(checkpoint_path)
+        if filename_step is None:
+            raise RuntimeError(
+                f"Cannot parse Phase 2 resume step from checkpoint filename: {checkpoint_path.name}"
+            )
+        metadata_step_raw = metadata.get("global_step")
+        if metadata_step_raw is None:
+            raise RuntimeError("Phase 2 checkpoint metadata is missing global_step")
+        try:
+            metadata_step = int(metadata_step_raw)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"Invalid Phase 2 checkpoint metadata global_step={metadata_step_raw!r}"
+            ) from exc
+        if metadata.get("training_phase") != "phase2":
+            raise RuntimeError("Phase 2 exact resume requires training_phase=phase2 metadata")
+        if filename_step != metadata_step or filename_step != state.global_step:
+            raise RuntimeError(
+                "Phase 2 resume step mismatch:\n"
+                f"filename={filename_step}, metadata={metadata_step}, "
+                f"training_state={state.global_step}"
+            )
+        if state.global_step < 0:
+            raise RuntimeError(
+                f"Phase 2 resume global_step must be non-negative, got {state.global_step}"
+            )
+        if state.global_step >= self._config.optimization.steps:
+            raise RuntimeError(
+                f"Phase 2 resume global_step={state.global_step} must be less than "
+                f"optimization.steps={self._config.optimization.steps}"
+            )
+
+        scheduler_state = state.lr_scheduler_state_dict
+        if not isinstance(scheduler_state, dict):
+            raise RuntimeError("Phase 2 exact resume is missing LR scheduler state")
+        scheduler_last_epoch = scheduler_state.get("last_epoch")
+        if scheduler_last_epoch is None:
+            raise RuntimeError("Phase 2 LR scheduler state is missing last_epoch")
+        if int(scheduler_last_epoch) != state.global_step:
+            raise RuntimeError(
+                "Phase 2 scheduler/global_step mismatch: "
+                f"last_epoch={scheduler_last_epoch}, global_step={state.global_step}"
+            )
+
+        data_state = state.data_state
+        if not isinstance(data_state, dict):
+            raise RuntimeError("Phase 2 exact resume is missing online sampler state")
+        if (
+            data_state.get("task_schedule_cursor") != state.global_step
+            or data_state.get("microstep_in_optimizer_step") != 0
+        ):
+            raise RuntimeError(
+                "Phase 2 sampler/global_step mismatch: "
+                f"global_step={state.global_step}, "
+                f"task_schedule_cursor={data_state.get('task_schedule_cursor')}, "
+                f"microstep={data_state.get('microstep_in_optimizer_step')}"
+            )
+
+        accelerator_state_path = self._phase2_accelerator_state_path(checkpoint_path)
+        if not accelerator_state_path.is_dir():
+            raise RuntimeError(
+                "Phase 2 exact resume is missing its distributed Accelerate state: "
+                f"{accelerator_state_path}"
+            )
 
     def _validate_legacy_resume_state(
         self,
@@ -1739,16 +2084,29 @@ class LtxvTrainer:
         )
 
     @staticmethod
-    def _load_training_state(checkpoint_path: Path) -> TrainingState | None:
+    def _load_training_state(
+        checkpoint_path: Path,
+        *,
+        required: bool = False,
+    ) -> TrainingState | None:
         """Load training state file that corresponds to a checkpoint weights file."""
         match = re.search(r"step_(\d+)", checkpoint_path.name)
         if not match:
+            if required:
+                raise RuntimeError(
+                    "Required Phase 2 training state cannot be resolved from "
+                    f"checkpoint filename: {checkpoint_path.name}"
+                )
             return None
 
         step_str = match.group(1)
         state_path = checkpoint_path.parent / f"training_state_step_{step_str}.pt"
 
         if not state_path.exists():
+            if required:
+                raise RuntimeError(
+                    f"Required Phase 2 training state is missing: {state_path}"
+                )
             return None
 
         try:
@@ -1756,8 +2114,15 @@ class LtxvTrainer:
             state = TrainingState.from_save_dict(raw)
             logger.info(f"📥 Loaded training state from {state_path}")
             return state
-        except Exception as e:
-            logger.warning(f"⚠️ Failed to load training state from {state_path}: {e}. Starting from step 0.")
+        except Exception as exc:
+            if required:
+                raise RuntimeError(
+                    f"Failed to load required Phase 2 training state: {state_path}"
+                ) from exc
+            logger.warning(
+                f"⚠️ Failed to load training state from {state_path}: {exc}. "
+                "Starting from step 0."
+            )
             return None
 
     def _restore_training_state(self, training_state: TrainingState) -> bool:

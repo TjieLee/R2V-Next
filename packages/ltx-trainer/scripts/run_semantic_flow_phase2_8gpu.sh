@@ -11,6 +11,18 @@ RUNTIME_DIR="$PHASE2_ROOT/runtime"
 START_AUDIT="$RUNTIME_DIR/phase2_start_audit.json"
 RESUME_AUDIT="$RUNTIME_DIR/phase2_resume_audit.json"
 PARAMETER_AUDIT="$RUNTIME_DIR/phase2_parameter_audit.jsonl"
+CHECKER="$REPO_ROOT/packages/ltx-trainer/scripts/check_semantic_flow_phase2_runtime.py"
+PYTHON="${PYTHON:-/mnt/workspace/litengjie/R2V-Next/.venv/bin/python}"
+ACCELERATE="${ACCELERATE:-/mnt/workspace/litengjie/R2V-Next/.venv/bin/accelerate}"
+
+if [[ ! -x "$PYTHON" ]]; then
+  printf '%s\n' "Configured PYTHON is not executable: $PYTHON" >&2
+  exit 2
+fi
+if [[ ! -x "$ACCELERATE" ]]; then
+  printf '%s\n' "Configured ACCELERATE is not executable: $ACCELERATE" >&2
+  exit 2
+fi
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export TMPDIR="${TMPDIR:-/mnt/workspace/litengjie/t}"
@@ -39,22 +51,7 @@ mkdir -p \
 
 latest_phase2_checkpoint() {
   local checkpoint_dir="${1:-$PHASE2_ROOT/train/checkpoints}"
-  python3 - "$checkpoint_dir" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-root = Path(sys.argv[1])
-candidates = []
-for marker in root.glob("checkpoint_step_*.ready.json"):
-    payload = json.loads(marker.read_text(encoding="utf-8"))
-    checkpoint = Path(str(payload.get("checkpoint_path", "")))
-    if checkpoint.is_file() and payload.get("training_phase") == "phase2":
-        candidates.append((int(payload["global_step"]), checkpoint))
-if not candidates:
-    raise SystemExit(f"No ready Phase 2 checkpoint found under {root}")
-print(max(candidates)[1])
-PY
+  "$PYTHON" "$CHECKER" --find-latest-resume-checkpoint "$checkpoint_dir"
 }
 
 write_runtime_config() {
@@ -65,7 +62,7 @@ write_runtime_config() {
   local steps="$5"
   local output_dir="$6"
   local interval="$7"
-  python3 - "$source_config" "$destination_config" "$checkpoint" "$no_resume" "$steps" "$output_dir" "$interval" <<'PY'
+  "$PYTHON" - "$source_config" "$destination_config" "$checkpoint" "$no_resume" "$steps" "$output_dir" "$interval" <<'PY'
 import sys
 from pathlib import Path
 
@@ -91,7 +88,7 @@ run_preflight() {
   local accelerate_config="$3"
   local expected_processes="$4"
   local audit="$5"
-  python3 "$REPO_ROOT/packages/ltx-trainer/scripts/check_semantic_flow_phase2_runtime.py" \
+  "$PYTHON" "$CHECKER" \
     --config "$config" \
     --accelerate-config "$accelerate_config" \
     --mode "$mode" \
@@ -103,27 +100,32 @@ run_preflight() {
 launch_train() {
   local config="$1"
   local accelerate_config="$2"
-  accelerate launch --config_file "$accelerate_config" \
+  local smoke_audit="${3:-false}"
+  local extra_args=()
+  if [[ "$smoke_audit" == "true" ]]; then
+    extra_args+=(--phase2-smoke-audit)
+  fi
+  "$ACCELERATE" launch --config_file "$accelerate_config" \
     "$REPO_ROOT/packages/ltx-trainer/scripts/train.py" \
     "$config" \
-    --disable-progress-bars
+    --disable-progress-bars \
+    "${extra_args[@]}"
 }
 
 run_phase2_inference_smoke() {
   local smoke_root="$1"
   local config="$2"
-  local checkpoint
-  checkpoint="$(latest_phase2_checkpoint "$smoke_root/checkpoints")" || exit $?
+  local checkpoint="$3"
   local inference_root="$smoke_root/inference"
   local selection_root="$inference_root/selection"
-  CUDA_VISIBLE_DEVICES=0 python3 \
+  CUDA_VISIBLE_DEVICES=0 "$PYTHON" \
     "$REPO_ROOT/packages/ltx-trainer/scripts/select_multitask_online_train_samples.py" \
     --manifest "/mnt/workspace/litengjie/jd_ltx_multitask_online_480p121/semantic_flow_v2/manifests/train_i2i_opens2v.jsonl" \
     --output-dir "$selection_root" \
     --tasks r2v \
     --samples-per-task 1 \
     --overwrite || exit $?
-  CUDA_VISIBLE_DEVICES=0 python3 \
+  CUDA_VISIBLE_DEVICES=0 "$PYTHON" \
     "$REPO_ROOT/packages/ltx-trainer/scripts/infer_multitask_online_train_samples.py" \
     --config "$config" \
     --samples "$selection_root/selected_samples.jsonl" \
@@ -138,7 +140,7 @@ run_phase2_inference_smoke() {
     --stg-scale 1 \
     --no-dry-run \
     --overwrite || exit $?
-  CUDA_VISIBLE_DEVICES=0 python3 \
+  CUDA_VISIBLE_DEVICES=0 "$PYTHON" \
     "$REPO_ROOT/packages/ltx-trainer/scripts/infer_multitask_online_train_samples.py" \
     --config "$config" \
     --samples "$selection_root/selected_samples.jsonl" \
@@ -153,6 +155,20 @@ run_phase2_inference_smoke() {
     --stg-scale 1 \
     --no-dry-run \
     --overwrite
+}
+
+validate_smoke_output() {
+  local smoke_root="$1"
+  local expected_processes="$2"
+  local expected_final_step="$3"
+  local result_output="$4"
+  shift 4
+  "$PYTHON" "$CHECKER" \
+    --validate-smoke-output "$smoke_root" \
+    --expected-processes "$expected_processes" \
+    --expected-final-step "$expected_final_step" \
+    --result-output "$result_output" \
+    "$@"
 }
 
 case "${1:-}" in
@@ -179,6 +195,7 @@ case "${1:-}" in
     ;;
   smoke-2gpu)
     export CUDA_VISIBLE_DEVICES="${PHASE2_SMOKE_2GPU_DEVICES:-0,1}"
+    SMOKE_ROOT="$PHASE2_ROOT/smoke/2gpu"
     SMOKE_CONFIG="$RUNTIME_DIR/semantic_flow_phase2_smoke_2gpu.yaml"
     write_runtime_config \
       "$BASE_CONFIG" \
@@ -186,29 +203,71 @@ case "${1:-}" in
       "$PARENT_CHECKPOINT" \
       true \
       1 \
-      "$PHASE2_ROOT/smoke/2gpu" \
+      "$SMOKE_ROOT" \
       1 || exit $?
     run_preflight \
       "$SMOKE_CONFIG" start "$SMOKE_ACCELERATE_CONFIG" 2 \
       "$RUNTIME_DIR/phase2_smoke_2gpu_audit.json" || exit $?
-    launch_train "$SMOKE_CONFIG" "$SMOKE_ACCELERATE_CONFIG" || exit $?
+    launch_train "$SMOKE_CONFIG" "$SMOKE_ACCELERATE_CONFIG" true || exit $?
+    validate_smoke_output \
+      "$SMOKE_ROOT" \
+      2 \
+      1 \
+      "$SMOKE_ROOT/phase2_smoke_2gpu_result.json" || exit $?
     ;;
   smoke-8gpu)
     export CUDA_VISIBLE_DEVICES="${PHASE2_SMOKE_8GPU_DEVICES:-0,1,2,3,4,5,6,7}"
-    SMOKE_CONFIG="$RUNTIME_DIR/semantic_flow_phase2_smoke_8gpu.yaml"
+    SMOKE_ROOT="$PHASE2_ROOT/smoke/8gpu"
+    STAGE_A_CONFIG="$RUNTIME_DIR/semantic_flow_phase2_smoke_8gpu_stage_a.yaml"
+    STAGE_B_CONFIG="$RUNTIME_DIR/semantic_flow_phase2_smoke_8gpu_stage_b.yaml"
+
     write_runtime_config \
       "$BASE_CONFIG" \
-      "$SMOKE_CONFIG" \
+      "$STAGE_A_CONFIG" \
       "$PARENT_CHECKPOINT" \
       true \
       1 \
-      "$PHASE2_ROOT/smoke/8gpu" \
+      "$SMOKE_ROOT" \
       1 || exit $?
     run_preflight \
-      "$SMOKE_CONFIG" start "$TRAIN_ACCELERATE_CONFIG" 8 \
-      "$RUNTIME_DIR/phase2_smoke_8gpu_audit.json" || exit $?
-    launch_train "$SMOKE_CONFIG" "$TRAIN_ACCELERATE_CONFIG" || exit $?
-    run_phase2_inference_smoke "$PHASE2_ROOT/smoke/8gpu" "$SMOKE_CONFIG"
+      "$STAGE_A_CONFIG" start "$TRAIN_ACCELERATE_CONFIG" 8 \
+      "$RUNTIME_DIR/phase2_smoke_8gpu_stage_a_audit.json" || exit $?
+    launch_train "$STAGE_A_CONFIG" "$TRAIN_ACCELERATE_CONFIG" true || exit $?
+
+    STAGE_A_CHECKPOINT="$(latest_phase2_checkpoint "$SMOKE_ROOT/checkpoints")" || exit $?
+    if [[ "$(basename "$STAGE_A_CHECKPOINT")" != "model_weights_step_00001.safetensors" ]]; then
+      printf '%s\n' "Phase 2 smoke Stage A did not publish step 1: $STAGE_A_CHECKPOINT" >&2
+      exit 1
+    fi
+    write_runtime_config \
+      "$BASE_CONFIG" \
+      "$STAGE_B_CONFIG" \
+      "$STAGE_A_CHECKPOINT" \
+      false \
+      2 \
+      "$SMOKE_ROOT" \
+      1 || exit $?
+    run_preflight \
+      "$STAGE_B_CONFIG" resume "$TRAIN_ACCELERATE_CONFIG" 8 \
+      "$RUNTIME_DIR/phase2_smoke_8gpu_stage_b_audit.json" || exit $?
+    launch_train "$STAGE_B_CONFIG" "$TRAIN_ACCELERATE_CONFIG" false || exit $?
+
+    STAGE_B_CHECKPOINT="$(latest_phase2_checkpoint "$SMOKE_ROOT/checkpoints")" || exit $?
+    if [[ "$(basename "$STAGE_B_CHECKPOINT")" != "model_weights_step_00002.safetensors" ]]; then
+      printf '%s\n' "Phase 2 smoke Stage B did not publish step 2: $STAGE_B_CHECKPOINT" >&2
+      exit 1
+    fi
+    run_phase2_inference_smoke \
+      "$SMOKE_ROOT" \
+      "$STAGE_B_CONFIG" \
+      "$STAGE_B_CHECKPOINT" || exit $?
+    validate_smoke_output \
+      "$SMOKE_ROOT" \
+      8 \
+      2 \
+      "$SMOKE_ROOT/phase2_smoke_8gpu_result.json" \
+      --require-exact-resume \
+      --require-inference
     ;;
   *)
     printf '%s\n' "Usage: $0 {preflight|start|resume|smoke-2gpu|smoke-8gpu}"

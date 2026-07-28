@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import ast
 import copy
+import hashlib
 import inspect
+import json
 import runpy
 from contextlib import nullcontext
 from pathlib import Path
@@ -11,6 +13,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 import yaml
+from safetensors.torch import save_file
 from torch import nn
 
 from ltx_core.text_encoders.gemma.embeddings_processor import EmbeddingsProcessor
@@ -32,6 +35,7 @@ from ltx_trainer.training_strategies.semantic_flow_bridge import (
     configure_phase2_bridge_trainability,
     expected_phase2_bridge_state,
     phase2_bridge_audit_rows,
+    phase2_bridge_parameters,
     validate_and_load_phase2_bridge_state,
 )
 
@@ -99,6 +103,108 @@ def _runtime_audit_trainer() -> LtxvTrainer:
     trainer._text_encoder = nn.Linear(4, 4).requires_grad_(False)
     trainer._online_vae_encoder = nn.Linear(4, 4).requires_grad_(False)
     trainer._phase2_runtime_trainability_checked = False
+    return trainer
+
+
+def _training_state(step: int) -> TrainingState:
+    return TrainingState(
+        global_step=step,
+        config_fingerprint=ConfigFingerprint(
+            optimizer_type="adamw",
+            scheduler_type="linear",
+            training_mode="full",
+        ),
+        rng_states=RngStates(torch_state=torch.random.get_rng_state()),
+        lr_scheduler_state_dict={"last_epoch": step},
+        data_state={
+            "task_schedule_cursor": step,
+            "microstep_in_optimizer_step": 0,
+        },
+    )
+
+
+def _write_phase2_bundle(checkpoint_dir: Path, step: int) -> Path:
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint = checkpoint_dir / f"model_weights_step_{step:05d}.safetensors"
+    save_file(
+        {"weight": torch.ones(1)},
+        checkpoint,
+        metadata={
+            "architecture": "semantic_flow_v2",
+            "training_phase": "phase2",
+            "global_step": str(step),
+        },
+    )
+    training_state = checkpoint_dir / f"training_state_step_{step:05d}.pt"
+    torch.save(_training_state(step).to_save_dict(), training_state)
+    accelerator_state = checkpoint_dir / f"accelerator_state_step_{step:05d}"
+    accelerator_state.mkdir()
+    (accelerator_state / "state.bin").write_bytes(b"state")
+    digest = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    marker = checkpoint_dir / f"checkpoint_step_{step:05d}.ready.json"
+    marker.write_text(
+        json.dumps(
+            {
+                "global_step": step,
+                "checkpoint_path": str(checkpoint.resolve()),
+                "training_state_path": str(training_state.resolve()),
+                "accelerator_state_path": str(accelerator_state.resolve()),
+                "checkpoint_sha256": digest,
+                "metadata_global_step": str(step),
+                "training_phase": "phase2",
+            }
+        ),
+        encoding="utf-8",
+    )
+    return checkpoint
+
+
+def _gradient_audit_trainer(tmp_path: Path) -> LtxvTrainer:
+    trainer = _runtime_audit_trainer()
+    bridge = phase2_bridge_parameters(trainer._embeddings_processor)
+    for item in bridge:
+        item.parameter.grad = torch.ones_like(item.parameter)
+    dit_parameter = nn.Parameter(torch.ones(1))
+    trainer._optimizer = SimpleNamespace(
+        param_groups=[
+            {
+                "name": "dit_semantic",
+                "lr": 5.0e-6,
+                "params": [dit_parameter],
+            },
+            {
+                "name": "conditioning_bridge",
+                "lr": 3.0e-6,
+                "params": [item.parameter for item in bridge],
+            },
+        ]
+    )
+    trainer._config = SimpleNamespace(
+        output_dir=str(tmp_path),
+        optimization=SimpleNamespace(
+            learning_rate=5.0e-6,
+            bridge_learning_rate=3.0e-6,
+        ),
+    )
+
+    class _Accelerator:
+        device = torch.device("cpu")
+        num_processes = 1
+        is_main_process = True
+
+        @staticmethod
+        def reduce(value: torch.Tensor, *, reduction: str) -> torch.Tensor:
+            assert reduction == "sum"
+            return value
+
+        @staticmethod
+        def wait_for_everyone() -> None:
+            return None
+
+    trainer._accelerator = _Accelerator()
+    trainer._global_step = 0
+    trainer._phase2_smoke_audit_enabled = True
+    trainer._phase2_gradient_audit_completed = False
     return trainer
 
 
@@ -474,6 +580,85 @@ def test_phase2_runtime_audit_occurs_after_online_encoding_before_forward() -> N
     assert encoded < audited < forwarded
 
 
+def test_phase2_smoke_gradient_audit_records_every_bridge_parameter(
+    tmp_path: Path,
+) -> None:
+    trainer = _gradient_audit_trainer(tmp_path)
+    trainer._run_phase2_gradient_audit_once()
+    report = json.loads(
+        (tmp_path / "phase2_gradient_audit.json").read_text(encoding="utf-8")
+    )
+    assert report["passed"] is True
+    assert set(report["parameters"]) == {
+        item.name for item in phase2_bridge_parameters(trainer._embeddings_processor)
+    }
+    for record in report["parameters"].values():
+        assert record["requires_grad"] is True
+        assert record["grad_exists"] is True
+        assert record["grad_finite"] is True
+        assert record["grad_nonzero"] is True
+        assert record["grad_norm"] > 0
+        assert record["parameter_norm"] >= 0
+    assert report["frozen_module_gradients"] == {
+        "audio_connector": False,
+        "text_encoder": False,
+        "vae_encoder": False,
+    }
+    assert [group["name"] for group in report["optimizer_groups"]] == [
+        "dit_semantic",
+        "conditioning_bridge",
+    ]
+    assert trainer._phase2_gradient_audit_completed is True
+
+
+@pytest.mark.parametrize(
+    ("failure", "message"),
+    [
+        ("missing_projection", "missing, frozen, or non-finite"),
+        ("zero_register", "learnable_registers has zero gradient"),
+        ("nan_projection", "missing, frozen, or non-finite"),
+        ("inf_projection", "missing, frozen, or non-finite"),
+        ("frozen_text_gradient", "frozen modules received gradients"),
+    ],
+)
+def test_phase2_smoke_gradient_audit_fails_closed(
+    tmp_path: Path,
+    failure: str,
+    message: str,
+) -> None:
+    trainer = _gradient_audit_trainer(tmp_path)
+    projection = trainer._embeddings_processor.feature_extractor.video_aggregate_embed
+    registers = trainer._embeddings_processor.video_connector.learnable_registers
+    if failure == "missing_projection":
+        projection.weight.grad = None
+    elif failure == "zero_register":
+        registers.grad = torch.zeros_like(registers)
+    elif failure == "nan_projection":
+        projection.weight.grad.fill_(float("nan"))
+    elif failure == "inf_projection":
+        projection.weight.grad.fill_(float("inf"))
+    else:
+        trainer._text_encoder.weight.grad = torch.ones_like(
+            trainer._text_encoder.weight
+        )
+    with pytest.raises(RuntimeError, match=message):
+        trainer._run_phase2_gradient_audit_once()
+    report = json.loads(
+        (tmp_path / "phase2_gradient_audit.json").read_text(encoding="utf-8")
+    )
+    assert report["passed"] is False
+    assert trainer._phase2_gradient_audit_completed is False
+
+
+def test_phase2_smoke_gradient_audit_runs_between_backward_and_optimizer_step() -> None:
+    source = inspect.getsource(LtxvTrainer.train)
+    backward = source.index("self._accelerator.backward(output.loss.mean())")
+    audit = source.index("self._run_phase2_gradient_audit_once()")
+    optimizer_step = source.index("self._optimizer.step()")
+    zero_grad = source.index("self._optimizer.zero_grad()")
+    assert backward < audit < optimizer_step < zero_grad
+
+
 def test_phase2_checkpoint_metadata_is_additive_only_for_phase2() -> None:
     phase1 = SemanticFlowStrategy(SemanticFlowConfig()).get_checkpoint_metadata()
     assert "training_phase" not in phase1
@@ -521,6 +706,286 @@ def test_phase2_exact_resume_uses_matching_distributed_accelerate_state(
     )
     trainer._restore_phase2_accelerator_state(training_state)
     assert loaded == [str(state_dir)]
+    assert trainer._phase2_accelerator_state_restored is True
+
+
+def test_phase2_required_training_state_fails_closed_and_preserves_cause(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "model_weights_step_00001.safetensors"
+    checkpoint.touch()
+    with pytest.raises(RuntimeError, match="training state is missing"):
+        LtxvTrainer._load_training_state(checkpoint, required=True)
+    assert LtxvTrainer._load_training_state(checkpoint) is None
+
+    state_path = tmp_path / "training_state_step_00001.pt"
+    state_path.write_bytes(b"not a torch state")
+    with pytest.raises(RuntimeError, match="Failed to load required") as exc_info:
+        LtxvTrainer._load_training_state(checkpoint, required=True)
+    assert exc_info.value.__cause__ is not None
+    assert LtxvTrainer._load_training_state(checkpoint) is None
+
+
+@pytest.mark.parametrize("corrupt", [False, True])
+def test_phase2_resolve_resume_never_falls_back_to_step_zero(
+    tmp_path: Path,
+    corrupt: bool,
+) -> None:
+    checkpoint = tmp_path / "model_weights_step_00001.safetensors"
+    save_file(
+        {"weight": torch.ones(1)},
+        checkpoint,
+        metadata={"training_phase": "phase2", "global_step": "1"},
+    )
+    if corrupt:
+        (tmp_path / "training_state_step_00001.pt").write_bytes(b"corrupt")
+    trainer = object.__new__(LtxvTrainer)
+    trainer._config = SimpleNamespace(
+        checkpoints=SimpleNamespace(no_resume=False),
+        optimization=SimpleNamespace(
+            optimizer_type="adamw",
+            scheduler_type="linear",
+            steps=2,
+        ),
+        model=SimpleNamespace(training_mode="full"),
+        lora=None,
+    )
+    trainer._training_strategy = SemanticFlowStrategy(
+        SemanticFlowConfig(training_phase="phase2")
+    )
+    trainer._loaded_checkpoint_path = checkpoint
+    with pytest.raises(RuntimeError, match="training state"):
+        trainer._resolve_resume_state()
+
+
+def test_phase1_resolve_resume_keeps_missing_state_compatibility(
+    tmp_path: Path,
+) -> None:
+    trainer = object.__new__(LtxvTrainer)
+    trainer._config = SimpleNamespace(
+        checkpoints=SimpleNamespace(no_resume=False),
+    )
+    trainer._training_strategy = SemanticFlowStrategy(SemanticFlowConfig())
+    trainer._loaded_checkpoint_path = (
+        tmp_path / "model_weights_step_00001.safetensors"
+    )
+    assert trainer._resolve_resume_state() == (0, None)
+
+
+def test_phase2_resume_state_validates_step_scheduler_sampler_and_accelerate(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "model_weights_step_00007.safetensors"
+    checkpoint.touch()
+    (tmp_path / "accelerator_state_step_00007").mkdir()
+    trainer = object.__new__(LtxvTrainer)
+    trainer._config = SimpleNamespace(
+        optimization=SimpleNamespace(steps=10),
+    )
+    metadata = {"training_phase": "phase2", "global_step": "7"}
+    trainer._validate_phase2_resume_state(
+        checkpoint_path=checkpoint,
+        metadata=metadata,
+        state=_training_state(7),
+    )
+
+    with pytest.raises(RuntimeError, match="step mismatch"):
+        trainer._validate_phase2_resume_state(
+            checkpoint_path=checkpoint,
+            metadata={**metadata, "global_step": "6"},
+            state=_training_state(7),
+        )
+    bad_scheduler = _training_state(7)
+    bad_scheduler.lr_scheduler_state_dict = {"last_epoch": 6}
+    with pytest.raises(RuntimeError, match="scheduler/global_step"):
+        trainer._validate_phase2_resume_state(
+            checkpoint_path=checkpoint,
+            metadata=metadata,
+            state=bad_scheduler,
+        )
+    missing_sampler = _training_state(7)
+    missing_sampler.data_state = None
+    with pytest.raises(RuntimeError, match="sampler state"):
+        trainer._validate_phase2_resume_state(
+            checkpoint_path=checkpoint,
+            metadata=metadata,
+            state=missing_sampler,
+        )
+    (tmp_path / "accelerator_state_step_00007").rmdir()
+    with pytest.raises(RuntimeError, match="Accelerate state"):
+        trainer._validate_phase2_resume_state(
+            checkpoint_path=checkpoint,
+            metadata=metadata,
+            state=_training_state(7),
+        )
+
+
+def test_phase2_resume_bundle_is_complete_and_latest_selection_fails_on_partial(
+    tmp_path: Path,
+) -> None:
+    script = Path(__file__).parents[1] / "scripts" / "check_semantic_flow_phase2_runtime.py"
+    runtime = runpy.run_path(str(script))
+    validate = runtime["validate_phase2_resume_bundle"]
+    latest = runtime["find_latest_phase2_resume_checkpoint"]
+    checkpoint_dir = tmp_path / "checkpoints"
+    first = _write_phase2_bundle(checkpoint_dir, 1)
+    assert validate(first)["global_step"] == 1
+    assert latest(checkpoint_dir) == first.resolve()
+
+    partial = checkpoint_dir / "model_weights_step_00002.safetensors"
+    save_file(
+        {"weight": torch.ones(1)},
+        partial,
+        metadata={"training_phase": "phase2", "global_step": "2"},
+    )
+    with pytest.raises(RuntimeError, match="ready marker is missing"):
+        latest(checkpoint_dir)
+
+
+@pytest.mark.parametrize(
+    "broken_artifact",
+    ["marker", "checkpoint", "sha", "training_state", "accelerator_state"],
+)
+def test_phase2_resume_bundle_rejects_each_missing_or_corrupt_component(
+    tmp_path: Path,
+    broken_artifact: str,
+) -> None:
+    script = Path(__file__).parents[1] / "scripts" / "check_semantic_flow_phase2_runtime.py"
+    validate = runpy.run_path(str(script))["validate_phase2_resume_bundle"]
+    checkpoint = _write_phase2_bundle(tmp_path, 1)
+    marker = tmp_path / "checkpoint_step_00001.ready.json"
+    if broken_artifact == "marker":
+        marker.unlink()
+    elif broken_artifact == "checkpoint":
+        checkpoint.unlink()
+    elif broken_artifact == "sha":
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+        payload["checkpoint_sha256"] = "0" * 64
+        marker.write_text(json.dumps(payload), encoding="utf-8")
+    elif broken_artifact == "training_state":
+        (tmp_path / "training_state_step_00001.pt").unlink()
+    else:
+        (tmp_path / "accelerator_state_step_00001" / "state.bin").unlink()
+        (tmp_path / "accelerator_state_step_00001").rmdir()
+    with pytest.raises(RuntimeError):
+        validate(checkpoint)
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    ["marker_step", "metadata_step", "training_state_step"],
+)
+def test_phase2_resume_bundle_rejects_step_mismatches(
+    tmp_path: Path,
+    mismatch: str,
+) -> None:
+    script = Path(__file__).parents[1] / "scripts" / "check_semantic_flow_phase2_runtime.py"
+    validate = runpy.run_path(str(script))["validate_phase2_resume_bundle"]
+    checkpoint = _write_phase2_bundle(tmp_path, 1)
+    marker = tmp_path / "checkpoint_step_00001.ready.json"
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    if mismatch == "marker_step":
+        payload["global_step"] = 2
+    elif mismatch == "metadata_step":
+        save_file(
+            {"weight": torch.ones(1)},
+            checkpoint,
+            metadata={"training_phase": "phase2", "global_step": "2"},
+        )
+        payload["checkpoint_sha256"] = hashlib.sha256(
+            checkpoint.read_bytes()
+        ).hexdigest()
+    else:
+        torch.save(
+            _training_state(2).to_save_dict(),
+            tmp_path / "training_state_step_00001.pt",
+        )
+    marker.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="step mismatch"):
+        validate(checkpoint)
+
+
+def test_phase2_smoke_result_requires_gradient_resume_and_inference_evidence(
+    tmp_path: Path,
+) -> None:
+    script = Path(__file__).parents[1] / "scripts" / "check_semantic_flow_phase2_runtime.py"
+    validate = runpy.run_path(str(script))["validate_phase2_smoke_output"]
+    first = _write_phase2_bundle(tmp_path / "checkpoints", 1)
+    final = _write_phase2_bundle(tmp_path / "checkpoints", 2)
+    del first
+    (tmp_path / "phase2_gradient_audit.json").write_text(
+        json.dumps(
+            {
+                "passed": True,
+                "world_size": 8,
+                "parameters": {
+                    "feature_extractor.video_aggregate_embed.weight": {
+                        "requires_grad": True,
+                        "grad_exists": True,
+                        "grad_finite": True,
+                        "grad_nonzero": True,
+                    },
+                    "video_connector.learnable_registers": {
+                        "requires_grad": True,
+                        "grad_exists": True,
+                        "grad_finite": True,
+                        "grad_nonzero": True,
+                    },
+                },
+                "frozen_module_gradients": {
+                    "text_encoder": False,
+                    "vae_encoder": False,
+                    "audio_connector": False,
+                },
+                "optimizer_groups": [
+                    {"name": "dit_semantic", "learning_rate": 5.0e-6},
+                    {"name": "conditioning_bridge", "learning_rate": 3.0e-6},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "phase2_resume_runtime_audit.json").write_text(
+        json.dumps(
+            {
+                "initial_step": 1,
+                "scheduler_last_epoch": 1,
+                "sampler_task_schedule_cursor": 1,
+                "sampler_microstep_in_optimizer_step": 0,
+                "accelerator_state_restored": True,
+                "scheduler_restored": True,
+                "sampler_restored": True,
+                "optimizer_groups_restored": True,
+                "passed": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    for mode in ("positive_ref", "latent_ref"):
+        summary = tmp_path / "inference" / mode / "run_summary.json"
+        summary.parent.mkdir(parents=True)
+        summary.write_text(
+            json.dumps(
+                {
+                    "guidance_mode": mode,
+                    "success_count": 1,
+                    "failure_count": 0,
+                    "checkpoint": str(final.resolve()),
+                }
+            ),
+            encoding="utf-8",
+        )
+    report = validate(
+        tmp_path,
+        expected_processes=8,
+        expected_final_step=2,
+        require_exact_resume=True,
+        require_inference=True,
+    )
+    assert report["passed"] is True
+    assert report["first_bundle"]["global_step"] == 1
+    assert report["final_bundle"]["global_step"] == 2
+    assert set(report["inference"]) == {"positive_ref", "latent_ref"}
 
 
 def test_phase2_distributed_state_save_is_additive_to_minimal_state(
@@ -577,8 +1042,37 @@ def test_phase2_production_config_and_launcher_are_isolated_from_phase1() -> Non
     assert "--ref-guidance-scale 0" in launcher_text
     assert "--guidance-mode latent_ref" in launcher_text
     assert "--ref-guidance-scale 1" in launcher_text
+    assert 'PYTHON="${PYTHON:-/mnt/workspace/litengjie/R2V-Next/.venv/bin/python}"' in launcher_text
+    assert 'ACCELERATE="${ACCELERATE:-/mnt/workspace/litengjie/R2V-Next/.venv/bin/accelerate}"' in launcher_text
+    assert '"$PYTHON" "$CHECKER" --find-latest-resume-checkpoint' in launcher_text
+    assert '"$ACCELERATE" launch' in launcher_text
+    assert "--phase2-smoke-audit" in launcher_text
+    assert "semantic_flow_phase2_smoke_8gpu_stage_a.yaml" in launcher_text
+    assert "semantic_flow_phase2_smoke_8gpu_stage_b.yaml" in launcher_text
+    assert "model_weights_step_00001.safetensors" in launcher_text
+    assert "model_weights_step_00002.safetensors" in launcher_text
+    assert (
+        launcher_text.count(
+            'launch_train "$STAGE_A_CONFIG" "$TRAIN_ACCELERATE_CONFIG" true'
+        )
+        == 1
+    )
+    assert (
+        launcher_text.count(
+            'launch_train "$STAGE_B_CONFIG" "$TRAIN_ACCELERATE_CONFIG" false'
+        )
+        == 1
+    )
+    assert '"$STAGE_A_CHECKPOINT" \\\n      false \\\n      2 \\' in launcher_text
+    assert "--require-exact-resume" in launcher_text
+    assert "--require-inference" in launcher_text
+    assert "phase2_smoke_8gpu_result.json" in launcher_text
     for command in ("start", "resume", "smoke-2gpu", "smoke-8gpu", "preflight"):
         assert command in launcher_text
+
+    train_cli = (trainer_root / "scripts" / "train.py").read_text(encoding="utf-8")
+    assert "--phase2-smoke-audit" in train_cli
+    assert "trainer.enable_phase2_smoke_audit()" in train_cli
 
 
 def test_phase2_runtime_contract_accepts_production_shape_and_rejects_wrong_world_size() -> None:

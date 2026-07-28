@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,7 @@ from ltx_trainer.config import LtxTrainerConfig
 from ltx_trainer.model_loader import load_embeddings_processor
 from ltx_trainer.online_data.path_safety import assert_write_path_allowed
 from ltx_trainer.online_inference.checkpoint_runtime import read_checkpoint_metadata
+from ltx_trainer.training_state import TrainingState
 from ltx_trainer.training_strategies.semantic_flow_bridge import (
     configure_phase2_bridge_trainability,
     phase2_bridge_audit_rows,
@@ -58,6 +60,340 @@ def _load_ready_marker(checkpoint: Path) -> tuple[Path, dict[str, Any]]:
     if payload.get("checkpoint_sha256") != actual_sha:
         raise RuntimeError("Parent checkpoint SHA256 does not match its ready marker")
     return marker, payload
+
+
+def _artifact_step(path: Path) -> int:
+    match = re.search(r"_step_(\d+)", path.name)
+    if match is None:
+        raise RuntimeError(f"Cannot parse checkpoint step from {path.name}")
+    return int(match.group(1))
+
+
+def validate_phase2_resume_bundle(checkpoint: Path) -> dict[str, Any]:
+    checkpoint = checkpoint.expanduser().resolve()
+    step = _artifact_step(checkpoint)
+    if not checkpoint.is_file():
+        raise RuntimeError(f"Phase 2 checkpoint is missing: {checkpoint}")
+
+    marker_path, marker = _load_ready_marker(checkpoint)
+    expected_training_state = (
+        checkpoint.parent / f"training_state_step_{step:05d}.pt"
+    ).resolve()
+    expected_accelerator_state = (
+        checkpoint.parent / f"accelerator_state_step_{step:05d}"
+    ).resolve()
+    try:
+        marker_step = int(marker["global_step"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"Phase 2 ready marker has invalid global_step: {marker_path}"
+        ) from exc
+    if marker_step != step:
+        raise RuntimeError(
+            f"Phase 2 ready marker step mismatch: filename={step}, marker={marker_step}"
+        )
+    marker_training_state = Path(
+        str(marker.get("training_state_path", ""))
+    ).expanduser().resolve()
+    if marker_training_state != expected_training_state:
+        raise RuntimeError(
+            "Phase 2 ready marker training_state_path does not match its step"
+        )
+    marker_accelerator_state = Path(
+        str(marker.get("accelerator_state_path", ""))
+    ).expanduser().resolve()
+    if marker_accelerator_state != expected_accelerator_state:
+        raise RuntimeError(
+            "Phase 2 ready marker accelerator_state_path does not match its step"
+        )
+    if not expected_training_state.is_file():
+        raise RuntimeError(
+            f"Phase 2 training state is missing: {expected_training_state}"
+        )
+    if not expected_accelerator_state.is_dir():
+        raise RuntimeError(
+            f"Phase 2 Accelerate state is missing: {expected_accelerator_state}"
+        )
+
+    metadata = read_checkpoint_metadata(checkpoint)
+    if metadata.get("training_phase") != "phase2":
+        raise RuntimeError("Phase 2 resume checkpoint metadata is not training_phase=phase2")
+    try:
+        metadata_step = int(metadata["global_step"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("Phase 2 checkpoint metadata has invalid global_step") from exc
+    if metadata_step != step:
+        raise RuntimeError(
+            f"Phase 2 checkpoint metadata step mismatch: filename={step}, metadata={metadata_step}"
+        )
+    if marker.get("training_phase") != "phase2":
+        raise RuntimeError("Phase 2 ready marker is missing training_phase=phase2")
+    marker_metadata_step = marker.get("metadata_global_step")
+    if marker_metadata_step is not None and int(marker_metadata_step) != step:
+        raise RuntimeError(
+            "Phase 2 ready marker metadata_global_step does not match its step"
+        )
+
+    try:
+        raw_state = torch.load(
+            expected_training_state,
+            map_location="cpu",
+            weights_only=False,
+        )
+        training_state = TrainingState.from_save_dict(raw_state)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not load Phase 2 training state: {expected_training_state}"
+        ) from exc
+    if training_state.global_step != step:
+        raise RuntimeError(
+            "Phase 2 training-state step mismatch: "
+            f"filename={step}, training_state={training_state.global_step}"
+        )
+    scheduler_state = training_state.lr_scheduler_state_dict
+    if not isinstance(scheduler_state, dict) or int(
+        scheduler_state.get("last_epoch", -1)
+    ) != step:
+        raise RuntimeError(
+            "Phase 2 training-state scheduler does not match the checkpoint step"
+        )
+    data_state = training_state.data_state
+    if (
+        not isinstance(data_state, dict)
+        or data_state.get("task_schedule_cursor") != step
+        or data_state.get("microstep_in_optimizer_step") != 0
+    ):
+        raise RuntimeError(
+            "Phase 2 training-state sampler does not match the checkpoint step"
+        )
+    return {
+        "global_step": step,
+        "checkpoint": str(checkpoint),
+        "checkpoint_sha256": _sha256(checkpoint),
+        "ready_marker": str(marker_path),
+        "training_state": str(expected_training_state),
+        "accelerator_state": str(expected_accelerator_state),
+    }
+
+
+def find_latest_phase2_resume_checkpoint(checkpoint_dir: Path) -> Path:
+    checkpoint_dir = checkpoint_dir.expanduser().resolve()
+    artifacts = [
+        path
+        for pattern in PHASE2_TRAINING_ARTIFACT_PATTERNS
+        for path in checkpoint_dir.glob(pattern)
+    ]
+    if not artifacts:
+        raise RuntimeError(
+            f"No Phase 2 checkpoint artifacts found under {checkpoint_dir}"
+        )
+    latest_step = max(_artifact_step(path) for path in artifacts)
+    checkpoint = checkpoint_dir / f"model_weights_step_{latest_step:05d}.safetensors"
+    validate_phase2_resume_bundle(checkpoint)
+    return checkpoint
+
+
+def _load_json_object(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Could not read JSON evidence {path}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Expected JSON object in {path}")
+    return payload
+
+
+def validate_phase2_smoke_output(
+    smoke_root: Path,
+    *,
+    expected_processes: int,
+    expected_final_step: int,
+    require_exact_resume: bool,
+    require_inference: bool,
+) -> dict[str, Any]:
+    smoke_root = smoke_root.expanduser().resolve()
+    checkpoint_dir = smoke_root / "checkpoints"
+    final_checkpoint = find_latest_phase2_resume_checkpoint(checkpoint_dir)
+    final_bundle = validate_phase2_resume_bundle(final_checkpoint)
+    if final_bundle["global_step"] != expected_final_step:
+        raise RuntimeError(
+            "Phase 2 smoke final checkpoint step mismatch: "
+            f"expected={expected_final_step}, actual={final_bundle['global_step']}"
+        )
+
+    gradient_path = smoke_root / "phase2_gradient_audit.json"
+    gradient = _load_json_object(gradient_path)
+    if gradient.get("passed") is not True:
+        raise RuntimeError("Phase 2 smoke gradient audit did not pass")
+    if int(gradient.get("world_size", -1)) != expected_processes:
+        raise RuntimeError("Phase 2 smoke gradient audit world size mismatch")
+    parameters = gradient.get("parameters")
+    if not isinstance(parameters, dict) or not parameters:
+        raise RuntimeError("Phase 2 smoke gradient audit has no parameter records")
+    invalid_parameters = [
+        name
+        for name, record in parameters.items()
+        if not isinstance(record, dict)
+        or record.get("requires_grad") is not True
+        or record.get("grad_exists") is not True
+        or record.get("grad_finite") is not True
+    ]
+    if invalid_parameters:
+        raise RuntimeError(
+            "Phase 2 smoke gradient parameter evidence is invalid: "
+            f"{invalid_parameters[:20]}"
+        )
+    projection_records = [
+        record
+        for name, record in parameters.items()
+        if name.startswith("feature_extractor.video_aggregate_embed.")
+        or name.startswith("feature_extractor.aggregate_embed.")
+    ]
+    register_record = parameters.get("video_connector.learnable_registers")
+    if not projection_records or not any(
+        record.get("grad_nonzero") is True for record in projection_records
+    ):
+        raise RuntimeError("Phase 2 smoke projection gradient is zero")
+    if (
+        not isinstance(register_record, dict)
+        or register_record.get("grad_nonzero") is not True
+    ):
+        raise RuntimeError("Phase 2 smoke learnable-register gradient is zero")
+    frozen_gradients = gradient.get("frozen_module_gradients")
+    if not isinstance(frozen_gradients, dict) or frozen_gradients != {
+        "text_encoder": False,
+        "vae_encoder": False,
+        "audio_connector": False,
+    }:
+        raise RuntimeError("Phase 2 smoke frozen-module gradient evidence is invalid")
+    groups = gradient.get("optimizer_groups")
+    if (
+        not isinstance(groups, list)
+        or len(groups) != 2
+        or not all(isinstance(group, dict) for group in groups)
+        or [group.get("name") for group in groups]
+        != ["dit_semantic", "conditioning_bridge"]
+    ):
+        raise RuntimeError("Phase 2 smoke optimizer group evidence is invalid")
+    learning_rates = [
+        float(group["learning_rate"])
+        for group in groups
+        if isinstance(group, dict)
+    ]
+    if learning_rates != [5.0e-6, 3.0e-6]:
+        raise RuntimeError(
+            f"Phase 2 smoke optimizer learning rates are invalid: {learning_rates}"
+        )
+
+    first_bundle: dict[str, Any] | None = None
+    resume_audit: dict[str, Any] | None = None
+    if require_exact_resume:
+        first_checkpoint = checkpoint_dir / "model_weights_step_00001.safetensors"
+        first_bundle = validate_phase2_resume_bundle(first_checkpoint)
+        resume_path = smoke_root / "phase2_resume_runtime_audit.json"
+        resume_audit = _load_json_object(resume_path)
+        required_resume_values = {
+            "initial_step": 1,
+            "scheduler_last_epoch": 1,
+            "sampler_task_schedule_cursor": 1,
+            "sampler_microstep_in_optimizer_step": 0,
+            "accelerator_state_restored": True,
+            "scheduler_restored": True,
+            "sampler_restored": True,
+            "optimizer_groups_restored": True,
+            "passed": True,
+        }
+        mismatches = {
+            key: {"expected": expected, "actual": resume_audit.get(key)}
+            for key, expected in required_resume_values.items()
+            if resume_audit.get(key) != expected
+        }
+        if mismatches:
+            raise RuntimeError(
+                f"Phase 2 exact-resume runtime evidence mismatch: {mismatches}"
+            )
+
+    inference: dict[str, Any] = {}
+    if require_inference:
+        for mode in ("positive_ref", "latent_ref"):
+            summary_path = smoke_root / "inference" / mode / "run_summary.json"
+            summary = _load_json_object(summary_path)
+            if (
+                summary.get("guidance_mode") != mode
+                or summary.get("success_count") != 1
+                or summary.get("failure_count") != 0
+            ):
+                raise RuntimeError(
+                    f"Phase 2 {mode} inference smoke evidence is invalid"
+                )
+            if Path(str(summary.get("checkpoint", ""))).resolve() != final_checkpoint:
+                raise RuntimeError(
+                    f"Phase 2 {mode} inference did not load the final checkpoint"
+                )
+            inference[mode] = {
+                "run_summary": str(summary_path),
+                "success_count": 1,
+                "failure_count": 0,
+            }
+
+    is_exact_resume_smoke = require_exact_resume and expected_final_step == 2
+    return {
+        "passed": True,
+        "world_size": expected_processes,
+        "stage_a_step": 1 if is_exact_resume_smoke else expected_final_step,
+        "stage_b_resume_initial_step": 1 if is_exact_resume_smoke else None,
+        "stage_b_final_step": expected_final_step if is_exact_resume_smoke else None,
+        "gradient_audit_passed": True,
+        "checkpoint_step1_ready": (
+            first_bundle is not None
+            if is_exact_resume_smoke
+            else expected_final_step == 1
+        ),
+        "checkpoint_step2_ready": (
+            final_bundle["global_step"] == 2 if is_exact_resume_smoke else None
+        ),
+        "accelerator_state_restored": (
+            bool(resume_audit["accelerator_state_restored"])
+            if resume_audit is not None
+            else None
+        ),
+        "scheduler_restored": (
+            bool(resume_audit["scheduler_restored"])
+            if resume_audit is not None
+            else None
+        ),
+        "sampler_restored": (
+            bool(resume_audit["sampler_restored"])
+            if resume_audit is not None
+            else None
+        ),
+        "optimizer_groups_restored": (
+            bool(resume_audit["optimizer_groups_restored"])
+            if resume_audit is not None
+            else None
+        ),
+        "bridge_strict_reload_passed": (
+            set(inference) == {"positive_ref", "latent_ref"}
+            if require_inference
+            else None
+        ),
+        "positive_ref_inference_passed": (
+            "positive_ref" in inference if require_inference else None
+        ),
+        "latent_ref_inference_passed": (
+            "latent_ref" in inference if require_inference else None
+        ),
+        "expected_processes": expected_processes,
+        "expected_final_step": expected_final_step,
+        "gradient_audit": str(gradient_path),
+        "gradient_parameter_count": len(parameters),
+        "optimizer_group_names": ["dit_semantic", "conditioning_bridge"],
+        "optimizer_learning_rates": learning_rates,
+        "first_bundle": first_bundle,
+        "final_bundle": final_bundle,
+        "resume_runtime_audit": resume_audit,
+        "inference": inference,
+    }
 
 
 def assert_phase2_start_output_is_empty(output_dir: Path, *, mode: str) -> None:
@@ -143,14 +479,64 @@ def validate_phase2_config_contract(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=Path, required=True)
-    parser.add_argument("--accelerate-config", type=Path, required=True)
-    parser.add_argument("--mode", choices=("start", "resume"), required=True)
+    parser.add_argument("--config", type=Path)
+    parser.add_argument("--accelerate-config", type=Path)
+    parser.add_argument("--mode", choices=("start", "resume"))
     parser.add_argument("--expected-processes", type=int, default=8)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--parameter-audit", type=Path, required=True)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--parameter-audit", type=Path)
+    parser.add_argument("--find-latest-resume-checkpoint", type=Path)
+    parser.add_argument("--validate-smoke-output", type=Path)
+    parser.add_argument("--expected-final-step", type=int)
+    parser.add_argument("--require-exact-resume", action="store_true")
+    parser.add_argument("--require-inference", action="store_true")
+    parser.add_argument("--result-output", type=Path)
     args = parser.parse_args()
 
+    if args.find_latest_resume_checkpoint is not None:
+        print(  # noqa: T201
+            find_latest_phase2_resume_checkpoint(
+                args.find_latest_resume_checkpoint
+            )
+        )
+        return
+    if args.validate_smoke_output is not None:
+        if args.expected_final_step is None or args.result_output is None:
+            parser.error(
+                "--validate-smoke-output requires --expected-final-step and "
+                "--result-output"
+            )
+        report = validate_phase2_smoke_output(
+            args.validate_smoke_output,
+            expected_processes=args.expected_processes,
+            expected_final_step=args.expected_final_step,
+            require_exact_resume=args.require_exact_resume,
+            require_inference=args.require_inference,
+        )
+        result_path = assert_write_path_allowed(args.result_output)
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        result_path.write_text(
+            json.dumps(report, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        print(json.dumps(report, indent=2, sort_keys=True))  # noqa: T201
+        return
+    required = {
+        "--config": args.config,
+        "--accelerate-config": args.accelerate_config,
+        "--mode": args.mode,
+        "--output": args.output,
+        "--parameter-audit": args.parameter_audit,
+    }
+    missing = [name for name, value in required.items() if value is None]
+    if missing:
+        parser.error(f"the following arguments are required: {', '.join(missing)}")
+
+    assert args.config is not None
+    assert args.accelerate_config is not None
+    assert args.mode is not None
+    assert args.output is not None
+    assert args.parameter_audit is not None
     config_path = args.config.expanduser().resolve()
     accelerate_path = args.accelerate_config.expanduser().resolve()
     raw_config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
@@ -180,8 +566,8 @@ def main() -> None:
             raise RuntimeError("Phase 2 parent checkpoint is not the configured Phase 1 step")
         if metadata.get("training_phase", "phase1") != "phase1":
             raise RuntimeError("Phase 2 start requires a Phase 1 parent checkpoint")
-    elif metadata.get("training_phase") != "phase2":
-        raise RuntimeError("Phase 2 resume requires a Phase 2 checkpoint")
+    else:
+        validate_phase2_resume_bundle(checkpoint)
 
     if torch.cuda.device_count() != args.expected_processes:
         raise RuntimeError(

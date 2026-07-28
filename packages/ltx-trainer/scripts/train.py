@@ -39,6 +39,11 @@ def main(
         "--disable-progress-bars",
         help="Disable progress bars (useful for multi-process runs)",
     ),
+    phase2_smoke_audit: bool = typer.Option(
+        False,
+        "--phase2-smoke-audit",
+        help="Run the fail-closed Phase 2 bridge gradient audit on the first optimizer step",
+    ),
 ) -> None:
     """Train the model using the provided configuration file."""
     config_path = Path(config_path)
@@ -56,6 +61,8 @@ def main(
         raise typer.Exit(code=1) from e
 
     trainer = LtxvTrainer(trainer_config)
+    if phase2_smoke_audit:
+        trainer.enable_phase2_smoke_audit()
     trainer.train(disable_progress_bars=disable_progress_bars)
 
 
