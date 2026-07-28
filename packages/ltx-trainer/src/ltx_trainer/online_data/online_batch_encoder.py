@@ -586,7 +586,8 @@ class OnlineBatchEncoder:
         feature_extractor = getattr(self.embeddings_processor, "feature_extractor", None)
         if feature_extractor is None:
             raise RuntimeError("Online prefix encoding requires embeddings_processor.feature_extractor")
-        feature_extractor.requires_grad_(False).eval()
+        if not defer_feature_extractor:
+            feature_extractor.requires_grad_(False).eval()
         language_model.eval()
         prefix_reference_segment_mask = reference_segment_mask.to(device=self.device).unsqueeze(0)
         prefix_image_token_mask = image_token_mask.to(device=self.device).unsqueeze(0)

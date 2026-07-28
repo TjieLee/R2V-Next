@@ -23,6 +23,13 @@ from ltx_trainer.training_strategies.semantic_flow_bridge import (
     resolve_phase2_bridge_modules,
 )
 
+PHASE2_TRAINING_ARTIFACT_PATTERNS = (
+    "checkpoint_step_*.ready.json",
+    "model_weights_step_*.safetensors",
+    "training_state_step_*.pt",
+    "accelerator_state_step_*",
+)
+
 
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
@@ -51,6 +58,19 @@ def _load_ready_marker(checkpoint: Path) -> tuple[Path, dict[str, Any]]:
     if payload.get("checkpoint_sha256") != actual_sha:
         raise RuntimeError("Parent checkpoint SHA256 does not match its ready marker")
     return marker, payload
+
+
+def assert_phase2_start_output_is_empty(output_dir: Path, *, mode: str) -> None:
+    if mode != "start":
+        return
+    checkpoint_dir = output_dir / "checkpoints"
+    artifacts = sorted({path for pattern in PHASE2_TRAINING_ARTIFACT_PATTERNS for path in checkpoint_dir.glob(pattern)})
+    if artifacts:
+        raise RuntimeError(
+            "Phase 2 output already contains training artifacts. "
+            "Use `run_semantic_flow_phase2_8gpu.sh resume` instead of `start`. "
+            f"First artifact: {artifacts[0]}"
+        )
 
 
 def validate_phase2_config_contract(
@@ -82,10 +102,13 @@ def validate_phase2_config_contract(
         errors.append("Phase 2 Gemma LoRA must be disabled")
     if model.get("training_mode") != "full":
         errors.append("Phase 2 requires full DiT training")
-    if float(optimization.get("learning_rate", 0.0)) != 5.0e-6:
+    dit_lr = float(optimization.get("learning_rate", 0.0))
+    raw_bridge_lr = optimization.get("bridge_learning_rate")
+    bridge_lr = dit_lr if raw_bridge_lr is None else float(raw_bridge_lr)
+    if dit_lr != 5.0e-6:
         errors.append("Phase 2 DiT/semantic learning rate must be 5e-6")
-    if float(optimization.get("bridge_learning_rate", 0.0)) != 3.0e-6:
-        errors.append("Phase 2 bridge learning rate must be 3e-6")
+    if bridge_lr not in {3.0e-6, 5.0e-6}:
+        errors.append("Phase 2 bridge learning rate must be 3e-6 or 5e-6")
     if set(probabilities) != expected_modes:
         errors.append("Phase 2 condition probabilities must define all eight T/I/L modes")
     if abs(sum(float(value) for value in probabilities.values()) - 1.0) > 1.0e-6:
@@ -112,8 +135,8 @@ def validate_phase2_config_contract(
     return {
         "condition_probability_sum": sum(float(value) for value in probabilities.values()),
         "condition_modes": sorted(probabilities),
-        "dit_semantic_learning_rate": float(optimization["learning_rate"]),
-        "conditioning_bridge_learning_rate": float(optimization["bridge_learning_rate"]),
+        "dit_semantic_learning_rate": dit_lr,
+        "conditioning_bridge_learning_rate": bridge_lr,
         "num_processes": int(accelerate_config["num_processes"]),
     }
 
@@ -145,6 +168,7 @@ def main() -> None:
     phase1_output = Path("/mnt/workspace/litengjie/jd_ltx_multitask_online_480p121/semantic_flow_v2/train").resolve()
     if output_dir.resolve() == phase1_output:
         raise RuntimeError("Phase 2 output directory must differ from Phase 1")
+    assert_phase2_start_output_is_empty(output_dir, mode=args.mode)
 
     checkpoint = Path(str(cfg.model.load_checkpoint)).expanduser().resolve()
     if not checkpoint.is_file():

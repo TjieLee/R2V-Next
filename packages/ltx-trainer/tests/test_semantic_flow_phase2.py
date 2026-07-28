@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import ast
 import copy
+import inspect
 import runpy
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,6 +15,7 @@ from torch import nn
 
 from ltx_core.text_encoders.gemma.embeddings_processor import EmbeddingsProcessor
 from ltx_core.text_encoders.gemma.feature_extractor import FeatureExtractorV2
+from ltx_trainer.online_data.constants import IMAGE_TASK
 from ltx_trainer.online_data.online_batch_encoder import (
     OnlineBatchEncoder,
     phase2_condition_axes,
@@ -40,6 +43,33 @@ class _TinyConnector(nn.Module):
         self.projection = nn.Linear(4, 4, bias=False, dtype=torch.bfloat16)
 
 
+class _FakePhase2LanguageModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.embedding = nn.Embedding(8, 2)
+        self.layers = nn.ModuleList([nn.Linear(2, 2, bias=False) for _ in range(4)])
+        self.config = SimpleNamespace(sliding_window=4)
+
+    def get_input_embeddings(self) -> nn.Module:
+        return self.embedding
+
+    def forward(
+        self,
+        *,
+        inputs_embeds: torch.Tensor,
+        attention_mask: dict[str, torch.Tensor],
+        position_ids: torch.Tensor,
+        output_hidden_states: bool,
+        return_dict: bool,
+        use_cache: bool,
+    ) -> SimpleNamespace:
+        del attention_mask, position_ids
+        assert output_hidden_states
+        assert return_dict
+        assert not use_cache
+        return SimpleNamespace(hidden_states=tuple(layer(inputs_embeds) for layer in self.layers))
+
+
 def _processor() -> EmbeddingsProcessor:
     return EmbeddingsProcessor(
         feature_extractor=FeatureExtractorV2(
@@ -59,6 +89,17 @@ def _strategy_modules() -> dict[str, nn.Module]:
         "semantic_reconstruction_decoder": nn.Linear(3, 2, bias=False),
         "semantic_alignment_head": nn.Linear(3, 4, bias=False),
     }
+
+
+def _runtime_audit_trainer() -> LtxvTrainer:
+    trainer = object.__new__(LtxvTrainer)
+    trainer._training_strategy = SemanticFlowStrategy(SemanticFlowConfig(training_phase="phase2"))
+    trainer._embeddings_processor = _processor()
+    configure_phase2_bridge_trainability(trainer._embeddings_processor)
+    trainer._text_encoder = nn.Linear(4, 4).requires_grad_(False)
+    trainer._online_vae_encoder = nn.Linear(4, 4).requires_grad_(False)
+    trainer._phase2_runtime_trainability_checked = False
+    return trainer
 
 
 def test_phase1_defaults_and_sampling_sequence_remain_unchanged() -> None:
@@ -215,6 +256,55 @@ def test_phase2_feature_extractor_runs_in_training_graph_from_detached_hidden_st
     assert all(value.grad_fn is None and not value.requires_grad for value in hidden_states)
 
 
+def test_phase2_prefix_encoding_preserves_bridge_trainability_and_projection_gradient() -> None:
+    processor = _processor()
+    configure_phase2_bridge_trainability(processor)
+    language_model = _FakePhase2LanguageModel().requires_grad_(False)
+    encoder = OnlineBatchEncoder.__new__(OnlineBatchEncoder)
+    encoder.device = torch.device("cpu")
+    encoder.dtype = torch.float32
+    encoder.embeddings_processor = processor
+    encoder.last_dtype_diagnostics = {}
+    encoder.last_hidden_state_diagnostics = {}
+    encoder._phase2_hidden_state_shape_logged = False
+    encoder._frozen_encode_autocast = nullcontext  # type: ignore[method-assign]
+    encoder._get_language_model = lambda: language_model  # type: ignore[method-assign]
+    encoder._process_multimodal_prefix = (  # type: ignore[method-assign]
+        lambda **_kwargs: (
+            {
+                "input_ids": torch.tensor([[1, 2, 0]]),
+                "attention_mask": torch.tensor([[1, 1, 0]]),
+            },
+            torch.zeros(3, dtype=torch.bool),
+            torch.zeros(3, dtype=torch.bool),
+        )
+    )
+
+    conditions, teacher_prefix = encoder._encode_prefix(
+        caption="edit the image",
+        reference_images=[],
+        task=IMAGE_TASK,
+        sample_key="phase2-prefix",
+        defer_feature_extractor=True,
+    )
+
+    video_projection = processor.feature_extractor.video_aggregate_embed
+    assert all(parameter.requires_grad for parameter in video_projection.parameters())
+    assert all(parameter.requires_grad for parameter in processor.video_connector.parameters())
+    assert all(not parameter.requires_grad for parameter in processor.audio_connector.parameters())
+    assert all(not value.requires_grad for value in conditions["frozen_vlm_hidden_states"])
+    assert all(not torch.is_inference(value) for value in conditions["frozen_vlm_hidden_states"])
+    assert teacher_prefix["prefix_inputs_embeds"].requires_grad is False
+
+    strategy = SemanticFlowStrategy(SemanticFlowConfig(training_phase="phase2"))
+    strategy._embeddings_processor = processor
+    prepared = strategy.prepare_conditions({}, conditions)
+    prepared["video_prompt_embeds"].square().mean().backward()
+    assert video_projection.weight.grad is not None
+    assert torch.isfinite(video_projection.weight.grad).all()
+    assert torch.count_nonzero(video_projection.weight.grad)
+
+
 def test_phase2_frozen_processor_modules_remain_in_eval_mode() -> None:
     processor = _processor()
     configure_phase2_bridge_trainability(processor)
@@ -337,6 +427,51 @@ def test_phase2_trainability_rejects_frozen_dit_or_bridge_allowlist_parameter() 
     trainer._embeddings_processor.video_connector.learnable_registers.requires_grad_(False)
     with pytest.raises(RuntimeError, match="allowlist contains frozen"):
         trainer._validate_phase2_trainability(strategy_modules)
+
+
+def test_phase2_post_encoding_trainability_audit_runs_once_and_fails_closed() -> None:
+    trainer = _runtime_audit_trainer()
+
+    trainer._validate_phase2_runtime_trainability_once()
+    assert trainer._phase2_runtime_trainability_checked is True
+    trainer._validate_phase2_runtime_trainability_once()
+
+    failing = _runtime_audit_trainer()
+    failing._embeddings_processor.feature_extractor.video_aggregate_embed.weight.requires_grad_(False)
+    with pytest.raises(RuntimeError, match="frozen after online encoding"):
+        failing._validate_phase2_runtime_trainability_once()
+    assert failing._phase2_runtime_trainability_checked is False
+
+
+@pytest.mark.parametrize(
+    ("component", "message"),
+    [
+        ("text_encoder", "Gemma/SigLIP/projector"),
+        ("vae_encoder", "VAE encoder"),
+        ("audio_connector", "audio connector"),
+    ],
+)
+def test_phase2_post_encoding_audit_rejects_newly_trainable_frozen_modules(
+    component: str,
+    message: str,
+) -> None:
+    trainer = _runtime_audit_trainer()
+    if component == "text_encoder":
+        trainer._text_encoder.weight.requires_grad_(True)
+    elif component == "vae_encoder":
+        trainer._online_vae_encoder.weight.requires_grad_(True)
+    else:
+        trainer._embeddings_processor.audio_connector.weight.requires_grad_(True)
+    with pytest.raises(RuntimeError, match=message):
+        trainer._validate_phase2_runtime_trainability_once()
+
+
+def test_phase2_runtime_audit_occurs_after_online_encoding_before_forward() -> None:
+    source = inspect.getsource(LtxvTrainer.train)
+    encoded = source.index("batch = self._prepare_online_batch_with_retry(batch)")
+    audited = source.index("self._validate_phase2_runtime_trainability_once()")
+    forwarded = source.index("output = self._training_step(batch)")
+    assert encoded < audited < forwarded
 
 
 def test_phase2_checkpoint_metadata_is_additive_only_for_phase2() -> None:
@@ -473,10 +608,77 @@ def test_phase2_runtime_contract_accepts_production_shape_and_rejects_wrong_worl
             "fsdp_state_dict_type": "FULL_STATE_DICT",
         },
     }
-    assert validate(config, accelerate, mode="start")["num_processes"] == 8
+    contract = validate(config, accelerate, mode="start")
+    assert contract["num_processes"] == 8
+    assert contract["dit_semantic_learning_rate"] == 5.0e-6
+    assert contract["conditioning_bridge_learning_rate"] == 3.0e-6
+
+    unified = copy.deepcopy(config)
+    unified["optimization"]["bridge_learning_rate"] = 5.0e-6
+    assert (
+        validate(
+            unified,
+            accelerate,
+            mode="start",
+        )["conditioning_bridge_learning_rate"]
+        == 5.0e-6
+    )
+
+    implicit = copy.deepcopy(config)
+    implicit["optimization"]["bridge_learning_rate"] = None
+    assert (
+        validate(
+            implicit,
+            accelerate,
+            mode="start",
+        )["conditioning_bridge_learning_rate"]
+        == 5.0e-6
+    )
+
+    invalid_bridge = copy.deepcopy(config)
+    invalid_bridge["optimization"]["bridge_learning_rate"] = 1.0e-5
+    with pytest.raises(RuntimeError, match="3e-6 or 5e-6"):
+        validate(invalid_bridge, accelerate, mode="start")
+
+    invalid_dit = copy.deepcopy(config)
+    invalid_dit["optimization"]["learning_rate"] = 1.0e-5
+    with pytest.raises(RuntimeError, match="DiT/semantic learning rate"):
+        validate(invalid_dit, accelerate, mode="start")
+
     with pytest.raises(RuntimeError, match="8 processes"):
         validate(
             config,
             {**accelerate, "num_processes": 7},
             mode="start",
         )
+
+
+@pytest.mark.parametrize(
+    ("artifact_name", "is_directory"),
+    [
+        ("checkpoint_step_00001.ready.json", False),
+        ("model_weights_step_00001.safetensors", False),
+        ("training_state_step_00001.pt", False),
+        ("accelerator_state_step_00001", True),
+    ],
+)
+def test_phase2_start_refuses_existing_training_artifacts_but_resume_allows_them(
+    tmp_path: Path,
+    artifact_name: str,
+    is_directory: bool,
+) -> None:
+    script = Path(__file__).parents[1] / "scripts" / "check_semantic_flow_phase2_runtime.py"
+    guard = runpy.run_path(str(script))["assert_phase2_start_output_is_empty"]
+    output_dir = tmp_path / "phase2"
+    guard(output_dir, mode="start")
+
+    artifact = output_dir / "checkpoints" / artifact_name
+    if is_directory:
+        artifact.mkdir(parents=True)
+    else:
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.touch()
+
+    with pytest.raises(RuntimeError, match="Use .* resume"):
+        guard(output_dir, mode="start")
+    guard(output_dir, mode="resume")

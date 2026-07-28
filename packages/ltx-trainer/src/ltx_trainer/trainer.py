@@ -227,6 +227,7 @@ class LtxvTrainer:
         self._last_optimizer_group_metrics: dict[str, float] = {}
         self._last_phase2_accelerator_state_path: Path | None = None
         self._last_bridge_checkpoint_key_count = 0
+        self._phase2_runtime_trainability_checked = False
         if IS_MAIN_PROCESS:
             print_config(trainer_config)
         self._training_strategy = get_training_strategy(self._config.training_strategy)
@@ -375,6 +376,7 @@ class LtxvTrainer:
                 data_wait_ms = (time.perf_counter() - data_wait_started) * 1000.0
                 if cfg.data.encoding_mode == "online":
                     batch = self._prepare_online_batch_with_retry(batch)
+                    self._validate_phase2_runtime_trainability_once()
                     batch.setdefault("_online_metrics", {})["data_wait_ms"] = data_wait_ms
 
                 step_start_time = time.time()
@@ -828,6 +830,64 @@ class LtxvTrainer:
     def _is_semantic_flow_phase2(self) -> bool:
         strategy_config = getattr(self._training_strategy, "config", None)
         return getattr(strategy_config, "training_phase", "phase1") == "phase2"
+
+    def _validate_phase2_runtime_trainability_once(self) -> None:
+        if (
+            not self._is_semantic_flow_phase2()
+            or self._phase2_runtime_trainability_checked
+        ):
+            return
+        expected_bridge = phase2_bridge_parameters(self._embeddings_processor)
+        frozen_bridge = [
+            item.name
+            for item in expected_bridge
+            if not item.parameter.requires_grad
+        ]
+        if frozen_bridge:
+            raise RuntimeError(
+                "Phase 2 bridge parameters were frozen after online encoding: "
+                f"{frozen_bridge[:20]}"
+            )
+        expected_bridge_ids = {id(item.parameter) for item in expected_bridge}
+        if self._text_encoder is None or any(
+            parameter.requires_grad for parameter in self._text_encoder.parameters()
+        ):
+            raise RuntimeError(
+                "Phase 2 Gemma/SigLIP/projector became trainable after online encoding"
+            )
+        if self._online_vae_encoder is None or any(
+            parameter.requires_grad
+            for parameter in self._online_vae_encoder.parameters()
+        ):
+            raise RuntimeError(
+                "Phase 2 VAE encoder became trainable after online encoding"
+            )
+        audio_connector = getattr(
+            self._embeddings_processor,
+            "audio_connector",
+            None,
+        )
+        if isinstance(audio_connector, nn.Module) and any(
+            parameter.requires_grad for parameter in audio_connector.parameters()
+        ):
+            raise RuntimeError(
+                "Phase 2 audio connector became trainable after online encoding"
+            )
+        unexpected_processor = [
+            name
+            for name, parameter in self._embeddings_processor.named_parameters()
+            if parameter.requires_grad and id(parameter) not in expected_bridge_ids
+        ]
+        if unexpected_processor:
+            raise RuntimeError(
+                "Unexpected trainable embedding-processor parameters after online "
+                f"encoding: {unexpected_processor[:20]}"
+            )
+        self._phase2_runtime_trainability_checked = True
+        logger.info(
+            "Phase 2 post-encoding trainability audit passed for %d bridge parameters",
+            len(expected_bridge),
+        )
 
     def _validate_phase2_trainability(
         self,

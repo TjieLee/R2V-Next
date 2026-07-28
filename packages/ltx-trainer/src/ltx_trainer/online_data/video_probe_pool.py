@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import atexit
 import multiprocessing as mp
-import os
 import queue
 import threading
 import time
