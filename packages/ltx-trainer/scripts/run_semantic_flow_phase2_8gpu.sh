@@ -62,22 +62,49 @@ write_runtime_config() {
   local steps="$5"
   local output_dir="$6"
   local interval="$7"
-  "$PYTHON" - "$source_config" "$destination_config" "$checkpoint" "$no_resume" "$steps" "$output_dir" "$interval" <<'PY'
+  local train_data_config="${8:-}"
+  "$PYTHON" - "$source_config" "$destination_config" "$checkpoint" "$no_resume" "$steps" "$output_dir" "$interval" "$train_data_config" <<'PY'
 import sys
 from pathlib import Path
 
 import yaml
 
-source, destination, checkpoint, no_resume, steps, output_dir, interval = sys.argv[1:]
+source, destination, checkpoint, no_resume, steps, output_dir, interval, train_data_config = sys.argv[1:]
 config = yaml.safe_load(Path(source).read_text(encoding="utf-8"))
 config["model"]["load_checkpoint"] = checkpoint
 config["checkpoints"]["no_resume"] = no_resume == "true"
 config["checkpoints"]["interval"] = int(interval)
 config["optimization"]["steps"] = int(steps)
 config["output_dir"] = output_dir
+if train_data_config:
+    config["data"]["train_data_config"] = train_data_config
+    config["data"]["online_encoding"]["image_ratio"] = 0.0
+    config["data"]["online_encoding"]["video_ratio"] = 1.0
 path = Path(destination)
 path.parent.mkdir(parents=True, exist_ok=True)
 path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+print(path)
+PY
+}
+
+write_smoke_data_config() {
+  local source_config="$1"
+  local destination_config="$2"
+  "$PYTHON" - "$source_config" "$destination_config" <<'PY'
+import sys
+from pathlib import Path
+
+import yaml
+
+source_config, destination = sys.argv[1:]
+training_config = yaml.safe_load(Path(source_config).read_text(encoding="utf-8"))
+source = Path(training_config["data"]["train_data_config"])
+data_config = yaml.safe_load(source.read_text(encoding="utf-8"))
+data_config["online_sampling"]["image_ratio"] = 0.0
+data_config["online_sampling"]["video_ratio"] = 1.0
+path = Path(destination)
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text(yaml.safe_dump(data_config, sort_keys=False), encoding="utf-8")
 print(path)
 PY
 }
@@ -101,9 +128,13 @@ launch_train() {
   local config="$1"
   local accelerate_config="$2"
   local smoke_audit="${3:-false}"
+  local stop_after_global_step="${4:-}"
   local extra_args=()
   if [[ "$smoke_audit" == "true" ]]; then
     extra_args+=(--phase2-smoke-audit)
+  fi
+  if [[ -n "$stop_after_global_step" ]]; then
+    extra_args+=(--stop-after-global-step "$stop_after_global_step")
   fi
   "$ACCELERATE" launch --config_file "$accelerate_config" \
     "$REPO_ROOT/packages/ltx-trainer/scripts/train.py" \
@@ -220,19 +251,25 @@ case "${1:-}" in
     SMOKE_ROOT="$PHASE2_ROOT/smoke/8gpu"
     STAGE_A_CONFIG="$RUNTIME_DIR/semantic_flow_phase2_smoke_8gpu_stage_a.yaml"
     STAGE_B_CONFIG="$RUNTIME_DIR/semantic_flow_phase2_smoke_8gpu_stage_b.yaml"
+    SMOKE_DATA_CONFIG="$RUNTIME_DIR/semantic_flow_phase2_smoke_8gpu_data.yaml"
+
+    write_smoke_data_config \
+      "$BASE_CONFIG" \
+      "$SMOKE_DATA_CONFIG" || exit $?
 
     write_runtime_config \
       "$BASE_CONFIG" \
       "$STAGE_A_CONFIG" \
       "$PARENT_CHECKPOINT" \
       true \
-      1 \
+      2 \
       "$SMOKE_ROOT" \
-      1 || exit $?
+      1 \
+      "$SMOKE_DATA_CONFIG" || exit $?
     run_preflight \
       "$STAGE_A_CONFIG" start "$TRAIN_ACCELERATE_CONFIG" 8 \
       "$RUNTIME_DIR/phase2_smoke_8gpu_stage_a_audit.json" || exit $?
-    launch_train "$STAGE_A_CONFIG" "$TRAIN_ACCELERATE_CONFIG" true || exit $?
+    launch_train "$STAGE_A_CONFIG" "$TRAIN_ACCELERATE_CONFIG" true 1 || exit $?
 
     STAGE_A_CHECKPOINT="$(latest_phase2_checkpoint "$SMOKE_ROOT/checkpoints")" || exit $?
     if [[ "$(basename "$STAGE_A_CHECKPOINT")" != "model_weights_step_00001.safetensors" ]]; then
@@ -246,7 +283,8 @@ case "${1:-}" in
       false \
       2 \
       "$SMOKE_ROOT" \
-      1 || exit $?
+      1 \
+      "$SMOKE_DATA_CONFIG" || exit $?
     run_preflight \
       "$STAGE_B_CONFIG" resume "$TRAIN_ACCELERATE_CONFIG" 8 \
       "$RUNTIME_DIR/phase2_smoke_8gpu_stage_b_audit.json" || exit $?

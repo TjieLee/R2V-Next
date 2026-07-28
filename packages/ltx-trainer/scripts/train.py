@@ -44,6 +44,12 @@ def main(
         "--phase2-smoke-audit",
         help="Run the fail-closed Phase 2 bridge gradient audit on the first optimizer step",
     ),
+    stop_after_global_step: int | None = typer.Option(
+        None,
+        "--stop-after-global-step",
+        min=1,
+        help="Stop this process cleanly after the selected global step without changing the configured target",
+    ),
 ) -> None:
     """Train the model using the provided configuration file."""
     config_path = Path(config_path)
@@ -63,7 +69,10 @@ def main(
     trainer = LtxvTrainer(trainer_config)
     if phase2_smoke_audit:
         trainer.enable_phase2_smoke_audit()
-    trainer.train(disable_progress_bars=disable_progress_bars)
+    trainer.train(
+        disable_progress_bars=disable_progress_bars,
+        stop_after_global_step=stop_after_global_step,
+    )
 
 
 if __name__ == "__main__":

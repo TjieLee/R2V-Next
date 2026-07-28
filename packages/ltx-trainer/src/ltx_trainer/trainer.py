@@ -95,6 +95,11 @@ if not IS_MAIN_PROCESS:
 StepCallback = Callable[[int, int, list[Path]], None]  # (step, total, list[sampled_video_path]) -> None
 
 MEMORY_CHECK_INTERVAL = 200
+PHASE2_ADAM_MOMENT_KEYS = (
+    "exp_avg",
+    "exp_avg_sq",
+    "max_exp_avg_sq",
+)
 
 
 def _normalize_fsdp_config_value(value: Any) -> str | None:
@@ -279,6 +284,7 @@ class LtxvTrainer:
         disable_progress_bars: bool = False,
         step_callback: StepCallback | None = None,
         finalize_accelerator: bool = True,
+        stop_after_global_step: int | None = None,
     ) -> tuple[Path | None, TrainingStats]:
         """
         Start the training process.
@@ -287,6 +293,8 @@ class LtxvTrainer:
             step_callback: Optional callback invoked after each optimization step.
             finalize_accelerator: End trackers/process groups before returning. Smoke callers may defer this
                 until their final distributed audits have completed.
+            stop_after_global_step: Optional runtime-only stop boundary. This does not
+                change the configured training target, scheduler, sampler, or checkpoint metadata.
         Returns:
             Tuple of (saved_model_path, training_stats)
         """
@@ -331,17 +339,33 @@ class LtxvTrainer:
         # Save the training configuration as YAML
         self._save_config()
 
-        remaining_steps = cfg.optimization.steps - initial_step
+        run_target_step = (
+            min(cfg.optimization.steps, stop_after_global_step)
+            if stop_after_global_step is not None
+            else cfg.optimization.steps
+        )
+        if stop_after_global_step is not None and stop_after_global_step <= 0:
+            raise ValueError("stop_after_global_step must be positive")
+        remaining_steps = run_target_step - initial_step
         if remaining_steps <= 0:
             raise ValueError(
                 f"No remaining training steps: initial_step={initial_step} >= "
-                f"target_steps={cfg.optimization.steps}. Nothing to train."
+                f"run_target_step={run_target_step}. Nothing to train."
             )
 
         if resuming:
-            logger.info(f"🚀 Resuming training from step {initial_step} → {cfg.optimization.steps}")
+            logger.info(
+                f"🚀 Resuming training from step {initial_step} → {run_target_step} "
+                f"(configured target: {cfg.optimization.steps})"
+            )
         else:
             logger.info("🚀 Starting training...")
+        if run_target_step != cfg.optimization.steps:
+            logger.info(
+                "Runtime stop enabled at global step %d; configured training target remains %d",
+                run_target_step,
+                cfg.optimization.steps,
+            )
 
         # Create progress tracking (disabled for non-main processes or when explicitly disabled)
         progress_enabled = IS_MAIN_PROCESS and not disable_progress_bars
@@ -380,7 +404,7 @@ class LtxvTrainer:
             self._accelerator.wait_for_everyone()
 
             micro_step = 0
-            while self._global_step < cfg.optimization.steps:
+            while self._global_step < run_target_step:
                 # Get next batch, reset the dataloader if needed
                 try:
                     data_wait_started = time.perf_counter()
@@ -390,6 +414,12 @@ class LtxvTrainer:
                     batch = next(data_iter)
                 data_wait_ms = (time.perf_counter() - data_wait_started) * 1000.0
                 if cfg.data.encoding_mode == "online":
+                    self._assert_phase2_optimizer_moments_on_cpu(
+                        context="online encoding",
+                    )
+                    self._log_phase2_gpu_allocated(
+                        "GPU allocated before online encode",
+                    )
                     batch = self._prepare_online_batch_with_retry(batch)
                     self._validate_phase2_runtime_trainability_once()
                     batch.setdefault("_online_metrics", {})["data_wait_ms"] = data_wait_ms
@@ -419,8 +449,41 @@ class LtxvTrainer:
                             cfg.optimization.max_grad_norm,
                         )
 
-                    self._optimizer.step()
-                    self._optimizer.zero_grad()
+                    phase2_real_optimizer_step = (
+                        self._accelerator.sync_gradients
+                        and self._phase2_optimizer_state_cpu_offload_enabled()
+                    )
+                    if phase2_real_optimizer_step:
+                        moved_bytes = (
+                            self._move_phase2_optimizer_moments_to_parameter_devices()
+                        )
+                        if self._accelerator.is_main_process:
+                            logger.info(
+                                "Phase 2 optimizer state moved to CUDA: %.2f GiB",
+                                moved_bytes / (1024**3),
+                            )
+                        self._log_phase2_gpu_allocated(
+                            "GPU allocated before optimizer step",
+                        )
+                    try:
+                        self._optimizer.step()
+                        self._optimizer.zero_grad()
+                    finally:
+                        if phase2_real_optimizer_step:
+                            offloaded_bytes = (
+                                self._offload_phase2_optimizer_state_to_cpu()
+                            )
+                            if torch.cuda.is_available():
+                                torch.cuda.synchronize(self._accelerator.device)
+                                torch.cuda.empty_cache()
+                            if self._accelerator.is_main_process:
+                                logger.info(
+                                    "Phase 2 optimizer state offloaded to CPU: %.2f GiB",
+                                    offloaded_bytes / (1024**3),
+                                )
+                            self._log_phase2_gpu_allocated(
+                                "GPU allocated after optimizer offload",
+                            )
 
                     self._step_lr_scheduler(
                         self._lr_scheduler,
@@ -837,6 +900,98 @@ class LtxvTrainer:
     def _is_semantic_flow_phase2(self) -> bool:
         strategy_config = getattr(self._training_strategy, "config", None)
         return getattr(strategy_config, "training_phase", "phase1") == "phase2"
+
+    def _phase2_optimizer_state_cpu_offload_enabled(self) -> bool:
+        data_config = getattr(self._config, "data", None)
+        optimization_config = getattr(self._config, "optimization", None)
+        return (
+            self._is_semantic_flow_phase2()
+            and getattr(data_config, "encoding_mode", None) == "online"
+            and getattr(self._accelerator, "distributed_type", None)
+            == DistributedType.FSDP
+            and getattr(optimization_config, "optimizer_type", None) == "adamw"
+        )
+
+    def _iter_phase2_optimizer_moments(
+        self,
+    ) -> Iterator[tuple[Tensor, dict[str, Any], str, Tensor]]:
+        for parameter, state in self._optimizer.state.items():
+            if not isinstance(parameter, Tensor) or not isinstance(state, dict):
+                continue
+            for key in PHASE2_ADAM_MOMENT_KEYS:
+                value = state.get(key)
+                if isinstance(value, Tensor):
+                    yield parameter, state, key, value
+
+    def _phase2_optimizer_moment_residency(self) -> str:
+        device_types = {
+            value.device.type
+            for _, _, _, value in self._iter_phase2_optimizer_moments()
+        }
+        if not device_types:
+            return "empty"
+        if len(device_types) == 1:
+            return next(iter(device_types))
+        return "mixed"
+
+    @staticmethod
+    def _iter_state_tensors(value: object) -> Iterator[Tensor]:
+        if isinstance(value, Tensor):
+            yield value
+        elif isinstance(value, dict):
+            for item in value.values():
+                yield from LtxvTrainer._iter_state_tensors(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                yield from LtxvTrainer._iter_state_tensors(item)
+
+    def _assert_phase2_optimizer_moments_on_cpu(self, *, context: str) -> None:
+        if not self._phase2_optimizer_state_cpu_offload_enabled():
+            return
+        residency = self._phase2_optimizer_moment_residency()
+        if residency not in {"cpu", "empty"}:
+            raise RuntimeError(
+                "Phase 2 optimizer moments must reside on CPU outside a real "
+                f"optimizer step; found residency={residency!r} before {context}"
+            )
+
+    def _move_phase2_optimizer_moments_to_parameter_devices(self) -> int:
+        if not self._phase2_optimizer_state_cpu_offload_enabled():
+            return 0
+        moved_bytes = 0
+        for parameter, state, key, value in self._iter_phase2_optimizer_moments():
+            if value.device == parameter.device:
+                continue
+            moved_bytes += value.numel() * value.element_size()
+            state[key] = value.to(device=parameter.device)
+        return moved_bytes
+
+    def _offload_phase2_optimizer_state_to_cpu(self) -> int:
+        if not self._phase2_optimizer_state_cpu_offload_enabled():
+            return 0
+        offloaded_bytes = 0
+        for _, state, key, value in self._iter_phase2_optimizer_moments():
+            if value.device.type == "cpu":
+                continue
+            offloaded_bytes += value.numel() * value.element_size()
+            state[key] = value.cpu()
+        for state in self._optimizer.state.values():
+            if not isinstance(state, dict):
+                continue
+            step = state.get("step")
+            if isinstance(step, Tensor) and step.device.type != "cpu":
+                state["step"] = step.cpu()
+        return offloaded_bytes
+
+    def _log_phase2_gpu_allocated(self, label: str) -> None:
+        if (
+            not self._phase2_optimizer_state_cpu_offload_enabled()
+            or not self._accelerator.is_main_process
+            or not torch.cuda.is_available()
+        ):
+            return
+        allocated_bytes = torch.cuda.memory_allocated(self._accelerator.device)
+        logger.info("%s: %.2f GiB", label, allocated_bytes / (1024**3))
 
     def enable_phase2_smoke_audit(self) -> None:
         if not self._is_semantic_flow_phase2():
@@ -1302,6 +1457,12 @@ class LtxvTrainer:
         optimizer_state_audit = self._phase2_optimizer_state_audit(
             expected_step=expected_step,
         )
+        optimizer_state_cpu_offload_enabled = (
+            self._phase2_optimizer_state_cpu_offload_enabled()
+        )
+        optimizer_state_residency = (
+            self._phase2_optimizer_moment_residency()
+        )
         errors = []
         if not self._phase2_distributed_optimizer_state_restored:
             errors.append("distributed optimizer state was not restored")
@@ -1319,6 +1480,14 @@ class LtxvTrainer:
             errors.append("sampler microstep_in_optimizer_step is not zero")
         if optimizer_groups != ["dit_semantic", "conditioning_bridge"]:
             errors.append(f"optimizer groups are invalid: {optimizer_groups}")
+        if (
+            optimizer_state_cpu_offload_enabled
+            and optimizer_state_residency != "cpu"
+        ):
+            errors.append(
+                "optimizer moments are not CPU-resident after restore: "
+                f"{optimizer_state_residency}"
+            )
         errors.extend(optimizer_state_audit["errors"])
         report = {
             "initial_step": expected_step,
@@ -1344,6 +1513,12 @@ class LtxvTrainer:
             "optimizer_groups_restored": optimizer_groups
             == ["dit_semantic", "conditioning_bridge"],
             "optimizer_state_restored": optimizer_state_audit["passed"],
+            "optimizer_state_residency_after_restore": (
+                optimizer_state_residency
+            ),
+            "optimizer_state_cpu_offload_enabled": (
+                optimizer_state_cpu_offload_enabled
+            ),
             "optimizer_state": optimizer_state_audit["groups"],
             "errors": errors,
             "passed": not errors,
@@ -2208,7 +2383,10 @@ class LtxvTrainer:
         local_error = None
         try:
             self._optimizer.load_state_dict(payload["optimizer_state_dict"])
-            self._move_optimizer_state_to_parameter_devices()
+            self._offload_phase2_optimizer_state_to_cpu()
+            self._assert_phase2_optimizer_moments_on_cpu(
+                context="exact resume audit",
+            )
 
             scheduler_state = training_state.lr_scheduler_state_dict
             if not isinstance(scheduler_state, dict):
@@ -2285,37 +2463,6 @@ class LtxvTrainer:
             state_path,
             training_state.global_step,
         )
-
-    @staticmethod
-    def _move_state_value_to_device(value: Any, device: torch.device) -> Any:
-        if isinstance(value, Tensor):
-            return value.to(device=device)
-        if isinstance(value, dict):
-            return {
-                key: LtxvTrainer._move_state_value_to_device(item, device)
-                for key, item in value.items()
-            }
-        if isinstance(value, list):
-            return [
-                LtxvTrainer._move_state_value_to_device(item, device)
-                for item in value
-            ]
-        if isinstance(value, tuple):
-            return tuple(
-                LtxvTrainer._move_state_value_to_device(item, device)
-                for item in value
-            )
-        return value
-
-    def _move_optimizer_state_to_parameter_devices(self) -> None:
-        for parameter, state in self._optimizer.state.items():
-            if not isinstance(parameter, Tensor) or not isinstance(state, dict):
-                continue
-            for key, value in list(state.items()):
-                state[key] = self._move_state_value_to_device(
-                    value,
-                    parameter.device,
-                )
 
     def _phase2_all_ranks_succeeded(
         self,
@@ -3773,13 +3920,35 @@ class LtxvTrainer:
         local_error = None
         try:
             scaler = getattr(self._accelerator, "scaler", None)
+            if self._phase2_optimizer_state_cpu_offload_enabled():
+                self._offload_phase2_optimizer_state_to_cpu()
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize(self._accelerator.device)
+                    torch.cuda.empty_cache()
+                self._assert_phase2_optimizer_moments_on_cpu(
+                    context="checkpoint serialization",
+                )
+            optimizer_state_dict = self._optimizer.state_dict()
+            if self._phase2_optimizer_state_cpu_offload_enabled():
+                non_cpu_optimizer_tensors = [
+                    tensor
+                    for tensor in self._iter_state_tensors(
+                        optimizer_state_dict["state"]
+                    )
+                    if tensor.device.type != "cpu"
+                ]
+                if non_cpu_optimizer_tensors:
+                    raise RuntimeError(
+                        "Phase 2 checkpoint optimizer state contains "
+                        f"{len(non_cpu_optimizer_tensors)} non-CPU tensors"
+                    )
             payload = {
                 "format_version": PHASE2_DISTRIBUTED_STATE_FORMAT_VERSION,
                 "global_step": self._global_step,
                 "rank": rank,
                 "world_size": world_size,
                 "optimizer_group_names": optimizer_group_names,
-                "optimizer_state_dict": self._optimizer.state_dict(),
+                "optimizer_state_dict": optimizer_state_dict,
                 "torch_rng_state": torch.random.get_rng_state(),
                 "cuda_rng_state": (
                     torch.cuda.get_rng_state(self._accelerator.device)

@@ -350,6 +350,8 @@ def validate_phase2_smoke_output(
             "sampler_restored": True,
             "optimizer_groups_restored": True,
             "optimizer_state_restored": True,
+            "optimizer_state_residency_after_restore": "cpu",
+            "optimizer_state_cpu_offload_enabled": True,
             "passed": True,
         }
         mismatches = {
@@ -497,6 +499,16 @@ def validate_phase2_smoke_output(
         ),
         "optimizer_state_restored": (
             bool(resume_audit["optimizer_state_restored"])
+            if resume_audit is not None
+            else None
+        ),
+        "optimizer_state_residency_after_restore": (
+            str(resume_audit["optimizer_state_residency_after_restore"])
+            if resume_audit is not None
+            else None
+        ),
+        "optimizer_state_cpu_offload_enabled": (
+            bool(resume_audit["optimizer_state_cpu_offload_enabled"])
             if resume_audit is not None
             else None
         ),

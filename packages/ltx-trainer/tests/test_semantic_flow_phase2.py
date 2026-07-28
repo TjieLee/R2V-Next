@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 import torch
 import yaml
+from accelerate import DistributedType
 from accelerate.scheduler import AcceleratedScheduler
 from safetensors.torch import save_file
 from torch import nn
@@ -23,6 +24,9 @@ from torch import nn
 from ltx_core.text_encoders.gemma.embeddings_processor import EmbeddingsProcessor
 from ltx_core.text_encoders.gemma.feature_extractor import FeatureExtractorV2
 from ltx_trainer.online_data.constants import IMAGE_TASK
+from ltx_trainer.online_data.distributed_multitask_sampler import (
+    DistributedMultiTaskMicrobatchSampler,
+)
 from ltx_trainer.online_data.online_batch_encoder import (
     OnlineBatchEncoder,
     phase2_condition_axes,
@@ -287,6 +291,8 @@ def _write_phase2_smoke_evidence(
                 "sampler_restored": True,
                 "optimizer_groups_restored": True,
                 "optimizer_state_restored": True,
+                "optimizer_state_residency_after_restore": "cpu",
+                "optimizer_state_cpu_offload_enabled": True,
                 "optimizer_state": {
                     "dit_semantic": {
                         "parameter_count": 2,
@@ -365,6 +371,7 @@ def _gradient_audit_trainer(tmp_path: Path) -> LtxvTrainer:
 
     class _Accelerator:
         device = torch.device("cpu")
+        distributed_type = DistributedType.FSDP
         num_processes = 1
         process_index = 0
         is_main_process = True
@@ -442,6 +449,7 @@ def _optimizer_state_audit_trainer(
 
     class _Accelerator:
         device = torch.device("cpu")
+        distributed_type = DistributedType.FSDP
         num_processes = 1
         process_index = 0
         is_main_process = True
@@ -461,6 +469,9 @@ def _optimizer_state_audit_trainer(
             return None
 
     trainer = object.__new__(LtxvTrainer)
+    trainer._training_strategy = SemanticFlowStrategy(
+        SemanticFlowConfig(training_phase="phase2")
+    )
     trainer._optimizer = target_optimizer
     trainer._accelerator = _Accelerator()
     trainer._phase2_optimizer_parameter_names = {
@@ -477,7 +488,11 @@ def _optimizer_state_audit_trainer(
             "microstep_in_optimizer_step": 0,
         }
     )
-    trainer._config = SimpleNamespace(output_dir=str(tmp_path))
+    trainer._config = SimpleNamespace(
+        output_dir=str(tmp_path),
+        data=SimpleNamespace(encoding_mode="online"),
+        optimization=SimpleNamespace(optimizer_type="adamw"),
+    )
     trainer._embeddings_processor = target_processor
     return trainer, parameters_by_name
 
@@ -1013,7 +1028,9 @@ def test_phase2_custom_distributed_optimizer_state_roundtrip_restores_adam_and_r
         SemanticFlowConfig(training_phase="phase2")
     )
     source._config = SimpleNamespace(
-        checkpoints=SimpleNamespace(save_training_state="minimal")
+        checkpoints=SimpleNamespace(save_training_state="minimal"),
+        data=SimpleNamespace(encoding_mode="online"),
+        optimization=SimpleNamespace(optimizer_type="adamw"),
     )
     source._global_step = 1
     source._last_phase2_accelerator_state_path = None
@@ -1061,6 +1078,12 @@ def test_phase2_custom_distributed_optimizer_state_roundtrip_restores_adam_and_r
         weights_only=False,
     )
     saved_states = list(payload["optimizer_state_dict"]["state"].values())
+    assert all(
+        tensor.device.type == "cpu"
+        for tensor in LtxvTrainer._iter_state_tensors(
+            payload["optimizer_state_dict"]["state"]
+        )
+    )
     restored_states = list(target._optimizer.state_dict()["state"].values())
     assert len(restored_states) == len(saved_states)
     for saved, restored in zip(saved_states, restored_states, strict=True):
@@ -1083,7 +1106,112 @@ def test_phase2_custom_distributed_optimizer_state_roundtrip_restores_adam_and_r
     )
     assert runtime_audit["scheduler_last_epoch"] == 1
     assert runtime_audit["scheduler_restored"] is True
+    assert runtime_audit["optimizer_state_residency_after_restore"] == "cpu"
+    assert runtime_audit["optimizer_state_cpu_offload_enabled"] is True
     assert runtime_audit["passed"] is True
+
+
+def test_phase2_cpu_optimizer_state_roundtrip_runs_next_real_adamw_step(
+    tmp_path: Path,
+) -> None:
+    trainer, _ = _optimizer_state_audit_trainer(tmp_path)
+    assert trainer._phase2_optimizer_state_cpu_offload_enabled() is True
+    assert trainer._phase2_optimizer_moment_residency() == "cpu"
+
+    trainer._move_phase2_optimizer_moments_to_parameter_devices()
+    for group in trainer._optimizer.param_groups:
+        for parameter in group["params"]:
+            if parameter in trainer._optimizer.state:
+                parameter.grad = torch.ones_like(parameter)
+    trainer._optimizer.step()
+    trainer._offload_phase2_optimizer_state_to_cpu()
+
+    assert trainer._phase2_optimizer_moment_residency() == "cpu"
+    for state in trainer._optimizer.state.values():
+        assert LtxvTrainer._phase2_optimizer_step_value(state["step"]) == 2
+        assert state["step"].device.type == "cpu"
+        assert state["exp_avg"].device.type == "cpu"
+        assert state["exp_avg_sq"].device.type == "cpu"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_phase2_cuda_adamw_moments_are_staged_only_for_real_step() -> None:
+    parameter = nn.Parameter(torch.ones(4, device="cuda"))
+    optimizer = torch.optim.AdamW([parameter])
+    parameter.grad = torch.ones_like(parameter)
+    optimizer.step()
+
+    trainer = object.__new__(LtxvTrainer)
+    trainer._training_strategy = SemanticFlowStrategy(
+        SemanticFlowConfig(training_phase="phase2")
+    )
+    trainer._config = SimpleNamespace(
+        data=SimpleNamespace(encoding_mode="online"),
+        optimization=SimpleNamespace(optimizer_type="adamw"),
+    )
+    trainer._accelerator = SimpleNamespace(
+        device=parameter.device,
+        distributed_type=DistributedType.FSDP,
+        is_main_process=True,
+    )
+    trainer._optimizer = optimizer
+
+    trainer._offload_phase2_optimizer_state_to_cpu()
+    assert trainer._phase2_optimizer_moment_residency() == "cpu"
+    parameter.grad = torch.ones_like(parameter)
+    trainer._move_phase2_optimizer_moments_to_parameter_devices()
+    assert trainer._phase2_optimizer_moment_residency() == "cuda"
+    assert optimizer.state[parameter]["step"].device.type == "cpu"
+    optimizer.step()
+    trainer._offload_phase2_optimizer_state_to_cpu()
+    assert trainer._phase2_optimizer_moment_residency() == "cpu"
+    assert LtxvTrainer._phase2_optimizer_step_value(
+        optimizer.state[parameter]["step"]
+    ) == 2
+
+
+def test_phase2_optimizer_state_offload_is_narrowly_scoped(
+    tmp_path: Path,
+) -> None:
+    trainer, _ = _optimizer_state_audit_trainer(tmp_path)
+    assert trainer._phase2_optimizer_state_cpu_offload_enabled() is True
+
+    trainer._config.data.encoding_mode = "precomputed"
+    assert trainer._phase2_optimizer_state_cpu_offload_enabled() is False
+    trainer._config.data.encoding_mode = "online"
+
+    trainer._config.optimization.optimizer_type = "adamw8bit"
+    assert trainer._phase2_optimizer_state_cpu_offload_enabled() is False
+    trainer._config.optimization.optimizer_type = "adamw"
+
+    trainer._accelerator.distributed_type = DistributedType.NO
+    assert trainer._phase2_optimizer_state_cpu_offload_enabled() is False
+
+    trainer._training_strategy = SemanticFlowStrategy(SemanticFlowConfig())
+    trainer._accelerator.distributed_type = DistributedType.FSDP
+    assert trainer._phase2_optimizer_state_cpu_offload_enabled() is False
+
+
+def test_phase2_optimizer_moments_move_only_at_real_step_boundary() -> None:
+    source = inspect.getsource(LtxvTrainer.train)
+    real_step_guard = source.index(
+        "phase2_real_optimizer_step = ("
+    )
+    move = source.index(
+        "self._move_phase2_optimizer_moments_to_parameter_devices()"
+    )
+    optimizer_step = source.index("self._optimizer.step()")
+    offload = source.index("self._offload_phase2_optimizer_state_to_cpu()")
+    assert source.index("self._accelerator.sync_gradients", real_step_guard) < move
+    assert real_step_guard < move < optimizer_step < offload
+    assert source.index(
+        "self._assert_phase2_optimizer_moments_on_cpu("
+    ) < source.index("batch = self._prepare_online_batch_with_retry(batch)")
+    restore_source = inspect.getsource(
+        LtxvTrainer._restore_phase2_accelerator_state
+    )
+    assert "_move_optimizer_state_to_parameter_devices" not in restore_source
+    assert "_offload_phase2_optimizer_state_to_cpu" in restore_source
 
 
 def test_phase2_optimizer_state_audit_accepts_real_adamw_restore(
@@ -1549,6 +1677,8 @@ def test_phase2_smoke_result_requires_gradient_resume_and_inference_evidence(
     assert report["final_bundle"]["global_step"] == 2
     assert report["distributed_optimizer_state_restored"] is True
     assert report["optimizer_state_restored"] is True
+    assert report["optimizer_state_residency_after_restore"] == "cpu"
+    assert report["optimizer_state_cpu_offload_enabled"] is True
     assert report["rng_state_restored"] is True
     assert set(report["inference"]) == {"positive_ref", "latent_ref"}
 
@@ -1561,6 +1691,8 @@ def test_phase2_smoke_result_requires_gradient_resume_and_inference_evidence(
         "missing_distributed_restored_flag",
         "false_rng_restored_flag",
         "wrong_resume_world_size",
+        "wrong_optimizer_residency",
+        "cpu_offload_disabled",
         "missing_optimizer_state",
         "dit_without_state",
         "bridge_without_state",
@@ -1592,6 +1724,10 @@ def test_phase2_smoke_validator_rejects_invalid_optimizer_state_evidence(
         resume["rng_state_restored"] = False
     elif failure == "wrong_resume_world_size":
         resume["world_size"] = 7
+    elif failure == "wrong_optimizer_residency":
+        resume["optimizer_state_residency_after_restore"] = "cuda"
+    elif failure == "cpu_offload_disabled":
+        resume["optimizer_state_cpu_offload_enabled"] = False
     elif failure == "missing_optimizer_state":
         resume.pop("optimizer_state")
     elif failure == "dit_without_state":
@@ -1756,6 +1892,76 @@ def test_phase2_checkpoint_cleanup_never_tracks_partial_state_directory(
     assert not partial.exists()
 
 
+def test_phase2_smoke_sampler_state_roundtrips_with_one_shared_schedule() -> None:
+    sampler_args = {
+        "task_indices": {
+            "i2i": list(range(8)),
+            "r2v": list(range(100, 108)),
+        },
+        "total_optimizer_steps": 2,
+        "gradient_accumulation_steps": 1,
+        "rank": 0,
+        "world_size": 1,
+        "seed": 42,
+        "image_ratio": 0.0,
+        "video_ratio": 1.0,
+    }
+    stage_a = DistributedMultiTaskMicrobatchSampler(**sampler_args)
+    stage_b = DistributedMultiTaskMicrobatchSampler(**sampler_args)
+    assert stage_a.task_schedule == stage_b.task_schedule == ("r2v", "r2v")
+
+    first_index = next(iter(stage_a))
+    stage_a.mark_microbatch_consumed([first_index])
+    step_one_state = stage_a.state_dict()
+    stage_b.load_state_dict(step_one_state)
+
+    assert stage_b.state_dict() == step_one_state
+    assert list(stage_b) == list(stage_a)
+
+
+def test_phase2_smoke_scheduler_roundtrip_keeps_step_one_lr() -> None:
+    def _scheduler() -> tuple[
+        torch.optim.AdamW,
+        AcceleratedScheduler,
+    ]:
+        parameter = nn.Parameter(torch.ones(()))
+        optimizer = torch.optim.AdamW([parameter], lr=5.0e-6)
+        scheduler = AcceleratedScheduler(
+            torch.optim.lr_scheduler.LinearLR(
+                optimizer,
+                start_factor=1.0,
+                end_factor=0.5,
+                total_iters=2,
+            ),
+            optimizer,
+        )
+        return optimizer, scheduler
+
+    stage_a_optimizer, stage_a_scheduler = _scheduler()
+    stage_a_optimizer.step()
+    stage_a_scheduler.scheduler.step()
+    step_one_state = stage_a_scheduler.state_dict()
+    step_one_lr = stage_a_scheduler.get_last_lr()
+
+    stage_b_optimizer, stage_b_scheduler = _scheduler()
+    stage_b_scheduler.load_state_dict(step_one_state)
+    trainer = object.__new__(LtxvTrainer)
+    trainer._optimizer = stage_b_optimizer
+    trainer._lr_scheduler = stage_b_scheduler
+    trainer._restore_optimizer_learning_rates(step_one_state)
+
+    assert LtxvTrainer._scheduler_last_epoch(stage_b_scheduler) == 1
+    assert stage_b_scheduler.get_last_lr() == step_one_lr
+    assert [group["lr"] for group in stage_b_optimizer.param_groups] == step_one_lr
+
+
+def test_runtime_stop_does_not_change_configured_training_target() -> None:
+    source = inspect.getsource(LtxvTrainer.train)
+    assert "min(cfg.optimization.steps, stop_after_global_step)" in source
+    assert "while self._global_step < run_target_step" in source
+    assert "step_callback(self._global_step, cfg.optimization.steps" in source
+
+
 def test_phase2_production_config_and_launcher_are_isolated_from_phase1() -> None:
     trainer_root = Path(__file__).parents[1]
     phase1_path = trainer_root / "configs" / "semantic_flow_multitask_480p121.yaml"
@@ -1795,7 +2001,7 @@ def test_phase2_production_config_and_launcher_are_isolated_from_phase1() -> Non
     assert "model_weights_step_00002.safetensors" in launcher_text
     assert (
         launcher_text.count(
-            'launch_train "$STAGE_A_CONFIG" "$TRAIN_ACCELERATE_CONFIG" true'
+            'launch_train "$STAGE_A_CONFIG" "$TRAIN_ACCELERATE_CONFIG" true 1'
         )
         == 1
     )
@@ -1805,7 +2011,14 @@ def test_phase2_production_config_and_launcher_are_isolated_from_phase1() -> Non
         )
         == 1
     )
+    assert '"$PARENT_CHECKPOINT" \\\n      true \\\n      2 \\' in launcher_text
     assert '"$STAGE_A_CHECKPOINT" \\\n      false \\\n      2 \\' in launcher_text
+    assert "semantic_flow_phase2_smoke_8gpu_data.yaml" in launcher_text
+    assert 'data_config["online_sampling"]["image_ratio"] = 0.0' in launcher_text
+    assert 'data_config["online_sampling"]["video_ratio"] = 1.0' in launcher_text
+    assert 'config["data"]["online_encoding"]["image_ratio"] = 0.0' in launcher_text
+    assert 'config["data"]["online_encoding"]["video_ratio"] = 1.0' in launcher_text
+    assert "--stop-after-global-step" in launcher_text
     assert "--require-exact-resume" in launcher_text
     assert "--require-inference" in launcher_text
     assert "phase2_smoke_8gpu_result.json" in launcher_text
@@ -1814,6 +2027,7 @@ def test_phase2_production_config_and_launcher_are_isolated_from_phase1() -> Non
 
     train_cli = (trainer_root / "scripts" / "train.py").read_text(encoding="utf-8")
     assert "--phase2-smoke-audit" in train_cli
+    assert "--stop-after-global-step" in train_cli
     assert "trainer.enable_phase2_smoke_audit()" in train_cli
 
 
