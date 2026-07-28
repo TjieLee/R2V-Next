@@ -32,6 +32,9 @@ from ltx_trainer.online_inference.semantic_guidance import (
 )
 from ltx_trainer.training_strategies import get_training_strategy
 from ltx_trainer.training_strategies.semantic_flow import SemanticFlowStrategy
+from ltx_trainer.training_strategies.semantic_flow_bridge import (
+    validate_and_load_phase2_bridge_state,
+)
 
 if TYPE_CHECKING:
     from ltx_trainer.online_data.online_batch_encoder import OnlineBatchEncoder
@@ -574,6 +577,8 @@ def load_online_inference_runtime(
         state,
         checkpoint_metadata=audit["metadata"],
     )
+    if audit["metadata"].get("training_phase") == "phase2":
+        validate_and_load_phase2_bridge_state(embeddings_processor, state)
     transformer_state = {
         key: value
         for key, value in state.items()

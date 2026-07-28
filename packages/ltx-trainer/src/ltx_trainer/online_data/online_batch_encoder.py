@@ -25,6 +25,7 @@ from ltx_core.multicond.visual_tokens import (
 )
 from ltx_core.text_encoders.gemma.config import GEMMA3_CONFIG_FOR_LTX
 from ltx_core.utils import find_matching_file
+from ltx_trainer import logger
 from ltx_trainer.config import OnlineEncodingConfig
 from ltx_trainer.online_data.anchor_geometry import (
     normalized_anchor_timestamps,
@@ -37,6 +38,7 @@ from ltx_trainer.online_data.transforms import (
     augmentation_seed,
 )
 from ltx_trainer.online_inference.semantic_guidance import GuidanceMode
+from ltx_trainer.training_strategies.semantic_flow import PHASE2_CONDITION_MODES
 
 
 class OnlineSampleEncodeError(RuntimeError):
@@ -82,6 +84,16 @@ class OnlineSampleEncodeError(RuntimeError):
             if value is not None:
                 payload[key] = value
         return payload
+
+
+def phase2_condition_axes(condition_mode: str) -> tuple[bool, bool, bool]:
+    if condition_mode not in PHASE2_CONDITION_MODES:
+        raise ValueError(f"Unsupported Phase 2 condition mode {condition_mode!r}")
+    axes = tuple(
+        value == "1"
+        for value in condition_mode.removeprefix("til_")
+    )
+    return axes[0], axes[1], axes[2]
 
 
 def _to_pil(image: Tensor) -> Image.Image:
@@ -166,6 +178,8 @@ class OnlineBatchEncoder:
             "float32": torch.float32,
         }[config.encoder_dtype]
         self.last_dtype_diagnostics: dict[str, str] = {}
+        self.last_hidden_state_diagnostics: dict[str, Any] = {}
+        self._phase2_hidden_state_shape_logged = False
 
         tokenizer_root = str(find_matching_file(text_encoder_path, "tokenizer.model").parent)
         processor_root = str(find_matching_file(text_encoder_path, "preprocessor_config.json").parent)
@@ -238,11 +252,22 @@ class OnlineBatchEncoder:
             global_seed=global_seed,
             strategy_config=strategy_config,
         )
-        drop_reference = condition_mode in {"drop_reference_all", "drop_all"}
-        drop_text = condition_mode in {"drop_text", "drop_all"}
-        if drop_reference:
-            reference_pixels_vae = [[]]
-            reference_images_vlm = [[]]
+        phase2 = getattr(strategy_config, "training_phase", "phase1") == "phase2"
+        if phase2:
+            if condition_mode not in PHASE2_CONDITION_MODES:
+                raise RuntimeError(f"Unsupported Phase 2 condition mode {condition_mode!r}")
+            t_active, i_active, l_active = phase2_condition_axes(condition_mode)
+            if not i_active:
+                reference_images_vlm = [[]]
+            if not l_active:
+                reference_pixels_vae = [[]]
+            drop_text = not t_active
+        else:
+            drop_reference = condition_mode in {"drop_reference_all", "drop_all"}
+            drop_text = condition_mode in {"drop_text", "drop_all"}
+            if drop_reference:
+                reference_pixels_vae = [[]]
+                reference_images_vlm = [[]]
         references = self._reference_images(reference_images_vlm[0])
         caption = "" if drop_text else str(raw_batch["caption"][0])
 
@@ -261,11 +286,14 @@ class OnlineBatchEncoder:
             reference_images=references,
             task=task,
             sample_key=str(raw_batch["sample_key"][0]),
+            defer_feature_extractor=phase2,
         )
         metrics["gemma_prefix_ms"] = (time.perf_counter() - prefix_started) * 1000.0
 
         evidence_started = time.perf_counter()
         if condition_mode == "drop_all":
+            if phase2:
+                raise RuntimeError("Phase 2 must not use the Phase 1 drop_all condition")
             conditions = _zero_condition_tensors(conditions)
         evidence = self._encode_gt_evidence(raw_batch)
         metrics["gemma_evidence_ms"] = (time.perf_counter() - evidence_started) * 1000.0
@@ -525,6 +553,7 @@ class OnlineBatchEncoder:
         reference_images: list[Image.Image],
         task: str,
         sample_key: str,
+        defer_feature_extractor: bool = False,
     ) -> tuple[dict[str, Tensor], dict[str, Tensor]]:
         processed, reference_segment_mask, image_token_mask = self._process_multimodal_prefix(
             caption=caption,
@@ -583,17 +612,60 @@ class OnlineBatchEncoder:
                 return_dict=True,
                 use_cache=False,
             )
+        if defer_feature_extractor:
+            selected_hidden_states, selected_indices = self._select_feature_hidden_states(
+                outputs.hidden_states,
+                feature_extractor,
+            )
+            materialized_hidden_states = tuple(
+                _materialize_frozen_tensor(value)
+                for value in selected_hidden_states
+            )
+            total_bytes = sum(
+                value.numel() * value.element_size()
+                for value in materialized_hidden_states
+            )
+            self.last_hidden_state_diagnostics = {
+                "selected_hidden_layer_indices": selected_indices,
+                "selected_hidden_state_count": len(materialized_hidden_states),
+                "selected_hidden_state_shapes": [
+                    list(value.shape)
+                    for value in materialized_hidden_states
+                ],
+                "selected_hidden_state_total_bytes": total_bytes,
+            }
+            if not self._phase2_hidden_state_shape_logged:
+                logger.info(
+                    "Phase 2 frozen VLM bridge input: selected_hidden_layer_indices=%s "
+                    "selected_hidden_state_count=%d selected_hidden_state_shapes=%s "
+                    "selected_hidden_state_total_bytes=%d",
+                    selected_indices,
+                    len(materialized_hidden_states),
+                    self.last_hidden_state_diagnostics["selected_hidden_state_shapes"],
+                    total_bytes,
+                )
+                self._phase2_hidden_state_shape_logged = True
+            conditions = {
+                "frozen_vlm_hidden_states": materialized_hidden_states,
+                "prompt_attention_mask": attention_mask,
+            }
+        else:
             hidden_states = self._align_hidden_states(outputs.hidden_states, feature_extractor)
-            video_features, audio_features = feature_extractor(hidden_states, attention_mask, "right")
-        video_features = _materialize_frozen_tensor(video_features)
-        if audio_features is not None:
-            audio_features = _materialize_frozen_tensor(audio_features)
-        conditions = {
-            "video_prompt_embeds": video_features,
-            "prompt_attention_mask": attention_mask,
-        }
-        if audio_features is not None:
-            conditions["audio_prompt_embeds"] = audio_features
+            with torch.inference_mode(), self._frozen_encode_autocast():
+                video_features, audio_features = feature_extractor(
+                    hidden_states,
+                    attention_mask,
+                    "right",
+                )
+            video_features = _materialize_frozen_tensor(video_features)
+            if audio_features is not None:
+                audio_features = _materialize_frozen_tensor(audio_features)
+            conditions = {
+                "video_prompt_embeds": video_features,
+                "prompt_attention_mask": attention_mask,
+            }
+            if audio_features is not None:
+                conditions["audio_prompt_embeds"] = audio_features
         teacher_prefix = {
             "prefix_inputs_embeds": inputs_embeds.detach(),
             "prefix_attention_mask": attention_mask,
@@ -800,6 +872,41 @@ class OnlineBatchEncoder:
             return [align(value) for value in hidden_states]
         return align(hidden_states)
 
+    @staticmethod
+    def _select_feature_hidden_states(
+        hidden_states: Any,
+        feature_extractor: nn.Module,
+    ) -> tuple[tuple[Tensor, ...], list[int]]:
+        if not isinstance(hidden_states, (tuple, list)) or not hidden_states:
+            raise RuntimeError("Gemma did not return the hidden-state tuple required by the feature extractor")
+        projection = getattr(
+            feature_extractor,
+            "video_aggregate_embed",
+            getattr(feature_extractor, "aggregate_embed", None),
+        )
+        projection_in_features = getattr(projection, "in_features", None)
+        for attribute in ("module", "_fsdp_wrapped_module"):
+            if projection_in_features is not None:
+                break
+            projection = getattr(projection, attribute, projection)
+            projection_in_features = getattr(projection, "in_features", None)
+        if projection_in_features is None:
+            raise RuntimeError("Cannot determine Phase 2 feature-extractor hidden-layer contract")
+        hidden_dim = int(hidden_states[0].shape[-1])
+        if int(projection_in_features) % hidden_dim:
+            raise RuntimeError(
+                "Feature extractor input width is not divisible by Gemma hidden width: "
+                f"projection={projection_in_features}, hidden={hidden_dim}"
+            )
+        required_layers = int(projection_in_features) // hidden_dim
+        if len(hidden_states) != required_layers:
+            raise RuntimeError(
+                "Gemma hidden-state count differs from the pretrained feature-extractor contract: "
+                f"expected={required_layers}, actual={len(hidden_states)}"
+            )
+        indices = list(range(required_layers))
+        return tuple(hidden_states), indices
+
     def _frozen_encode_autocast(self) -> Any:
         if self.device.type == "cuda" and self.dtype in {torch.bfloat16, torch.float16}:
             return torch.autocast(device_type="cuda", dtype=self.dtype)
@@ -845,6 +952,17 @@ class OnlineBatchEncoder:
         )
         generator = torch.Generator(device="cpu").manual_seed(seed)
         draw = float(torch.rand((), generator=generator).item())
+        if getattr(strategy_config, "training_phase", "phase1") == "phase2":
+            probabilities = tuple(
+                (name, strategy_config.phase2_condition_probabilities[name])
+                for name in PHASE2_CONDITION_MODES
+            )
+            cumulative = 0.0
+            for name, probability in probabilities:
+                cumulative += float(probability)
+                if draw < cumulative:
+                    return name
+            return "til_000"
         probabilities = (
             ("full", strategy_config.condition_full_p),
             ("drop_text", strategy_config.condition_drop_text_p),

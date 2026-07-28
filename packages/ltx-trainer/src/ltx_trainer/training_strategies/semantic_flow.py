@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections import Counter
 from dataclasses import dataclass, replace
 from typing import Any, Literal
 
@@ -47,6 +48,10 @@ from ltx_trainer.training_strategies.base_strategy import (
     TrainingStrategy,
     TrainingStrategyConfigBase,
 )
+from ltx_trainer.training_strategies.semantic_flow_bridge import (
+    configure_phase2_bridge_trainability,
+    resolve_phase2_bridge_modules,
+)
 
 TYPE_REFERENCE = 0
 TYPE_SEMANTIC = 1
@@ -64,6 +69,26 @@ REQUIRED_SEMANTIC_CHECKPOINT_MODULES = (
 SINGLE_VALUE_CHECKPOINT_PARAMETERS = {
     ("semantic_query", "position_gate"),
 }
+PHASE2_CONDITION_MODES = (
+    "til_111",
+    "til_110",
+    "til_101",
+    "til_011",
+    "til_100",
+    "til_010",
+    "til_001",
+    "til_000",
+)
+DEFAULT_PHASE2_CONDITION_PROBABILITIES = {
+    "til_111": 0.50,
+    "til_110": 0.10,
+    "til_101": 0.10,
+    "til_011": 0.10,
+    "til_100": 0.05,
+    "til_010": 0.05,
+    "til_001": 0.05,
+    "til_000": 0.05,
+}
 
 
 @dataclass(frozen=True)
@@ -80,6 +105,11 @@ class SemanticFlowConfig(TrainingStrategyConfigBase):
     """Configuration for frozen Gemma prefix plus joint semantic/video flow."""
 
     name: Literal["semantic_flow"] = "semantic_flow"
+    training_phase: Literal["phase1", "phase2"] = "phase1"
+    parent_checkpoint_step: int = Field(default=14000, ge=0)
+    phase2_condition_probabilities: dict[str, float] = Field(
+        default_factory=lambda: dict(DEFAULT_PHASE2_CONDITION_PROBABILITIES)
+    )
     reference_latents_dir: str = "reference_latents"
     conditions_dir: str = "conditions"
     max_ref_images_per_sample: int = Field(default=4, ge=1, le=MAX_REFERENCE_ENTITIES)
@@ -120,6 +150,26 @@ class SemanticFlowConfig(TrainingStrategyConfigBase):
         )
         if abs(probability_sum - 1.0) > 1.0e-6:
             raise ValueError(f"condition dropout probabilities must sum to 1.0, got {probability_sum}")
+        if self.training_phase == "phase1":
+            return self
+        phase2_keys = set(self.phase2_condition_probabilities)
+        expected_phase2_keys = set(PHASE2_CONDITION_MODES)
+        if phase2_keys != expected_phase2_keys:
+            raise ValueError(
+                "phase2_condition_probabilities must contain exactly "
+                f"{list(PHASE2_CONDITION_MODES)}; missing={sorted(expected_phase2_keys - phase2_keys)}, "
+                f"unexpected={sorted(phase2_keys - expected_phase2_keys)}"
+            )
+        invalid_phase2 = {
+            name: probability
+            for name, probability in self.phase2_condition_probabilities.items()
+            if probability < 0.0
+        }
+        if invalid_phase2:
+            raise ValueError(f"Phase 2 condition probabilities must be non-negative: {invalid_phase2}")
+        phase2_sum = sum(self.phase2_condition_probabilities.values())
+        if abs(phase2_sum - 1.0) > 1.0e-6:
+            raise ValueError(f"Phase 2 condition probabilities must sum to 1.0, got {phase2_sum}")
         return self
 
     def get_data_sources(self) -> dict[str, str]:
@@ -138,6 +188,7 @@ class SemanticFlowStrategy(TrainingStrategy):
     def __init__(self, config: SemanticFlowConfig) -> None:
         super().__init__(config)
         self._text_encoder: nn.Module | None = None
+        self._embeddings_processor: nn.Module | None = None
         self._query_initializer: SemanticQueryInitializer | None = None
         self._semantic_encoder: SemanticEncoder | None = None
         self._reconstruction_decoder: SemanticReconstructionDecoder | None = None
@@ -145,10 +196,15 @@ class SemanticFlowStrategy(TrainingStrategy):
         self._semantic_dim: int | None = None
         self._gemma_dim: int | None = None
         self._last_training_metrics: dict[str, Tensor] = {}
+        self._last_bridge_metrics: dict[str, Tensor] = {}
         self._geometry_logged_tasks: set[str] = set()
         self.checkpoint_loaded_as_warm_start = False
         self.teacher_checkpointed_layer_count = 0
         self.teacher_checkpoint_forward_calls = 0
+        self._phase2_condition_counts: Counter[str] = Counter()
+        self.phase2_initialization_source: str | None = None
+        self.phase2_parent_checkpoint_sha256: str | None = None
+        self.phase2_loaded_bridge_key_count = 0
 
     def requires_text_encoder(self) -> bool:
         return True
@@ -157,7 +213,7 @@ class SemanticFlowStrategy(TrainingStrategy):
         return False
 
     def train_embeddings_processor(self) -> bool:
-        return False
+        return self.config.training_phase == "phase2"
 
     def attach_models(
         self,
@@ -166,7 +222,7 @@ class SemanticFlowStrategy(TrainingStrategy):
         embeddings_processor: nn.Module,
         text_encoder: nn.Module | None = None,
     ) -> None:
-        del embeddings_processor
+        self._embeddings_processor = embeddings_processor
         if text_encoder is None:
             raise ValueError("semantic_flow requires the frozen Gemma multimodal text encoder")
         self._text_encoder = text_encoder
@@ -215,6 +271,65 @@ class SemanticFlowStrategy(TrainingStrategy):
             semantic_token_type_id=TYPE_SEMANTIC,
         )
 
+    def configure_embeddings_processor_trainability(
+        self,
+        embeddings_processor: nn.Module,
+    ) -> None:
+        if self.config.training_phase != "phase2":
+            raise RuntimeError("Phase 1 must not configure trainable embedding-processor modules")
+        configure_phase2_bridge_trainability(embeddings_processor)
+
+    def get_embeddings_processor_trainable_modules(
+        self,
+        embeddings_processor: nn.Module,
+    ) -> dict[str, nn.Module]:
+        if self.config.training_phase != "phase2":
+            return {}
+        return resolve_phase2_bridge_modules(embeddings_processor)
+
+    def set_embeddings_processor_trainable_modules(
+        self,
+        embeddings_processor: nn.Module,
+        modules: dict[str, nn.Module],
+    ) -> None:
+        if self.config.training_phase != "phase2":
+            if modules:
+                raise RuntimeError("Phase 1 received unexpected trainable bridge modules")
+            return
+        projection_names = [
+            name
+            for name in modules
+            if name.startswith("feature_extractor.")
+        ]
+        if len(projection_names) != 1 or "video_connector" not in modules:
+            raise RuntimeError(
+                "Prepared Phase 2 bridge modules are incomplete: "
+                f"{sorted(modules)}"
+            )
+        projection_name = projection_names[0].removeprefix("feature_extractor.")
+        setattr(
+            embeddings_processor.feature_extractor,
+            projection_name,
+            modules[projection_names[0]],
+        )
+        embeddings_processor.video_connector = modules["video_connector"]
+        self._embeddings_processor = embeddings_processor
+
+    def enforce_frozen_module_eval(self) -> None:
+        if self._text_encoder is not None:
+            self._text_encoder.eval()
+        if self._embeddings_processor is None:
+            return
+        self._embeddings_processor.eval()
+        if self.config.training_phase == "phase2":
+            for module in resolve_phase2_bridge_modules(
+                self._embeddings_processor
+            ).values():
+                module.train()
+        audio_connector = getattr(self._embeddings_processor, "audio_connector", None)
+        if isinstance(audio_connector, nn.Module):
+            audio_connector.eval()
+
     def get_trainable_modules(self) -> dict[str, nn.Module]:
         modules = {
             "semantic_query": self._query_initializer,
@@ -234,6 +349,59 @@ class SemanticFlowStrategy(TrainingStrategy):
         if "semantic_alignment_head" in modules:
             self._semantic_alignment_head = modules["semantic_alignment_head"]  # type: ignore[assignment]
 
+    def prepare_conditions(
+        self,
+        batch: dict[str, Any],
+        conditions: dict[str, Tensor],
+    ) -> dict[str, Tensor]:
+        del batch
+        if self.config.training_phase == "phase1":
+            return conditions
+        if self._embeddings_processor is None:
+            raise RuntimeError("Phase 2 embedding processor is not attached")
+        hidden_states = conditions.get("frozen_vlm_hidden_states")
+        if not isinstance(hidden_states, (tuple, list)) or not hidden_states:
+            raise RuntimeError("Phase 2 conditions require frozen_vlm_hidden_states")
+        if any(not isinstance(value, Tensor) for value in hidden_states):
+            raise TypeError("Phase 2 frozen VLM hidden states must be tensors")
+        if any(value.requires_grad or torch.is_inference(value) for value in hidden_states):
+            raise RuntimeError("Phase 2 frozen VLM hidden states must be detached normal tensors")
+        attention_mask = conditions["prompt_attention_mask"]
+        feature_extractor = self._embeddings_processor.feature_extractor
+        video_features, audio_features = feature_extractor(
+            tuple(hidden_states),
+            attention_mask,
+            "right",
+        )
+        prepared = {
+            key: value
+            for key, value in conditions.items()
+            if key != "frozen_vlm_hidden_states"
+        }
+        prepared["video_prompt_embeds"] = video_features
+        if audio_features is not None:
+            prepared["audio_prompt_embeds"] = audio_features
+        bridge_input = torch.stack(
+            [value.detach().float().pow(2).mean() for value in hidden_states]
+        ).mean().sqrt()
+        self._last_bridge_metrics = {
+            "train/bridge_input_rms": bridge_input,
+            "train/bridge_feature_output_rms": video_features.detach().float().pow(2).mean().sqrt(),
+        }
+        return prepared
+
+    def postprocess_conditions_after_connector(
+        self,
+        batch: dict[str, Any],
+        conditions: dict[str, Tensor],
+    ) -> dict[str, Tensor]:
+        del batch
+        if self.config.training_phase == "phase2":
+            self._last_bridge_metrics["train/bridge_output_rms"] = (
+                conditions["video_prompt_embeds"].detach().float().pow(2).mean().sqrt()
+            )
+        return conditions
+
     def load_extra_checkpoint_state_dict(
         self,
         state_dict: dict[str, Tensor],
@@ -242,7 +410,8 @@ class SemanticFlowStrategy(TrainingStrategy):
     ) -> None:
         """Strictly load v2 modules or explicitly warm-migrate a v1 checkpoint."""
         modules = self.get_trainable_modules()
-        architecture = (checkpoint_metadata or {}).get("architecture")
+        metadata = checkpoint_metadata or {}
+        architecture = metadata.get("architecture")
         if architecture is None:
             has_alignment = any(
                 key.startswith("training_strategy.semantic_alignment_head.")
@@ -253,6 +422,24 @@ class SemanticFlowStrategy(TrainingStrategy):
         if architecture not in {"semantic_flow_v1", "semantic_flow_v2"}:
             raise RuntimeError(f"Unsupported semantic-flow checkpoint architecture: {architecture!r}")
         self.checkpoint_loaded_as_warm_start = architecture == "semantic_flow_v1"
+        if self.config.training_phase == "phase2":
+            checkpoint_phase = metadata.get("training_phase", "phase1")
+            if checkpoint_phase == "phase2":
+                if metadata.get("condition_factorization") != "T_I_L_8way_v1":
+                    raise RuntimeError("Phase 2 checkpoint has incompatible condition factorization")
+                self.phase2_initialization_source = "phase2_resume"
+                self.phase2_parent_checkpoint_sha256 = metadata.get("parent_checkpoint_sha256")
+            elif checkpoint_phase == "phase1":
+                parent_step = metadata.get("global_step")
+                if parent_step is None or int(parent_step) != self.config.parent_checkpoint_step:
+                    raise RuntimeError(
+                        "Phase 2 warm start requires the configured Phase 1 parent step: "
+                        f"expected={self.config.parent_checkpoint_step}, actual={parent_step!r}"
+                    )
+                self.phase2_initialization_source = "phase1_parent"
+                self.checkpoint_loaded_as_warm_start = True
+            else:
+                raise RuntimeError(f"Unsupported semantic-flow training_phase metadata: {checkpoint_phase!r}")
 
         required_modules = (
             REQUIRED_SEMANTIC_CHECKPOINT_MODULES[:-1]
@@ -513,6 +700,7 @@ class SemanticFlowStrategy(TrainingStrategy):
         )
         semantic_token_count_kept = semantic_valid.sum(dim=1).to(dtype=torch.float32)
         self._last_training_metrics = {
+            **self._last_bridge_metrics,
             "train/semantic_requested_drop_rate": keep_sample.requested_drop_rate.to(device=device).detach().mean(),
             "train/semantic_drop_count_per_frame": keep_sample.drop_count_per_frame.to(
                 device=device, dtype=torch.float32
@@ -533,6 +721,33 @@ class SemanticFlowStrategy(TrainingStrategy):
             "train/semantic_latent_rms": semantic_clean.detach().float().pow(2).mean().sqrt(),
             "train/query_position_gate": self._module_scalar(query_initializer, "position_gate", device),
         }
+        if self.config.training_phase == "phase2":
+            raw_condition_mode = batch.get("condition_mode")
+            condition_mode = (
+                str(raw_condition_mode[0])
+                if isinstance(raw_condition_mode, (list, tuple))
+                else str(raw_condition_mode)
+            )
+            if condition_mode not in PHASE2_CONDITION_MODES:
+                raise RuntimeError(f"Invalid Phase 2 condition mode in encoded batch: {condition_mode!r}")
+            mode_index = PHASE2_CONDITION_MODES.index(condition_mode)
+            t_active, i_active, l_active = (float(value) for value in condition_mode.removeprefix("til_"))
+            self._phase2_condition_counts[condition_mode] += batch_size
+            self._last_training_metrics.update(
+                {
+                    "train/condition_t": torch.tensor(t_active, device=device),
+                    "train/condition_i": torch.tensor(i_active, device=device),
+                    "train/condition_l": torch.tensor(l_active, device=device),
+                    "train/condition_mode_id": torch.tensor(float(mode_index), device=device),
+                    **{
+                        f"train/condition_count_{name}": torch.tensor(
+                            float(self._phase2_condition_counts[name]),
+                            device=device,
+                        )
+                        for name in PHASE2_CONDITION_MODES
+                    },
+                }
+            )
 
         ref_tokens, ref_positions, ref_valid, ref_entities = self._reference_sequence(
             batch["reference_latents"],
@@ -704,6 +919,22 @@ class SemanticFlowStrategy(TrainingStrategy):
             "train/loss_semantic_reconstruction": reconstruction_loss.detach().mean(),
             "train/loss_semantic_alignment": alignment_loss.detach().mean(),
         }
+        if self.config.training_phase == "phase2":
+            active_mode = max(
+                PHASE2_CONDITION_MODES,
+                key=lambda name: self._phase2_condition_counts[name],
+            )
+            raw_condition_mode = self._last_training_metrics.get("train/condition_mode_id")
+            if raw_condition_mode is not None:
+                active_mode = PHASE2_CONDITION_MODES[int(raw_condition_mode.item())]
+            self._last_training_metrics.update(
+                {
+                    f"train/loss_video_flow_{active_mode}": video_loss.detach().mean(),
+                    f"train/loss_semantic_flow_{active_mode}": semantic_loss.detach().mean(),
+                    f"train/loss_semantic_reconstruction_{active_mode}": reconstruction_loss.detach().mean(),
+                    f"train/loss_semantic_alignment_{active_mode}": alignment_loss.detach().mean(),
+                }
+            )
         return total
 
     def get_last_training_metrics(self) -> dict[str, Tensor]:
@@ -1205,7 +1436,7 @@ class SemanticFlowStrategy(TrainingStrategy):
 
     def get_checkpoint_metadata(self) -> dict[str, Any]:
         appended = self.config.reference_rope_mode == "appended_time_shifted_width"
-        return {
+        metadata = {
             "architecture": "semantic_flow_v2",
             "semantic_dim": self._semantic_dim,
             "gemma_dim": self._gemma_dim,
@@ -1220,6 +1451,22 @@ class SemanticFlowStrategy(TrainingStrategy):
             "reference_rope_spatial_shift": "width_adjacent" if appended else "native_overlap",
             "semantic_rope_mode": "target_interpolated_8x8",
         }
+        if self.config.training_phase == "phase2":
+            metadata.update(
+                {
+                    "training_phase": "phase2",
+                    "parent_checkpoint_step": self.config.parent_checkpoint_step,
+                    "parent_checkpoint_sha256": self.phase2_parent_checkpoint_sha256,
+                    "train_dit": True,
+                    "train_semantic_modules": True,
+                    "train_conditioning_bridge": True,
+                    "freeze_gemma": True,
+                    "freeze_vision_tower": True,
+                    "freeze_multimodal_projector": True,
+                    "condition_factorization": "T_I_L_8way_v1",
+                }
+            )
+        return metadata
 
     def _require_semantic_modules(
         self,

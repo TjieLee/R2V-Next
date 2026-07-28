@@ -1,0 +1,122 @@
+# Semantic Flow Phase 2: full DiT/semantic training plus the video conditioning bridge.
+# Production writes must stay under /mnt/workspace/litengjie.
+model:
+  model_path: "/mnt/workspace/litengjie/LTX-2/models/LTX-2.3/ltx-2.3-22b-dev.safetensors"
+  text_encoder_path: "/mnt/workspace/litengjie/LTX-2/models/gemma-3-12b-it-qat-q4_0-unquantized"
+  training_mode: "full"
+  load_checkpoint: "/mnt/workspace/litengjie/jd_ltx_multitask_online_480p121/semantic_flow_v2/train/checkpoints/model_weights_step_14000.safetensors"
+
+text_encoder_lora:
+  enabled: false
+
+training_strategy:
+  name: "semantic_flow"
+  training_phase: "phase2"
+  parent_checkpoint_step: 14000
+  reference_latents_dir: "reference_latents"
+  conditions_dir: "conditions"
+  max_ref_images_per_sample: 4
+  reference_rope_mode: "appended_time_shifted_width"
+  anchor_frame_ratio: 0.10
+  vlm_prefix_max_length: 2560
+  vlm_teacher_max_length: 6656
+  semantic_hidden_dim: 512
+  semantic_alignment_hidden_dim: 1024
+  semantic_position_gate_init: 0.0
+  semantic_maximum_drop_rate: 0.25
+  semantic_minimum_tokens_per_frame: 48
+  video_flow_weight: 1.0
+  semantic_flow_weight: 1.0
+  semantic_reconstruction_weight: 1.0
+  semantic_alignment_weight: 1.0
+  condition_full_p: 0.70
+  condition_drop_text_p: 0.10
+  condition_drop_reference_all_p: 0.15
+  condition_drop_all_p: 0.05
+  phase2_condition_probabilities:
+    til_111: 0.50
+    til_110: 0.10
+    til_101: 0.10
+    til_011: 0.10
+    til_100: 0.05
+    til_010: 0.05
+    til_001: 0.05
+    til_000: 0.05
+
+optimization:
+  learning_rate: 5.0e-6
+  bridge_learning_rate: 3.0e-6
+  steps: 16000
+  batch_size: 1
+  gradient_accumulation_steps: 4
+  max_grad_norm: 1.0
+  optimizer_type: "adamw"
+  scheduler_type: "linear"
+  scheduler_params: {}
+  enable_gradient_checkpointing: true
+
+acceleration:
+  mixed_precision_mode: "bf16"
+  quantization: null
+  load_text_encoder_in_8bit: false
+  offload_optimizer_during_validation: false
+
+data:
+  encoding_mode: "online"
+  train_data_config: "/mnt/workspace/litengjie/jd_ltx_multitask_online_480p121/semantic_flow_v2/manifests/multitask_online_480p121_opens2v.yaml"
+  manifest_path: "/mnt/workspace/litengjie/jd_ltx_multitask_online_480p121/semantic_flow_v2/manifests/train_i2i_opens2v.jsonl"
+  num_dataloader_workers: 2
+  online_encoding:
+    width: 832
+    height: 480
+    image_num_frames: 1
+    image_fps: 1.0
+    video_num_frames: 121
+    video_fps: 24.0
+    anchor_frame_ratio: 0.10
+    vlm_prefix_max_length: 2560
+    vlm_teacher_max_length: 6656
+    encoder_dtype: "bfloat16"
+    encoder_device_policy: "resident_cuda"
+    vlm_reference_preprocess: "original"
+    video_decoder: "pyav"
+    decode_timeout_seconds: 120.0
+    pin_memory: true
+    prefetch_factor: 2
+    cpu_transform_chunk_frames: 4
+    max_ref_images: 4
+    image_ratio: 0.30
+    video_ratio: 0.70
+    runtime_max_retries: 8
+    runtime_reject_log_dir: "/mnt/workspace/litengjie/jd_ltx_multitask_online_480p121/semantic_flow_v2_phase2_parent14000/logs/runtime_rejects"
+
+validation:
+  interval: null
+  skip_initial_validation: true
+  generate_audio: false
+  generate_video: true
+
+checkpoints:
+  interval: 1000
+  keep_last_n: 3
+  precision: "bfloat16"
+  no_resume: true
+  save_training_state: "minimal"
+
+hub:
+  push_to_hub: false
+  hub_model_id: null
+
+flow_matching:
+  timestep_sampling_mode: "shifted_logit_normal"
+  timestep_sampling_params: {}
+
+wandb:
+  enabled: false
+  project: "r2v-semantic-flow-phase2"
+  entity: null
+  tags: ["reference-aware", "semantic-flow", "phase2", "multimodal-bridge", "480p", "121f"]
+  log_validation_videos: false
+
+seed: 42
+output_dir: "/mnt/workspace/litengjie/jd_ltx_multitask_online_480p121/semantic_flow_v2_phase2_parent14000/train"

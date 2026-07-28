@@ -4,6 +4,7 @@ import json
 import math
 import os
 import re
+import shutil
 import time
 import warnings
 from collections.abc import Iterator
@@ -60,6 +61,11 @@ from ltx_trainer.sigma_tracker import SigmaBucketTracker
 from ltx_trainer.timestep_samplers import SAMPLERS
 from ltx_trainer.training_state import ConfigFingerprint, RngStates, TrainingState
 from ltx_trainer.training_strategies import get_training_strategy
+from ltx_trainer.training_strategies.semantic_flow_bridge import (
+    phase2_bridge_audit_rows,
+    phase2_bridge_parameters,
+    validate_and_load_phase2_bridge_state,
+)
 from ltx_trainer.validation_runner import ValidationRunner
 
 # Disable irrelevant warnings from transformers
@@ -216,6 +222,11 @@ class LtxvTrainer:
         self._last_online_metrics: dict[str, float] = {}
         self._capture_gradient_audit = False
         self._last_gradient_audit_by_parameter_id: dict[int, dict[str, bool]] = {}
+        self._embeddings_processor_trainable_modules: dict[str, nn.Module] = {}
+        self._optimizer_group_parameter_counts: dict[str, int] = {}
+        self._last_optimizer_group_metrics: dict[str, float] = {}
+        self._last_phase2_accelerator_state_path: Path | None = None
+        self._last_bridge_checkpoint_key_count = 0
         if IS_MAIN_PROCESS:
             print_config(trainer_config)
         self._training_strategy = get_training_strategy(self._config.training_strategy)
@@ -279,7 +290,9 @@ class LtxvTrainer:
 
         self._init_optimizer()
 
-        if training_state is not None and not self._restore_training_state(training_state):
+        if training_state is not None and self._is_semantic_flow_phase2():
+            self._restore_phase2_accelerator_state(training_state)
+        elif training_state is not None and not self._restore_training_state(training_state):
             initial_step = 0
             resuming = False
 
@@ -379,6 +392,8 @@ class LtxvTrainer:
                         ) * 1000.0
 
                     optimizer_started = time.perf_counter()
+                    if self._accelerator.sync_gradients:
+                        self._last_optimizer_group_metrics = self._optimizer_group_metrics()
                     if self._accelerator.sync_gradients and cfg.optimization.max_grad_norm > 0:
                         self._accelerator.clip_grad_norm_(
                             self._trainable_params,
@@ -473,6 +488,7 @@ class LtxvTrainer:
                             "train/global_step": self._global_step,
                         }
                         metrics.update(strategy_metrics)
+                        metrics.update(self._last_optimizer_group_metrics)
                         metrics.update(
                             {f"train/{name}": value for name, value in self._last_online_metrics.items()}
                         )
@@ -757,7 +773,30 @@ class LtxvTrainer:
 
         self._embeddings_processor.requires_grad_(False)
         if self._train_embeddings_processor:
-            self._embeddings_processor.video_connector.requires_grad_(True)
+            configure_processor = getattr(
+                self._training_strategy,
+                "configure_embeddings_processor_trainability",
+                None,
+            )
+            if callable(configure_processor):
+                configure_processor(self._embeddings_processor)
+            else:
+                self._embeddings_processor.video_connector.requires_grad_(True)
+            get_processor_modules = getattr(
+                self._training_strategy,
+                "get_embeddings_processor_trainable_modules",
+                None,
+            )
+            if callable(get_processor_modules):
+                self._embeddings_processor_trainable_modules = get_processor_modules(
+                    self._embeddings_processor
+                )
+            else:
+                self._embeddings_processor_trainable_modules = {
+                    "video_connector": self._embeddings_processor.video_connector
+                }
+            if not self._embeddings_processor_trainable_modules:
+                raise RuntimeError("Embedding-processor training resolved to zero modules")
         if self._text_encoder is not None and not self._train_text_encoder:
             self._text_encoder.requires_grad_(False)
 
@@ -767,7 +806,8 @@ class LtxvTrainer:
 
         candidate_params = [p for p in self._transformer.parameters() if p.requires_grad]
         if self._train_embeddings_processor:
-            candidate_params.extend(p for p in self._embeddings_processor.parameters() if p.requires_grad)
+            for module in self._embeddings_processor_trainable_modules.values():
+                candidate_params.extend(p for p in module.parameters() if p.requires_grad)
         if self._train_text_encoder:
             if self._text_encoder is None:
                 raise ValueError("Training strategy requested text encoder training, but no text encoder was loaded.")
@@ -781,7 +821,185 @@ class LtxvTrainer:
             raise ValueError("No trainable parameters were found for the selected training strategy.")
 
         logger.debug(f"Trainable params count: {sum(p.numel() for p in self._trainable_params):,}")
+        self._validate_phase2_trainability(strategy_modules)
+        self._write_phase2_parameter_audit(strategy_modules)
         self._log_parameter_summary(strategy_modules)
+
+    def _is_semantic_flow_phase2(self) -> bool:
+        strategy_config = getattr(self._training_strategy, "config", None)
+        return getattr(strategy_config, "training_phase", "phase1") == "phase2"
+
+    def _validate_phase2_trainability(
+        self,
+        strategy_modules: dict[str, torch.nn.Module],
+    ) -> None:
+        if not self._is_semantic_flow_phase2():
+            return
+        frozen_dit = [
+            name
+            for name, parameter in self._transformer.named_parameters()
+            if not parameter.requires_grad
+        ]
+        if frozen_dit:
+            raise RuntimeError(
+                f"Phase 2 requires full DiT training; frozen parameters: {frozen_dit[:20]}"
+            )
+        frozen_semantic = [
+            f"{module_name}.{parameter_name}"
+            for module_name, module in strategy_modules.items()
+            for parameter_name, parameter in module.named_parameters()
+            if not parameter.requires_grad
+        ]
+        if frozen_semantic:
+            raise RuntimeError(
+                "Phase 2 requires all semantic modules to be trainable; "
+                f"frozen parameters: {frozen_semantic[:20]}"
+            )
+        bridge_parameters = self._deduplicate_parameters(
+            [
+                parameter
+                for module in self._embeddings_processor_trainable_modules.values()
+                for parameter in module.parameters()
+                if parameter.requires_grad
+            ]
+        )
+        if not bridge_parameters:
+            raise RuntimeError("Phase 2 conditioning bridge has zero trainable parameters")
+        expected_bridge = phase2_bridge_parameters(self._embeddings_processor)
+        frozen_bridge = [
+            item.name
+            for item in expected_bridge
+            if not item.parameter.requires_grad
+        ]
+        if frozen_bridge:
+            raise RuntimeError(
+                f"Phase 2 bridge allowlist contains frozen parameters: {frozen_bridge[:20]}"
+            )
+        expected_bridge_ids = {id(item.parameter) for item in expected_bridge}
+        actual_bridge_ids = {id(parameter) for parameter in bridge_parameters}
+        if actual_bridge_ids != expected_bridge_ids:
+            raise RuntimeError(
+                "Phase 2 prepared bridge modules do not match the explicit allowlist"
+            )
+        dit_semantic_parameters = self._deduplicate_parameters(
+            [
+                *[parameter for parameter in self._transformer.parameters() if parameter.requires_grad],
+                *[
+                    parameter
+                    for module in strategy_modules.values()
+                    for parameter in module.parameters()
+                    if parameter.requires_grad
+                ],
+            ]
+        )
+        overlap = {id(parameter) for parameter in bridge_parameters} & {
+            id(parameter) for parameter in dit_semantic_parameters
+        }
+        if overlap:
+            raise RuntimeError("Phase 2 bridge and DiT/semantic optimizer groups overlap")
+        if self._text_encoder is None or any(
+            parameter.requires_grad for parameter in self._text_encoder.parameters()
+        ):
+            raise RuntimeError("Phase 2 Gemma/SigLIP/projector must remain frozen")
+        if self._online_vae_encoder is None or any(
+            parameter.requires_grad for parameter in self._online_vae_encoder.parameters()
+        ):
+            raise RuntimeError("Phase 2 VAE encoder must remain frozen")
+        audio_connector = getattr(self._embeddings_processor, "audio_connector", None)
+        if isinstance(audio_connector, nn.Module) and any(
+            parameter.requires_grad for parameter in audio_connector.parameters()
+        ):
+            raise RuntimeError("Phase 2 audio connector must remain frozen")
+        unexpected_processor = [
+            name
+            for name, parameter in self._embeddings_processor.named_parameters()
+            if parameter.requires_grad and id(parameter) not in expected_bridge_ids
+        ]
+        if unexpected_processor:
+            raise RuntimeError(
+                f"Unexpected Phase 2 trainable embedding-processor parameters: {unexpected_processor}"
+            )
+        self._optimizer_group_parameter_counts = {
+            "dit_semantic": sum(parameter.numel() for parameter in dit_semantic_parameters),
+            "conditioning_bridge": sum(parameter.numel() for parameter in bridge_parameters),
+        }
+        logger.info(
+            "Phase 2 optimizer ownership: dit_semantic=%s conditioning_bridge=%s",
+            f"{self._optimizer_group_parameter_counts['dit_semantic']:,}",
+            f"{self._optimizer_group_parameter_counts['conditioning_bridge']:,}",
+        )
+
+    def _write_phase2_parameter_audit(
+        self,
+        strategy_modules: dict[str, torch.nn.Module],
+    ) -> None:
+        if not self._is_semantic_flow_phase2() or not IS_MAIN_PROCESS:
+            return
+        from ltx_trainer.online_data.path_safety import assert_write_path_allowed  # noqa: PLC0415
+
+        rows: list[dict[str, Any]] = []
+        rows.extend(
+            {
+                "parameter_name": f"transformer.{name}",
+                "shape": list(parameter.shape),
+                "numel": parameter.numel(),
+                "requires_grad": bool(parameter.requires_grad),
+                "owner_group": "dit_semantic",
+            }
+            for name, parameter in self._transformer.named_parameters()
+        )
+        for module_name, module in strategy_modules.items():
+            rows.extend(
+                {
+                    "parameter_name": f"training_strategy.{module_name}.{name}",
+                    "shape": list(parameter.shape),
+                    "numel": parameter.numel(),
+                    "requires_grad": bool(parameter.requires_grad),
+                    "owner_group": "dit_semantic",
+                }
+                for name, parameter in module.named_parameters()
+            )
+        rows.extend(phase2_bridge_audit_rows(self._embeddings_processor))
+        if self._text_encoder is not None:
+            rows.extend(
+                {
+                    "parameter_name": f"text_encoder.{name}",
+                    "shape": list(parameter.shape),
+                    "numel": parameter.numel(),
+                    "requires_grad": bool(parameter.requires_grad),
+                    "owner_group": "frozen_vlm",
+                }
+                for name, parameter in self._text_encoder.named_parameters()
+            )
+        if self._online_vae_encoder is not None:
+            rows.extend(
+                {
+                    "parameter_name": f"vae_encoder.{name}",
+                    "shape": list(parameter.shape),
+                    "numel": parameter.numel(),
+                    "requires_grad": bool(parameter.requires_grad),
+                    "owner_group": "frozen_other",
+                }
+                for name, parameter in self._online_vae_encoder.named_parameters()
+            )
+        unexpected = [
+            row["parameter_name"]
+            for row in rows
+            if row["requires_grad"]
+            and row["owner_group"] in {"frozen_vlm", "frozen_other"}
+        ]
+        if unexpected:
+            raise RuntimeError(
+                f"Phase 2 parameter audit found unexpected trainable parameters: {unexpected[:20]}"
+            )
+        audit_path = assert_write_path_allowed(
+            Path(self._config.output_dir) / "phase2_parameter_audit_rank0.jsonl"
+        )
+        audit_path.parent.mkdir(parents=True, exist_ok=True)
+        with audit_path.open("w", encoding="utf-8") as handle:
+            for row in rows:
+                handle.write(json.dumps(row, sort_keys=True) + "\n")
+        logger.info("Phase 2 parameter audit written to %s (%d rows)", audit_path, len(rows))
 
     @staticmethod
     def _deduplicate_parameters(parameters: list[Tensor]) -> list[Tensor]:
@@ -817,7 +1035,12 @@ class LtxvTrainer:
                 if not parameter.requires_grad
                 and ("vision_tower" in name or "multi_modal_projector" in name)
             ]
-        connector_trainable = [p for p in self._embeddings_processor.video_connector.parameters() if p.requires_grad]
+        connector_trainable = [
+            parameter
+            for module in self._embeddings_processor_trainable_modules.values()
+            for parameter in module.parameters()
+            if parameter.requires_grad
+        ]
         logger.info(f"Trainable DiT params: {count(trainable_dit):,}")
         for module_name, module in sorted(strategy_modules.items()):
             logger.info(f"Trainable strategy module {module_name}: {count(module.parameters()):,}")
@@ -892,6 +1115,18 @@ class LtxvTrainer:
             self._load_full_checkpoint(checkpoint_path)
         else:  # LoRA mode
             self._load_lora_checkpoint(checkpoint_path)
+
+        if self._is_semantic_flow_phase2():
+            metadata = read_checkpoint_metadata(checkpoint_path)
+            if getattr(self._training_strategy, "phase2_initialization_source", None) == "phase1_parent":
+                self._training_strategy.phase2_parent_checkpoint_sha256 = self._sha256_file(
+                    checkpoint_path
+                )
+            elif metadata.get("training_phase") == "phase2":
+                parent_sha = metadata.get("parent_checkpoint_sha256")
+                if not parent_sha:
+                    raise RuntimeError("Phase 2 resume checkpoint is missing parent_checkpoint_sha256")
+                self._training_strategy.phase2_parent_checkpoint_sha256 = parent_sha
 
         self._resume_state = self._resolve_resume_state()
 
@@ -1150,7 +1385,24 @@ class LtxvTrainer:
             for key, value in state_dict.items()
             if key.startswith("embeddings_processor.")
         }
-        if processor_state:
+        if self._is_semantic_flow_phase2() and (checkpoint_metadata or {}).get(
+            "training_phase"
+        ) == "phase2":
+            loaded = validate_and_load_phase2_bridge_state(
+                self._embeddings_processor,
+                state_dict,
+            )
+            self._training_strategy.phase2_loaded_bridge_key_count = loaded
+            logger.info("✅ Strictly loaded %d Phase 2 conditioning-bridge tensors", loaded)
+        elif self._is_semantic_flow_phase2():
+            if processor_state:
+                logger.info(
+                    "Ignoring Phase 1 embeddings_processor weights during Phase 2 warm start; "
+                    "using the base LTX-2.3 bridge"
+                )
+            else:
+                logger.info("Phase 2 warm start is using the base LTX-2.3 bridge")
+        elif processor_state:
             missing, unexpected = self._embeddings_processor.load_state_dict(processor_state, strict=False)
             if missing:
                 logger.debug(f"Missing embeddings processor keys while loading auxiliary checkpoint: {missing}")
@@ -1250,6 +1502,22 @@ class LtxvTrainer:
                 raise RuntimeError(self._legacy_resume_error_message())
             return 0, None
 
+        if self._is_semantic_flow_phase2():
+            metadata = self._read_safetensors_metadata(self._loaded_checkpoint_path)
+            if metadata.get("training_phase") != "phase2":
+                raise RuntimeError(
+                    "Phase 2 exact resume requires a Phase 2 checkpoint; "
+                    "use checkpoints.no_resume=true for a Phase 1 warm start"
+                )
+            accelerator_state_path = self._phase2_accelerator_state_path(
+                self._loaded_checkpoint_path
+            )
+            if not accelerator_state_path.is_dir():
+                raise RuntimeError(
+                    "Phase 2 exact resume is missing its distributed Accelerate state: "
+                    f"{accelerator_state_path}"
+                )
+
         if strict_legacy_resume:
             assert checkpoint_metadata is not None
             self._validate_legacy_resume_state(
@@ -1296,6 +1564,46 @@ class LtxvTrainer:
             logger.warning("Warm legacy resume: optimizer moments are reset.")
         logger.info(f"📌 Resuming from step {state.global_step}")
         return state.global_step, state
+
+    @classmethod
+    def _phase2_accelerator_state_path(cls, checkpoint_path: Path) -> Path:
+        step = cls._checkpoint_step(checkpoint_path)
+        if step is None:
+            raise RuntimeError(
+                f"Cannot resolve Phase 2 Accelerate state for {checkpoint_path.name}"
+            )
+        return checkpoint_path.parent / f"accelerator_state_step_{step:05d}"
+
+    def _restore_phase2_accelerator_state(self, training_state: TrainingState) -> None:
+        if self._loaded_checkpoint_path is None:
+            raise RuntimeError("Phase 2 resume has no loaded checkpoint path")
+        state_path = self._phase2_accelerator_state_path(self._loaded_checkpoint_path)
+        try:
+            self._accelerator.load_state(str(state_path))
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to restore exact Phase 2 distributed state from {state_path}"
+            ) from exc
+        scheduler_epoch = (
+            int(getattr(self._lr_scheduler, "last_epoch", -1))
+            if self._lr_scheduler is not None
+            else training_state.global_step
+        )
+        if scheduler_epoch != training_state.global_step:
+            raise RuntimeError(
+                "Phase 2 restored scheduler/global-step mismatch: "
+                f"scheduler={scheduler_epoch}, state={training_state.global_step}"
+            )
+        group_names = [str(group.get("name", "")) for group in self._optimizer.param_groups]
+        if group_names != ["dit_semantic", "conditioning_bridge"]:
+            raise RuntimeError(
+                f"Phase 2 restored optimizer groups are invalid: {group_names}"
+            )
+        logger.info(
+            "Restored exact Phase 2 distributed state from %s at local step %d",
+            state_path,
+            training_state.global_step,
+        )
 
     def _validate_legacy_resume_state(
         self,
@@ -1478,8 +1786,9 @@ class LtxvTrainer:
             self._transformer.requires_grad_(False)
             self._transformer.eval()
         if self._train_embeddings_processor:
-            models_to_prepare.append(
-                ("embeddings_processor_video_connector", self._embeddings_processor.video_connector)
+            models_to_prepare.extend(
+                (f"embeddings_processor.{name}", module)
+                for name, module in self._embeddings_processor_trainable_modules.items()
             )
         if self._train_text_encoder:
             get_text_module = getattr(self._training_strategy, "get_text_encoder_trainable_module", None)
@@ -1505,13 +1814,14 @@ class LtxvTrainer:
             prepared_models = (prepared_models,)
 
         prepared_strategy_modules = {}
+        prepared_processor_modules = {}
         for (name, _module), prepared_module in zip(models_to_prepare, prepared_models, strict=True):
             if name == "transformer":
                 self._transformer = prepared_module
             elif name == "embeddings_processor":
                 self._embeddings_processor = prepared_module
-            elif name == "embeddings_processor_video_connector":
-                self._embeddings_processor.video_connector = prepared_module
+            elif name.startswith("embeddings_processor."):
+                prepared_processor_modules[name.removeprefix("embeddings_processor.")] = prepared_module
             elif name == "text_encoder":
                 self._text_encoder = prepared_module
             elif name == "text_encoder_trainable":
@@ -1524,6 +1834,25 @@ class LtxvTrainer:
 
         if prepared_strategy_modules:
             self._training_strategy.set_trainable_modules(prepared_strategy_modules)
+        if prepared_processor_modules:
+            set_processor_modules = getattr(
+                self._training_strategy,
+                "set_embeddings_processor_trainable_modules",
+                None,
+            )
+            if callable(set_processor_modules):
+                set_processor_modules(
+                    self._embeddings_processor,
+                    prepared_processor_modules,
+                )
+            elif set(prepared_processor_modules) == {"video_connector"}:
+                self._embeddings_processor.video_connector = prepared_processor_modules["video_connector"]
+            else:
+                raise RuntimeError(
+                    "Training strategy cannot receive prepared embedding-processor modules: "
+                    f"{sorted(prepared_processor_modules)}"
+                )
+            self._embeddings_processor_trainable_modules = prepared_processor_modules
         if self._train_text_encoder and self._text_encoder is not None:
             set_text_encoder = getattr(self._training_strategy, "set_text_encoder", None)
             if callable(set_text_encoder):
@@ -1533,7 +1862,7 @@ class LtxvTrainer:
         if self._train_transformer:
             self._accumulation_models.append(self._transformer)
         if self._train_embeddings_processor:
-            self._accumulation_models.append(self._embeddings_processor.video_connector)
+            self._accumulation_models.extend(self._embeddings_processor_trainable_modules.values())
         if self._train_text_encoder:
             get_text_module = getattr(self._training_strategy, "get_text_encoder_trainable_module", None)
             self._accumulation_models.append(get_text_module() if callable(get_text_module) else self._text_encoder)
@@ -1888,13 +2217,51 @@ class LtxvTrainer:
         opt_cfg = self._config.optimization
 
         lr = opt_cfg.learning_rate
+        optimizer_parameters: Any = self._trainable_params
+        if self._is_semantic_flow_phase2():
+            strategy_modules = self._training_strategy.get_trainable_modules()
+            dit_semantic = self._deduplicate_parameters(
+                [
+                    *[parameter for parameter in self._transformer.parameters() if parameter.requires_grad],
+                    *[
+                        parameter
+                        for module in strategy_modules.values()
+                        for parameter in module.parameters()
+                        if parameter.requires_grad
+                    ],
+                ]
+            )
+            conditioning_bridge = self._deduplicate_parameters(
+                [
+                    parameter
+                    for module in self._embeddings_processor_trainable_modules.values()
+                    for parameter in module.parameters()
+                    if parameter.requires_grad
+                ]
+            )
+            grouped_ids = {id(parameter) for parameter in dit_semantic + conditioning_bridge}
+            if grouped_ids != {id(parameter) for parameter in self._trainable_params}:
+                raise RuntimeError("Phase 2 optimizer groups do not cover the exact trainable parameter set")
+            bridge_lr = opt_cfg.bridge_learning_rate or opt_cfg.learning_rate
+            optimizer_parameters = [
+                {
+                    "name": "dit_semantic",
+                    "params": dit_semantic,
+                    "lr": opt_cfg.learning_rate,
+                },
+                {
+                    "name": "conditioning_bridge",
+                    "params": conditioning_bridge,
+                    "lr": bridge_lr,
+                },
+            ]
         if opt_cfg.optimizer_type == "adamw":
-            optimizer = AdamW(self._trainable_params, lr=lr)
+            optimizer = AdamW(optimizer_parameters, lr=lr)
         elif opt_cfg.optimizer_type == "adamw8bit":
             # noinspection PyUnresolvedReferences
             from bitsandbytes.optim import AdamW8bit  # noqa: PLC0415
 
-            optimizer = AdamW8bit(self._trainable_params, lr=lr)
+            optimizer = AdamW8bit(optimizer_parameters, lr=lr)
         else:
             raise ValueError(f"Unknown optimizer type: {opt_cfg.optimizer_type}")
 
@@ -1902,6 +2269,53 @@ class LtxvTrainer:
 
         # noinspection PyTypeChecker
         self._optimizer, self._lr_scheduler = self._accelerator.prepare(optimizer, lr_scheduler)
+        if self._is_semantic_flow_phase2():
+            logger.info(
+                "Phase 2 optimizer learning rates: dit_semantic=%g conditioning_bridge=%g",
+                opt_cfg.learning_rate,
+                opt_cfg.bridge_learning_rate or opt_cfg.learning_rate,
+            )
+
+    def _optimizer_group_metrics(self) -> dict[str, float]:
+        if not self._is_semantic_flow_phase2():
+            return {}
+        metrics: dict[str, float] = {}
+        for group in self._optimizer.param_groups:
+            name = str(group.get("name", ""))
+            if name not in {"dit_semantic", "conditioning_bridge"}:
+                continue
+            parameters = [parameter for parameter in group["params"] if parameter.requires_grad]
+            grad_square = sum(
+                parameter.grad.detach().float().pow(2).sum()
+                for parameter in parameters
+                if parameter.grad is not None
+            )
+            grad_norm = float(torch.sqrt(grad_square).item()) if isinstance(grad_square, Tensor) else 0.0
+            metrics[f"train/lr_{name}"] = float(group["lr"])
+            metrics[f"train/grad_norm_{name}"] = grad_norm
+            if name == "conditioning_bridge":
+                parameter_square = sum(
+                    parameter.detach().float().pow(2).sum()
+                    for parameter in parameters
+                )
+                parameter_norm = (
+                    float(torch.sqrt(parameter_square).item())
+                    if isinstance(parameter_square, Tensor)
+                    else 0.0
+                )
+                update_ratio = float(group["lr"]) * grad_norm / max(parameter_norm, 1.0e-12)
+                metrics.update(
+                    {
+                        "train/bridge_grad_norm": grad_norm,
+                        "train/bridge_parameter_norm": parameter_norm,
+                        "train/bridge_update_ratio": update_ratio,
+                        "train/update_ratio_conditioning_bridge": update_ratio,
+                        "train/bridge_trainable_parameter_count": float(
+                            self._optimizer_group_parameter_counts.get(name, 0)
+                        ),
+                    }
+                )
+        return metrics
 
     def _create_scheduler(self, optimizer: torch.optim.Optimizer) -> LRScheduler | None:
         """Create learning rate scheduler based on config."""
@@ -2179,6 +2593,8 @@ class LtxvTrainer:
         self._accelerator.wait_for_everyone()
         full_state_dict = self._accelerator.get_state_dict(self._transformer)
         strategy_checkpoint_states = self._collect_strategy_checkpoint_state_dicts()
+        processor_checkpoint_states = self._collect_embeddings_processor_checkpoint_state_dicts()
+        self._save_phase2_accelerator_state(save_dir)
 
         if not IS_MAIN_PROCESS:
             self._last_saved_step = self._global_step
@@ -2196,6 +2612,7 @@ class LtxvTrainer:
         auxiliary_state_dict = self._collect_auxiliary_checkpoint_state(
             save_dtype,
             precollected_strategy_states=strategy_checkpoint_states,
+            precollected_processor_states=processor_checkpoint_states,
         )
 
         # For LoRA: extract only adapter weights; for full: use as-is
@@ -2235,6 +2652,11 @@ class LtxvTrainer:
                 f"training_strategy.{name}."
                 for name in self._training_strategy.get_trainable_modules()
             )
+            if self._is_semantic_flow_phase2():
+                required_prefixes += (
+                    "embeddings_processor.feature_extractor.",
+                    "embeddings_processor.video_connector.",
+                )
             self._atomic_save_safetensors(
                 full_state_dict,
                 saved_weights_path,
@@ -2345,6 +2767,19 @@ class LtxvTrainer:
             "metadata_global_step": metadata.get("global_step"),
             "config_path": str((Path(self._config.output_dir) / "training_config.yaml").resolve()),
         }
+        if self._is_semantic_flow_phase2():
+            payload.update(
+                {
+                    "training_phase": "phase2",
+                    "parent_checkpoint_step": int(metadata["parent_checkpoint_step"]),
+                    "effective_total_step": int(metadata["effective_total_step"]),
+                    "bridge_key_count": int(metadata["bridge_key_count"]),
+                    "bridge_parameter_count": int(metadata["bridge_parameter_count"]),
+                    "accelerator_state_path": str(
+                        self._last_phase2_accelerator_state_path.resolve()
+                    ),
+                }
+            )
         temporary_path = Path(f"{marker_path}.tmp.{os.getpid()}")
         try:
             with temporary_path.open("w", encoding="utf-8") as handle:
@@ -2366,11 +2801,42 @@ class LtxvTrainer:
             for name, module in self._training_strategy.get_trainable_modules().items()
         }
 
+    def _collect_embeddings_processor_checkpoint_state_dicts(
+        self,
+    ) -> dict[str, dict[str, Tensor]]:
+        if not self._train_embeddings_processor:
+            return {}
+        return {
+            name: self._accelerator.get_state_dict(module)
+            for name, module in self._embeddings_processor_trainable_modules.items()
+        }
+
+    def _save_phase2_accelerator_state(self, save_dir: Path) -> Path | None:
+        if (
+            not self._is_semantic_flow_phase2()
+            or self._config.checkpoints.save_training_state == "off"
+        ):
+            return None
+        state_path = save_dir / f"accelerator_state_step_{self._global_step:05d}"
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        self._accelerator.save_state(
+            output_dir=str(state_path),
+            safe_serialization=True,
+        )
+        self._accelerator.wait_for_everyone()
+        if IS_MAIN_PROCESS and not state_path.is_dir():
+            raise RuntimeError(
+                f"Phase 2 distributed Accelerate state was not created: {state_path}"
+            )
+        self._last_phase2_accelerator_state_path = state_path
+        return state_path
+
     def _collect_auxiliary_checkpoint_state(
         self,
         save_dtype: torch.dtype,
         *,
         precollected_strategy_states: dict[str, dict[str, Tensor]] | None = None,
+        precollected_processor_states: dict[str, dict[str, Tensor]] | None = None,
     ) -> dict[str, Tensor]:
         state_dict = self._training_strategy.get_extra_checkpoint_state_dict(
             self._accelerator,
@@ -2378,7 +2844,10 @@ class LtxvTrainer:
         )
 
         if self._train_embeddings_processor:
-            processor_state = self._collect_trainable_embeddings_processor_state()
+            processor_state = self._collect_trainable_embeddings_processor_state(
+                precollected_states=precollected_processor_states,
+            )
+            self._last_bridge_checkpoint_key_count = len(processor_state)
             state_dict.update({f"embeddings_processor.{key}": value for key, value in processor_state.items()})
         if self._train_text_encoder and self._text_encoder is not None:
             text_encoder_state = self._collect_trainable_text_encoder_state()
@@ -2386,12 +2855,43 @@ class LtxvTrainer:
 
         return {key: value.to(save_dtype) if isinstance(value, Tensor) else value for key, value in state_dict.items()}
 
-    def _collect_trainable_embeddings_processor_state(self) -> dict[str, Tensor]:
-        connector = self._embeddings_processor.video_connector
-        unwrapped = self._accelerator.unwrap_model(connector, keep_torch_compile=False)
-        trainable_names = {name for name, param in unwrapped.named_parameters() if param.requires_grad}
-        full_state = self._accelerator.get_state_dict(connector)
-        return {f"video_connector.{key}": value for key, value in full_state.items() if key in trainable_names}
+    def _collect_trainable_embeddings_processor_state(
+        self,
+        *,
+        precollected_states: dict[str, dict[str, Tensor]] | None = None,
+    ) -> dict[str, Tensor]:
+        collected: dict[str, Tensor] = {}
+        for module_name, module in self._embeddings_processor_trainable_modules.items():
+            unwrapped = self._accelerator.unwrap_model(module, keep_torch_compile=False)
+            trainable_names = {
+                name
+                for name, parameter in unwrapped.named_parameters()
+                if parameter.requires_grad
+            }
+            full_state = (
+                (precollected_states or {}).get(module_name)
+                if precollected_states is not None
+                else None
+            )
+            if full_state is None:
+                full_state = self._accelerator.get_state_dict(module)
+            selected = {
+                key: value
+                for key, value in full_state.items()
+                if key in trainable_names
+            }
+            missing = sorted(trainable_names - set(selected))
+            if missing:
+                raise RuntimeError(
+                    f"Trainable embedding-processor state is incomplete for {module_name}: {missing[:20]}"
+                )
+            collected.update(
+                {
+                    f"{module_name}.{key}": value
+                    for key, value in selected.items()
+                }
+            )
+        return collected
 
     def _collect_trainable_text_encoder_state(self) -> dict[str, Tensor]:
         get_strategy_state = getattr(self._training_strategy, "get_text_encoder_checkpoint_state_dict", None)
@@ -2493,6 +2993,11 @@ class LtxvTrainer:
             step = self._checkpoint_step(path)
             if step is not None:
                 markers_by_step[step] = path
+        accelerator_states_by_step: dict[int, Path] = {}
+        for path in save_dir.glob("accelerator_state_step_*"):
+            step = self._checkpoint_step(path)
+            if step is not None and path.is_dir():
+                accelerator_states_by_step[step] = path
 
         # Keep exactly one weight path per step, preferring the currently loaded path.
         selected_weights: dict[int, Path] = {}
@@ -2540,6 +3045,12 @@ class LtxvTrainer:
             if marker_path is not None:
                 marker_path.unlink(missing_ok=True)
                 logger.debug(f"Removed matching checkpoint ready marker: {marker_path}")
+            accelerator_state_path = accelerator_states_by_step.pop(step, None)
+            if accelerator_state_path is not None:
+                shutil.rmtree(accelerator_state_path)
+                logger.debug(
+                    f"Removed matching Phase 2 Accelerate state: {accelerator_state_path}"
+                )
 
         remaining_weights = {
             step: path
@@ -2556,6 +3067,13 @@ class LtxvTrainer:
                 marker_path.unlink(missing_ok=True)
                 markers_by_step.pop(step)
                 logger.debug(f"Removed orphan checkpoint ready marker: {marker_path}")
+        for step, accelerator_state_path in list(accelerator_states_by_step.items()):
+            if step not in remaining_weights or step not in states_by_step:
+                shutil.rmtree(accelerator_state_path)
+                accelerator_states_by_step.pop(step)
+                logger.debug(
+                    f"Removed orphan Phase 2 Accelerate state: {accelerator_state_path}"
+                )
 
         self._checkpoint_paths = [remaining_weights[step] for step in sorted(remaining_weights)]
         self._training_state_paths = [
@@ -2662,6 +3180,28 @@ class LtxvTrainer:
         """
         raw_metadata = self._training_strategy.get_checkpoint_metadata()
         raw_metadata["global_step"] = self._global_step
+        if self._is_semantic_flow_phase2():
+            parent_sha = self._training_strategy.phase2_parent_checkpoint_sha256
+            if not parent_sha:
+                raise RuntimeError("Phase 2 checkpoint metadata is missing the parent SHA256")
+            if self._last_bridge_checkpoint_key_count <= 0:
+                raise RuntimeError("Phase 2 checkpoint collected zero bridge tensors")
+            parent_step = int(self._training_strategy.config.parent_checkpoint_step)
+            raw_metadata.update(
+                {
+                    "dit_semantic_initial_lr": self._config.optimization.learning_rate,
+                    "conditioning_bridge_initial_lr": (
+                        self._config.optimization.bridge_learning_rate
+                        or self._config.optimization.learning_rate
+                    ),
+                    "phase2_local_global_step": self._global_step,
+                    "effective_total_step": parent_step + self._global_step,
+                    "bridge_key_count": self._last_bridge_checkpoint_key_count,
+                    "bridge_parameter_count": self._optimizer_group_parameter_counts[
+                        "conditioning_bridge"
+                    ],
+                }
+            )
         if self._config.text_encoder_lora.enabled:
             raw_metadata.update(
                 {
