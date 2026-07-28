@@ -178,17 +178,37 @@ def validate_phase2_resume_bundle(checkpoint: Path) -> dict[str, Any]:
 
 def find_latest_phase2_resume_checkpoint(checkpoint_dir: Path) -> Path:
     checkpoint_dir = checkpoint_dir.expanduser().resolve()
-    artifacts = [
-        path
-        for pattern in PHASE2_TRAINING_ARTIFACT_PATTERNS
-        for path in checkpoint_dir.glob(pattern)
-    ]
-    if not artifacts:
+    markers = sorted(
+        checkpoint_dir.glob("checkpoint_step_*.ready.json"),
+        key=_artifact_step,
+        reverse=True,
+    )
+    if not markers:
         raise RuntimeError(
-            f"No Phase 2 checkpoint artifacts found under {checkpoint_dir}"
+            f"No ready Phase 2 checkpoint found under {checkpoint_dir}"
         )
-    latest_step = max(_artifact_step(path) for path in artifacts)
-    checkpoint = checkpoint_dir / f"model_weights_step_{latest_step:05d}.safetensors"
+    latest_marker = markers[0]
+    latest_step = _artifact_step(latest_marker)
+    marker = _load_json_object(latest_marker)
+    try:
+        marker_step = int(marker["global_step"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"Latest Phase 2 ready marker has invalid global_step: {latest_marker}"
+        ) from exc
+    if marker_step != latest_step:
+        raise RuntimeError(
+            "Latest Phase 2 ready marker step mismatch: "
+            f"filename={latest_step}, marker={marker_step}"
+        )
+    checkpoint = Path(
+        str(marker.get("checkpoint_path", ""))
+    ).expanduser().resolve()
+    if _artifact_step(checkpoint) != latest_step:
+        raise RuntimeError(
+            "Latest Phase 2 ready marker checkpoint step does not match "
+            f"marker step {latest_step}: {checkpoint}"
+        )
     validate_phase2_resume_bundle(checkpoint)
     return checkpoint
 
@@ -301,6 +321,7 @@ def validate_phase2_smoke_output(
             "scheduler_restored": True,
             "sampler_restored": True,
             "optimizer_groups_restored": True,
+            "optimizer_state_restored": True,
             "passed": True,
         }
         mismatches = {
@@ -311,6 +332,70 @@ def validate_phase2_smoke_output(
         if mismatches:
             raise RuntimeError(
                 f"Phase 2 exact-resume runtime evidence mismatch: {mismatches}"
+            )
+        optimizer_state = resume_audit.get("optimizer_state")
+        if not isinstance(optimizer_state, dict):
+            raise RuntimeError(
+                "Phase 2 exact-resume audit is missing optimizer_state"
+            )
+        for group_name in ("dit_semantic", "conditioning_bridge"):
+            group_state = optimizer_state.get(group_name)
+            if not isinstance(group_state, dict):
+                raise RuntimeError(
+                    f"Phase 2 optimizer state is missing group {group_name}"
+                )
+            parameter_count = int(group_state.get("parameter_count", 0))
+            state_count = int(group_state.get("parameters_with_state", 0))
+            exp_avg_count = int(
+                group_state.get("parameters_with_exp_avg", 0)
+            )
+            exp_avg_sq_count = int(
+                group_state.get("parameters_with_exp_avg_sq", 0)
+            )
+            step_count = int(group_state.get("parameters_with_step", 0))
+            if parameter_count <= 0:
+                raise RuntimeError(
+                    f"Phase 2 optimizer group {group_name} has no parameters"
+                )
+            if state_count <= 0:
+                raise RuntimeError(
+                    f"Phase 2 optimizer group {group_name} has no restored state"
+                )
+            if exp_avg_count != state_count:
+                raise RuntimeError(
+                    f"Phase 2 optimizer group {group_name} has incomplete exp_avg"
+                )
+            if exp_avg_sq_count != state_count:
+                raise RuntimeError(
+                    f"Phase 2 optimizer group {group_name} has incomplete exp_avg_sq"
+                )
+            if step_count != state_count:
+                raise RuntimeError(
+                    f"Phase 2 optimizer group {group_name} has incomplete state steps"
+                )
+            if group_state.get("exp_avg_finite") is not True:
+                raise RuntimeError(
+                    f"Phase 2 optimizer group {group_name} has invalid exp_avg"
+                )
+            if group_state.get("exp_avg_sq_finite") is not True:
+                raise RuntimeError(
+                    f"Phase 2 optimizer group {group_name} has invalid exp_avg_sq"
+                )
+            if (
+                float(group_state.get("state_step_min", -1)) != 1.0
+                or float(group_state.get("state_step_max", -1)) != 1.0
+            ):
+                raise RuntimeError(
+                    f"Phase 2 optimizer group {group_name} has invalid state steps"
+                )
+        bridge_state = optimizer_state["conditioning_bridge"]
+        if bridge_state.get("video_projection_state_restored") is not True:
+            raise RuntimeError(
+                "Phase 2 optimizer state is missing the video projection"
+            )
+        if bridge_state.get("learnable_registers_state_restored") is not True:
+            raise RuntimeError(
+                "Phase 2 optimizer state is missing learnable registers"
             )
 
     inference: dict[str, Any] = {}
@@ -369,6 +454,11 @@ def validate_phase2_smoke_output(
         ),
         "optimizer_groups_restored": (
             bool(resume_audit["optimizer_groups_restored"])
+            if resume_audit is not None
+            else None
+        ),
+        "optimizer_state_restored": (
+            bool(resume_audit["optimizer_state_restored"])
             if resume_audit is not None
             else None
         ),

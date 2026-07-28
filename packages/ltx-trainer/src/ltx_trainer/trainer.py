@@ -223,6 +223,7 @@ class LtxvTrainer:
         self._last_online_metrics: dict[str, float] = {}
         self._embeddings_processor_trainable_modules: dict[str, nn.Module] = {}
         self._optimizer_group_parameter_counts: dict[str, int] = {}
+        self._phase2_optimizer_parameter_names: dict[int, str] = {}
         self._last_optimizer_group_metrics: dict[str, float] = {}
         self._last_phase2_accelerator_state_path: Path | None = None
         self._last_bridge_checkpoint_key_count = 0
@@ -1019,6 +1020,241 @@ class LtxvTrainer:
             raise RuntimeError("Phase 2 smoke gradient audit failed: " + "; ".join(errors))
         self._phase2_gradient_audit_completed = True
 
+    @staticmethod
+    def _phase2_optimizer_step_value(value: Any) -> float | None:
+        if isinstance(value, Tensor):
+            if value.numel() != 1:
+                return None
+            value = float(value.detach().item())
+        elif isinstance(value, (int, float)):
+            value = float(value)
+        else:
+            return None
+        return value if math.isfinite(value) else None
+
+    def _phase2_optimizer_state_audit(
+        self,
+        *,
+        expected_step: int,
+    ) -> dict[str, Any]:
+        expected_group_names = ["dit_semantic", "conditioning_bridge"]
+        actual_group_names = [
+            str(group.get("name", ""))
+            for group in self._optimizer.param_groups
+        ]
+        errors: list[str] = []
+        if actual_group_names != expected_group_names:
+            errors.append(
+                f"optimizer groups are invalid: {actual_group_names}"
+            )
+
+        groups: dict[str, dict[str, Any]] = {}
+        world_size = int(self._accelerator.num_processes)
+        for expected_group_name in expected_group_names:
+            matching_groups = [
+                group
+                for group in self._optimizer.param_groups
+                if str(group.get("name", "")) == expected_group_name
+            ]
+            if len(matching_groups) != 1:
+                errors.append(
+                    f"optimizer group {expected_group_name!r} is missing or duplicated"
+                )
+                continue
+            group = matching_groups[0]
+            local_parameter_count = len(group["params"])
+            local_parameters_with_state = 0
+            local_parameters_with_exp_avg = 0
+            local_parameters_with_exp_avg_sq = 0
+            local_parameters_with_step = 0
+            local_exp_avg_finite = True
+            local_exp_avg_sq_finite = True
+            local_steps: list[float] = []
+            local_projection_state_restored = False
+            local_registers_state_restored = False
+
+            for parameter in group["params"]:
+                state = self._optimizer.state.get(parameter)
+                has_state = isinstance(state, dict) and bool(state)
+                if not has_state:
+                    continue
+                local_parameters_with_state += 1
+                exp_avg = state.get("exp_avg")
+                exp_avg_sq = state.get("exp_avg_sq")
+                has_exp_avg = isinstance(exp_avg, Tensor)
+                has_exp_avg_sq = isinstance(exp_avg_sq, Tensor)
+                if has_exp_avg:
+                    local_parameters_with_exp_avg += 1
+                    local_exp_avg_finite = (
+                        local_exp_avg_finite
+                        and bool(torch.isfinite(exp_avg).all())
+                    )
+                if has_exp_avg_sq:
+                    local_parameters_with_exp_avg_sq += 1
+                    local_exp_avg_sq_finite = (
+                        local_exp_avg_sq_finite
+                        and bool(torch.isfinite(exp_avg_sq).all())
+                    )
+                state_step = self._phase2_optimizer_step_value(
+                    state.get("step")
+                )
+                if state_step is not None:
+                    local_parameters_with_step += 1
+                    local_steps.append(state_step)
+
+                parameter_name = self._phase2_optimizer_parameter_names.get(
+                    id(parameter),
+                    "",
+                )
+                full_state_restored = (
+                    has_exp_avg
+                    and has_exp_avg_sq
+                    and state_step is not None
+                    and bool(torch.isfinite(exp_avg).all())
+                    and bool(torch.isfinite(exp_avg_sq).all())
+                )
+                if (
+                    parameter_name.startswith(
+                        "feature_extractor.video_aggregate_embed."
+                    )
+                    or parameter_name.startswith(
+                        "feature_extractor.aggregate_embed."
+                    )
+                ):
+                    local_projection_state_restored = (
+                        local_projection_state_restored
+                        or full_state_restored
+                    )
+                if parameter_name == "video_connector.learnable_registers":
+                    local_registers_state_restored = (
+                        local_registers_state_restored
+                        or full_state_restored
+                    )
+
+            local_counts = torch.tensor(
+                [
+                    local_parameter_count,
+                    local_parameters_with_state,
+                    local_parameters_with_exp_avg,
+                    local_parameters_with_exp_avg_sq,
+                    local_parameters_with_step,
+                    int(local_exp_avg_finite),
+                    int(local_exp_avg_sq_finite),
+                    int(local_projection_state_restored),
+                    int(local_registers_state_restored),
+                ],
+                dtype=torch.int64,
+                device=self._accelerator.device,
+            )
+            reduced_counts = self._accelerator.reduce(
+                local_counts,
+                reduction="sum",
+            )
+            local_step_summary = torch.tensor(
+                [
+                    len(local_steps),
+                    min(local_steps) if local_steps else 0.0,
+                    max(local_steps) if local_steps else 0.0,
+                ],
+                dtype=torch.float64,
+                device=self._accelerator.device,
+            )
+            gathered_step_summaries = self._accelerator.gather(
+                local_step_summary
+            ).reshape(-1, 3)
+            step_rows = [
+                row
+                for row in gathered_step_summaries
+                if int(row[0].item()) > 0
+            ]
+            state_step_min = (
+                min(float(row[1].item()) for row in step_rows)
+                if step_rows
+                else None
+            )
+            state_step_max = (
+                max(float(row[2].item()) for row in step_rows)
+                if step_rows
+                else None
+            )
+            record = {
+                "parameter_count": int(reduced_counts[0].item()),
+                "parameters_with_state": int(reduced_counts[1].item()),
+                "parameters_with_exp_avg": int(reduced_counts[2].item()),
+                "parameters_with_exp_avg_sq": int(reduced_counts[3].item()),
+                "parameters_with_step": int(reduced_counts[4].item()),
+                "exp_avg_finite": int(reduced_counts[5].item())
+                == world_size,
+                "exp_avg_sq_finite": int(reduced_counts[6].item())
+                == world_size,
+                "state_step_min": state_step_min,
+                "state_step_max": state_step_max,
+            }
+            if expected_group_name == "conditioning_bridge":
+                record.update(
+                    {
+                        "video_projection_state_restored": bool(
+                            reduced_counts[7].item() > 0
+                        ),
+                        "learnable_registers_state_restored": bool(
+                            reduced_counts[8].item() > 0
+                        ),
+                    }
+                )
+            groups[expected_group_name] = record
+
+            state_count = int(record["parameters_with_state"])
+            exp_avg_count = int(record["parameters_with_exp_avg"])
+            exp_avg_sq_count = int(record["parameters_with_exp_avg_sq"])
+            step_count = int(record["parameters_with_step"])
+            if state_count <= 0:
+                errors.append(
+                    f"optimizer group {expected_group_name} has no Adam state"
+                )
+            if exp_avg_count <= 0 or exp_avg_count != state_count:
+                errors.append(
+                    f"optimizer group {expected_group_name} has missing exp_avg"
+                )
+            if exp_avg_sq_count <= 0 or exp_avg_sq_count != state_count:
+                errors.append(
+                    f"optimizer group {expected_group_name} has missing exp_avg_sq"
+                )
+            if step_count != state_count:
+                errors.append(
+                    f"optimizer group {expected_group_name} has missing or invalid state step"
+                )
+            if record["exp_avg_finite"] is not True:
+                errors.append(
+                    f"optimizer group {expected_group_name} has non-finite exp_avg"
+                )
+            if record["exp_avg_sq_finite"] is not True:
+                errors.append(
+                    f"optimizer group {expected_group_name} has non-finite exp_avg_sq"
+                )
+            if (
+                state_step_min != float(expected_step)
+                or state_step_max != float(expected_step)
+            ):
+                errors.append(
+                    f"optimizer group {expected_group_name} state step mismatch: "
+                    f"expected={expected_step}, min={state_step_min}, max={state_step_max}"
+                )
+            if expected_group_name == "conditioning_bridge":
+                if record["video_projection_state_restored"] is not True:
+                    errors.append(
+                        "video projection optimizer state was not restored"
+                    )
+                if record["learnable_registers_state_restored"] is not True:
+                    errors.append(
+                        "learnable registers optimizer state was not restored"
+                    )
+
+        return {
+            "groups": groups,
+            "errors": errors,
+            "passed": not errors,
+        }
+
     def _write_phase2_resume_runtime_audit(
         self,
         training_state: TrainingState,
@@ -1038,6 +1274,9 @@ class LtxvTrainer:
             for group in self._optimizer.param_groups
         ]
         expected_step = int(training_state.global_step)
+        optimizer_state_audit = self._phase2_optimizer_state_audit(
+            expected_step=expected_step,
+        )
         errors = []
         if not self._phase2_accelerator_state_restored:
             errors.append("Accelerate state was not restored")
@@ -1053,6 +1292,7 @@ class LtxvTrainer:
             errors.append("sampler microstep_in_optimizer_step is not zero")
         if optimizer_groups != ["dit_semantic", "conditioning_bridge"]:
             errors.append(f"optimizer groups are invalid: {optimizer_groups}")
+        errors.extend(optimizer_state_audit["errors"])
         report = {
             "initial_step": expected_step,
             "scheduler_last_epoch": scheduler_epoch,
@@ -1071,6 +1311,8 @@ class LtxvTrainer:
             ),
             "optimizer_groups_restored": optimizer_groups
             == ["dit_semantic", "conditioning_bridge"],
+            "optimizer_state_restored": optimizer_state_audit["passed"],
+            "optimizer_state": optimizer_state_audit["groups"],
             "errors": errors,
             "passed": not errors,
         }
@@ -2643,6 +2885,7 @@ class LtxvTrainer:
 
         lr = opt_cfg.learning_rate
         optimizer_parameters: Any = self._trainable_params
+        phase2_parameter_names_by_group: dict[str, list[str]] = {}
         if self._is_semantic_flow_phase2():
             strategy_modules = self._training_strategy.get_trainable_modules()
             dit_semantic = self._deduplicate_parameters(
@@ -2667,6 +2910,62 @@ class LtxvTrainer:
             grouped_ids = {id(parameter) for parameter in dit_semantic + conditioning_bridge}
             if grouped_ids != {id(parameter) for parameter in self._trainable_params}:
                 raise RuntimeError("Phase 2 optimizer groups do not cover the exact trainable parameter set")
+            dit_names_by_id = {
+                id(parameter): self._canonical_optimizer_parameter_name(
+                    "transformer",
+                    name,
+                )
+                for name, parameter in self._transformer.named_parameters()
+                if parameter.requires_grad
+            }
+            for module_name, module in strategy_modules.items():
+                dit_names_by_id.update(
+                    {
+                        id(parameter): self._canonical_optimizer_parameter_name(
+                            f"training_strategy.{module_name}",
+                            name,
+                        )
+                        for name, parameter in module.named_parameters()
+                        if parameter.requires_grad
+                    }
+                )
+            bridge_names_by_id: dict[int, str] = {}
+            for module_name, module in self._embeddings_processor_trainable_modules.items():
+                bridge_names_by_id.update(
+                    {
+                        id(parameter): self._canonical_optimizer_parameter_name(
+                            module_name,
+                            name,
+                        )
+                        for name, parameter in module.named_parameters()
+                        if parameter.requires_grad
+                    }
+                )
+            missing_dit_names = [
+                index
+                for index, parameter in enumerate(dit_semantic)
+                if id(parameter) not in dit_names_by_id
+            ]
+            missing_bridge_names = [
+                index
+                for index, parameter in enumerate(conditioning_bridge)
+                if id(parameter) not in bridge_names_by_id
+            ]
+            if missing_dit_names or missing_bridge_names:
+                raise RuntimeError(
+                    "Phase 2 optimizer parameter-name mapping is incomplete: "
+                    f"dit={missing_dit_names[:20]}, bridge={missing_bridge_names[:20]}"
+                )
+            phase2_parameter_names_by_group = {
+                "dit_semantic": [
+                    dit_names_by_id[id(parameter)]
+                    for parameter in dit_semantic
+                ],
+                "conditioning_bridge": [
+                    bridge_names_by_id[id(parameter)]
+                    for parameter in conditioning_bridge
+                ],
+            }
             bridge_lr = opt_cfg.bridge_learning_rate or opt_cfg.learning_rate
             optimizer_parameters = [
                 {
@@ -2695,11 +2994,43 @@ class LtxvTrainer:
         # noinspection PyTypeChecker
         self._optimizer, self._lr_scheduler = self._accelerator.prepare(optimizer, lr_scheduler)
         if self._is_semantic_flow_phase2():
+            self._phase2_optimizer_parameter_names = {}
+            for group in self._optimizer.param_groups:
+                group_name = str(group.get("name", ""))
+                parameter_names = phase2_parameter_names_by_group.get(group_name)
+                if parameter_names is None:
+                    raise RuntimeError(
+                        f"Unexpected Phase 2 optimizer group after prepare: {group_name!r}"
+                    )
+                if len(parameter_names) != len(group["params"]):
+                    raise RuntimeError(
+                        "Phase 2 optimizer parameter count changed during prepare: "
+                        f"group={group_name}, before={len(parameter_names)}, "
+                        f"after={len(group['params'])}"
+                    )
+                self._phase2_optimizer_parameter_names.update(
+                    {
+                        id(parameter): parameter_name
+                        for parameter, parameter_name in zip(
+                            group["params"],
+                            parameter_names,
+                            strict=True,
+                        )
+                    }
+                )
             logger.info(
                 "Phase 2 optimizer learning rates: dit_semantic=%g conditioning_bridge=%g",
                 opt_cfg.learning_rate,
                 opt_cfg.bridge_learning_rate or opt_cfg.learning_rate,
             )
+
+    @staticmethod
+    def _canonical_optimizer_parameter_name(owner: str, name: str) -> str:
+        wrapper_parts = {"module", "_fsdp_wrapped_module"}
+        clean_name = ".".join(
+            part for part in name.split(".") if part not in wrapper_parts
+        )
+        return f"{owner}.{clean_name}" if clean_name else owner
 
     def _optimizer_group_metrics(self) -> dict[str, float]:
         if not self._is_semantic_flow_phase2():

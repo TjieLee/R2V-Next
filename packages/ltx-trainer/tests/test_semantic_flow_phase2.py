@@ -159,6 +159,104 @@ def _write_phase2_bundle(checkpoint_dir: Path, step: int) -> Path:
     return checkpoint
 
 
+def _write_phase2_smoke_evidence(
+    smoke_root: Path,
+) -> tuple[Path, Path]:
+    _write_phase2_bundle(smoke_root / "checkpoints", 1)
+    final = _write_phase2_bundle(smoke_root / "checkpoints", 2)
+    (smoke_root / "phase2_gradient_audit.json").write_text(
+        json.dumps(
+            {
+                "passed": True,
+                "world_size": 8,
+                "parameters": {
+                    "feature_extractor.video_aggregate_embed.weight": {
+                        "requires_grad": True,
+                        "grad_exists": True,
+                        "grad_finite": True,
+                        "grad_nonzero": True,
+                    },
+                    "video_connector.learnable_registers": {
+                        "requires_grad": True,
+                        "grad_exists": True,
+                        "grad_finite": True,
+                        "grad_nonzero": True,
+                    },
+                },
+                "frozen_module_gradients": {
+                    "text_encoder": False,
+                    "vae_encoder": False,
+                    "audio_connector": False,
+                },
+                "optimizer_groups": [
+                    {"name": "dit_semantic", "learning_rate": 5.0e-6},
+                    {"name": "conditioning_bridge", "learning_rate": 3.0e-6},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    resume_path = smoke_root / "phase2_resume_runtime_audit.json"
+    resume_path.write_text(
+        json.dumps(
+            {
+                "initial_step": 1,
+                "scheduler_last_epoch": 1,
+                "sampler_task_schedule_cursor": 1,
+                "sampler_microstep_in_optimizer_step": 0,
+                "accelerator_state_restored": True,
+                "scheduler_restored": True,
+                "sampler_restored": True,
+                "optimizer_groups_restored": True,
+                "optimizer_state_restored": True,
+                "optimizer_state": {
+                    "dit_semantic": {
+                        "parameter_count": 2,
+                        "parameters_with_state": 2,
+                        "parameters_with_exp_avg": 2,
+                        "parameters_with_exp_avg_sq": 2,
+                        "parameters_with_step": 2,
+                        "exp_avg_finite": True,
+                        "exp_avg_sq_finite": True,
+                        "state_step_min": 1,
+                        "state_step_max": 1,
+                    },
+                    "conditioning_bridge": {
+                        "parameter_count": 3,
+                        "parameters_with_state": 3,
+                        "parameters_with_exp_avg": 3,
+                        "parameters_with_exp_avg_sq": 3,
+                        "parameters_with_step": 3,
+                        "exp_avg_finite": True,
+                        "exp_avg_sq_finite": True,
+                        "state_step_min": 1,
+                        "state_step_max": 1,
+                        "video_projection_state_restored": True,
+                        "learnable_registers_state_restored": True,
+                    },
+                },
+                "passed": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    for mode in ("positive_ref", "latent_ref"):
+        summary = smoke_root / "inference" / mode / "run_summary.json"
+        summary.parent.mkdir(parents=True)
+        summary.write_text(
+            json.dumps(
+                {
+                    "guidance_mode": mode,
+                    "success_count": 1,
+                    "failure_count": 0,
+                    "checkpoint": str(final.resolve()),
+                }
+            ),
+            encoding="utf-8",
+        )
+    return final, resume_path
+
+
 def _gradient_audit_trainer(tmp_path: Path) -> LtxvTrainer:
     trainer = _runtime_audit_trainer()
     bridge = phase2_bridge_parameters(trainer._embeddings_processor)
@@ -206,6 +304,98 @@ def _gradient_audit_trainer(tmp_path: Path) -> LtxvTrainer:
     trainer._phase2_smoke_audit_enabled = True
     trainer._phase2_gradient_audit_completed = False
     return trainer
+
+
+def _optimizer_state_audit_trainer(
+    tmp_path: Path,
+    *,
+    restore_state: bool = True,
+) -> tuple[LtxvTrainer, dict[str, nn.Parameter]]:
+    def _components() -> tuple[
+        nn.Linear,
+        EmbeddingsProcessor,
+        torch.optim.AdamW,
+        dict[str, nn.Parameter],
+    ]:
+        dit = nn.Linear(4, 4)
+        processor = _processor()
+        bridge = configure_phase2_bridge_trainability(processor)
+        parameters_by_name = {
+            **{
+                f"transformer.{name}": parameter
+                for name, parameter in dit.named_parameters()
+            },
+            **{item.name: item.parameter for item in bridge},
+        }
+        optimizer = torch.optim.AdamW(
+            [
+                {
+                    "name": "dit_semantic",
+                    "params": list(dit.parameters()),
+                    "lr": 5.0e-6,
+                },
+                {
+                    "name": "conditioning_bridge",
+                    "params": [item.parameter for item in bridge],
+                    "lr": 3.0e-6,
+                },
+            ]
+        )
+        return dit, processor, optimizer, parameters_by_name
+
+    source_dit, source_processor, source_optimizer, _ = _components()
+    source_parameters = [
+        *source_dit.parameters(),
+        *[
+            item.parameter
+            for item in phase2_bridge_parameters(source_processor)
+        ],
+    ]
+    loss = sum(parameter.float().square().sum() for parameter in source_parameters)
+    loss.backward()
+    source_optimizer.step()
+    saved_state = source_optimizer.state_dict()
+
+    _, target_processor, target_optimizer, parameters_by_name = _components()
+    if restore_state:
+        target_optimizer.load_state_dict(saved_state)
+
+    class _Accelerator:
+        device = torch.device("cpu")
+        num_processes = 1
+        is_main_process = True
+
+        @staticmethod
+        def reduce(value: torch.Tensor, *, reduction: str) -> torch.Tensor:
+            assert reduction == "sum"
+            return value
+
+        @staticmethod
+        def gather(value: torch.Tensor) -> torch.Tensor:
+            return value
+
+        @staticmethod
+        def wait_for_everyone() -> None:
+            return None
+
+    trainer = object.__new__(LtxvTrainer)
+    trainer._optimizer = target_optimizer
+    trainer._accelerator = _Accelerator()
+    trainer._phase2_optimizer_parameter_names = {
+        id(parameter): name
+        for name, parameter in parameters_by_name.items()
+    }
+    trainer._phase2_accelerator_state_restored = True
+    trainer._lr_scheduler = SimpleNamespace(last_epoch=1)
+    trainer._online_sampler = SimpleNamespace(
+        state_dict=lambda: {
+            "task_schedule_cursor": 1,
+            "microstep_in_optimizer_step": 0,
+        }
+    )
+    trainer._config = SimpleNamespace(output_dir=str(tmp_path))
+    trainer._embeddings_processor = target_processor
+    return trainer, parameters_by_name
 
 
 def test_phase1_defaults_and_sampling_sequence_remain_unchanged() -> None:
@@ -505,6 +695,12 @@ def test_phase2_optimizer_has_named_disjoint_groups_and_independent_lrs() -> Non
     first_ids = {id(parameter) for parameter in trainer._optimizer.param_groups[0]["params"]}
     second_ids = {id(parameter) for parameter in trainer._optimizer.param_groups[1]["params"]}
     assert not first_ids & second_ids
+    bridge_names = {
+        trainer._phase2_optimizer_parameter_names[id(parameter)]
+        for parameter in trainer._optimizer.param_groups[1]["params"]
+    }
+    assert "feature_extractor.video_aggregate_embed.weight" in bridge_names
+    assert "video_connector.learnable_registers" in bridge_names
 
 
 def test_phase2_trainability_rejects_frozen_dit_or_bridge_allowlist_parameter() -> None:
@@ -709,6 +905,130 @@ def test_phase2_exact_resume_uses_matching_distributed_accelerate_state(
     assert trainer._phase2_accelerator_state_restored is True
 
 
+def test_phase2_optimizer_state_audit_accepts_real_adamw_restore(
+    tmp_path: Path,
+) -> None:
+    trainer, _ = _optimizer_state_audit_trainer(tmp_path)
+    audit = trainer._phase2_optimizer_state_audit(expected_step=1)
+    assert audit["passed"] is True
+    assert audit["errors"] == []
+    assert set(audit["groups"]) == {
+        "dit_semantic",
+        "conditioning_bridge",
+    }
+    for group in audit["groups"].values():
+        assert group["parameters_with_state"] > 0
+        assert group["parameters_with_exp_avg"] == group["parameters_with_state"]
+        assert group["parameters_with_exp_avg_sq"] == group["parameters_with_state"]
+        assert group["exp_avg_finite"] is True
+        assert group["exp_avg_sq_finite"] is True
+        assert group["state_step_min"] == 1
+        assert group["state_step_max"] == 1
+    bridge = audit["groups"]["conditioning_bridge"]
+    assert bridge["video_projection_state_restored"] is True
+    assert bridge["learnable_registers_state_restored"] is True
+
+    trainer._write_phase2_resume_runtime_audit(_training_state(1))
+    report = json.loads(
+        (tmp_path / "phase2_resume_runtime_audit.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert report["optimizer_state_restored"] is True
+    assert report["optimizer_state"] == audit["groups"]
+    assert report["passed"] is True
+
+
+def test_phase2_optimizer_state_audit_aggregates_all_ranks(
+    tmp_path: Path,
+) -> None:
+    trainer, _ = _optimizer_state_audit_trainer(tmp_path)
+
+    class _TwoRankAccelerator:
+        device = torch.device("cpu")
+        num_processes = 2
+        is_main_process = True
+
+        @staticmethod
+        def reduce(value: torch.Tensor, *, reduction: str) -> torch.Tensor:
+            assert reduction == "sum"
+            return value * 2
+
+        @staticmethod
+        def gather(value: torch.Tensor) -> torch.Tensor:
+            return torch.cat([value, value])
+
+        @staticmethod
+        def wait_for_everyone() -> None:
+            return None
+
+    trainer._accelerator = _TwoRankAccelerator()
+    audit = trainer._phase2_optimizer_state_audit(expected_step=1)
+    assert audit["passed"] is True
+    for group, optimizer_group in zip(
+        audit["groups"].values(),
+        trainer._optimizer.param_groups,
+        strict=True,
+    ):
+        assert group["parameter_count"] == len(optimizer_group["params"]) * 2
+        assert group["parameters_with_state"] > 0
+        assert group["exp_avg_finite"] is True
+        assert group["exp_avg_sq_finite"] is True
+
+
+@pytest.mark.parametrize(
+    ("failure", "message"),
+    [
+        ("no_state", "has no Adam state"),
+        ("missing_exp_avg", "missing exp_avg"),
+        ("missing_exp_avg_sq", "missing exp_avg_sq"),
+        ("nan_exp_avg", "non-finite exp_avg"),
+        ("inf_exp_avg_sq", "non-finite exp_avg_sq"),
+        ("missing_register_state", "learnable registers"),
+        ("missing_projection_state", "video projection"),
+    ],
+)
+def test_phase2_optimizer_state_audit_fails_closed(
+    tmp_path: Path,
+    failure: str,
+    message: str,
+) -> None:
+    trainer, parameters = _optimizer_state_audit_trainer(
+        tmp_path,
+        restore_state=failure != "no_state",
+    )
+    projection_parameters = [
+        parameter
+        for name, parameter in parameters.items()
+        if name.startswith("feature_extractor.video_aggregate_embed.")
+    ]
+    register = parameters["video_connector.learnable_registers"]
+    dit_parameter = parameters["transformer.weight"]
+    if failure == "missing_exp_avg":
+        trainer._optimizer.state[register].pop("exp_avg")
+    elif failure == "missing_exp_avg_sq":
+        trainer._optimizer.state[projection_parameters[0]].pop("exp_avg_sq")
+    elif failure == "nan_exp_avg":
+        trainer._optimizer.state[dit_parameter]["exp_avg"].fill_(float("nan"))
+    elif failure == "inf_exp_avg_sq":
+        trainer._optimizer.state[dit_parameter]["exp_avg_sq"].fill_(float("inf"))
+    elif failure == "missing_register_state":
+        trainer._optimizer.state.pop(register)
+    elif failure == "missing_projection_state":
+        for parameter in projection_parameters:
+            trainer._optimizer.state.pop(parameter)
+
+    with pytest.raises(RuntimeError, match=message):
+        trainer._write_phase2_resume_runtime_audit(_training_state(1))
+    report = json.loads(
+        (tmp_path / "phase2_resume_runtime_audit.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert report["optimizer_state_restored"] is False
+    assert report["passed"] is False
+
+
 def test_phase2_required_training_state_fails_closed_and_preserves_cause(
     tmp_path: Path,
 ) -> None:
@@ -820,7 +1140,7 @@ def test_phase2_resume_state_validates_step_scheduler_sampler_and_accelerate(
         )
 
 
-def test_phase2_resume_bundle_is_complete_and_latest_selection_fails_on_partial(
+def test_phase2_resume_bundle_is_complete_and_latest_selection_ignores_partial(
     tmp_path: Path,
 ) -> None:
     script = Path(__file__).parents[1] / "scripts" / "check_semantic_flow_phase2_runtime.py"
@@ -838,8 +1158,45 @@ def test_phase2_resume_bundle_is_complete_and_latest_selection_fails_on_partial(
         partial,
         metadata={"training_phase": "phase2", "global_step": "2"},
     )
-    with pytest.raises(RuntimeError, match="ready marker is missing"):
+    assert latest(checkpoint_dir) == first.resolve()
+
+
+def test_phase2_latest_selection_requires_a_ready_marker(
+    tmp_path: Path,
+) -> None:
+    script = Path(__file__).parents[1] / "scripts" / "check_semantic_flow_phase2_runtime.py"
+    latest = runpy.run_path(str(script))["find_latest_phase2_resume_checkpoint"]
+    checkpoint_dir = tmp_path / "checkpoints"
+    _write_phase2_bundle(checkpoint_dir, 1)
+    (checkpoint_dir / "checkpoint_step_00001.ready.json").unlink()
+    with pytest.raises(RuntimeError, match="No ready Phase 2 checkpoint"):
         latest(checkpoint_dir)
+
+
+def test_phase2_latest_selection_fails_on_broken_latest_ready_bundle(
+    tmp_path: Path,
+) -> None:
+    script = Path(__file__).parents[1] / "scripts" / "check_semantic_flow_phase2_runtime.py"
+    latest = runpy.run_path(str(script))["find_latest_phase2_resume_checkpoint"]
+    checkpoint_dir = tmp_path / "checkpoints"
+    _write_phase2_bundle(checkpoint_dir, 1)
+    _write_phase2_bundle(checkpoint_dir, 2)
+    (checkpoint_dir / "training_state_step_00002.pt").unlink()
+    with pytest.raises(RuntimeError, match="training state is missing"):
+        latest(checkpoint_dir)
+
+
+def test_phase2_latest_selection_ignores_higher_temporary_artifacts(
+    tmp_path: Path,
+) -> None:
+    script = Path(__file__).parents[1] / "scripts" / "check_semantic_flow_phase2_runtime.py"
+    latest = runpy.run_path(str(script))["find_latest_phase2_resume_checkpoint"]
+    checkpoint_dir = tmp_path / "checkpoints"
+    checkpoint = _write_phase2_bundle(checkpoint_dir, 1)
+    (checkpoint_dir / "model_weights_step_00003.safetensors.tmp.123").touch()
+    (checkpoint_dir / "training_state_step_00003.pt.tmp.123").touch()
+    (checkpoint_dir / "accelerator_state_step_00003.partial").mkdir()
+    assert latest(checkpoint_dir) == checkpoint.resolve()
 
 
 @pytest.mark.parametrize(
@@ -910,71 +1267,7 @@ def test_phase2_smoke_result_requires_gradient_resume_and_inference_evidence(
 ) -> None:
     script = Path(__file__).parents[1] / "scripts" / "check_semantic_flow_phase2_runtime.py"
     validate = runpy.run_path(str(script))["validate_phase2_smoke_output"]
-    first = _write_phase2_bundle(tmp_path / "checkpoints", 1)
-    final = _write_phase2_bundle(tmp_path / "checkpoints", 2)
-    del first
-    (tmp_path / "phase2_gradient_audit.json").write_text(
-        json.dumps(
-            {
-                "passed": True,
-                "world_size": 8,
-                "parameters": {
-                    "feature_extractor.video_aggregate_embed.weight": {
-                        "requires_grad": True,
-                        "grad_exists": True,
-                        "grad_finite": True,
-                        "grad_nonzero": True,
-                    },
-                    "video_connector.learnable_registers": {
-                        "requires_grad": True,
-                        "grad_exists": True,
-                        "grad_finite": True,
-                        "grad_nonzero": True,
-                    },
-                },
-                "frozen_module_gradients": {
-                    "text_encoder": False,
-                    "vae_encoder": False,
-                    "audio_connector": False,
-                },
-                "optimizer_groups": [
-                    {"name": "dit_semantic", "learning_rate": 5.0e-6},
-                    {"name": "conditioning_bridge", "learning_rate": 3.0e-6},
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
-    (tmp_path / "phase2_resume_runtime_audit.json").write_text(
-        json.dumps(
-            {
-                "initial_step": 1,
-                "scheduler_last_epoch": 1,
-                "sampler_task_schedule_cursor": 1,
-                "sampler_microstep_in_optimizer_step": 0,
-                "accelerator_state_restored": True,
-                "scheduler_restored": True,
-                "sampler_restored": True,
-                "optimizer_groups_restored": True,
-                "passed": True,
-            }
-        ),
-        encoding="utf-8",
-    )
-    for mode in ("positive_ref", "latent_ref"):
-        summary = tmp_path / "inference" / mode / "run_summary.json"
-        summary.parent.mkdir(parents=True)
-        summary.write_text(
-            json.dumps(
-                {
-                    "guidance_mode": mode,
-                    "success_count": 1,
-                    "failure_count": 0,
-                    "checkpoint": str(final.resolve()),
-                }
-            ),
-            encoding="utf-8",
-        )
+    _write_phase2_smoke_evidence(tmp_path)
     report = validate(
         tmp_path,
         expected_processes=8,
@@ -985,7 +1278,85 @@ def test_phase2_smoke_result_requires_gradient_resume_and_inference_evidence(
     assert report["passed"] is True
     assert report["first_bundle"]["global_step"] == 1
     assert report["final_bundle"]["global_step"] == 2
+    assert report["optimizer_state_restored"] is True
     assert set(report["inference"]) == {"positive_ref", "latent_ref"}
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "missing_restored_flag",
+        "false_restored_flag",
+        "missing_optimizer_state",
+        "dit_without_state",
+        "bridge_without_state",
+        "incomplete_exp_avg",
+        "incomplete_exp_avg_sq",
+        "incomplete_state_steps",
+        "invalid_state_step_range",
+        "nonfinite_exp_avg",
+        "nonfinite_exp_avg_sq",
+        "projection_not_restored",
+        "registers_not_restored",
+    ],
+)
+def test_phase2_smoke_validator_rejects_invalid_optimizer_state_evidence(
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    script = Path(__file__).parents[1] / "scripts" / "check_semantic_flow_phase2_runtime.py"
+    validate = runpy.run_path(str(script))["validate_phase2_smoke_output"]
+    _, resume_path = _write_phase2_smoke_evidence(tmp_path)
+    resume = json.loads(resume_path.read_text(encoding="utf-8"))
+    if failure == "missing_restored_flag":
+        resume.pop("optimizer_state_restored")
+    elif failure == "false_restored_flag":
+        resume["optimizer_state_restored"] = False
+    elif failure == "missing_optimizer_state":
+        resume.pop("optimizer_state")
+    elif failure == "dit_without_state":
+        resume["optimizer_state"]["dit_semantic"]["parameters_with_state"] = 0
+    elif failure == "bridge_without_state":
+        resume["optimizer_state"]["conditioning_bridge"][
+            "parameters_with_state"
+        ] = 0
+    elif failure == "incomplete_exp_avg":
+        resume["optimizer_state"]["dit_semantic"][
+            "parameters_with_exp_avg"
+        ] = 1
+    elif failure == "incomplete_exp_avg_sq":
+        resume["optimizer_state"]["conditioning_bridge"][
+            "parameters_with_exp_avg_sq"
+        ] = 2
+    elif failure == "incomplete_state_steps":
+        resume["optimizer_state"]["dit_semantic"][
+            "parameters_with_step"
+        ] = 1
+    elif failure == "invalid_state_step_range":
+        resume["optimizer_state"]["dit_semantic"]["state_step_max"] = 2
+    elif failure == "nonfinite_exp_avg":
+        resume["optimizer_state"]["dit_semantic"]["exp_avg_finite"] = False
+    elif failure == "nonfinite_exp_avg_sq":
+        resume["optimizer_state"]["conditioning_bridge"][
+            "exp_avg_sq_finite"
+        ] = False
+    elif failure == "projection_not_restored":
+        resume["optimizer_state"]["conditioning_bridge"][
+            "video_projection_state_restored"
+        ] = False
+    else:
+        resume["optimizer_state"]["conditioning_bridge"][
+            "learnable_registers_state_restored"
+        ] = False
+    resume_path.write_text(json.dumps(resume), encoding="utf-8")
+    with pytest.raises(RuntimeError):
+        validate(
+            tmp_path,
+            expected_processes=8,
+            expected_final_step=2,
+            require_exact_resume=True,
+            require_inference=True,
+        )
 
 
 def test_phase2_distributed_state_save_is_additive_to_minimal_state(
