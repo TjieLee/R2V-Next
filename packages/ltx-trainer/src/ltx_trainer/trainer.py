@@ -465,6 +465,7 @@ class LtxvTrainer:
                         self._log_phase2_gpu_allocated(
                             "GPU allocated before optimizer step",
                         )
+                        self._audit_phase2_optimizer_pre_step_compatibility()
                     try:
                         self._optimizer.step()
                         self._optimizer.zero_grad()
@@ -966,33 +967,247 @@ class LtxvTrainer:
                 f"optimizer step; found residency={residency!r} before {context}"
             )
 
+    @staticmethod
+    def _phase2_optimizer_tensor_description(value: object) -> str:
+        if isinstance(value, Tensor):
+            scalar_value = (
+                f", value={value.detach().item()!r}"
+                if value.numel() == 1
+                else ""
+            )
+            finite = (
+                bool(torch.isfinite(value).all())
+                if value.numel() <= 1
+                else "not_checked"
+            )
+            return (
+                f"device={value.device}, dtype={value.dtype}, "
+                f"shape={tuple(value.shape)}, finite={finite}{scalar_value}"
+            )
+        return f"type={type(value).__name__}, value={value!r}"
+
+    def _phase2_optimizer_contract_error(
+        self,
+        *,
+        parameter: Tensor,
+        group: dict[str, Any],
+        state: dict[str, Any],
+        reason: str,
+    ) -> RuntimeError:
+        parameter_name = self._phase2_optimizer_parameter_names.get(
+            id(parameter),
+            f"<parameter:{id(parameter)}>",
+        )
+        gradient = parameter.grad
+        state_details = ", ".join(
+            f"{key}=({self._phase2_optimizer_tensor_description(state.get(key))})"
+            for key in (*PHASE2_ADAM_MOMENT_KEYS, "step")
+        )
+        return RuntimeError(
+            "Phase 2 optimizer pre-step compatibility failed: "
+            f"{reason}; canonical_name={parameter_name!r}; "
+            f"group={str(group.get('name', ''))!r}; "
+            f"parameter=(device={parameter.device}, dtype={parameter.dtype}, "
+            f"shape={tuple(parameter.shape)}); "
+            f"gradient=({self._phase2_optimizer_tensor_description(gradient)}); "
+            f"{state_details}"
+        )
+
+    def _iter_phase2_optimizer_parameter_states(
+        self,
+    ) -> Iterator[tuple[dict[str, Any], Tensor, dict[str, Any]]]:
+        for group in self._optimizer.param_groups:
+            for parameter in group["params"]:
+                if not isinstance(parameter, Tensor):
+                    continue
+                state = self._optimizer.state.get(parameter)
+                if state is None:
+                    state = {}
+                if not isinstance(state, dict):
+                    raise RuntimeError(
+                        "Phase 2 optimizer state must be a dictionary for "
+                        f"parameter id={id(parameter)}"
+                    )
+                yield group, parameter, state
+
+    def _normalize_phase2_adam_step(
+        self,
+        *,
+        parameter: Tensor,
+        group: dict[str, Any],
+        state: dict[str, Any],
+    ) -> None:
+        if not state:
+            return
+        if bool(group.get("capturable", False)) or bool(
+            group.get("fused", False)
+        ):
+            raise self._phase2_optimizer_contract_error(
+                parameter=parameter,
+                group=group,
+                state=state,
+                reason=(
+                    "CPU-offloaded Phase 2 AdamW does not support "
+                    "capturable=True or fused=True"
+                ),
+            )
+        step = state.get("step")
+        step_value = self._phase2_optimizer_step_value(step)
+        if step_value is None:
+            raise self._phase2_optimizer_contract_error(
+                parameter=parameter,
+                group=group,
+                state=state,
+                reason="Adam step must be finite and contain exactly one value",
+            )
+        state["step"] = torch.tensor(
+            step_value,
+            dtype=torch.float32,
+            device="cpu",
+        )
+
+    def _normalize_phase2_adam_moments(
+        self,
+        *,
+        parameter: Tensor,
+        group: dict[str, Any],
+        state: dict[str, Any],
+        device: torch.device,
+    ) -> int:
+        if not state:
+            return 0
+        self._normalize_phase2_adam_step(
+            parameter=parameter,
+            group=group,
+            state=state,
+        )
+        required_keys = {"exp_avg", "exp_avg_sq"}
+        if bool(group.get("amsgrad", False)):
+            required_keys.add("max_exp_avg_sq")
+        converted_bytes = 0
+        for key in PHASE2_ADAM_MOMENT_KEYS:
+            value = state.get(key)
+            if value is None and key not in required_keys:
+                continue
+            if not isinstance(value, Tensor):
+                raise self._phase2_optimizer_contract_error(
+                    parameter=parameter,
+                    group=group,
+                    state=state,
+                    reason=f"Adam moment {key!r} is missing or is not a tensor",
+                )
+            if value.shape != parameter.shape:
+                raise self._phase2_optimizer_contract_error(
+                    parameter=parameter,
+                    group=group,
+                    state=state,
+                    reason=(
+                        f"Adam moment {key!r} shape {tuple(value.shape)} does "
+                        f"not match parameter shape {tuple(parameter.shape)}"
+                    ),
+                )
+            if value.device != device or value.dtype != parameter.dtype:
+                converted_bytes += value.numel() * value.element_size()
+                state[key] = value.to(
+                    device=device,
+                    dtype=parameter.dtype,
+                )
+            normalized = state[key]
+            if (
+                normalized.device != device
+                or normalized.dtype != parameter.dtype
+                or normalized.shape != parameter.shape
+            ):
+                raise self._phase2_optimizer_contract_error(
+                    parameter=parameter,
+                    group=group,
+                    state=state,
+                    reason=f"Adam moment {key!r} normalization failed",
+                )
+        return converted_bytes
+
     def _move_phase2_optimizer_moments_to_parameter_devices(self) -> int:
         if not self._phase2_optimizer_state_cpu_offload_enabled():
             return 0
         moved_bytes = 0
-        for parameter, state, key, value in self._iter_phase2_optimizer_moments():
-            if value.device == parameter.device:
-                continue
-            moved_bytes += value.numel() * value.element_size()
-            state[key] = value.to(device=parameter.device)
+        for group, parameter, state in self._iter_phase2_optimizer_parameter_states():
+            moved_bytes += self._normalize_phase2_adam_moments(
+                parameter=parameter,
+                group=group,
+                state=state,
+                device=parameter.device,
+            )
         return moved_bytes
 
     def _offload_phase2_optimizer_state_to_cpu(self) -> int:
         if not self._phase2_optimizer_state_cpu_offload_enabled():
             return 0
         offloaded_bytes = 0
-        for _, state, key, value in self._iter_phase2_optimizer_moments():
-            if value.device.type == "cpu":
-                continue
-            offloaded_bytes += value.numel() * value.element_size()
-            state[key] = value.cpu()
-        for state in self._optimizer.state.values():
-            if not isinstance(state, dict):
-                continue
-            step = state.get("step")
-            if isinstance(step, Tensor) and step.device.type != "cpu":
-                state["step"] = step.cpu()
+        cpu_device = torch.device("cpu")
+        for group, parameter, state in self._iter_phase2_optimizer_parameter_states():
+            offloaded_bytes += self._normalize_phase2_adam_moments(
+                parameter=parameter,
+                group=group,
+                state=state,
+                device=cpu_device,
+            )
         return offloaded_bytes
+
+    def _audit_phase2_optimizer_pre_step_compatibility(self) -> None:
+        if not self._phase2_optimizer_state_cpu_offload_enabled():
+            return
+        for group, parameter, state in self._iter_phase2_optimizer_parameter_states():
+            gradient = parameter.grad
+            if gradient is None:
+                continue
+            if (
+                gradient.device != parameter.device
+                or gradient.dtype != parameter.dtype
+                or gradient.shape != parameter.shape
+            ):
+                raise self._phase2_optimizer_contract_error(
+                    parameter=parameter,
+                    group=group,
+                    state=state,
+                    reason="gradient device, dtype, or shape does not match parameter",
+                )
+            if not state:
+                continue
+            required_keys = {"exp_avg", "exp_avg_sq"}
+            if bool(group.get("amsgrad", False)):
+                required_keys.add("max_exp_avg_sq")
+            for key in PHASE2_ADAM_MOMENT_KEYS:
+                moment = state.get(key)
+                if moment is None and key not in required_keys:
+                    continue
+                if (
+                    not isinstance(moment, Tensor)
+                    or moment.device != parameter.device
+                    or moment.dtype != parameter.dtype
+                    or moment.shape != parameter.shape
+                ):
+                    raise self._phase2_optimizer_contract_error(
+                        parameter=parameter,
+                        group=group,
+                        state=state,
+                        reason=(
+                            f"Adam moment {key!r} is incompatible with parameter"
+                        ),
+                    )
+            step = state.get("step")
+            if (
+                not isinstance(step, Tensor)
+                or step.numel() != 1
+                or not bool(torch.isfinite(step).all())
+                or step.device.type != "cpu"
+                or step.dtype not in {torch.float32, torch.float64}
+            ):
+                raise self._phase2_optimizer_contract_error(
+                    parameter=parameter,
+                    group=group,
+                    state=state,
+                    reason="Adam step is incompatible with foreach AdamW",
+                )
 
     def _log_phase2_gpu_allocated(self, label: str) -> None:
         if (

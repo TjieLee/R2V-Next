@@ -497,6 +497,41 @@ def _optimizer_state_audit_trainer(
     return trainer, parameters_by_name
 
 
+def _optimizer_lifecycle_trainer(
+    *,
+    parameter_dtype: torch.dtype = torch.float32,
+) -> tuple[LtxvTrainer, nn.Parameter]:
+    parameter = nn.Parameter(torch.ones(2, 2, dtype=parameter_dtype))
+    optimizer = torch.optim.AdamW(
+        [
+            {
+                "name": "dit_semantic",
+                "params": [parameter],
+                "lr": 5.0e-6,
+            }
+        ],
+        foreach=True,
+    )
+    trainer = object.__new__(LtxvTrainer)
+    trainer._training_strategy = SemanticFlowStrategy(
+        SemanticFlowConfig(training_phase="phase2")
+    )
+    trainer._config = SimpleNamespace(
+        data=SimpleNamespace(encoding_mode="online"),
+        optimization=SimpleNamespace(optimizer_type="adamw"),
+    )
+    trainer._accelerator = SimpleNamespace(
+        device=torch.device("cpu"),
+        distributed_type=DistributedType.FSDP,
+        is_main_process=True,
+    )
+    trainer._optimizer = optimizer
+    trainer._phase2_optimizer_parameter_names = {
+        id(parameter): "transformer.test_weight"
+    }
+    return trainer, parameter
+
+
 def test_phase1_defaults_and_sampling_sequence_remain_unchanged() -> None:
     config = SemanticFlowConfig()
     assert config.training_phase == "phase1"
@@ -1090,6 +1125,12 @@ def test_phase2_custom_distributed_optimizer_state_roundtrip_restores_adam_and_r
         assert torch.equal(restored["exp_avg"], saved["exp_avg"])
         assert torch.equal(restored["exp_avg_sq"], saved["exp_avg_sq"])
         assert torch.equal(restored["step"], saved["step"])
+        assert saved["exp_avg"].device.type == "cpu"
+        assert saved["exp_avg_sq"].device.type == "cpu"
+        assert saved["exp_avg"].dtype == torch.float32
+        assert saved["exp_avg_sq"].dtype == torch.float32
+        assert saved["step"].device.type == "cpu"
+        assert saved["step"].dtype in {torch.float32, torch.float64}
 
     assert torch.equal(torch.rand(4), expected_torch)
     assert random.random() == expected_python
@@ -1109,6 +1150,20 @@ def test_phase2_custom_distributed_optimizer_state_roundtrip_restores_adam_and_r
     assert runtime_audit["optimizer_state_residency_after_restore"] == "cpu"
     assert runtime_audit["optimizer_state_cpu_offload_enabled"] is True
     assert runtime_audit["passed"] is True
+
+    for group in target._optimizer.param_groups:
+        for parameter in group["params"]:
+            if parameter in target._optimizer.state:
+                parameter.grad = torch.ones_like(parameter)
+    target._move_phase2_optimizer_moments_to_parameter_devices()
+    target._audit_phase2_optimizer_pre_step_compatibility()
+    target._optimizer.step()
+    target._offload_phase2_optimizer_state_to_cpu()
+    assert target._phase2_optimizer_moment_residency() == "cpu"
+    for state in target._optimizer.state.values():
+        assert LtxvTrainer._phase2_optimizer_step_value(state["step"]) == 2
+        assert state["step"].device.type == "cpu"
+        assert state["step"].dtype == torch.float32
 
 
 def test_phase2_cpu_accelerator_does_not_use_host_cuda(
@@ -1205,6 +1260,147 @@ def test_phase2_cuda_rng_restore_fails_closed_for_cpu_accelerator(
         trainer._restore_phase2_accelerator_state(training_state)
 
 
+def test_phase2_fp32_parameter_rebuilds_bf16_moments_and_runs_foreach_adamw() -> None:
+    trainer, parameter = _optimizer_lifecycle_trainer()
+    trainer._optimizer.state[parameter] = {
+        "step": torch.tensor(1, dtype=torch.int64),
+        "exp_avg": torch.zeros_like(parameter, dtype=torch.bfloat16),
+        "exp_avg_sq": torch.ones_like(parameter, dtype=torch.bfloat16),
+    }
+    parameter.grad = torch.ones_like(parameter)
+
+    source_bytes = sum(
+        state_value.numel() * state_value.element_size()
+        for key, state_value in trainer._optimizer.state[parameter].items()
+        if key in {"exp_avg", "exp_avg_sq"}
+    )
+    assert (
+        trainer._move_phase2_optimizer_moments_to_parameter_devices()
+        == source_bytes
+    )
+    state = trainer._optimizer.state[parameter]
+    assert state["exp_avg"].dtype == parameter.dtype == torch.float32
+    assert state["exp_avg_sq"].dtype == parameter.dtype
+    assert state["step"].device.type == "cpu"
+    assert state["step"].dtype == torch.float32
+    trainer._audit_phase2_optimizer_pre_step_compatibility()
+    trainer._optimizer.step()
+    assert LtxvTrainer._phase2_optimizer_step_value(state["step"]) == 2
+
+
+def test_phase2_bf16_parameter_rebuilds_fp32_moments() -> None:
+    trainer, parameter = _optimizer_lifecycle_trainer(
+        parameter_dtype=torch.bfloat16,
+    )
+    trainer._optimizer.state[parameter] = {
+        "step": torch.tensor(1.0),
+        "exp_avg": torch.zeros_like(parameter, dtype=torch.float32),
+        "exp_avg_sq": torch.ones_like(parameter, dtype=torch.float32),
+    }
+    parameter.grad = torch.ones_like(parameter)
+
+    trainer._move_phase2_optimizer_moments_to_parameter_devices()
+    state = trainer._optimizer.state[parameter]
+    assert state["exp_avg"].dtype == parameter.dtype == torch.bfloat16
+    assert state["exp_avg_sq"].dtype == parameter.dtype
+    trainer._audit_phase2_optimizer_pre_step_compatibility()
+
+
+def test_phase2_python_int_step_is_normalized_to_cpu_float32() -> None:
+    trainer, parameter = _optimizer_lifecycle_trainer()
+    trainer._optimizer.state[parameter] = {
+        "step": 1,
+        "exp_avg": torch.zeros_like(parameter),
+        "exp_avg_sq": torch.ones_like(parameter),
+    }
+    parameter.grad = torch.ones_like(parameter)
+
+    trainer._move_phase2_optimizer_moments_to_parameter_devices()
+    step = trainer._optimizer.state[parameter]["step"]
+    assert isinstance(step, torch.Tensor)
+    assert step.device.type == "cpu"
+    assert step.dtype == torch.float32
+    assert step.item() == 1.0
+    trainer._audit_phase2_optimizer_pre_step_compatibility()
+
+
+@pytest.mark.parametrize(
+    "invalid_step",
+    [
+        torch.tensor([1.0, 2.0]),
+        torch.tensor(float("nan")),
+    ],
+)
+def test_phase2_invalid_adam_step_fails_closed(
+    invalid_step: torch.Tensor,
+) -> None:
+    trainer, parameter = _optimizer_lifecycle_trainer()
+    trainer._optimizer.state[parameter] = {
+        "step": invalid_step,
+        "exp_avg": torch.zeros_like(parameter),
+        "exp_avg_sq": torch.ones_like(parameter),
+    }
+
+    with pytest.raises(
+        RuntimeError,
+        match="Adam step must be finite and contain exactly one value",
+    ):
+        trainer._move_phase2_optimizer_moments_to_parameter_devices()
+
+
+def test_phase2_mismatched_moment_shape_fails_closed() -> None:
+    trainer, parameter = _optimizer_lifecycle_trainer()
+    trainer._optimizer.state[parameter] = {
+        "step": torch.tensor(1.0),
+        "exp_avg": torch.zeros(3),
+        "exp_avg_sq": torch.ones_like(parameter),
+    }
+
+    with pytest.raises(
+        RuntimeError,
+        match="does not match parameter shape",
+    ):
+        trainer._move_phase2_optimizer_moments_to_parameter_devices()
+
+
+def test_phase2_gradient_dtype_mismatch_reports_canonical_parameter() -> None:
+    trainer, parameter = _optimizer_lifecycle_trainer()
+    trainer._optimizer.state[parameter] = {
+        "step": torch.tensor(1.0),
+        "exp_avg": torch.zeros_like(parameter),
+        "exp_avg_sq": torch.ones_like(parameter),
+    }
+    parameter.grad = torch.ones_like(parameter)
+    parameter.grad.data = parameter.grad.data.to(torch.bfloat16)
+
+    trainer._move_phase2_optimizer_moments_to_parameter_devices()
+    with pytest.raises(
+        RuntimeError,
+        match="transformer.test_weight",
+    ):
+        trainer._audit_phase2_optimizer_pre_step_compatibility()
+    assert parameter.grad.dtype == torch.bfloat16
+
+
+@pytest.mark.parametrize("group_flag", ["capturable", "fused"])
+def test_phase2_unsupported_adam_step_mode_fails_closed(
+    group_flag: str,
+) -> None:
+    trainer, parameter = _optimizer_lifecycle_trainer()
+    trainer._optimizer.param_groups[0][group_flag] = True
+    trainer._optimizer.state[parameter] = {
+        "step": torch.tensor(1.0),
+        "exp_avg": torch.zeros_like(parameter),
+        "exp_avg_sq": torch.ones_like(parameter),
+    }
+
+    with pytest.raises(
+        RuntimeError,
+        match="does not support capturable=True or fused=True",
+    ):
+        trainer._move_phase2_optimizer_moments_to_parameter_devices()
+
+
 def test_phase2_cpu_optimizer_state_roundtrip_runs_next_real_adamw_step(
     tmp_path: Path,
 ) -> None:
@@ -1217,6 +1413,7 @@ def test_phase2_cpu_optimizer_state_roundtrip_runs_next_real_adamw_step(
         for parameter in group["params"]:
             if parameter in trainer._optimizer.state:
                 parameter.grad = torch.ones_like(parameter)
+    trainer._audit_phase2_optimizer_pre_step_compatibility()
     trainer._optimizer.step()
     trainer._offload_phase2_optimizer_state_to_cpu()
 
@@ -1294,10 +1491,19 @@ def test_phase2_optimizer_moments_move_only_at_real_step_boundary() -> None:
     move = source.index(
         "self._move_phase2_optimizer_moments_to_parameter_devices()"
     )
+    compatibility_audit = source.index(
+        "self._audit_phase2_optimizer_pre_step_compatibility()"
+    )
     optimizer_step = source.index("self._optimizer.step()")
     offload = source.index("self._offload_phase2_optimizer_state_to_cpu()")
     assert source.index("self._accelerator.sync_gradients", real_step_guard) < move
-    assert real_step_guard < move < optimizer_step < offload
+    assert (
+        real_step_guard
+        < move
+        < compatibility_audit
+        < optimizer_step
+        < offload
+    )
     assert source.index(
         "self._assert_phase2_optimizer_moments_on_cpu("
     ) < source.index("batch = self._prepare_online_batch_with_retry(batch)")
