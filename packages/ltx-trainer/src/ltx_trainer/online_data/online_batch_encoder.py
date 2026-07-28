@@ -340,7 +340,11 @@ class OnlineBatchEncoder:
         """Encode guidance conditions and one shared reference latent set."""
         if task not in {IMAGE_TASK, VIDEO_TASK}:
             raise ValueError(f"Unsupported online inference task {task!r}")
-        if guidance_mode not in {"positive_ref", "debiased_ref"}:
+        if guidance_mode not in {
+            "positive_ref",
+            "debiased_ref",
+            "latent_ref",
+        }:
             raise ValueError(f"Unsupported guidance mode {guidance_mode!r}")
         expected_geometry = (
             self.config.width,
@@ -375,11 +379,15 @@ class OnlineBatchEncoder:
         if need_negative:
             negative_conditions, _ = self._encode_prefix(
                 caption=str(negative_prompt),
-                reference_images=references if guidance_mode == "positive_ref" else [],
+                reference_images=(
+                    references
+                    if guidance_mode in {"positive_ref", "latent_ref"}
+                    else []
+                ),
                 task=task,
                 sample_key=(
                     "inference-negative"
-                    if guidance_mode == "positive_ref"
+                    if guidance_mode in {"positive_ref", "latent_ref"}
                     else "inference-negative-no-reference"
                 ),
             )
@@ -393,7 +401,7 @@ class OnlineBatchEncoder:
                 task=task,
                 sample_key="inference-no-reference",
             )
-        elif need_no_reference:
+        elif need_no_reference and guidance_mode == "debiased_ref":
             empty_reference_conditions, _ = self._encode_prefix(
                 caption="",
                 reference_images=references,
@@ -428,7 +436,7 @@ class OnlineBatchEncoder:
         }
         if guidance_mode == "positive_ref":
             result["no_reference_conditions"] = no_reference_conditions
-        else:
+        elif guidance_mode == "debiased_ref":
             result.update(
                 {
                     "empty_reference_conditions": empty_reference_conditions,

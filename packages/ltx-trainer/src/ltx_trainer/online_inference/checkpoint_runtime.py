@@ -346,7 +346,7 @@ class OnlineInferenceRuntime:
             num_inference_steps=num_inference_steps,
         )
 
-    def prepare_guidance_states(  # noqa: PLR0915
+    def prepare_guidance_states(  # noqa: PLR0912, PLR0915
         self,
         encoded: dict[str, Any],
         *,
@@ -388,8 +388,11 @@ class OnlineInferenceRuntime:
         positive_conditions = encoded.get("positive_conditions", encoded.get("conditions"))
         if positive_conditions is None:
             raise ValueError("Encoded inference bundle is missing positive conditions")
+        connected_positive_conditions = self.connector_conditions(
+            positive_conditions
+        )
         positive = self.strategy.prepare_inference_state(
-            conditions=self.connector_conditions(positive_conditions),
+            conditions=connected_positive_conditions,
             reference_latents=encoded["reference_latents"],
             target_shape=target_shape,
             semantic_frame_count=semantic_frames,
@@ -440,6 +443,7 @@ class OnlineInferenceRuntime:
             )
 
         no_reference = None
+        no_latent_reference = None
         empty_reference = None
         empty_no_reference = None
         if guidance.need_reference and guidance.guidance_mode == "positive_ref":
@@ -453,6 +457,16 @@ class OnlineInferenceRuntime:
             )
             no_reference = branch_state(
                 self.connector_conditions(raw_no_reference),
+                reference_latents=no_ref_latents,
+            )
+        elif guidance.need_reference and guidance.guidance_mode == "latent_ref":
+            no_ref_latents = dict(encoded["reference_latents"])
+            no_ref_latents["ref_valid_mask"] = torch.zeros_like(
+                encoded["reference_latents"]["ref_valid_mask"],
+                dtype=torch.bool,
+            )
+            no_latent_reference = branch_state(
+                connected_positive_conditions,
                 reference_latents=no_ref_latents,
             )
         elif guidance.need_control_pair:
@@ -474,6 +488,7 @@ class OnlineInferenceRuntime:
             positive=positive,
             negative=negative,
             no_reference=no_reference,
+            no_latent_reference=no_latent_reference,
             empty_reference=empty_reference,
             empty_no_reference=empty_no_reference,
         )
