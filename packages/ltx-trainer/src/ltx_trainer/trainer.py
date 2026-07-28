@@ -1042,6 +1042,25 @@ class LtxvTrainer:
             return None
         return value if math.isfinite(value) else None
 
+    @staticmethod
+    def _scheduler_last_epoch(lr_scheduler: Any | None) -> int:
+        if lr_scheduler is None:
+            return -1
+        try:
+            state = lr_scheduler.state_dict()
+        except Exception:
+            state = None
+        if isinstance(state, dict) and "last_epoch" in state:
+            try:
+                return int(state["last_epoch"])
+            except (TypeError, ValueError):
+                pass
+        scheduler = getattr(lr_scheduler, "scheduler", lr_scheduler)
+        try:
+            return int(getattr(scheduler, "last_epoch"))
+        except (AttributeError, TypeError, ValueError):
+            return -1
+
     def _phase2_optimizer_state_audit(
         self,
         *,
@@ -1269,11 +1288,7 @@ class LtxvTrainer:
         self,
         training_state: TrainingState,
     ) -> None:
-        scheduler_epoch = (
-            int(getattr(self._lr_scheduler, "last_epoch", -1))
-            if self._lr_scheduler is not None
-            else -1
-        )
+        scheduler_epoch = self._scheduler_last_epoch(self._lr_scheduler)
         sampler_state = (
             self._online_sampler.state_dict()
             if self._online_sampler is not None
@@ -2236,9 +2251,7 @@ class LtxvTrainer:
             random.setstate(payload["python_rng_state"])
             np.random.set_state(payload["numpy_rng_state"])
 
-            scheduler_epoch = int(
-                getattr(self._lr_scheduler, "last_epoch", -1)
-            )
+            scheduler_epoch = self._scheduler_last_epoch(self._lr_scheduler)
             if scheduler_epoch != training_state.global_step:
                 raise RuntimeError(
                     "Phase 2 restored scheduler/global-step mismatch: "

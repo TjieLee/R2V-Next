@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 import torch
 import yaml
+from accelerate.scheduler import AcceleratedScheduler
 from safetensors.torch import save_file
 from torch import nn
 
@@ -950,6 +951,59 @@ def test_phase2_checkpoint_metadata_is_additive_only_for_phase2() -> None:
     assert phase2["condition_factorization"] == "T_I_L_8way_v1"
 
 
+def test_scheduler_last_epoch_supports_accelerated_scheduler_roundtrip() -> None:
+    source_parameter = nn.Parameter(torch.ones(()))
+    source_optimizer = torch.optim.AdamW([source_parameter])
+    source_base_scheduler = torch.optim.lr_scheduler.LambdaLR(
+        source_optimizer,
+        lr_lambda=lambda _: 1.0,
+    )
+    source_scheduler = AcceleratedScheduler(
+        source_base_scheduler,
+        source_optimizer,
+    )
+    source_optimizer.step()
+    source_base_scheduler.step()
+    saved_state = source_scheduler.state_dict()
+    assert saved_state["last_epoch"] == 1
+
+    target_parameter = nn.Parameter(torch.ones(()))
+    target_optimizer = torch.optim.AdamW([target_parameter])
+    target_scheduler = AcceleratedScheduler(
+        torch.optim.lr_scheduler.LambdaLR(
+            target_optimizer,
+            lr_lambda=lambda _: 1.0,
+        ),
+        target_optimizer,
+    )
+    target_scheduler.load_state_dict(saved_state)
+    assert not hasattr(target_scheduler, "last_epoch")
+    assert LtxvTrainer._scheduler_last_epoch(target_scheduler) == 1
+
+
+def test_scheduler_last_epoch_handles_direct_none_and_invalid_values() -> None:
+    parameter = nn.Parameter(torch.ones(()))
+    optimizer = torch.optim.AdamW([parameter])
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lr_lambda=lambda _: 1.0,
+    )
+    optimizer.step()
+    scheduler.step()
+    assert LtxvTrainer._scheduler_last_epoch(scheduler) == 1
+    assert LtxvTrainer._scheduler_last_epoch(None) == -1
+
+    class _InvalidScheduler:
+        scheduler = SimpleNamespace(last_epoch="invalid")
+
+        @staticmethod
+        def state_dict() -> dict[str, object]:
+            return {"last_epoch": object()}
+
+    assert LtxvTrainer._scheduler_last_epoch(object()) == -1
+    assert LtxvTrainer._scheduler_last_epoch(_InvalidScheduler()) == -1
+
+
 def test_phase2_custom_distributed_optimizer_state_roundtrip_restores_adam_and_rng(
     tmp_path: Path,
 ) -> None:
@@ -980,14 +1034,14 @@ def test_phase2_custom_distributed_optimizer_state_roundtrip_restores_adam_and_r
         restore_state=False,
     )
 
-    class _Scheduler:
-        last_epoch = 0
-
-        def load_state_dict(self, state: dict[str, object]) -> None:
-            self.last_epoch = int(state["last_epoch"])
-
     target._loaded_checkpoint_path = checkpoint
-    target._lr_scheduler = _Scheduler()
+    target._lr_scheduler = AcceleratedScheduler(
+        torch.optim.lr_scheduler.LambdaLR(
+            target._optimizer,
+            lr_lambda=lambda _: 1.0,
+        ),
+        target._optimizer,
+    )
     target._phase2_accelerator_state_restored = False
     target._phase2_distributed_optimizer_state_restored = False
     target._phase2_rng_state_restored = False
@@ -995,7 +1049,11 @@ def test_phase2_custom_distributed_optimizer_state_roundtrip_restores_adam_and_r
     torch.manual_seed(999)
     random.seed(999)
     np.random.seed(999)
-    target._restore_phase2_accelerator_state(_training_state(1))
+    training_state = _training_state(1)
+    scheduler_state = target._lr_scheduler.state_dict()
+    scheduler_state["last_epoch"] = 1
+    training_state.lr_scheduler_state_dict = scheduler_state
+    target._restore_phase2_accelerator_state(training_state)
 
     payload = torch.load(
         state_dir / "optimizer_rank_00000.pt",
@@ -1017,6 +1075,15 @@ def test_phase2_custom_distributed_optimizer_state_roundtrip_restores_adam_and_r
     assert target._phase2_distributed_optimizer_state_restored is True
     assert target._phase2_rng_state_restored is True
     assert target._phase2_optimizer_state_audit(expected_step=1)["passed"] is True
+    target._write_phase2_resume_runtime_audit(training_state)
+    runtime_audit = json.loads(
+        (tmp_path / "phase2_resume_runtime_audit.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert runtime_audit["scheduler_last_epoch"] == 1
+    assert runtime_audit["scheduler_restored"] is True
+    assert runtime_audit["passed"] is True
 
 
 def test_phase2_optimizer_state_audit_accepts_real_adamw_restore(
