@@ -5,11 +5,14 @@ import copy
 import hashlib
 import inspect
 import json
+import random
 import runpy
+import shutil
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 import yaml
@@ -22,6 +25,12 @@ from ltx_trainer.online_data.constants import IMAGE_TASK
 from ltx_trainer.online_data.online_batch_encoder import (
     OnlineBatchEncoder,
     phase2_condition_axes,
+)
+from ltx_trainer.phase2_distributed_state import (
+    PHASE2_DISTRIBUTED_STATE_FORMAT_VERSION,
+    PHASE2_OPTIMIZER_GROUP_NAMES,
+    sha256_file,
+    validate_phase2_distributed_state,
 )
 from ltx_trainer.trainer import LtxvTrainer
 from ltx_trainer.training_state import ConfigFingerprint, RngStates, TrainingState
@@ -123,7 +132,70 @@ def _training_state(step: int) -> TrainingState:
     )
 
 
-def _write_phase2_bundle(checkpoint_dir: Path, step: int) -> Path:
+def _write_phase2_distributed_state(
+    checkpoint_dir: Path,
+    *,
+    step: int,
+    world_size: int,
+) -> Path:
+    state_dir = checkpoint_dir / f"accelerator_state_step_{step:05d}"
+    state_dir.mkdir()
+    optimizer_state_dict = {
+        "state": {},
+        "param_groups": [
+            {"name": group_name, "params": []}
+            for group_name in PHASE2_OPTIMIZER_GROUP_NAMES
+        ],
+    }
+    files: dict[str, dict[str, object]] = {}
+    for rank in range(world_size):
+        rank_path = state_dir / f"optimizer_rank_{rank:05d}.pt"
+        torch.save(
+            {
+                "format_version": PHASE2_DISTRIBUTED_STATE_FORMAT_VERSION,
+                "global_step": step,
+                "rank": rank,
+                "world_size": world_size,
+                "optimizer_group_names": list(
+                    PHASE2_OPTIMIZER_GROUP_NAMES
+                ),
+                "optimizer_state_dict": optimizer_state_dict,
+                "torch_rng_state": torch.random.get_rng_state(),
+                "cuda_rng_state": None,
+                "python_rng_state": random.getstate(),
+                "numpy_rng_state": np.random.get_state(),
+                "grad_scaler_state": None,
+            },
+            rank_path,
+        )
+        files[str(rank)] = {
+            "path": rank_path.name,
+            "size_bytes": rank_path.stat().st_size,
+            "sha256": sha256_file(rank_path),
+        }
+    (state_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "format_version": PHASE2_DISTRIBUTED_STATE_FORMAT_VERSION,
+                "global_step": step,
+                "world_size": world_size,
+                "optimizer_group_names": list(
+                    PHASE2_OPTIMIZER_GROUP_NAMES
+                ),
+                "files": files,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return state_dir
+
+
+def _write_phase2_bundle(
+    checkpoint_dir: Path,
+    step: int,
+    *,
+    world_size: int = 8,
+) -> Path:
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     checkpoint = checkpoint_dir / f"model_weights_step_{step:05d}.safetensors"
     save_file(
@@ -137,9 +209,11 @@ def _write_phase2_bundle(checkpoint_dir: Path, step: int) -> Path:
     )
     training_state = checkpoint_dir / f"training_state_step_{step:05d}.pt"
     torch.save(_training_state(step).to_save_dict(), training_state)
-    accelerator_state = checkpoint_dir / f"accelerator_state_step_{step:05d}"
-    accelerator_state.mkdir()
-    (accelerator_state / "state.bin").write_bytes(b"state")
+    accelerator_state = _write_phase2_distributed_state(
+        checkpoint_dir,
+        step=step,
+        world_size=world_size,
+    )
     digest = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
     marker = checkpoint_dir / f"checkpoint_step_{step:05d}.ready.json"
     marker.write_text(
@@ -205,6 +279,9 @@ def _write_phase2_smoke_evidence(
                 "sampler_task_schedule_cursor": 1,
                 "sampler_microstep_in_optimizer_step": 0,
                 "accelerator_state_restored": True,
+                "distributed_optimizer_state_restored": True,
+                "rng_state_restored": True,
+                "world_size": 8,
                 "scheduler_restored": True,
                 "sampler_restored": True,
                 "optimizer_groups_restored": True,
@@ -288,7 +365,9 @@ def _gradient_audit_trainer(tmp_path: Path) -> LtxvTrainer:
     class _Accelerator:
         device = torch.device("cpu")
         num_processes = 1
+        process_index = 0
         is_main_process = True
+        scaler = None
 
         @staticmethod
         def reduce(value: torch.Tensor, *, reduction: str) -> torch.Tensor:
@@ -363,7 +442,9 @@ def _optimizer_state_audit_trainer(
     class _Accelerator:
         device = torch.device("cpu")
         num_processes = 1
+        process_index = 0
         is_main_process = True
+        scaler = None
 
         @staticmethod
         def reduce(value: torch.Tensor, *, reduction: str) -> torch.Tensor:
@@ -386,6 +467,8 @@ def _optimizer_state_audit_trainer(
         for name, parameter in parameters_by_name.items()
     }
     trainer._phase2_accelerator_state_restored = True
+    trainer._phase2_distributed_optimizer_state_restored = True
+    trainer._phase2_rng_state_restored = True
     trainer._lr_scheduler = SimpleNamespace(last_epoch=1)
     trainer._online_sampler = SimpleNamespace(
         state_dict=lambda: {
@@ -867,42 +950,73 @@ def test_phase2_checkpoint_metadata_is_additive_only_for_phase2() -> None:
     assert phase2["condition_factorization"] == "T_I_L_8way_v1"
 
 
-def test_phase2_exact_resume_uses_matching_distributed_accelerate_state(
+def test_phase2_custom_distributed_optimizer_state_roundtrip_restores_adam_and_rng(
     tmp_path: Path,
 ) -> None:
-    checkpoint = tmp_path / "model_weights_step_00007.safetensors"
+    checkpoints = tmp_path / "checkpoints"
+    source, _ = _optimizer_state_audit_trainer(tmp_path)
+    source._training_strategy = SemanticFlowStrategy(
+        SemanticFlowConfig(training_phase="phase2")
+    )
+    source._config = SimpleNamespace(
+        checkpoints=SimpleNamespace(save_training_state="minimal")
+    )
+    source._global_step = 1
+    source._last_phase2_accelerator_state_path = None
+
+    torch.manual_seed(1234)
+    random.seed(1234)
+    np.random.seed(1234)
+    state_dir = source._save_phase2_accelerator_state(checkpoints)
+    assert state_dir == checkpoints / "accelerator_state_step_00001"
+    expected_torch = torch.rand(4)
+    expected_python = random.random()
+    expected_numpy = float(np.random.random())
+
+    checkpoint = checkpoints / "model_weights_step_00001.safetensors"
     checkpoint.touch()
-    state_dir = tmp_path / "accelerator_state_step_00007"
-    state_dir.mkdir()
-    loaded: list[str] = []
-
-    class _Accelerator:
-        @staticmethod
-        def load_state(path: str) -> None:
-            loaded.append(path)
-
-    trainer = object.__new__(LtxvTrainer)
-    trainer._loaded_checkpoint_path = checkpoint
-    trainer._accelerator = _Accelerator()
-    trainer._lr_scheduler = SimpleNamespace(last_epoch=7)
-    trainer._optimizer = SimpleNamespace(
-        param_groups=[
-            {"name": "dit_semantic"},
-            {"name": "conditioning_bridge"},
-        ]
+    target, _ = _optimizer_state_audit_trainer(
+        tmp_path,
+        restore_state=False,
     )
-    training_state = TrainingState(
-        global_step=7,
-        config_fingerprint=ConfigFingerprint(
-            optimizer_type="adamw",
-            scheduler_type="linear",
-            training_mode="full",
-        ),
-        rng_states=RngStates(torch_state=torch.random.get_rng_state()),
+
+    class _Scheduler:
+        last_epoch = 0
+
+        def load_state_dict(self, state: dict[str, object]) -> None:
+            self.last_epoch = int(state["last_epoch"])
+
+    target._loaded_checkpoint_path = checkpoint
+    target._lr_scheduler = _Scheduler()
+    target._phase2_accelerator_state_restored = False
+    target._phase2_distributed_optimizer_state_restored = False
+    target._phase2_rng_state_restored = False
+
+    torch.manual_seed(999)
+    random.seed(999)
+    np.random.seed(999)
+    target._restore_phase2_accelerator_state(_training_state(1))
+
+    payload = torch.load(
+        state_dir / "optimizer_rank_00000.pt",
+        map_location="cpu",
+        weights_only=False,
     )
-    trainer._restore_phase2_accelerator_state(training_state)
-    assert loaded == [str(state_dir)]
-    assert trainer._phase2_accelerator_state_restored is True
+    saved_states = list(payload["optimizer_state_dict"]["state"].values())
+    restored_states = list(target._optimizer.state_dict()["state"].values())
+    assert len(restored_states) == len(saved_states)
+    for saved, restored in zip(saved_states, restored_states, strict=True):
+        assert torch.equal(restored["exp_avg"], saved["exp_avg"])
+        assert torch.equal(restored["exp_avg_sq"], saved["exp_avg_sq"])
+        assert torch.equal(restored["step"], saved["step"])
+
+    assert torch.equal(torch.rand(4), expected_torch)
+    assert random.random() == expected_python
+    assert float(np.random.random()) == expected_numpy
+    assert target._phase2_accelerator_state_restored is True
+    assert target._phase2_distributed_optimizer_state_restored is True
+    assert target._phase2_rng_state_restored is True
+    assert target._phase2_optimizer_state_audit(expected_step=1)["passed"] is True
 
 
 def test_phase2_optimizer_state_audit_accepts_real_adamw_restore(
@@ -1132,7 +1246,7 @@ def test_phase2_resume_state_validates_step_scheduler_sampler_and_accelerate(
             state=missing_sampler,
         )
     (tmp_path / "accelerator_state_step_00007").rmdir()
-    with pytest.raises(RuntimeError, match="Accelerate state"):
+    with pytest.raises(RuntimeError, match="distributed optimizer state"):
         trainer._validate_phase2_resume_state(
             checkpoint_path=checkpoint,
             metadata=metadata,
@@ -1222,10 +1336,98 @@ def test_phase2_resume_bundle_rejects_each_missing_or_corrupt_component(
     elif broken_artifact == "training_state":
         (tmp_path / "training_state_step_00001.pt").unlink()
     else:
-        (tmp_path / "accelerator_state_step_00001" / "state.bin").unlink()
-        (tmp_path / "accelerator_state_step_00001").rmdir()
+        shutil.rmtree(tmp_path / "accelerator_state_step_00001")
     with pytest.raises(RuntimeError):
         validate(checkpoint)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "missing_manifest",
+        "missing_rank_file",
+        "corrupt_rank_payload",
+        "sha_mismatch",
+        "manifest_global_step",
+        "optimizer_group_names",
+        "rank_payload_metadata",
+        "rank_payload_group_names",
+    ],
+)
+def test_phase2_resume_bundle_rejects_invalid_distributed_optimizer_state(
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    script = Path(__file__).parents[1] / (
+        "scripts/check_semantic_flow_phase2_runtime.py"
+    )
+    validate = runpy.run_path(str(script))["validate_phase2_resume_bundle"]
+    checkpoint = _write_phase2_bundle(tmp_path, 1, world_size=2)
+    state_dir = tmp_path / "accelerator_state_step_00001"
+    manifest_path = state_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    rank_path = state_dir / "optimizer_rank_00001.pt"
+    if failure == "missing_manifest":
+        manifest_path.unlink()
+    elif failure == "missing_rank_file":
+        rank_path.unlink()
+    elif failure == "corrupt_rank_payload":
+        rank_path.write_bytes(b"not a torch payload")
+        manifest["files"]["1"].update(
+            {
+                "size_bytes": rank_path.stat().st_size,
+                "sha256": sha256_file(rank_path),
+            }
+        )
+    elif failure == "sha_mismatch":
+        manifest["files"]["1"]["sha256"] = "0" * 64
+    elif failure == "manifest_global_step":
+        manifest["global_step"] = 2
+    elif failure == "optimizer_group_names":
+        manifest["optimizer_group_names"] = [
+            "conditioning_bridge",
+            "dit_semantic",
+        ]
+    else:
+        rank_payload = torch.load(
+            rank_path,
+            map_location="cpu",
+            weights_only=False,
+        )
+        if failure == "rank_payload_metadata":
+            rank_payload["rank"] = 0
+        else:
+            rank_payload["optimizer_state_dict"]["param_groups"][0][
+                "name"
+            ] = "wrong"
+        torch.save(rank_payload, rank_path)
+        manifest["files"]["1"].update(
+            {
+                "size_bytes": rank_path.stat().st_size,
+                "sha256": sha256_file(rank_path),
+            }
+        )
+    if failure != "missing_manifest":
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(RuntimeError):
+        validate(checkpoint)
+
+
+def test_phase2_distributed_optimizer_manifest_world_size_must_match_runtime(
+    tmp_path: Path,
+) -> None:
+    state_dir = _write_phase2_distributed_state(
+        tmp_path,
+        step=1,
+        world_size=2,
+    )
+    with pytest.raises(RuntimeError, match="world_size mismatch"):
+        validate_phase2_distributed_state(
+            state_dir,
+            expected_step=1,
+            expected_world_size=1,
+            validate_rank_payloads=False,
+        )
 
 
 @pytest.mark.parametrize(
@@ -1278,7 +1480,9 @@ def test_phase2_smoke_result_requires_gradient_resume_and_inference_evidence(
     assert report["passed"] is True
     assert report["first_bundle"]["global_step"] == 1
     assert report["final_bundle"]["global_step"] == 2
+    assert report["distributed_optimizer_state_restored"] is True
     assert report["optimizer_state_restored"] is True
+    assert report["rng_state_restored"] is True
     assert set(report["inference"]) == {"positive_ref", "latent_ref"}
 
 
@@ -1287,6 +1491,9 @@ def test_phase2_smoke_result_requires_gradient_resume_and_inference_evidence(
     [
         "missing_restored_flag",
         "false_restored_flag",
+        "missing_distributed_restored_flag",
+        "false_rng_restored_flag",
+        "wrong_resume_world_size",
         "missing_optimizer_state",
         "dit_without_state",
         "bridge_without_state",
@@ -1312,6 +1519,12 @@ def test_phase2_smoke_validator_rejects_invalid_optimizer_state_evidence(
         resume.pop("optimizer_state_restored")
     elif failure == "false_restored_flag":
         resume["optimizer_state_restored"] = False
+    elif failure == "missing_distributed_restored_flag":
+        resume.pop("distributed_optimizer_state_restored")
+    elif failure == "false_rng_restored_flag":
+        resume["rng_state_restored"] = False
+    elif failure == "wrong_resume_world_size":
+        resume["world_size"] = 7
     elif failure == "missing_optimizer_state":
         resume.pop("optimizer_state")
     elif failure == "dit_without_state":
@@ -1362,27 +1575,118 @@ def test_phase2_smoke_validator_rejects_invalid_optimizer_state_evidence(
 def test_phase2_distributed_state_save_is_additive_to_minimal_state(
     tmp_path: Path,
 ) -> None:
-    saved: list[tuple[str, bool]] = []
-
-    class _Accelerator:
-        @staticmethod
-        def save_state(*, output_dir: str, safe_serialization: bool) -> None:
-            Path(output_dir).mkdir(parents=True)
-            saved.append((output_dir, safe_serialization))
-
-        @staticmethod
-        def wait_for_everyone() -> None:
-            return None
-
-    trainer = object.__new__(LtxvTrainer)
-    trainer._training_strategy = SemanticFlowStrategy(SemanticFlowConfig(training_phase="phase2"))
-    trainer._config = SimpleNamespace(checkpoints=SimpleNamespace(save_training_state="minimal"))
-    trainer._accelerator = _Accelerator()
+    trainer, _ = _optimizer_state_audit_trainer(tmp_path)
+    trainer._training_strategy = SemanticFlowStrategy(
+        SemanticFlowConfig(training_phase="phase2")
+    )
+    trainer._config = SimpleNamespace(
+        checkpoints=SimpleNamespace(save_training_state="minimal")
+    )
     trainer._global_step = 7
     trainer._last_phase2_accelerator_state_path = None
     state_path = trainer._save_phase2_accelerator_state(tmp_path)
     assert state_path == tmp_path / "accelerator_state_step_00007"
-    assert saved == [(str(state_path), True)]
+    manifest = validate_phase2_distributed_state(
+        state_path,
+        expected_step=7,
+        expected_world_size=1,
+        validate_rank_payloads=True,
+    )
+    assert manifest["optimizer_group_names"] == [
+        "dit_semantic",
+        "conditioning_bridge",
+    ]
+    assert set(path.name for path in state_path.iterdir()) == {
+        "manifest.json",
+        "optimizer_rank_00000.pt",
+    }
+    assert not Path(f"{state_path}.partial").exists()
+
+
+def test_phase2_custom_state_path_never_calls_accelerate_state_api() -> None:
+    save_source = inspect.getsource(
+        LtxvTrainer._save_phase2_accelerator_state
+    )
+    restore_source = inspect.getsource(
+        LtxvTrainer._restore_phase2_accelerator_state
+    )
+    assert ".save_state(" not in save_source
+    assert ".load_state(" not in restore_source
+
+
+def test_phase2_distributed_state_commits_before_training_state_and_ready_marker() -> None:
+    source = inspect.getsource(LtxvTrainer._save_checkpoint)
+    distributed_state = source.index(
+        "self._save_phase2_accelerator_state(save_dir)"
+    )
+    training_state = source.index("self._save_training_state(save_dir)")
+    ready_marker = source.index("self._publish_checkpoint_ready_marker(")
+    assert distributed_state < training_state < ready_marker
+
+
+def test_phase2_distributed_restore_runs_after_optimizer_prepare() -> None:
+    source = inspect.getsource(LtxvTrainer.train)
+    optimizer_prepare = source.index("self._init_optimizer()")
+    distributed_restore = source.index(
+        "self._restore_phase2_accelerator_state(training_state)"
+    )
+    assert optimizer_prepare < distributed_restore
+
+
+def test_phase2_failed_rank_state_save_is_not_committed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer, _ = _optimizer_state_audit_trainer(tmp_path)
+    trainer._training_strategy = SemanticFlowStrategy(
+        SemanticFlowConfig(training_phase="phase2")
+    )
+    trainer._config = SimpleNamespace(
+        checkpoints=SimpleNamespace(save_training_state="minimal")
+    )
+    trainer._global_step = 7
+
+    def _fail_save(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise OSError("injected rank save failure")
+
+    monkeypatch.setattr(torch, "save", _fail_save)
+    with pytest.raises(RuntimeError, match="save failed"):
+        trainer._save_phase2_accelerator_state(tmp_path)
+    assert not (tmp_path / "accelerator_state_step_00007").exists()
+    assert not (tmp_path / "accelerator_state_step_00007.partial").exists()
+    assert not (tmp_path / "checkpoint_step_00007.ready.json").exists()
+
+
+def test_phase1_skips_phase2_distributed_optimizer_state_path(
+    tmp_path: Path,
+) -> None:
+    trainer = object.__new__(LtxvTrainer)
+    trainer._training_strategy = SemanticFlowStrategy(SemanticFlowConfig())
+    trainer._config = SimpleNamespace(
+        checkpoints=SimpleNamespace(save_training_state="minimal")
+    )
+    assert trainer._save_phase2_accelerator_state(tmp_path) is None
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_phase2_checkpoint_cleanup_never_tracks_partial_state_directory(
+    tmp_path: Path,
+) -> None:
+    checkpoint_dir = tmp_path / "checkpoints"
+    partial = checkpoint_dir / "accelerator_state_step_00007.partial"
+    partial.mkdir(parents=True)
+    (partial / "optimizer_rank_00000.pt.tmp").touch()
+    trainer = object.__new__(LtxvTrainer)
+    trainer._config = SimpleNamespace(
+        output_dir=str(tmp_path),
+        checkpoints=SimpleNamespace(keep_last_n=3),
+    )
+    trainer._loaded_checkpoint_path = None
+    trainer._checkpoint_paths = []
+    trainer._training_state_paths = []
+    trainer._cleanup_checkpoints()
+    assert not partial.exists()
 
 
 def test_phase2_production_config_and_launcher_are_isolated_from_phase1() -> None:

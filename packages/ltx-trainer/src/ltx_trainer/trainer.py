@@ -3,6 +3,7 @@ import hashlib
 import json
 import math
 import os
+import random
 import re
 import shutil
 import time
@@ -12,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+import numpy as np
 import torch
 import wandb
 import yaml
@@ -56,6 +58,12 @@ from ltx_trainer.online_inference.checkpoint_runtime import (
 )
 from ltx_trainer.online_inference.output_artifacts import atomic_write_json
 from ltx_trainer.online_inference.startup_memory import host_memory_snapshot
+from ltx_trainer.phase2_distributed_state import (
+    PHASE2_DISTRIBUTED_STATE_FORMAT_VERSION,
+    PHASE2_OPTIMIZER_GROUP_NAMES,
+    load_phase2_rank_state,
+    sha256_file,
+)
 from ltx_trainer.progress import TrainingProgress
 from ltx_trainer.quantization import quantize_model
 from ltx_trainer.sigma_tracker import SigmaBucketTracker
@@ -231,6 +239,8 @@ class LtxvTrainer:
         self._phase2_smoke_audit_enabled = False
         self._phase2_gradient_audit_completed = False
         self._phase2_accelerator_state_restored = False
+        self._phase2_distributed_optimizer_state_restored = False
+        self._phase2_rng_state_restored = False
         if IS_MAIN_PROCESS:
             print_config(trainer_config)
         self._training_strategy = get_training_strategy(self._config.training_strategy)
@@ -1278,8 +1288,10 @@ class LtxvTrainer:
             expected_step=expected_step,
         )
         errors = []
-        if not self._phase2_accelerator_state_restored:
-            errors.append("Accelerate state was not restored")
+        if not self._phase2_distributed_optimizer_state_restored:
+            errors.append("distributed optimizer state was not restored")
+        if not self._phase2_rng_state_restored:
+            errors.append("rank RNG state was not restored")
         if scheduler_epoch != expected_step:
             errors.append(
                 f"scheduler last_epoch={scheduler_epoch} does not match step={expected_step}"
@@ -1304,6 +1316,11 @@ class LtxvTrainer:
             ),
             "optimizer_group_names": optimizer_groups,
             "accelerator_state_restored": self._phase2_accelerator_state_restored,
+            "distributed_optimizer_state_restored": (
+                self._phase2_distributed_optimizer_state_restored
+            ),
+            "rng_state_restored": self._phase2_rng_state_restored,
+            "world_size": int(self._accelerator.num_processes),
             "scheduler_restored": scheduler_epoch == expected_step,
             "sampler_restored": (
                 sampler_state.get("task_schedule_cursor") == expected_step
@@ -2152,33 +2169,155 @@ class LtxvTrainer:
         if self._loaded_checkpoint_path is None:
             raise RuntimeError("Phase 2 resume has no loaded checkpoint path")
         state_path = self._phase2_accelerator_state_path(self._loaded_checkpoint_path)
+        rank = int(self._accelerator.process_index)
+        world_size = int(self._accelerator.num_processes)
+        payload: dict[str, Any] | None = None
+        local_error: BaseException | None = None
         try:
-            self._accelerator.load_state(str(state_path))
+            payload = load_phase2_rank_state(
+                state_path,
+                expected_step=training_state.global_step,
+                rank=rank,
+                world_size=world_size,
+            )
         except Exception as exc:
+            local_error = exc
+        if not self._phase2_all_ranks_succeeded(local_error):
+            detail = f": {local_error}" if local_error is not None else ""
             raise RuntimeError(
-                f"Failed to restore exact Phase 2 distributed state from {state_path}"
-            ) from exc
-        scheduler_epoch = (
-            int(getattr(self._lr_scheduler, "last_epoch", -1))
-            if self._lr_scheduler is not None
-            else training_state.global_step
-        )
-        if scheduler_epoch != training_state.global_step:
-            raise RuntimeError(
-                "Phase 2 restored scheduler/global-step mismatch: "
-                f"scheduler={scheduler_epoch}, state={training_state.global_step}"
+                "Failed to validate exact Phase 2 distributed optimizer state "
+                f"on at least one rank from {state_path}{detail}"
+            ) from local_error
+        assert payload is not None
+
+        local_error = None
+        try:
+            self._optimizer.load_state_dict(payload["optimizer_state_dict"])
+            self._move_optimizer_state_to_parameter_devices()
+
+            scheduler_state = training_state.lr_scheduler_state_dict
+            if not isinstance(scheduler_state, dict):
+                raise RuntimeError(
+                    "Phase 2 exact resume is missing LR scheduler state"
+                )
+            if self._lr_scheduler is None:
+                raise RuntimeError(
+                    "Phase 2 exact resume has no LR scheduler to restore"
+                )
+            self._lr_scheduler.load_state_dict(scheduler_state)
+            self._restore_optimizer_learning_rates(scheduler_state)
+
+            saved_scaler_state = payload.get("grad_scaler_state")
+            scaler = getattr(self._accelerator, "scaler", None)
+            if saved_scaler_state is None and scaler is not None:
+                raise RuntimeError(
+                    "Phase 2 distributed state is missing GradScaler state"
+                )
+            if saved_scaler_state is not None and scaler is None:
+                raise RuntimeError(
+                    "Phase 2 distributed state contains GradScaler state "
+                    "but the runtime has no GradScaler"
+                )
+            if saved_scaler_state is not None:
+                scaler.load_state_dict(saved_scaler_state)
+
+            torch.random.set_rng_state(payload["torch_rng_state"])
+            cuda_rng_state = payload.get("cuda_rng_state")
+            if cuda_rng_state is not None:
+                if not torch.cuda.is_available():
+                    raise RuntimeError(
+                        "Phase 2 distributed state contains CUDA RNG state "
+                        "but CUDA is unavailable"
+                    )
+                torch.cuda.set_rng_state(
+                    cuda_rng_state,
+                    device=self._accelerator.device,
+                )
+            random.setstate(payload["python_rng_state"])
+            np.random.set_state(payload["numpy_rng_state"])
+
+            scheduler_epoch = int(
+                getattr(self._lr_scheduler, "last_epoch", -1)
             )
-        group_names = [str(group.get("name", "")) for group in self._optimizer.param_groups]
-        if group_names != ["dit_semantic", "conditioning_bridge"]:
+            if scheduler_epoch != training_state.global_step:
+                raise RuntimeError(
+                    "Phase 2 restored scheduler/global-step mismatch: "
+                    f"scheduler={scheduler_epoch}, "
+                    f"state={training_state.global_step}"
+                )
+            group_names = [
+                str(group.get("name", ""))
+                for group in self._optimizer.param_groups
+            ]
+            if group_names != list(PHASE2_OPTIMIZER_GROUP_NAMES):
+                raise RuntimeError(
+                    "Phase 2 restored optimizer groups are invalid: "
+                    f"{group_names}"
+                )
+        except Exception as exc:
+            local_error = exc
+        if not self._phase2_all_ranks_succeeded(local_error):
+            detail = f": {local_error}" if local_error is not None else ""
             raise RuntimeError(
-                f"Phase 2 restored optimizer groups are invalid: {group_names}"
-            )
+                "Failed to restore exact Phase 2 distributed optimizer/RNG "
+                f"state on at least one rank from {state_path}{detail}"
+            ) from local_error
+
         self._phase2_accelerator_state_restored = True
+        self._phase2_distributed_optimizer_state_restored = True
+        self._phase2_rng_state_restored = True
         logger.info(
-            "Restored exact Phase 2 distributed state from %s at local step %d",
+            "Restored exact Phase 2 rank-local optimizer/RNG state from %s "
+            "at local step %d",
             state_path,
             training_state.global_step,
         )
+
+    @staticmethod
+    def _move_state_value_to_device(value: Any, device: torch.device) -> Any:
+        if isinstance(value, Tensor):
+            return value.to(device=device)
+        if isinstance(value, dict):
+            return {
+                key: LtxvTrainer._move_state_value_to_device(item, device)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [
+                LtxvTrainer._move_state_value_to_device(item, device)
+                for item in value
+            ]
+        if isinstance(value, tuple):
+            return tuple(
+                LtxvTrainer._move_state_value_to_device(item, device)
+                for item in value
+            )
+        return value
+
+    def _move_optimizer_state_to_parameter_devices(self) -> None:
+        for parameter, state in self._optimizer.state.items():
+            if not isinstance(parameter, Tensor) or not isinstance(state, dict):
+                continue
+            for key, value in list(state.items()):
+                state[key] = self._move_state_value_to_device(
+                    value,
+                    parameter.device,
+                )
+
+    def _phase2_all_ranks_succeeded(
+        self,
+        local_error: BaseException | None,
+    ) -> bool:
+        local_success = torch.tensor(
+            int(local_error is None),
+            dtype=torch.int64,
+            device=self._accelerator.device,
+        )
+        total_success = self._accelerator.reduce(
+            local_success,
+            reduction="sum",
+        )
+        return int(total_success.item()) == int(self._accelerator.num_processes)
 
     def _validate_phase2_resume_state(
         self,
@@ -2248,7 +2387,7 @@ class LtxvTrainer:
         accelerator_state_path = self._phase2_accelerator_state_path(checkpoint_path)
         if not accelerator_state_path.is_dir():
             raise RuntimeError(
-                "Phase 2 exact resume is missing its distributed Accelerate state: "
+                "Phase 2 exact resume is missing its distributed optimizer state: "
                 f"{accelerator_state_path}"
             )
 
@@ -3574,16 +3713,153 @@ class LtxvTrainer:
         ):
             return None
         state_path = save_dir / f"accelerator_state_step_{self._global_step:05d}"
-        state_path.parent.mkdir(parents=True, exist_ok=True)
-        self._accelerator.save_state(
-            output_dir=str(state_path),
-            safe_serialization=True,
-        )
-        self._accelerator.wait_for_everyone()
-        if IS_MAIN_PROCESS and not state_path.is_dir():
+        partial_path = Path(f"{state_path}.partial")
+        rank = int(self._accelerator.process_index)
+        world_size = int(self._accelerator.num_processes)
+        is_main_process = bool(self._accelerator.is_main_process)
+        optimizer_group_names = [
+            str(group.get("name", ""))
+            for group in self._optimizer.param_groups
+        ]
+        if optimizer_group_names != list(PHASE2_OPTIMIZER_GROUP_NAMES):
             raise RuntimeError(
-                f"Phase 2 distributed Accelerate state was not created: {state_path}"
+                "Cannot save Phase 2 distributed optimizer state with invalid "
+                f"groups: {optimizer_group_names}"
             )
+
+        local_error: BaseException | None = None
+        if is_main_process:
+            try:
+                state_path.parent.mkdir(parents=True, exist_ok=True)
+                if partial_path.exists():
+                    shutil.rmtree(partial_path)
+                if state_path.exists():
+                    marker_path = state_path.parent / (
+                        f"checkpoint_step_{self._global_step:05d}.ready.json"
+                    )
+                    if marker_path.exists():
+                        raise RuntimeError(
+                            "Refusing to replace a published Phase 2 distributed "
+                            f"state: {state_path}"
+                        )
+                    shutil.rmtree(state_path)
+                partial_path.mkdir()
+                self._fsync_directory(partial_path.parent)
+            except Exception as exc:
+                local_error = exc
+        if not self._phase2_all_ranks_succeeded(local_error):
+            detail = f": {local_error}" if local_error is not None else ""
+            raise RuntimeError(
+                "Could not initialize Phase 2 distributed optimizer state "
+                f"save on rank 0{detail}"
+            ) from local_error
+        self._accelerator.wait_for_everyone()
+
+        rank_path = partial_path / f"optimizer_rank_{rank:05d}.pt"
+        temporary_rank_path = Path(f"{rank_path}.tmp.{os.getpid()}")
+        local_error = None
+        try:
+            scaler = getattr(self._accelerator, "scaler", None)
+            payload = {
+                "format_version": PHASE2_DISTRIBUTED_STATE_FORMAT_VERSION,
+                "global_step": self._global_step,
+                "rank": rank,
+                "world_size": world_size,
+                "optimizer_group_names": optimizer_group_names,
+                "optimizer_state_dict": self._optimizer.state_dict(),
+                "torch_rng_state": torch.random.get_rng_state(),
+                "cuda_rng_state": (
+                    torch.cuda.get_rng_state(self._accelerator.device)
+                    if torch.cuda.is_available()
+                    else None
+                ),
+                "python_rng_state": random.getstate(),
+                "numpy_rng_state": np.random.get_state(),
+                "grad_scaler_state": (
+                    scaler.state_dict() if scaler is not None else None
+                ),
+            }
+            torch.save(payload, temporary_rank_path)
+            self._fsync_file(temporary_rank_path)
+            if temporary_rank_path.stat().st_size <= 0:
+                raise RuntimeError(
+                    f"Phase 2 rank-state temporary file is empty: {temporary_rank_path}"
+                )
+            os.replace(temporary_rank_path, rank_path)
+            self._fsync_directory(partial_path)
+        except Exception as exc:
+            temporary_rank_path.unlink(missing_ok=True)
+            local_error = exc
+        all_rank_files_saved = self._phase2_all_ranks_succeeded(local_error)
+        if not all_rank_files_saved:
+            self._accelerator.wait_for_everyone()
+            if is_main_process:
+                shutil.rmtree(partial_path, ignore_errors=True)
+            self._accelerator.wait_for_everyone()
+            detail = f": {local_error}" if local_error is not None else ""
+            raise RuntimeError(
+                "Phase 2 distributed optimizer state save failed on at least "
+                f"one rank{detail}"
+            ) from local_error
+
+        self._accelerator.wait_for_everyone()
+        local_error = None
+        if is_main_process:
+            manifest_tmp_path = partial_path / "manifest.json.tmp"
+            try:
+                files: dict[str, dict[str, Any]] = {}
+                for file_rank in range(world_size):
+                    file_path = partial_path / (
+                        f"optimizer_rank_{file_rank:05d}.pt"
+                    )
+                    if not file_path.is_file() or file_path.stat().st_size <= 0:
+                        raise RuntimeError(
+                            "Phase 2 distributed optimizer rank file is "
+                            f"missing or empty: {file_path}"
+                        )
+                    files[str(file_rank)] = {
+                        "path": file_path.name,
+                        "size_bytes": file_path.stat().st_size,
+                        "sha256": sha256_file(file_path),
+                    }
+                manifest = {
+                    "format_version": PHASE2_DISTRIBUTED_STATE_FORMAT_VERSION,
+                    "global_step": self._global_step,
+                    "world_size": world_size,
+                    "optimizer_group_names": optimizer_group_names,
+                    "files": files,
+                }
+                with manifest_tmp_path.open("w", encoding="utf-8") as handle:
+                    json.dump(
+                        manifest,
+                        handle,
+                        ensure_ascii=False,
+                        indent=2,
+                        sort_keys=True,
+                    )
+                    handle.write("\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(manifest_tmp_path, partial_path / "manifest.json")
+                self._fsync_directory(partial_path)
+                os.replace(partial_path, state_path)
+                self._fsync_directory(state_path.parent)
+            except Exception as exc:
+                manifest_tmp_path.unlink(missing_ok=True)
+                local_error = exc
+        state_committed = self._phase2_all_ranks_succeeded(local_error)
+        if not state_committed:
+            self._accelerator.wait_for_everyone()
+            if is_main_process:
+                shutil.rmtree(partial_path, ignore_errors=True)
+            self._accelerator.wait_for_everyone()
+            detail = f": {local_error}" if local_error is not None else ""
+            raise RuntimeError(
+                "Could not commit Phase 2 distributed optimizer state "
+                f"manifest{detail}"
+            ) from local_error
+
+        self._accelerator.wait_for_everyone()
         self._last_phase2_accelerator_state_path = state_path
         return state_path
 
@@ -3751,6 +4027,17 @@ class LtxvTrainer:
                 markers_by_step[step] = path
         accelerator_states_by_step: dict[int, Path] = {}
         for path in save_dir.glob("accelerator_state_step_*"):
+            if path.name.endswith(".partial"):
+                if path.is_dir():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink(missing_ok=True)
+                logger.debug(
+                    f"Removed incomplete Phase 2 distributed state: {path}"
+                )
+                continue
+            if re.fullmatch(r"accelerator_state_step_\d+", path.name) is None:
+                continue
             step = self._checkpoint_step(path)
             if step is not None and path.is_dir():
                 accelerator_states_by_step[step] = path

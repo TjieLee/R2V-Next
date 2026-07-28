@@ -18,6 +18,9 @@ from ltx_trainer.config import LtxTrainerConfig
 from ltx_trainer.model_loader import load_embeddings_processor
 from ltx_trainer.online_data.path_safety import assert_write_path_allowed
 from ltx_trainer.online_inference.checkpoint_runtime import read_checkpoint_metadata
+from ltx_trainer.phase2_distributed_state import (
+    validate_phase2_distributed_state,
+)
 from ltx_trainer.training_state import TrainingState
 from ltx_trainer.training_strategies.semantic_flow_bridge import (
     configure_phase2_bridge_trainability,
@@ -112,8 +115,14 @@ def validate_phase2_resume_bundle(checkpoint: Path) -> dict[str, Any]:
         )
     if not expected_accelerator_state.is_dir():
         raise RuntimeError(
-            f"Phase 2 Accelerate state is missing: {expected_accelerator_state}"
+            "Phase 2 distributed optimizer state is missing: "
+            f"{expected_accelerator_state}"
         )
+    distributed_state_manifest = validate_phase2_distributed_state(
+        expected_accelerator_state,
+        expected_step=step,
+        validate_rank_payloads=True,
+    )
 
     metadata = read_checkpoint_metadata(checkpoint)
     if metadata.get("training_phase") != "phase2":
@@ -173,6 +182,10 @@ def validate_phase2_resume_bundle(checkpoint: Path) -> dict[str, Any]:
         "ready_marker": str(marker_path),
         "training_state": str(expected_training_state),
         "accelerator_state": str(expected_accelerator_state),
+        "distributed_optimizer_state": str(expected_accelerator_state),
+        "distributed_optimizer_world_size": int(
+            distributed_state_manifest["world_size"]
+        ),
     }
 
 
@@ -239,6 +252,12 @@ def validate_phase2_smoke_output(
         raise RuntimeError(
             "Phase 2 smoke final checkpoint step mismatch: "
             f"expected={expected_final_step}, actual={final_bundle['global_step']}"
+        )
+    if final_bundle["distributed_optimizer_world_size"] != expected_processes:
+        raise RuntimeError(
+            "Phase 2 smoke distributed optimizer world_size mismatch: "
+            f"expected={expected_processes}, "
+            f"actual={final_bundle['distributed_optimizer_world_size']}"
         )
 
     gradient_path = smoke_root / "phase2_gradient_audit.json"
@@ -310,6 +329,12 @@ def validate_phase2_smoke_output(
     if require_exact_resume:
         first_checkpoint = checkpoint_dir / "model_weights_step_00001.safetensors"
         first_bundle = validate_phase2_resume_bundle(first_checkpoint)
+        if first_bundle["distributed_optimizer_world_size"] != expected_processes:
+            raise RuntimeError(
+                "Phase 2 Stage A distributed optimizer world_size mismatch: "
+                f"expected={expected_processes}, "
+                f"actual={first_bundle['distributed_optimizer_world_size']}"
+            )
         resume_path = smoke_root / "phase2_resume_runtime_audit.json"
         resume_audit = _load_json_object(resume_path)
         required_resume_values = {
@@ -318,6 +343,9 @@ def validate_phase2_smoke_output(
             "sampler_task_schedule_cursor": 1,
             "sampler_microstep_in_optimizer_step": 0,
             "accelerator_state_restored": True,
+            "distributed_optimizer_state_restored": True,
+            "rng_state_restored": True,
+            "world_size": expected_processes,
             "scheduler_restored": True,
             "sampler_restored": True,
             "optimizer_groups_restored": True,
@@ -439,6 +467,16 @@ def validate_phase2_smoke_output(
         ),
         "accelerator_state_restored": (
             bool(resume_audit["accelerator_state_restored"])
+            if resume_audit is not None
+            else None
+        ),
+        "distributed_optimizer_state_restored": (
+            bool(resume_audit["distributed_optimizer_state_restored"])
+            if resume_audit is not None
+            else None
+        ),
+        "rng_state_restored": (
+            bool(resume_audit["rng_state_restored"])
             if resume_audit is not None
             else None
         ),
