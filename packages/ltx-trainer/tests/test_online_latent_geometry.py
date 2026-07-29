@@ -209,6 +209,11 @@ def test_online_prompt_features_materialize_before_trainable_connectors() -> Non
     assert audio.shape == (1, 3, 2)
     assert audio.device == encoder.device
     assert audio.dtype == encoder.dtype
+    assert feature_extractor.training is False
+    assert all(
+        not parameter.requires_grad
+        for parameter in feature_extractor.parameters()
+    )
     video_head = nn.Linear(video.shape[-1], 1)
     audio_head = nn.Linear(audio.shape[-1], 1)
     loss = video_head(video).square().mean() + audio_head(audio).square().mean()

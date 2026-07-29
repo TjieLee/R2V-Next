@@ -10,8 +10,8 @@ from pathlib import Path
 import typer
 
 from ltx_trainer.online_data.constants import VIDEO_NUM_FRAMES, VIDEO_TASK
-from ltx_trainer.online_data.media_decoder import probe_video
 from ltx_trainer.online_data.manifest_index import default_manifest_index_path, validate_manifest_index
+from ltx_trainer.online_data.media_decoder import probe_video
 from ltx_trainer.online_data.multitask_dataset import validate_manifest_record
 from ltx_trainer.online_data.path_safety import assert_write_path_allowed
 

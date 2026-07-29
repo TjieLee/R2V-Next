@@ -32,6 +32,9 @@ from ltx_trainer.online_inference.semantic_guidance import (
 )
 from ltx_trainer.training_strategies import get_training_strategy
 from ltx_trainer.training_strategies.semantic_flow import SemanticFlowStrategy
+from ltx_trainer.training_strategies.semantic_flow_bridge import (
+    validate_and_load_phase2_bridge_state,
+)
 
 if TYPE_CHECKING:
     from ltx_trainer.online_data.online_batch_encoder import OnlineBatchEncoder
@@ -346,7 +349,7 @@ class OnlineInferenceRuntime:
             num_inference_steps=num_inference_steps,
         )
 
-    def prepare_guidance_states(
+    def prepare_guidance_states(  # noqa: PLR0912, PLR0915
         self,
         encoded: dict[str, Any],
         *,
@@ -358,7 +361,7 @@ class OnlineInferenceRuntime:
         guidance: SemanticGuidanceConfig,
         negative_prompt: str | None,
     ) -> SemanticGuidanceStateBundle:
-        """Build and validate P/N/Q states with one shared generated-noise pair."""
+        """Build and validate active guidance states with shared generated noise."""
         self.last_generation_geometry = {}
         forbidden = {"target_pixels", "latents", "semantic_teacher_inputs", "evidence_tokens"}
         leaked = sorted(forbidden & encoded.keys())
@@ -388,8 +391,11 @@ class OnlineInferenceRuntime:
         positive_conditions = encoded.get("positive_conditions", encoded.get("conditions"))
         if positive_conditions is None:
             raise ValueError("Encoded inference bundle is missing positive conditions")
+        connected_positive_conditions = self.connector_conditions(
+            positive_conditions
+        )
         positive = self.strategy.prepare_inference_state(
-            conditions=self.connector_conditions(positive_conditions),
+            conditions=connected_positive_conditions,
             reference_latents=encoded["reference_latents"],
             target_shape=target_shape,
             semantic_frame_count=semantic_frames,
@@ -420,17 +426,38 @@ class OnlineInferenceRuntime:
                 target_noise=target_noise,
             )
 
+        no_ref_latents = None
+        if guidance.need_control_pair:
+            no_ref_latents = dict(encoded["reference_latents"])
+            no_ref_latents["ref_valid_mask"] = torch.zeros_like(
+                encoded["reference_latents"]["ref_valid_mask"],
+                dtype=torch.bool,
+            )
         negative = None
         if guidance.need_negative:
-            raw_negative = encoded.get("negative_conditions")
+            negative_condition_key = (
+                "negative_no_vlm_conditions"
+                if guidance.uses_no_vlm_negative
+                else "negative_conditions"
+            )
+            raw_negative = encoded.get(negative_condition_key)
             if raw_negative is None:
-                raise ValueError("CFG is enabled but negative conditions were not encoded")
+                branch_name = "N_I0" if guidance.uses_no_vlm_negative else "N"
+                raise ValueError(
+                    f"CFG is enabled but {branch_name} conditions were not encoded"
+                )
             if not str(negative_prompt or "").strip():
                 raise ValueError("CFG is enabled but the negative prompt is empty")
-            negative = branch_state(self.connector_conditions(raw_negative))
+            negative = branch_state(
+                self.connector_conditions(raw_negative),
+                reference_latents=no_ref_latents,
+            )
 
         no_reference = None
-        if guidance.need_reference:
+        no_latent_reference = None
+        empty_reference = None
+        empty_no_reference = None
+        if guidance.need_reference and guidance.uses_q_reference_comparison:
             raw_no_reference = encoded.get("no_reference_conditions")
             if raw_no_reference is None:
                 raise ValueError("Reference guidance is enabled but Q conditions were not encoded")
@@ -443,10 +470,38 @@ class OnlineInferenceRuntime:
                 self.connector_conditions(raw_no_reference),
                 reference_latents=no_ref_latents,
             )
+        elif guidance.need_reference and guidance.uses_ql_reference_comparison:
+            no_ref_latents = dict(encoded["reference_latents"])
+            no_ref_latents["ref_valid_mask"] = torch.zeros_like(
+                encoded["reference_latents"]["ref_valid_mask"],
+                dtype=torch.bool,
+            )
+            no_latent_reference = branch_state(
+                connected_positive_conditions,
+                reference_latents=no_ref_latents,
+            )
+        elif guidance.need_control_pair:
+            raw_empty_reference = encoded.get("empty_reference_conditions")
+            raw_empty_no_reference = encoded.get("empty_no_reference_conditions")
+            if raw_empty_reference is None or raw_empty_no_reference is None:
+                raise ValueError(
+                    "Debiased reference guidance is enabled but R/U conditions were not encoded"
+                )
+            assert no_ref_latents is not None
+            empty_reference = branch_state(
+                self.connector_conditions(raw_empty_reference),
+            )
+            empty_no_reference = branch_state(
+                self.connector_conditions(raw_empty_no_reference),
+                reference_latents=no_ref_latents,
+            )
         states = SemanticGuidanceStateBundle(
             positive=positive,
             negative=negative,
             no_reference=no_reference,
+            no_latent_reference=no_latent_reference,
+            empty_reference=empty_reference,
+            empty_no_reference=empty_no_reference,
         )
         self.strategy.validate_guidance_state_bundle(states, guidance)
 
@@ -530,6 +585,8 @@ def load_online_inference_runtime(
         state,
         checkpoint_metadata=audit["metadata"],
     )
+    if audit["metadata"].get("training_phase") == "phase2":
+        validate_and_load_phase2_bridge_state(embeddings_processor, state)
     transformer_state = {
         key: value
         for key, value in state.items()

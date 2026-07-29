@@ -21,7 +21,6 @@ from typing import Any
 
 import yaml
 
-
 ALLOWED_OUTPUT_ROOT = Path("/mnt/workspace/litengjie")
 DEFAULT_OUTPUT_ROOT = ALLOWED_OUTPUT_ROOT / "manifest_benchmark_v7_1"
 DEFAULT_BASELINE_REF = "2a6779e61c3ecb791f84144b2f2a4e8bb0e9cf6e"

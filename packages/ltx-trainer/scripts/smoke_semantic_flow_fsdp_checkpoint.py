@@ -24,9 +24,11 @@ from safetensors.torch import load_file, save_file
 from torch import nn
 from torch.distributed.fsdp import (
     FullStateDictConfig,
-    FullyShardedDataParallel as FSDP,
     ShardingStrategy,
     StateDictType,
+)
+from torch.distributed.fsdp import (
+    FullyShardedDataParallel as FSDP,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[3]

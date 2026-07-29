@@ -3,7 +3,9 @@ import hashlib
 import json
 import math
 import os
+import random
 import re
+import shutil
 import time
 import warnings
 from collections.abc import Iterator
@@ -11,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+import numpy as np
 import torch
 import wandb
 import yaml
@@ -53,13 +56,25 @@ from ltx_trainer.online_inference.checkpoint_runtime import (
     validate_reference_rope_checkpoint_metadata,
     validate_semantic_flow_checkpoint_architecture,
 )
+from ltx_trainer.online_inference.output_artifacts import atomic_write_json
 from ltx_trainer.online_inference.startup_memory import host_memory_snapshot
+from ltx_trainer.phase2_distributed_state import (
+    PHASE2_DISTRIBUTED_STATE_FORMAT_VERSION,
+    PHASE2_OPTIMIZER_GROUP_NAMES,
+    load_phase2_rank_state,
+    sha256_file,
+)
 from ltx_trainer.progress import TrainingProgress
 from ltx_trainer.quantization import quantize_model
 from ltx_trainer.sigma_tracker import SigmaBucketTracker
 from ltx_trainer.timestep_samplers import SAMPLERS
 from ltx_trainer.training_state import ConfigFingerprint, RngStates, TrainingState
 from ltx_trainer.training_strategies import get_training_strategy
+from ltx_trainer.training_strategies.semantic_flow_bridge import (
+    phase2_bridge_audit_rows,
+    phase2_bridge_parameters,
+    validate_and_load_phase2_bridge_state,
+)
 from ltx_trainer.validation_runner import ValidationRunner
 
 # Disable irrelevant warnings from transformers
@@ -80,6 +95,11 @@ if not IS_MAIN_PROCESS:
 StepCallback = Callable[[int, int, list[Path]], None]  # (step, total, list[sampled_video_path]) -> None
 
 MEMORY_CHECK_INTERVAL = 200
+PHASE2_ADAM_MOMENT_KEYS = (
+    "exp_avg",
+    "exp_avg_sq",
+    "max_exp_avg_sq",
+)
 
 
 def _normalize_fsdp_config_value(value: Any) -> str | None:
@@ -214,8 +234,18 @@ class LtxvTrainer:
         self._pending_online_data_state: dict[str, Any] | None = None
         self._resume_initial_step = 0
         self._last_online_metrics: dict[str, float] = {}
-        self._capture_gradient_audit = False
-        self._last_gradient_audit_by_parameter_id: dict[int, dict[str, bool]] = {}
+        self._embeddings_processor_trainable_modules: dict[str, nn.Module] = {}
+        self._optimizer_group_parameter_counts: dict[str, int] = {}
+        self._phase2_optimizer_parameter_names: dict[int, str] = {}
+        self._last_optimizer_group_metrics: dict[str, float] = {}
+        self._last_phase2_accelerator_state_path: Path | None = None
+        self._last_bridge_checkpoint_key_count = 0
+        self._phase2_runtime_trainability_checked = False
+        self._phase2_smoke_audit_enabled = False
+        self._phase2_gradient_audit_completed = False
+        self._phase2_accelerator_state_restored = False
+        self._phase2_distributed_optimizer_state_restored = False
+        self._phase2_rng_state_restored = False
         if IS_MAIN_PROCESS:
             print_config(trainer_config)
         self._training_strategy = get_training_strategy(self._config.training_strategy)
@@ -254,6 +284,7 @@ class LtxvTrainer:
         disable_progress_bars: bool = False,
         step_callback: StepCallback | None = None,
         finalize_accelerator: bool = True,
+        stop_after_global_step: int | None = None,
     ) -> tuple[Path | None, TrainingStats]:
         """
         Start the training process.
@@ -262,6 +293,8 @@ class LtxvTrainer:
             step_callback: Optional callback invoked after each optimization step.
             finalize_accelerator: End trackers/process groups before returning. Smoke callers may defer this
                 until their final distributed audits have completed.
+            stop_after_global_step: Optional runtime-only stop boundary. This does not
+                change the configured training target, scheduler, sampler, or checkpoint metadata.
         Returns:
             Tuple of (saved_model_path, training_stats)
         """
@@ -279,7 +312,9 @@ class LtxvTrainer:
 
         self._init_optimizer()
 
-        if training_state is not None and not self._restore_training_state(training_state):
+        if training_state is not None and self._is_semantic_flow_phase2():
+            self._restore_phase2_accelerator_state(training_state)
+        elif training_state is not None and not self._restore_training_state(training_state):
             initial_step = 0
             resuming = False
 
@@ -298,21 +333,39 @@ class LtxvTrainer:
         self._accelerator.wait_for_everyone()
 
         Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
+        if training_state is not None and self._is_semantic_flow_phase2():
+            self._write_phase2_resume_runtime_audit(training_state)
 
         # Save the training configuration as YAML
         self._save_config()
 
-        remaining_steps = cfg.optimization.steps - initial_step
+        run_target_step = (
+            min(cfg.optimization.steps, stop_after_global_step)
+            if stop_after_global_step is not None
+            else cfg.optimization.steps
+        )
+        if stop_after_global_step is not None and stop_after_global_step <= 0:
+            raise ValueError("stop_after_global_step must be positive")
+        remaining_steps = run_target_step - initial_step
         if remaining_steps <= 0:
             raise ValueError(
                 f"No remaining training steps: initial_step={initial_step} >= "
-                f"target_steps={cfg.optimization.steps}. Nothing to train."
+                f"run_target_step={run_target_step}. Nothing to train."
             )
 
         if resuming:
-            logger.info(f"🚀 Resuming training from step {initial_step} → {cfg.optimization.steps}")
+            logger.info(
+                f"🚀 Resuming training from step {initial_step} → {run_target_step} "
+                f"(configured target: {cfg.optimization.steps})"
+            )
         else:
             logger.info("🚀 Starting training...")
+        if run_target_step != cfg.optimization.steps:
+            logger.info(
+                "Runtime stop enabled at global step %d; configured training target remains %d",
+                run_target_step,
+                cfg.optimization.steps,
+            )
 
         # Create progress tracking (disabled for non-main processes or when explicitly disabled)
         progress_enabled = IS_MAIN_PROCESS and not disable_progress_bars
@@ -351,7 +404,7 @@ class LtxvTrainer:
             self._accelerator.wait_for_everyone()
 
             micro_step = 0
-            while self._global_step < cfg.optimization.steps:
+            while self._global_step < run_target_step:
                 # Get next batch, reset the dataloader if needed
                 try:
                     data_wait_started = time.perf_counter()
@@ -361,7 +414,14 @@ class LtxvTrainer:
                     batch = next(data_iter)
                 data_wait_ms = (time.perf_counter() - data_wait_started) * 1000.0
                 if cfg.data.encoding_mode == "online":
+                    self._assert_phase2_optimizer_moments_on_cpu(
+                        context="online encoding",
+                    )
+                    self._log_phase2_gpu_allocated(
+                        "GPU allocated before online encode",
+                    )
                     batch = self._prepare_online_batch_with_retry(batch)
+                    self._validate_phase2_runtime_trainability_once()
                     batch.setdefault("_online_metrics", {})["data_wait_ms"] = data_wait_ms
 
                 step_start_time = time.time()
@@ -377,26 +437,55 @@ class LtxvTrainer:
                         self._last_online_metrics["backward_ms"] = (
                             time.perf_counter() - backward_started
                         ) * 1000.0
+                    if self._accelerator.sync_gradients:
+                        self._run_phase2_gradient_audit_once()
 
                     optimizer_started = time.perf_counter()
+                    if self._accelerator.sync_gradients:
+                        self._last_optimizer_group_metrics = self._optimizer_group_metrics()
                     if self._accelerator.sync_gradients and cfg.optimization.max_grad_norm > 0:
                         self._accelerator.clip_grad_norm_(
                             self._trainable_params,
                             cfg.optimization.max_grad_norm,
                         )
 
-                    if self._accelerator.sync_gradients and self._capture_gradient_audit:
-                        self._last_gradient_audit_by_parameter_id = {
-                            id(parameter): {
-                                "finite": bool(torch.isfinite(parameter.grad).all()),
-                                "nonzero": bool(torch.count_nonzero(parameter.grad).item()),
-                            }
-                            for parameter in self._trainable_params
-                            if parameter.grad is not None
-                        }
-
-                    self._optimizer.step()
-                    self._optimizer.zero_grad()
+                    phase2_real_optimizer_step = (
+                        self._accelerator.sync_gradients
+                        and self._phase2_optimizer_state_cpu_offload_enabled()
+                    )
+                    if phase2_real_optimizer_step:
+                        moved_bytes = (
+                            self._move_phase2_optimizer_moments_to_parameter_devices()
+                        )
+                        if self._accelerator.is_main_process:
+                            logger.info(
+                                "Phase 2 optimizer state moved to CUDA: %.2f GiB",
+                                moved_bytes / (1024**3),
+                            )
+                        self._log_phase2_gpu_allocated(
+                            "GPU allocated before optimizer step",
+                        )
+                        self._audit_phase2_optimizer_pre_step_compatibility()
+                    try:
+                        self._optimizer.step()
+                        self._optimizer.zero_grad()
+                    finally:
+                        if phase2_real_optimizer_step:
+                            offloaded_bytes = (
+                                self._offload_phase2_optimizer_state_to_cpu()
+                            )
+                            cuda_device = self._accelerator_cuda_device()
+                            if cuda_device is not None:
+                                torch.cuda.synchronize(cuda_device)
+                                torch.cuda.empty_cache()
+                            if self._accelerator.is_main_process:
+                                logger.info(
+                                    "Phase 2 optimizer state offloaded to CPU: %.2f GiB",
+                                    offloaded_bytes / (1024**3),
+                                )
+                            self._log_phase2_gpu_allocated(
+                                "GPU allocated after optimizer offload",
+                            )
 
                     self._step_lr_scheduler(
                         self._lr_scheduler,
@@ -473,6 +562,7 @@ class LtxvTrainer:
                             "train/global_step": self._global_step,
                         }
                         metrics.update(strategy_metrics)
+                        metrics.update(self._last_optimizer_group_metrics)
                         metrics.update(
                             {f"train/{name}": value for name, value in self._last_online_metrics.items()}
                         )
@@ -653,7 +743,7 @@ class LtxvTrainer:
 
         # Accelerator is initialized before model loading, so every rank resolves to its
         # assigned device before Gemma, VAE, and connector weights are materialized.
-        init_device = self._accelerator.device if torch.cuda.is_available() else torch.device("cpu")
+        init_device = self._accelerator_cuda_device() or torch.device("cpu")
 
         logger.debug("Loading embeddings processor...")
         self._embeddings_processor = load_embeddings_processor(
@@ -757,7 +847,30 @@ class LtxvTrainer:
 
         self._embeddings_processor.requires_grad_(False)
         if self._train_embeddings_processor:
-            self._embeddings_processor.video_connector.requires_grad_(True)
+            configure_processor = getattr(
+                self._training_strategy,
+                "configure_embeddings_processor_trainability",
+                None,
+            )
+            if callable(configure_processor):
+                configure_processor(self._embeddings_processor)
+            else:
+                self._embeddings_processor.video_connector.requires_grad_(True)
+            get_processor_modules = getattr(
+                self._training_strategy,
+                "get_embeddings_processor_trainable_modules",
+                None,
+            )
+            if callable(get_processor_modules):
+                self._embeddings_processor_trainable_modules = get_processor_modules(
+                    self._embeddings_processor
+                )
+            else:
+                self._embeddings_processor_trainable_modules = {
+                    "video_connector": self._embeddings_processor.video_connector
+                }
+            if not self._embeddings_processor_trainable_modules:
+                raise RuntimeError("Embedding-processor training resolved to zero modules")
         if self._text_encoder is not None and not self._train_text_encoder:
             self._text_encoder.requires_grad_(False)
 
@@ -767,7 +880,8 @@ class LtxvTrainer:
 
         candidate_params = [p for p in self._transformer.parameters() if p.requires_grad]
         if self._train_embeddings_processor:
-            candidate_params.extend(p for p in self._embeddings_processor.parameters() if p.requires_grad)
+            for module in self._embeddings_processor_trainable_modules.values():
+                candidate_params.extend(p for p in module.parameters() if p.requires_grad)
         if self._train_text_encoder:
             if self._text_encoder is None:
                 raise ValueError("Training strategy requested text encoder training, but no text encoder was loaded.")
@@ -781,7 +895,1102 @@ class LtxvTrainer:
             raise ValueError("No trainable parameters were found for the selected training strategy.")
 
         logger.debug(f"Trainable params count: {sum(p.numel() for p in self._trainable_params):,}")
+        self._validate_phase2_trainability(strategy_modules)
+        self._write_phase2_parameter_audit(strategy_modules)
         self._log_parameter_summary(strategy_modules)
+
+    def _is_semantic_flow_phase2(self) -> bool:
+        strategy_config = getattr(self._training_strategy, "config", None)
+        return getattr(strategy_config, "training_phase", "phase1") == "phase2"
+
+    def _phase2_optimizer_state_cpu_offload_enabled(self) -> bool:
+        data_config = getattr(self._config, "data", None)
+        optimization_config = getattr(self._config, "optimization", None)
+        return (
+            self._is_semantic_flow_phase2()
+            and getattr(data_config, "encoding_mode", None) == "online"
+            and getattr(self._accelerator, "distributed_type", None)
+            == DistributedType.FSDP
+            and getattr(optimization_config, "optimizer_type", None) == "adamw"
+        )
+
+    def _accelerator_cuda_device(self) -> torch.device | None:
+        if not torch.cuda.is_available():
+            return None
+        device = getattr(self._accelerator, "device", None)
+        try:
+            device = torch.device(device)
+        except (TypeError, RuntimeError):
+            return None
+        return device if device.type == "cuda" else None
+
+    def _iter_phase2_optimizer_moments(
+        self,
+    ) -> Iterator[tuple[Tensor, dict[str, Any], str, Tensor]]:
+        for parameter, state in self._optimizer.state.items():
+            if not isinstance(parameter, Tensor) or not isinstance(state, dict):
+                continue
+            for key in PHASE2_ADAM_MOMENT_KEYS:
+                value = state.get(key)
+                if isinstance(value, Tensor):
+                    yield parameter, state, key, value
+
+    def _phase2_optimizer_moment_residency(self) -> str:
+        device_types = {
+            value.device.type
+            for _, _, _, value in self._iter_phase2_optimizer_moments()
+        }
+        if not device_types:
+            return "empty"
+        if len(device_types) == 1:
+            return next(iter(device_types))
+        return "mixed"
+
+    @staticmethod
+    def _iter_state_tensors(value: object) -> Iterator[Tensor]:
+        if isinstance(value, Tensor):
+            yield value
+        elif isinstance(value, dict):
+            for item in value.values():
+                yield from LtxvTrainer._iter_state_tensors(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                yield from LtxvTrainer._iter_state_tensors(item)
+
+    def _assert_phase2_optimizer_moments_on_cpu(self, *, context: str) -> None:
+        if not self._phase2_optimizer_state_cpu_offload_enabled():
+            return
+        residency = self._phase2_optimizer_moment_residency()
+        if residency not in {"cpu", "empty"}:
+            raise RuntimeError(
+                "Phase 2 optimizer moments must reside on CPU outside a real "
+                f"optimizer step; found residency={residency!r} before {context}"
+            )
+
+    @staticmethod
+    def _phase2_optimizer_tensor_description(value: object) -> str:
+        if isinstance(value, Tensor):
+            scalar_value = (
+                f", value={value.detach().item()!r}"
+                if value.numel() == 1
+                else ""
+            )
+            finite = (
+                bool(torch.isfinite(value).all())
+                if value.numel() <= 1
+                else "not_checked"
+            )
+            return (
+                f"device={value.device}, dtype={value.dtype}, "
+                f"shape={tuple(value.shape)}, finite={finite}{scalar_value}"
+            )
+        return f"type={type(value).__name__}, value={value!r}"
+
+    def _phase2_optimizer_contract_error(
+        self,
+        *,
+        parameter: Tensor,
+        group: dict[str, Any],
+        state: dict[str, Any],
+        reason: str,
+    ) -> RuntimeError:
+        parameter_name = self._phase2_optimizer_parameter_names.get(
+            id(parameter),
+            f"<parameter:{id(parameter)}>",
+        )
+        gradient = parameter.grad
+        state_details = ", ".join(
+            f"{key}=({self._phase2_optimizer_tensor_description(state.get(key))})"
+            for key in (*PHASE2_ADAM_MOMENT_KEYS, "step")
+        )
+        return RuntimeError(
+            "Phase 2 optimizer pre-step compatibility failed: "
+            f"{reason}; canonical_name={parameter_name!r}; "
+            f"group={str(group.get('name', ''))!r}; "
+            f"parameter=(device={parameter.device}, dtype={parameter.dtype}, "
+            f"shape={tuple(parameter.shape)}); "
+            f"gradient=({self._phase2_optimizer_tensor_description(gradient)}); "
+            f"{state_details}"
+        )
+
+    def _iter_phase2_optimizer_parameter_states(
+        self,
+    ) -> Iterator[tuple[dict[str, Any], Tensor, dict[str, Any]]]:
+        for group in self._optimizer.param_groups:
+            for parameter in group["params"]:
+                if not isinstance(parameter, Tensor):
+                    continue
+                state = self._optimizer.state.get(parameter)
+                if state is None:
+                    state = {}
+                if not isinstance(state, dict):
+                    raise RuntimeError(
+                        "Phase 2 optimizer state must be a dictionary for "
+                        f"parameter id={id(parameter)}"
+                    )
+                yield group, parameter, state
+
+    def _normalize_phase2_adam_step(
+        self,
+        *,
+        parameter: Tensor,
+        group: dict[str, Any],
+        state: dict[str, Any],
+    ) -> None:
+        if not state:
+            return
+        if bool(group.get("capturable", False)) or bool(
+            group.get("fused", False)
+        ):
+            raise self._phase2_optimizer_contract_error(
+                parameter=parameter,
+                group=group,
+                state=state,
+                reason=(
+                    "CPU-offloaded Phase 2 AdamW does not support "
+                    "capturable=True or fused=True"
+                ),
+            )
+        step = state.get("step")
+        step_value = self._phase2_optimizer_step_value(step)
+        if step_value is None:
+            raise self._phase2_optimizer_contract_error(
+                parameter=parameter,
+                group=group,
+                state=state,
+                reason="Adam step must be finite and contain exactly one value",
+            )
+        state["step"] = torch.tensor(
+            step_value,
+            dtype=torch.float32,
+            device="cpu",
+        )
+
+    def _normalize_phase2_adam_moments(
+        self,
+        *,
+        parameter: Tensor,
+        group: dict[str, Any],
+        state: dict[str, Any],
+        device: torch.device,
+    ) -> int:
+        if not state:
+            return 0
+        self._normalize_phase2_adam_step(
+            parameter=parameter,
+            group=group,
+            state=state,
+        )
+        required_keys = {"exp_avg", "exp_avg_sq"}
+        if bool(group.get("amsgrad", False)):
+            required_keys.add("max_exp_avg_sq")
+        converted_bytes = 0
+        for key in PHASE2_ADAM_MOMENT_KEYS:
+            value = state.get(key)
+            if value is None and key not in required_keys:
+                continue
+            if not isinstance(value, Tensor):
+                raise self._phase2_optimizer_contract_error(
+                    parameter=parameter,
+                    group=group,
+                    state=state,
+                    reason=f"Adam moment {key!r} is missing or is not a tensor",
+                )
+            if value.shape != parameter.shape:
+                raise self._phase2_optimizer_contract_error(
+                    parameter=parameter,
+                    group=group,
+                    state=state,
+                    reason=(
+                        f"Adam moment {key!r} shape {tuple(value.shape)} does "
+                        f"not match parameter shape {tuple(parameter.shape)}"
+                    ),
+                )
+            if value.device != device or value.dtype != parameter.dtype:
+                converted_bytes += value.numel() * value.element_size()
+                state[key] = value.to(
+                    device=device,
+                    dtype=parameter.dtype,
+                )
+            normalized = state[key]
+            if (
+                normalized.device != device
+                or normalized.dtype != parameter.dtype
+                or normalized.shape != parameter.shape
+            ):
+                raise self._phase2_optimizer_contract_error(
+                    parameter=parameter,
+                    group=group,
+                    state=state,
+                    reason=f"Adam moment {key!r} normalization failed",
+                )
+        return converted_bytes
+
+    def _move_phase2_optimizer_moments_to_parameter_devices(self) -> int:
+        if not self._phase2_optimizer_state_cpu_offload_enabled():
+            return 0
+        moved_bytes = 0
+        for group, parameter, state in self._iter_phase2_optimizer_parameter_states():
+            moved_bytes += self._normalize_phase2_adam_moments(
+                parameter=parameter,
+                group=group,
+                state=state,
+                device=parameter.device,
+            )
+        return moved_bytes
+
+    def _offload_phase2_optimizer_state_to_cpu(self) -> int:
+        if not self._phase2_optimizer_state_cpu_offload_enabled():
+            return 0
+        offloaded_bytes = 0
+        cpu_device = torch.device("cpu")
+        for group, parameter, state in self._iter_phase2_optimizer_parameter_states():
+            offloaded_bytes += self._normalize_phase2_adam_moments(
+                parameter=parameter,
+                group=group,
+                state=state,
+                device=cpu_device,
+            )
+        return offloaded_bytes
+
+    def _audit_phase2_optimizer_pre_step_compatibility(self) -> None:
+        if not self._phase2_optimizer_state_cpu_offload_enabled():
+            return
+        for group, parameter, state in self._iter_phase2_optimizer_parameter_states():
+            gradient = parameter.grad
+            if gradient is None:
+                continue
+            if (
+                gradient.device != parameter.device
+                or gradient.dtype != parameter.dtype
+                or gradient.shape != parameter.shape
+            ):
+                raise self._phase2_optimizer_contract_error(
+                    parameter=parameter,
+                    group=group,
+                    state=state,
+                    reason="gradient device, dtype, or shape does not match parameter",
+                )
+            if not state:
+                continue
+            required_keys = {"exp_avg", "exp_avg_sq"}
+            if bool(group.get("amsgrad", False)):
+                required_keys.add("max_exp_avg_sq")
+            for key in PHASE2_ADAM_MOMENT_KEYS:
+                moment = state.get(key)
+                if moment is None and key not in required_keys:
+                    continue
+                if (
+                    not isinstance(moment, Tensor)
+                    or moment.device != parameter.device
+                    or moment.dtype != parameter.dtype
+                    or moment.shape != parameter.shape
+                ):
+                    raise self._phase2_optimizer_contract_error(
+                        parameter=parameter,
+                        group=group,
+                        state=state,
+                        reason=(
+                            f"Adam moment {key!r} is incompatible with parameter"
+                        ),
+                    )
+            step = state.get("step")
+            if (
+                not isinstance(step, Tensor)
+                or step.numel() != 1
+                or not bool(torch.isfinite(step).all())
+                or step.device.type != "cpu"
+                or step.dtype not in {torch.float32, torch.float64}
+            ):
+                raise self._phase2_optimizer_contract_error(
+                    parameter=parameter,
+                    group=group,
+                    state=state,
+                    reason="Adam step is incompatible with foreach AdamW",
+                )
+
+    def _log_phase2_gpu_allocated(self, label: str) -> None:
+        if (
+            not self._phase2_optimizer_state_cpu_offload_enabled()
+            or not self._accelerator.is_main_process
+        ):
+            return
+        cuda_device = self._accelerator_cuda_device()
+        if cuda_device is None:
+            return
+        allocated_bytes = torch.cuda.memory_allocated(cuda_device)
+        logger.info("%s: %.2f GiB", label, allocated_bytes / (1024**3))
+
+    def enable_phase2_smoke_audit(self) -> None:
+        if not self._is_semantic_flow_phase2():
+            raise RuntimeError("Phase 2 smoke gradient audit requires semantic_flow phase2")
+        self._phase2_smoke_audit_enabled = True
+
+    def _distributed_parameter_gradient_record(
+        self,
+        parameter: Tensor,
+    ) -> dict[str, bool | float]:
+        gradient = parameter.grad
+        has_local_gradient = gradient is not None and gradient.numel() > 0
+        local_finite = (
+            bool(torch.isfinite(gradient).all())
+            if has_local_gradient
+            else True
+        )
+        local_nonzero = (
+            bool(torch.count_nonzero(gradient).item())
+            if has_local_gradient
+            else False
+        )
+        local_gradient_square = (
+            gradient.detach().float().square().sum()
+            if has_local_gradient
+            else torch.zeros((), device=self._accelerator.device)
+        )
+        local_parameter_square = (
+            parameter.detach().float().square().sum()
+            if parameter.numel()
+            else torch.zeros((), device=self._accelerator.device)
+        )
+        flags = torch.tensor(
+            [
+                float(parameter.requires_grad),
+                float(has_local_gradient),
+                float(local_finite),
+                float(local_nonzero),
+            ],
+            device=self._accelerator.device,
+            dtype=torch.float32,
+        )
+        reduced_flags = self._accelerator.reduce(flags, reduction="sum")
+        reduced_gradient_square = self._accelerator.reduce(
+            local_gradient_square,
+            reduction="sum",
+        )
+        reduced_parameter_square = self._accelerator.reduce(
+            local_parameter_square,
+            reduction="sum",
+        )
+        world_size = int(self._accelerator.num_processes)
+        return {
+            "requires_grad": int(reduced_flags[0].item()) == world_size,
+            "grad_exists": bool(reduced_flags[1].item() > 0),
+            "grad_finite": int(reduced_flags[2].item()) == world_size,
+            "grad_nonzero": bool(reduced_flags[3].item() > 0),
+            "grad_norm": float(reduced_gradient_square.sqrt().item()),
+            "parameter_norm": float(reduced_parameter_square.sqrt().item()),
+        }
+
+    def _distributed_module_has_gradient(self, module: nn.Module | None) -> bool:
+        local_has_gradient = bool(
+            module is not None
+            and any(
+                parameter.grad is not None and parameter.grad.numel() > 0
+                for parameter in module.parameters()
+            )
+        )
+        value = torch.tensor(
+            float(local_has_gradient),
+            device=self._accelerator.device,
+        )
+        reduced = self._accelerator.reduce(value, reduction="sum")
+        return bool(reduced.item() > 0)
+
+    def _run_phase2_gradient_audit_once(self) -> None:
+        if (
+            not self._phase2_smoke_audit_enabled
+            or self._phase2_gradient_audit_completed
+        ):
+            return
+        if not self._is_semantic_flow_phase2():
+            raise RuntimeError("Phase 2 gradient audit reached a non-Phase 2 trainer")
+
+        bridge = phase2_bridge_parameters(self._embeddings_processor)
+        records = {
+            item.name: self._distributed_parameter_gradient_record(item.parameter)
+            for item in bridge
+        }
+        projection_names = [
+            name
+            for name in records
+            if name.startswith("feature_extractor.video_aggregate_embed.")
+            or name.startswith("feature_extractor.aggregate_embed.")
+        ]
+        register_name = "video_connector.learnable_registers"
+        errors: list[str] = []
+        missing_or_nonfinite = [
+            name
+            for name, record in records.items()
+            if not record["requires_grad"]
+            or not record["grad_exists"]
+            or not record["grad_finite"]
+        ]
+        if missing_or_nonfinite:
+            errors.append(
+                "bridge gradients missing, frozen, or non-finite: "
+                f"{missing_or_nonfinite[:20]}"
+            )
+        if not projection_names or not any(
+            bool(records[name]["grad_nonzero"])
+            for name in projection_names
+        ):
+            errors.append("video_aggregate_embed has no nonzero gradient")
+        if register_name not in records:
+            errors.append(f"missing required bridge parameter {register_name}")
+        elif not records[register_name]["grad_nonzero"]:
+            errors.append("video_connector.learnable_registers has zero gradient")
+
+        frozen_modules = {
+            "text_encoder": self._text_encoder,
+            "vae_encoder": self._online_vae_encoder,
+            "audio_connector": getattr(
+                self._embeddings_processor,
+                "audio_connector",
+                None,
+            ),
+        }
+        frozen_gradients = {
+            name: self._distributed_module_has_gradient(module)
+            for name, module in frozen_modules.items()
+        }
+        unexpected_frozen_gradients = [
+            name
+            for name, has_gradient in frozen_gradients.items()
+            if has_gradient
+        ]
+        if unexpected_frozen_gradients:
+            errors.append(
+                "frozen modules received gradients: "
+                f"{unexpected_frozen_gradients}"
+            )
+
+        optimizer_groups = [
+            {
+                "name": str(group.get("name", "")),
+                "learning_rate": float(group["lr"]),
+                "parameter_count": len(group["params"]),
+            }
+            for group in self._optimizer.param_groups
+        ]
+        group_names = [group["name"] for group in optimizer_groups]
+        if group_names != ["dit_semantic", "conditioning_bridge"]:
+            errors.append(f"invalid optimizer groups: {group_names}")
+        group_parameter_ids = [
+            {id(parameter) for parameter in group["params"]}
+            for group in self._optimizer.param_groups
+        ]
+        if len(group_parameter_ids) != 2 or group_parameter_ids[0] & group_parameter_ids[1]:
+            errors.append("optimizer parameter groups overlap")
+        expected_lrs = [
+            float(self._config.optimization.learning_rate),
+            float(
+                self._config.optimization.bridge_learning_rate
+                or self._config.optimization.learning_rate
+            ),
+        ]
+        actual_lrs = [float(group["lr"]) for group in self._optimizer.param_groups]
+        if actual_lrs != expected_lrs:
+            errors.append(
+                f"optimizer learning rates differ: expected={expected_lrs}, actual={actual_lrs}"
+            )
+
+        report = {
+            "global_step": int(self._global_step),
+            "world_size": int(self._accelerator.num_processes),
+            "parameters": records,
+            "frozen_module_gradients": frozen_gradients,
+            "optimizer_groups": optimizer_groups,
+            "errors": errors,
+            "passed": not errors,
+        }
+        if self._accelerator.is_main_process:
+            atomic_write_json(
+                Path(self._config.output_dir) / "phase2_gradient_audit.json",
+                report,
+            )
+        self._accelerator.wait_for_everyone()
+        if errors:
+            raise RuntimeError("Phase 2 smoke gradient audit failed: " + "; ".join(errors))
+        self._phase2_gradient_audit_completed = True
+
+    @staticmethod
+    def _phase2_optimizer_step_value(value: Any) -> float | None:
+        if isinstance(value, Tensor):
+            if value.numel() != 1:
+                return None
+            value = float(value.detach().item())
+        elif isinstance(value, (int, float)):
+            value = float(value)
+        else:
+            return None
+        return value if math.isfinite(value) else None
+
+    @staticmethod
+    def _scheduler_last_epoch(lr_scheduler: Any | None) -> int:
+        if lr_scheduler is None:
+            return -1
+        try:
+            state = lr_scheduler.state_dict()
+        except Exception:
+            state = None
+        if isinstance(state, dict) and "last_epoch" in state:
+            try:
+                return int(state["last_epoch"])
+            except (TypeError, ValueError):
+                pass
+        scheduler = getattr(lr_scheduler, "scheduler", lr_scheduler)
+        try:
+            return int(getattr(scheduler, "last_epoch"))
+        except (AttributeError, TypeError, ValueError):
+            return -1
+
+    def _phase2_optimizer_state_audit(
+        self,
+        *,
+        expected_step: int,
+    ) -> dict[str, Any]:
+        expected_group_names = ["dit_semantic", "conditioning_bridge"]
+        actual_group_names = [
+            str(group.get("name", ""))
+            for group in self._optimizer.param_groups
+        ]
+        errors: list[str] = []
+        if actual_group_names != expected_group_names:
+            errors.append(
+                f"optimizer groups are invalid: {actual_group_names}"
+            )
+
+        groups: dict[str, dict[str, Any]] = {}
+        world_size = int(self._accelerator.num_processes)
+        for expected_group_name in expected_group_names:
+            matching_groups = [
+                group
+                for group in self._optimizer.param_groups
+                if str(group.get("name", "")) == expected_group_name
+            ]
+            if len(matching_groups) != 1:
+                errors.append(
+                    f"optimizer group {expected_group_name!r} is missing or duplicated"
+                )
+                continue
+            group = matching_groups[0]
+            local_parameter_count = len(group["params"])
+            local_parameters_with_state = 0
+            local_parameters_with_exp_avg = 0
+            local_parameters_with_exp_avg_sq = 0
+            local_parameters_with_step = 0
+            local_exp_avg_finite = True
+            local_exp_avg_sq_finite = True
+            local_steps: list[float] = []
+            local_projection_state_restored = False
+            local_registers_state_restored = False
+
+            for parameter in group["params"]:
+                state = self._optimizer.state.get(parameter)
+                has_state = isinstance(state, dict) and bool(state)
+                if not has_state:
+                    continue
+                local_parameters_with_state += 1
+                exp_avg = state.get("exp_avg")
+                exp_avg_sq = state.get("exp_avg_sq")
+                has_exp_avg = isinstance(exp_avg, Tensor)
+                has_exp_avg_sq = isinstance(exp_avg_sq, Tensor)
+                if has_exp_avg:
+                    local_parameters_with_exp_avg += 1
+                    local_exp_avg_finite = (
+                        local_exp_avg_finite
+                        and bool(torch.isfinite(exp_avg).all())
+                    )
+                if has_exp_avg_sq:
+                    local_parameters_with_exp_avg_sq += 1
+                    local_exp_avg_sq_finite = (
+                        local_exp_avg_sq_finite
+                        and bool(torch.isfinite(exp_avg_sq).all())
+                    )
+                state_step = self._phase2_optimizer_step_value(
+                    state.get("step")
+                )
+                if state_step is not None:
+                    local_parameters_with_step += 1
+                    local_steps.append(state_step)
+
+                parameter_name = self._phase2_optimizer_parameter_names.get(
+                    id(parameter),
+                    "",
+                )
+                full_state_restored = (
+                    has_exp_avg
+                    and has_exp_avg_sq
+                    and state_step is not None
+                    and bool(torch.isfinite(exp_avg).all())
+                    and bool(torch.isfinite(exp_avg_sq).all())
+                )
+                if (
+                    parameter_name.startswith(
+                        "feature_extractor.video_aggregate_embed."
+                    )
+                    or parameter_name.startswith(
+                        "feature_extractor.aggregate_embed."
+                    )
+                ):
+                    local_projection_state_restored = (
+                        local_projection_state_restored
+                        or full_state_restored
+                    )
+                if parameter_name == "video_connector.learnable_registers":
+                    local_registers_state_restored = (
+                        local_registers_state_restored
+                        or full_state_restored
+                    )
+
+            local_counts = torch.tensor(
+                [
+                    local_parameter_count,
+                    local_parameters_with_state,
+                    local_parameters_with_exp_avg,
+                    local_parameters_with_exp_avg_sq,
+                    local_parameters_with_step,
+                    int(local_exp_avg_finite),
+                    int(local_exp_avg_sq_finite),
+                    int(local_projection_state_restored),
+                    int(local_registers_state_restored),
+                ],
+                dtype=torch.int64,
+                device=self._accelerator.device,
+            )
+            reduced_counts = self._accelerator.reduce(
+                local_counts,
+                reduction="sum",
+            )
+            local_step_summary = torch.tensor(
+                [
+                    len(local_steps),
+                    min(local_steps) if local_steps else 0.0,
+                    max(local_steps) if local_steps else 0.0,
+                ],
+                dtype=torch.float64,
+                device=self._accelerator.device,
+            )
+            gathered_step_summaries = self._accelerator.gather(
+                local_step_summary
+            ).reshape(-1, 3)
+            step_rows = [
+                row
+                for row in gathered_step_summaries
+                if int(row[0].item()) > 0
+            ]
+            state_step_min = (
+                min(float(row[1].item()) for row in step_rows)
+                if step_rows
+                else None
+            )
+            state_step_max = (
+                max(float(row[2].item()) for row in step_rows)
+                if step_rows
+                else None
+            )
+            record = {
+                "parameter_count": int(reduced_counts[0].item()),
+                "parameters_with_state": int(reduced_counts[1].item()),
+                "parameters_with_exp_avg": int(reduced_counts[2].item()),
+                "parameters_with_exp_avg_sq": int(reduced_counts[3].item()),
+                "parameters_with_step": int(reduced_counts[4].item()),
+                "exp_avg_finite": int(reduced_counts[5].item())
+                == world_size,
+                "exp_avg_sq_finite": int(reduced_counts[6].item())
+                == world_size,
+                "state_step_min": state_step_min,
+                "state_step_max": state_step_max,
+            }
+            if expected_group_name == "conditioning_bridge":
+                record.update(
+                    {
+                        "video_projection_state_restored": bool(
+                            reduced_counts[7].item() > 0
+                        ),
+                        "learnable_registers_state_restored": bool(
+                            reduced_counts[8].item() > 0
+                        ),
+                    }
+                )
+            groups[expected_group_name] = record
+
+            state_count = int(record["parameters_with_state"])
+            exp_avg_count = int(record["parameters_with_exp_avg"])
+            exp_avg_sq_count = int(record["parameters_with_exp_avg_sq"])
+            step_count = int(record["parameters_with_step"])
+            if state_count <= 0:
+                errors.append(
+                    f"optimizer group {expected_group_name} has no Adam state"
+                )
+            if exp_avg_count <= 0 or exp_avg_count != state_count:
+                errors.append(
+                    f"optimizer group {expected_group_name} has missing exp_avg"
+                )
+            if exp_avg_sq_count <= 0 or exp_avg_sq_count != state_count:
+                errors.append(
+                    f"optimizer group {expected_group_name} has missing exp_avg_sq"
+                )
+            if step_count != state_count:
+                errors.append(
+                    f"optimizer group {expected_group_name} has missing or invalid state step"
+                )
+            if record["exp_avg_finite"] is not True:
+                errors.append(
+                    f"optimizer group {expected_group_name} has non-finite exp_avg"
+                )
+            if record["exp_avg_sq_finite"] is not True:
+                errors.append(
+                    f"optimizer group {expected_group_name} has non-finite exp_avg_sq"
+                )
+            if (
+                state_step_min != float(expected_step)
+                or state_step_max != float(expected_step)
+            ):
+                errors.append(
+                    f"optimizer group {expected_group_name} state step mismatch: "
+                    f"expected={expected_step}, min={state_step_min}, max={state_step_max}"
+                )
+            if expected_group_name == "conditioning_bridge":
+                if record["video_projection_state_restored"] is not True:
+                    errors.append(
+                        "video projection optimizer state was not restored"
+                    )
+                if record["learnable_registers_state_restored"] is not True:
+                    errors.append(
+                        "learnable registers optimizer state was not restored"
+                    )
+
+        return {
+            "groups": groups,
+            "errors": errors,
+            "passed": not errors,
+        }
+
+    def _write_phase2_resume_runtime_audit(
+        self,
+        training_state: TrainingState,
+    ) -> None:
+        scheduler_epoch = self._scheduler_last_epoch(self._lr_scheduler)
+        sampler_state = (
+            self._online_sampler.state_dict()
+            if self._online_sampler is not None
+            else {}
+        )
+        optimizer_groups = [
+            str(group.get("name", ""))
+            for group in self._optimizer.param_groups
+        ]
+        expected_step = int(training_state.global_step)
+        optimizer_state_audit = self._phase2_optimizer_state_audit(
+            expected_step=expected_step,
+        )
+        optimizer_state_cpu_offload_enabled = (
+            self._phase2_optimizer_state_cpu_offload_enabled()
+        )
+        optimizer_state_residency = (
+            self._phase2_optimizer_moment_residency()
+        )
+        errors = []
+        if not self._phase2_distributed_optimizer_state_restored:
+            errors.append("distributed optimizer state was not restored")
+        if not self._phase2_rng_state_restored:
+            errors.append("rank RNG state was not restored")
+        if scheduler_epoch != expected_step:
+            errors.append(
+                f"scheduler last_epoch={scheduler_epoch} does not match step={expected_step}"
+            )
+        if sampler_state.get("task_schedule_cursor") != expected_step:
+            errors.append(
+                "sampler task_schedule_cursor does not match restored step"
+            )
+        if sampler_state.get("microstep_in_optimizer_step") != 0:
+            errors.append("sampler microstep_in_optimizer_step is not zero")
+        if optimizer_groups != ["dit_semantic", "conditioning_bridge"]:
+            errors.append(f"optimizer groups are invalid: {optimizer_groups}")
+        if (
+            optimizer_state_cpu_offload_enabled
+            and optimizer_state_residency != "cpu"
+        ):
+            errors.append(
+                "optimizer moments are not CPU-resident after restore: "
+                f"{optimizer_state_residency}"
+            )
+        errors.extend(optimizer_state_audit["errors"])
+        report = {
+            "initial_step": expected_step,
+            "scheduler_last_epoch": scheduler_epoch,
+            "sampler_task_schedule_cursor": sampler_state.get(
+                "task_schedule_cursor"
+            ),
+            "sampler_microstep_in_optimizer_step": sampler_state.get(
+                "microstep_in_optimizer_step"
+            ),
+            "optimizer_group_names": optimizer_groups,
+            "accelerator_state_restored": self._phase2_accelerator_state_restored,
+            "distributed_optimizer_state_restored": (
+                self._phase2_distributed_optimizer_state_restored
+            ),
+            "rng_state_restored": self._phase2_rng_state_restored,
+            "world_size": int(self._accelerator.num_processes),
+            "scheduler_restored": scheduler_epoch == expected_step,
+            "sampler_restored": (
+                sampler_state.get("task_schedule_cursor") == expected_step
+                and sampler_state.get("microstep_in_optimizer_step") == 0
+            ),
+            "optimizer_groups_restored": optimizer_groups
+            == ["dit_semantic", "conditioning_bridge"],
+            "optimizer_state_restored": optimizer_state_audit["passed"],
+            "optimizer_state_residency_after_restore": (
+                optimizer_state_residency
+            ),
+            "optimizer_state_cpu_offload_enabled": (
+                optimizer_state_cpu_offload_enabled
+            ),
+            "optimizer_state": optimizer_state_audit["groups"],
+            "errors": errors,
+            "passed": not errors,
+        }
+        if self._accelerator.is_main_process:
+            atomic_write_json(
+                Path(self._config.output_dir) / "phase2_resume_runtime_audit.json",
+                report,
+            )
+        self._accelerator.wait_for_everyone()
+        if errors:
+            raise RuntimeError(
+                "Phase 2 resume runtime audit failed: " + "; ".join(errors)
+            )
+
+    def _validate_phase2_runtime_trainability_once(self) -> None:
+        if (
+            not self._is_semantic_flow_phase2()
+            or self._phase2_runtime_trainability_checked
+        ):
+            return
+        expected_bridge = phase2_bridge_parameters(self._embeddings_processor)
+        frozen_bridge = [
+            item.name
+            for item in expected_bridge
+            if not item.parameter.requires_grad
+        ]
+        if frozen_bridge:
+            raise RuntimeError(
+                "Phase 2 bridge parameters were frozen after online encoding: "
+                f"{frozen_bridge[:20]}"
+            )
+        expected_bridge_ids = {id(item.parameter) for item in expected_bridge}
+        if self._text_encoder is None or any(
+            parameter.requires_grad for parameter in self._text_encoder.parameters()
+        ):
+            raise RuntimeError(
+                "Phase 2 Gemma/SigLIP/projector became trainable after online encoding"
+            )
+        if self._online_vae_encoder is None or any(
+            parameter.requires_grad
+            for parameter in self._online_vae_encoder.parameters()
+        ):
+            raise RuntimeError(
+                "Phase 2 VAE encoder became trainable after online encoding"
+            )
+        audio_connector = getattr(
+            self._embeddings_processor,
+            "audio_connector",
+            None,
+        )
+        if isinstance(audio_connector, nn.Module) and any(
+            parameter.requires_grad for parameter in audio_connector.parameters()
+        ):
+            raise RuntimeError(
+                "Phase 2 audio connector became trainable after online encoding"
+            )
+        unexpected_processor = [
+            name
+            for name, parameter in self._embeddings_processor.named_parameters()
+            if parameter.requires_grad and id(parameter) not in expected_bridge_ids
+        ]
+        if unexpected_processor:
+            raise RuntimeError(
+                "Unexpected trainable embedding-processor parameters after online "
+                f"encoding: {unexpected_processor[:20]}"
+            )
+        self._phase2_runtime_trainability_checked = True
+        logger.info(
+            "Phase 2 post-encoding trainability audit passed for %d bridge parameters",
+            len(expected_bridge),
+        )
+
+    def _validate_phase2_trainability(
+        self,
+        strategy_modules: dict[str, torch.nn.Module],
+    ) -> None:
+        if not self._is_semantic_flow_phase2():
+            return
+        frozen_dit = [
+            name
+            for name, parameter in self._transformer.named_parameters()
+            if not parameter.requires_grad
+        ]
+        if frozen_dit:
+            raise RuntimeError(
+                f"Phase 2 requires full DiT training; frozen parameters: {frozen_dit[:20]}"
+            )
+        frozen_semantic = [
+            f"{module_name}.{parameter_name}"
+            for module_name, module in strategy_modules.items()
+            for parameter_name, parameter in module.named_parameters()
+            if not parameter.requires_grad
+        ]
+        if frozen_semantic:
+            raise RuntimeError(
+                "Phase 2 requires all semantic modules to be trainable; "
+                f"frozen parameters: {frozen_semantic[:20]}"
+            )
+        bridge_parameters = self._deduplicate_parameters(
+            [
+                parameter
+                for module in self._embeddings_processor_trainable_modules.values()
+                for parameter in module.parameters()
+                if parameter.requires_grad
+            ]
+        )
+        if not bridge_parameters:
+            raise RuntimeError("Phase 2 conditioning bridge has zero trainable parameters")
+        expected_bridge = phase2_bridge_parameters(self._embeddings_processor)
+        frozen_bridge = [
+            item.name
+            for item in expected_bridge
+            if not item.parameter.requires_grad
+        ]
+        if frozen_bridge:
+            raise RuntimeError(
+                f"Phase 2 bridge allowlist contains frozen parameters: {frozen_bridge[:20]}"
+            )
+        expected_bridge_ids = {id(item.parameter) for item in expected_bridge}
+        actual_bridge_ids = {id(parameter) for parameter in bridge_parameters}
+        if actual_bridge_ids != expected_bridge_ids:
+            raise RuntimeError(
+                "Phase 2 prepared bridge modules do not match the explicit allowlist"
+            )
+        dit_semantic_parameters = self._deduplicate_parameters(
+            [
+                *[parameter for parameter in self._transformer.parameters() if parameter.requires_grad],
+                *[
+                    parameter
+                    for module in strategy_modules.values()
+                    for parameter in module.parameters()
+                    if parameter.requires_grad
+                ],
+            ]
+        )
+        overlap = {id(parameter) for parameter in bridge_parameters} & {
+            id(parameter) for parameter in dit_semantic_parameters
+        }
+        if overlap:
+            raise RuntimeError("Phase 2 bridge and DiT/semantic optimizer groups overlap")
+        if self._text_encoder is None or any(
+            parameter.requires_grad for parameter in self._text_encoder.parameters()
+        ):
+            raise RuntimeError("Phase 2 Gemma/SigLIP/projector must remain frozen")
+        if self._online_vae_encoder is None or any(
+            parameter.requires_grad for parameter in self._online_vae_encoder.parameters()
+        ):
+            raise RuntimeError("Phase 2 VAE encoder must remain frozen")
+        audio_connector = getattr(self._embeddings_processor, "audio_connector", None)
+        if isinstance(audio_connector, nn.Module) and any(
+            parameter.requires_grad for parameter in audio_connector.parameters()
+        ):
+            raise RuntimeError("Phase 2 audio connector must remain frozen")
+        unexpected_processor = [
+            name
+            for name, parameter in self._embeddings_processor.named_parameters()
+            if parameter.requires_grad and id(parameter) not in expected_bridge_ids
+        ]
+        if unexpected_processor:
+            raise RuntimeError(
+                f"Unexpected Phase 2 trainable embedding-processor parameters: {unexpected_processor}"
+            )
+        self._optimizer_group_parameter_counts = {
+            "dit_semantic": sum(parameter.numel() for parameter in dit_semantic_parameters),
+            "conditioning_bridge": sum(parameter.numel() for parameter in bridge_parameters),
+        }
+        logger.info(
+            "Phase 2 optimizer ownership: dit_semantic=%s conditioning_bridge=%s",
+            f"{self._optimizer_group_parameter_counts['dit_semantic']:,}",
+            f"{self._optimizer_group_parameter_counts['conditioning_bridge']:,}",
+        )
+
+    def _write_phase2_parameter_audit(
+        self,
+        strategy_modules: dict[str, torch.nn.Module],
+    ) -> None:
+        if not self._is_semantic_flow_phase2() or not IS_MAIN_PROCESS:
+            return
+        from ltx_trainer.online_data.path_safety import assert_write_path_allowed  # noqa: PLC0415
+
+        rows: list[dict[str, Any]] = []
+        rows.extend(
+            {
+                "parameter_name": f"transformer.{name}",
+                "shape": list(parameter.shape),
+                "numel": parameter.numel(),
+                "requires_grad": bool(parameter.requires_grad),
+                "owner_group": "dit_semantic",
+            }
+            for name, parameter in self._transformer.named_parameters()
+        )
+        for module_name, module in strategy_modules.items():
+            rows.extend(
+                {
+                    "parameter_name": f"training_strategy.{module_name}.{name}",
+                    "shape": list(parameter.shape),
+                    "numel": parameter.numel(),
+                    "requires_grad": bool(parameter.requires_grad),
+                    "owner_group": "dit_semantic",
+                }
+                for name, parameter in module.named_parameters()
+            )
+        rows.extend(phase2_bridge_audit_rows(self._embeddings_processor))
+        if self._text_encoder is not None:
+            rows.extend(
+                {
+                    "parameter_name": f"text_encoder.{name}",
+                    "shape": list(parameter.shape),
+                    "numel": parameter.numel(),
+                    "requires_grad": bool(parameter.requires_grad),
+                    "owner_group": "frozen_vlm",
+                }
+                for name, parameter in self._text_encoder.named_parameters()
+            )
+        if self._online_vae_encoder is not None:
+            rows.extend(
+                {
+                    "parameter_name": f"vae_encoder.{name}",
+                    "shape": list(parameter.shape),
+                    "numel": parameter.numel(),
+                    "requires_grad": bool(parameter.requires_grad),
+                    "owner_group": "frozen_other",
+                }
+                for name, parameter in self._online_vae_encoder.named_parameters()
+            )
+        unexpected = [
+            row["parameter_name"]
+            for row in rows
+            if row["requires_grad"]
+            and row["owner_group"] in {"frozen_vlm", "frozen_other"}
+        ]
+        if unexpected:
+            raise RuntimeError(
+                f"Phase 2 parameter audit found unexpected trainable parameters: {unexpected[:20]}"
+            )
+        audit_path = assert_write_path_allowed(
+            Path(self._config.output_dir) / "phase2_parameter_audit_rank0.jsonl"
+        )
+        audit_path.parent.mkdir(parents=True, exist_ok=True)
+        with audit_path.open("w", encoding="utf-8") as handle:
+            for row in rows:
+                handle.write(json.dumps(row, sort_keys=True) + "\n")
+        logger.info("Phase 2 parameter audit written to %s (%d rows)", audit_path, len(rows))
 
     @staticmethod
     def _deduplicate_parameters(parameters: list[Tensor]) -> list[Tensor]:
@@ -817,7 +2026,12 @@ class LtxvTrainer:
                 if not parameter.requires_grad
                 and ("vision_tower" in name or "multi_modal_projector" in name)
             ]
-        connector_trainable = [p for p in self._embeddings_processor.video_connector.parameters() if p.requires_grad]
+        connector_trainable = [
+            parameter
+            for module in self._embeddings_processor_trainable_modules.values()
+            for parameter in module.parameters()
+            if parameter.requires_grad
+        ]
         logger.info(f"Trainable DiT params: {count(trainable_dit):,}")
         for module_name, module in sorted(strategy_modules.items()):
             logger.info(f"Trainable strategy module {module_name}: {count(module.parameters()):,}")
@@ -892,6 +2106,18 @@ class LtxvTrainer:
             self._load_full_checkpoint(checkpoint_path)
         else:  # LoRA mode
             self._load_lora_checkpoint(checkpoint_path)
+
+        if self._is_semantic_flow_phase2():
+            metadata = read_checkpoint_metadata(checkpoint_path)
+            if getattr(self._training_strategy, "phase2_initialization_source", None) == "phase1_parent":
+                self._training_strategy.phase2_parent_checkpoint_sha256 = self._sha256_file(
+                    checkpoint_path
+                )
+            elif metadata.get("training_phase") == "phase2":
+                parent_sha = metadata.get("parent_checkpoint_sha256")
+                if not parent_sha:
+                    raise RuntimeError("Phase 2 resume checkpoint is missing parent_checkpoint_sha256")
+                self._training_strategy.phase2_parent_checkpoint_sha256 = parent_sha
 
         self._resume_state = self._resolve_resume_state()
 
@@ -1150,7 +2376,24 @@ class LtxvTrainer:
             for key, value in state_dict.items()
             if key.startswith("embeddings_processor.")
         }
-        if processor_state:
+        if self._is_semantic_flow_phase2() and (checkpoint_metadata or {}).get(
+            "training_phase"
+        ) == "phase2":
+            loaded = validate_and_load_phase2_bridge_state(
+                self._embeddings_processor,
+                state_dict,
+            )
+            self._training_strategy.phase2_loaded_bridge_key_count = loaded
+            logger.info("✅ Strictly loaded %d Phase 2 conditioning-bridge tensors", loaded)
+        elif self._is_semantic_flow_phase2():
+            if processor_state:
+                logger.info(
+                    "Ignoring Phase 1 embeddings_processor weights during Phase 2 warm start; "
+                    "using the base LTX-2.3 bridge"
+                )
+            else:
+                logger.info("Phase 2 warm start is using the base LTX-2.3 bridge")
+        elif processor_state:
             missing, unexpected = self._embeddings_processor.load_state_dict(processor_state, strict=False)
             if missing:
                 logger.debug(f"Missing embeddings processor keys while loading auxiliary checkpoint: {missing}")
@@ -1230,7 +2473,23 @@ class LtxvTrainer:
         """
         if self._config.checkpoints.no_resume or self._loaded_checkpoint_path is None:
             return 0, None
+        phase2_exact_resume = self._is_semantic_flow_phase2()
+        checkpoint_metadata: dict[str, str] | None = None
+        if phase2_exact_resume:
+            checkpoint_metadata = self._read_safetensors_metadata(
+                self._loaded_checkpoint_path
+            )
+            if checkpoint_metadata.get("training_phase") != "phase2":
+                raise RuntimeError(
+                    "Phase 2 exact resume requires a Phase 2 checkpoint; "
+                    "use checkpoints.no_resume=true for a Phase 1 warm start"
+                )
         if getattr(self._training_strategy, "checkpoint_loaded_as_warm_start", False):
+            if phase2_exact_resume:
+                raise RuntimeError(
+                    "Phase 2 exact resume cannot use a warm-migrated checkpoint; "
+                    "use checkpoints.no_resume=true only for an intentional warm start"
+                )
             logger.warning(
                 "Checkpoint weights were warm-migrated to a new architecture; "
                 "optimizer, scheduler, RNG, and global-step state will not be resumed."
@@ -1238,17 +2497,27 @@ class LtxvTrainer:
             return 0, None
 
         strict_legacy_resume = self._is_strict_legacy_resume()
-        checkpoint_metadata: dict[str, str] | None = None
         if strict_legacy_resume:
             checkpoint_metadata = self._read_safetensors_metadata(self._loaded_checkpoint_path)
             if checkpoint_metadata.get("legacy_phase") is None:
                 raise RuntimeError(self._legacy_resume_error_message())
 
-        state = self._load_training_state(self._loaded_checkpoint_path)
+        state = self._load_training_state(
+            self._loaded_checkpoint_path,
+            required=phase2_exact_resume,
+        )
         if state is None:
             if strict_legacy_resume:
                 raise RuntimeError(self._legacy_resume_error_message())
             return 0, None
+
+        if phase2_exact_resume:
+            assert checkpoint_metadata is not None
+            self._validate_phase2_resume_state(
+                checkpoint_path=self._loaded_checkpoint_path,
+                metadata=checkpoint_metadata,
+                state=state,
+            )
 
         if strict_legacy_resume:
             assert checkpoint_metadata is not None
@@ -1275,6 +2544,10 @@ class LtxvTrainer:
         ):
             mismatches.append(f"lora_rank: {fp.lora_rank} → {cfg.lora.rank}")
         if mismatches:
+            if phase2_exact_resume:
+                raise RuntimeError(
+                    f"Phase 2 training state config mismatch: {', '.join(mismatches)}"
+                )
             if strict_legacy_resume:
                 raise RuntimeError(
                     f"Legacy training state config mismatch: {', '.join(mismatches)}"
@@ -1286,6 +2559,10 @@ class LtxvTrainer:
             return 0, None
 
         if state.global_step < 0:
+            if phase2_exact_resume:
+                raise RuntimeError(
+                    f"Phase 2 training state has invalid global_step={state.global_step!r}"
+                )
             if strict_legacy_resume:
                 raise RuntimeError(f"Legacy training state has invalid global_step={state.global_step!r}")
             logger.warning(
@@ -1296,6 +2573,212 @@ class LtxvTrainer:
             logger.warning("Warm legacy resume: optimizer moments are reset.")
         logger.info(f"📌 Resuming from step {state.global_step}")
         return state.global_step, state
+
+    @classmethod
+    def _phase2_accelerator_state_path(cls, checkpoint_path: Path) -> Path:
+        step = cls._checkpoint_step(checkpoint_path)
+        if step is None:
+            raise RuntimeError(
+                f"Cannot resolve Phase 2 Accelerate state for {checkpoint_path.name}"
+            )
+        return checkpoint_path.parent / f"accelerator_state_step_{step:05d}"
+
+    def _restore_phase2_accelerator_state(self, training_state: TrainingState) -> None:
+        if self._loaded_checkpoint_path is None:
+            raise RuntimeError("Phase 2 resume has no loaded checkpoint path")
+        state_path = self._phase2_accelerator_state_path(self._loaded_checkpoint_path)
+        rank = int(self._accelerator.process_index)
+        world_size = int(self._accelerator.num_processes)
+        payload: dict[str, Any] | None = None
+        local_error: BaseException | None = None
+        try:
+            payload = load_phase2_rank_state(
+                state_path,
+                expected_step=training_state.global_step,
+                rank=rank,
+                world_size=world_size,
+            )
+        except Exception as exc:
+            local_error = exc
+        if not self._phase2_all_ranks_succeeded(local_error):
+            detail = f": {local_error}" if local_error is not None else ""
+            raise RuntimeError(
+                "Failed to validate exact Phase 2 distributed optimizer state "
+                f"on at least one rank from {state_path}{detail}"
+            ) from local_error
+        assert payload is not None
+
+        local_error = None
+        try:
+            self._optimizer.load_state_dict(payload["optimizer_state_dict"])
+            self._offload_phase2_optimizer_state_to_cpu()
+            self._assert_phase2_optimizer_moments_on_cpu(
+                context="exact resume audit",
+            )
+
+            scheduler_state = training_state.lr_scheduler_state_dict
+            if not isinstance(scheduler_state, dict):
+                raise RuntimeError(
+                    "Phase 2 exact resume is missing LR scheduler state"
+                )
+            if self._lr_scheduler is None:
+                raise RuntimeError(
+                    "Phase 2 exact resume has no LR scheduler to restore"
+                )
+            self._lr_scheduler.load_state_dict(scheduler_state)
+            self._restore_optimizer_learning_rates(scheduler_state)
+
+            saved_scaler_state = payload.get("grad_scaler_state")
+            scaler = getattr(self._accelerator, "scaler", None)
+            if saved_scaler_state is None and scaler is not None:
+                raise RuntimeError(
+                    "Phase 2 distributed state is missing GradScaler state"
+                )
+            if saved_scaler_state is not None and scaler is None:
+                raise RuntimeError(
+                    "Phase 2 distributed state contains GradScaler state "
+                    "but the runtime has no GradScaler"
+                )
+            if saved_scaler_state is not None:
+                scaler.load_state_dict(saved_scaler_state)
+
+            torch.random.set_rng_state(payload["torch_rng_state"])
+            cuda_rng_state = payload.get("cuda_rng_state")
+            if cuda_rng_state is not None:
+                cuda_device = self._accelerator_cuda_device()
+                if cuda_device is None:
+                    raise RuntimeError(
+                        "Phase 2 distributed state contains CUDA RNG state "
+                        "but the accelerator has no CUDA device"
+                    )
+                torch.cuda.set_rng_state(
+                    cuda_rng_state,
+                    device=cuda_device,
+                )
+            random.setstate(payload["python_rng_state"])
+            np.random.set_state(payload["numpy_rng_state"])
+
+            scheduler_epoch = self._scheduler_last_epoch(self._lr_scheduler)
+            if scheduler_epoch != training_state.global_step:
+                raise RuntimeError(
+                    "Phase 2 restored scheduler/global-step mismatch: "
+                    f"scheduler={scheduler_epoch}, "
+                    f"state={training_state.global_step}"
+                )
+            group_names = [
+                str(group.get("name", ""))
+                for group in self._optimizer.param_groups
+            ]
+            if group_names != list(PHASE2_OPTIMIZER_GROUP_NAMES):
+                raise RuntimeError(
+                    "Phase 2 restored optimizer groups are invalid: "
+                    f"{group_names}"
+                )
+        except Exception as exc:
+            local_error = exc
+        if not self._phase2_all_ranks_succeeded(local_error):
+            detail = f": {local_error}" if local_error is not None else ""
+            raise RuntimeError(
+                "Failed to restore exact Phase 2 distributed optimizer/RNG "
+                f"state on at least one rank from {state_path}{detail}"
+            ) from local_error
+
+        self._phase2_accelerator_state_restored = True
+        self._phase2_distributed_optimizer_state_restored = True
+        self._phase2_rng_state_restored = True
+        logger.info(
+            "Restored exact Phase 2 rank-local optimizer/RNG state from %s "
+            "at local step %d",
+            state_path,
+            training_state.global_step,
+        )
+
+    def _phase2_all_ranks_succeeded(
+        self,
+        local_error: BaseException | None,
+    ) -> bool:
+        local_success = torch.tensor(
+            int(local_error is None),
+            dtype=torch.int64,
+            device=self._accelerator.device,
+        )
+        total_success = self._accelerator.reduce(
+            local_success,
+            reduction="sum",
+        )
+        return int(total_success.item()) == int(self._accelerator.num_processes)
+
+    def _validate_phase2_resume_state(
+        self,
+        *,
+        checkpoint_path: Path,
+        metadata: dict[str, str],
+        state: TrainingState,
+    ) -> None:
+        filename_step = self._checkpoint_step(checkpoint_path)
+        if filename_step is None:
+            raise RuntimeError(
+                f"Cannot parse Phase 2 resume step from checkpoint filename: {checkpoint_path.name}"
+            )
+        metadata_step_raw = metadata.get("global_step")
+        if metadata_step_raw is None:
+            raise RuntimeError("Phase 2 checkpoint metadata is missing global_step")
+        try:
+            metadata_step = int(metadata_step_raw)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"Invalid Phase 2 checkpoint metadata global_step={metadata_step_raw!r}"
+            ) from exc
+        if metadata.get("training_phase") != "phase2":
+            raise RuntimeError("Phase 2 exact resume requires training_phase=phase2 metadata")
+        if filename_step != metadata_step or filename_step != state.global_step:
+            raise RuntimeError(
+                "Phase 2 resume step mismatch:\n"
+                f"filename={filename_step}, metadata={metadata_step}, "
+                f"training_state={state.global_step}"
+            )
+        if state.global_step < 0:
+            raise RuntimeError(
+                f"Phase 2 resume global_step must be non-negative, got {state.global_step}"
+            )
+        if state.global_step >= self._config.optimization.steps:
+            raise RuntimeError(
+                f"Phase 2 resume global_step={state.global_step} must be less than "
+                f"optimization.steps={self._config.optimization.steps}"
+            )
+
+        scheduler_state = state.lr_scheduler_state_dict
+        if not isinstance(scheduler_state, dict):
+            raise RuntimeError("Phase 2 exact resume is missing LR scheduler state")
+        scheduler_last_epoch = scheduler_state.get("last_epoch")
+        if scheduler_last_epoch is None:
+            raise RuntimeError("Phase 2 LR scheduler state is missing last_epoch")
+        if int(scheduler_last_epoch) != state.global_step:
+            raise RuntimeError(
+                "Phase 2 scheduler/global_step mismatch: "
+                f"last_epoch={scheduler_last_epoch}, global_step={state.global_step}"
+            )
+
+        data_state = state.data_state
+        if not isinstance(data_state, dict):
+            raise RuntimeError("Phase 2 exact resume is missing online sampler state")
+        if (
+            data_state.get("task_schedule_cursor") != state.global_step
+            or data_state.get("microstep_in_optimizer_step") != 0
+        ):
+            raise RuntimeError(
+                "Phase 2 sampler/global_step mismatch: "
+                f"global_step={state.global_step}, "
+                f"task_schedule_cursor={data_state.get('task_schedule_cursor')}, "
+                f"microstep={data_state.get('microstep_in_optimizer_step')}"
+            )
+
+        accelerator_state_path = self._phase2_accelerator_state_path(checkpoint_path)
+        if not accelerator_state_path.is_dir():
+            raise RuntimeError(
+                "Phase 2 exact resume is missing its distributed optimizer state: "
+                f"{accelerator_state_path}"
+            )
 
     def _validate_legacy_resume_state(
         self,
@@ -1371,16 +2854,29 @@ class LtxvTrainer:
         )
 
     @staticmethod
-    def _load_training_state(checkpoint_path: Path) -> TrainingState | None:
+    def _load_training_state(
+        checkpoint_path: Path,
+        *,
+        required: bool = False,
+    ) -> TrainingState | None:
         """Load training state file that corresponds to a checkpoint weights file."""
         match = re.search(r"step_(\d+)", checkpoint_path.name)
         if not match:
+            if required:
+                raise RuntimeError(
+                    "Required Phase 2 training state cannot be resolved from "
+                    f"checkpoint filename: {checkpoint_path.name}"
+                )
             return None
 
         step_str = match.group(1)
         state_path = checkpoint_path.parent / f"training_state_step_{step_str}.pt"
 
         if not state_path.exists():
+            if required:
+                raise RuntimeError(
+                    f"Required Phase 2 training state is missing: {state_path}"
+                )
             return None
 
         try:
@@ -1388,8 +2884,15 @@ class LtxvTrainer:
             state = TrainingState.from_save_dict(raw)
             logger.info(f"📥 Loaded training state from {state_path}")
             return state
-        except Exception as e:
-            logger.warning(f"⚠️ Failed to load training state from {state_path}: {e}. Starting from step 0.")
+        except Exception as exc:
+            if required:
+                raise RuntimeError(
+                    f"Failed to load required Phase 2 training state: {state_path}"
+                ) from exc
+            logger.warning(
+                f"⚠️ Failed to load training state from {state_path}: {exc}. "
+                "Starting from step 0."
+            )
             return None
 
     def _restore_training_state(self, training_state: TrainingState) -> bool:
@@ -1418,8 +2921,9 @@ class LtxvTrainer:
         else:
             if rng.torch_state is not None:
                 torch.random.set_rng_state(rng.torch_state)
-            if rng.cuda_state is not None and torch.cuda.is_available():
-                torch.cuda.set_rng_state(rng.cuda_state)
+            cuda_device = self._accelerator_cuda_device()
+            if rng.cuda_state is not None and cuda_device is not None:
+                torch.cuda.set_rng_state(rng.cuda_state, device=cuda_device)
             logger.debug("Restored RNG states")
 
         return True
@@ -1478,8 +2982,9 @@ class LtxvTrainer:
             self._transformer.requires_grad_(False)
             self._transformer.eval()
         if self._train_embeddings_processor:
-            models_to_prepare.append(
-                ("embeddings_processor_video_connector", self._embeddings_processor.video_connector)
+            models_to_prepare.extend(
+                (f"embeddings_processor.{name}", module)
+                for name, module in self._embeddings_processor_trainable_modules.items()
             )
         if self._train_text_encoder:
             get_text_module = getattr(self._training_strategy, "get_text_encoder_trainable_module", None)
@@ -1505,13 +3010,14 @@ class LtxvTrainer:
             prepared_models = (prepared_models,)
 
         prepared_strategy_modules = {}
+        prepared_processor_modules = {}
         for (name, _module), prepared_module in zip(models_to_prepare, prepared_models, strict=True):
             if name == "transformer":
                 self._transformer = prepared_module
             elif name == "embeddings_processor":
                 self._embeddings_processor = prepared_module
-            elif name == "embeddings_processor_video_connector":
-                self._embeddings_processor.video_connector = prepared_module
+            elif name.startswith("embeddings_processor."):
+                prepared_processor_modules[name.removeprefix("embeddings_processor.")] = prepared_module
             elif name == "text_encoder":
                 self._text_encoder = prepared_module
             elif name == "text_encoder_trainable":
@@ -1524,6 +3030,25 @@ class LtxvTrainer:
 
         if prepared_strategy_modules:
             self._training_strategy.set_trainable_modules(prepared_strategy_modules)
+        if prepared_processor_modules:
+            set_processor_modules = getattr(
+                self._training_strategy,
+                "set_embeddings_processor_trainable_modules",
+                None,
+            )
+            if callable(set_processor_modules):
+                set_processor_modules(
+                    self._embeddings_processor,
+                    prepared_processor_modules,
+                )
+            elif set(prepared_processor_modules) == {"video_connector"}:
+                self._embeddings_processor.video_connector = prepared_processor_modules["video_connector"]
+            else:
+                raise RuntimeError(
+                    "Training strategy cannot receive prepared embedding-processor modules: "
+                    f"{sorted(prepared_processor_modules)}"
+                )
+            self._embeddings_processor_trainable_modules = prepared_processor_modules
         if self._train_text_encoder and self._text_encoder is not None:
             set_text_encoder = getattr(self._training_strategy, "set_text_encoder", None)
             if callable(set_text_encoder):
@@ -1533,7 +3058,7 @@ class LtxvTrainer:
         if self._train_transformer:
             self._accumulation_models.append(self._transformer)
         if self._train_embeddings_processor:
-            self._accumulation_models.append(self._embeddings_processor.video_connector)
+            self._accumulation_models.extend(self._embeddings_processor_trainable_modules.values())
         if self._train_text_encoder:
             get_text_module = getattr(self._training_strategy, "get_text_encoder_trainable_module", None)
             self._accumulation_models.append(get_text_module() if callable(get_text_module) else self._text_encoder)
@@ -1542,7 +3067,12 @@ class LtxvTrainer:
             raise RuntimeError("At least one trainable module is required for gradient accumulation")
 
         # Log GPU memory usage after model preparation
-        vram_usage_gb = torch.cuda.memory_allocated() / 1024**3
+        cuda_device = self._accelerator_cuda_device()
+        vram_usage_gb = (
+            torch.cuda.memory_allocated(cuda_device) / 1024**3
+            if cuda_device is not None
+            else 0.0
+        )
         logger.debug(f"GPU memory usage after models preparation: {vram_usage_gb:.2f} GB")
 
     @staticmethod
@@ -1888,13 +3418,108 @@ class LtxvTrainer:
         opt_cfg = self._config.optimization
 
         lr = opt_cfg.learning_rate
+        optimizer_parameters: Any = self._trainable_params
+        phase2_parameter_names_by_group: dict[str, list[str]] = {}
+        if self._is_semantic_flow_phase2():
+            strategy_modules = self._training_strategy.get_trainable_modules()
+            dit_semantic = self._deduplicate_parameters(
+                [
+                    *[parameter for parameter in self._transformer.parameters() if parameter.requires_grad],
+                    *[
+                        parameter
+                        for module in strategy_modules.values()
+                        for parameter in module.parameters()
+                        if parameter.requires_grad
+                    ],
+                ]
+            )
+            conditioning_bridge = self._deduplicate_parameters(
+                [
+                    parameter
+                    for module in self._embeddings_processor_trainable_modules.values()
+                    for parameter in module.parameters()
+                    if parameter.requires_grad
+                ]
+            )
+            grouped_ids = {id(parameter) for parameter in dit_semantic + conditioning_bridge}
+            if grouped_ids != {id(parameter) for parameter in self._trainable_params}:
+                raise RuntimeError("Phase 2 optimizer groups do not cover the exact trainable parameter set")
+            dit_names_by_id = {
+                id(parameter): self._canonical_optimizer_parameter_name(
+                    "transformer",
+                    name,
+                )
+                for name, parameter in self._transformer.named_parameters()
+                if parameter.requires_grad
+            }
+            for module_name, module in strategy_modules.items():
+                dit_names_by_id.update(
+                    {
+                        id(parameter): self._canonical_optimizer_parameter_name(
+                            f"training_strategy.{module_name}",
+                            name,
+                        )
+                        for name, parameter in module.named_parameters()
+                        if parameter.requires_grad
+                    }
+                )
+            bridge_names_by_id: dict[int, str] = {}
+            for module_name, module in self._embeddings_processor_trainable_modules.items():
+                bridge_names_by_id.update(
+                    {
+                        id(parameter): self._canonical_optimizer_parameter_name(
+                            module_name,
+                            name,
+                        )
+                        for name, parameter in module.named_parameters()
+                        if parameter.requires_grad
+                    }
+                )
+            missing_dit_names = [
+                index
+                for index, parameter in enumerate(dit_semantic)
+                if id(parameter) not in dit_names_by_id
+            ]
+            missing_bridge_names = [
+                index
+                for index, parameter in enumerate(conditioning_bridge)
+                if id(parameter) not in bridge_names_by_id
+            ]
+            if missing_dit_names or missing_bridge_names:
+                raise RuntimeError(
+                    "Phase 2 optimizer parameter-name mapping is incomplete: "
+                    f"dit={missing_dit_names[:20]}, bridge={missing_bridge_names[:20]}"
+                )
+            phase2_parameter_names_by_group = {
+                "dit_semantic": [
+                    dit_names_by_id[id(parameter)]
+                    for parameter in dit_semantic
+                ],
+                "conditioning_bridge": [
+                    bridge_names_by_id[id(parameter)]
+                    for parameter in conditioning_bridge
+                ],
+            }
+            bridge_lr = opt_cfg.bridge_learning_rate or opt_cfg.learning_rate
+            optimizer_parameters = [
+                {
+                    "name": "dit_semantic",
+                    "params": dit_semantic,
+                    "lr": opt_cfg.learning_rate,
+                },
+                {
+                    "name": "conditioning_bridge",
+                    "params": conditioning_bridge,
+                    "lr": bridge_lr,
+                },
+            ]
         if opt_cfg.optimizer_type == "adamw":
-            optimizer = AdamW(self._trainable_params, lr=lr)
+            optimizer = AdamW(optimizer_parameters, lr=lr)
         elif opt_cfg.optimizer_type == "adamw8bit":
             # noinspection PyUnresolvedReferences
             from bitsandbytes.optim import AdamW8bit  # noqa: PLC0415
 
-            optimizer = AdamW8bit(self._trainable_params, lr=lr)
+            optimizer = AdamW8bit(optimizer_parameters, lr=lr)
         else:
             raise ValueError(f"Unknown optimizer type: {opt_cfg.optimizer_type}")
 
@@ -1902,6 +3527,85 @@ class LtxvTrainer:
 
         # noinspection PyTypeChecker
         self._optimizer, self._lr_scheduler = self._accelerator.prepare(optimizer, lr_scheduler)
+        if self._is_semantic_flow_phase2():
+            self._phase2_optimizer_parameter_names = {}
+            for group in self._optimizer.param_groups:
+                group_name = str(group.get("name", ""))
+                parameter_names = phase2_parameter_names_by_group.get(group_name)
+                if parameter_names is None:
+                    raise RuntimeError(
+                        f"Unexpected Phase 2 optimizer group after prepare: {group_name!r}"
+                    )
+                if len(parameter_names) != len(group["params"]):
+                    raise RuntimeError(
+                        "Phase 2 optimizer parameter count changed during prepare: "
+                        f"group={group_name}, before={len(parameter_names)}, "
+                        f"after={len(group['params'])}"
+                    )
+                self._phase2_optimizer_parameter_names.update(
+                    {
+                        id(parameter): parameter_name
+                        for parameter, parameter_name in zip(
+                            group["params"],
+                            parameter_names,
+                            strict=True,
+                        )
+                    }
+                )
+            logger.info(
+                "Phase 2 optimizer learning rates: dit_semantic=%g conditioning_bridge=%g",
+                opt_cfg.learning_rate,
+                opt_cfg.bridge_learning_rate or opt_cfg.learning_rate,
+            )
+
+    @staticmethod
+    def _canonical_optimizer_parameter_name(owner: str, name: str) -> str:
+        wrapper_parts = {"module", "_fsdp_wrapped_module"}
+        clean_name = ".".join(
+            part for part in name.split(".") if part not in wrapper_parts
+        )
+        return f"{owner}.{clean_name}" if clean_name else owner
+
+    def _optimizer_group_metrics(self) -> dict[str, float]:
+        if not self._is_semantic_flow_phase2():
+            return {}
+        metrics: dict[str, float] = {}
+        for group in self._optimizer.param_groups:
+            name = str(group.get("name", ""))
+            if name not in {"dit_semantic", "conditioning_bridge"}:
+                continue
+            parameters = [parameter for parameter in group["params"] if parameter.requires_grad]
+            grad_square = sum(
+                parameter.grad.detach().float().pow(2).sum()
+                for parameter in parameters
+                if parameter.grad is not None
+            )
+            grad_norm = float(torch.sqrt(grad_square).item()) if isinstance(grad_square, Tensor) else 0.0
+            metrics[f"train/lr_{name}"] = float(group["lr"])
+            metrics[f"train/grad_norm_{name}"] = grad_norm
+            if name == "conditioning_bridge":
+                parameter_square = sum(
+                    parameter.detach().float().pow(2).sum()
+                    for parameter in parameters
+                )
+                parameter_norm = (
+                    float(torch.sqrt(parameter_square).item())
+                    if isinstance(parameter_square, Tensor)
+                    else 0.0
+                )
+                update_ratio = float(group["lr"]) * grad_norm / max(parameter_norm, 1.0e-12)
+                metrics.update(
+                    {
+                        "train/bridge_grad_norm": grad_norm,
+                        "train/bridge_parameter_norm": parameter_norm,
+                        "train/bridge_update_ratio": update_ratio,
+                        "train/update_ratio_conditioning_bridge": update_ratio,
+                        "train/bridge_trainable_parameter_count": float(
+                            self._optimizer_group_parameter_counts.get(name, 0)
+                        ),
+                    }
+                )
+        return metrics
 
     def _create_scheduler(self, optimizer: torch.optim.Optimizer) -> LRScheduler | None:
         """Create learning rate scheduler based on config."""
@@ -2179,6 +3883,8 @@ class LtxvTrainer:
         self._accelerator.wait_for_everyone()
         full_state_dict = self._accelerator.get_state_dict(self._transformer)
         strategy_checkpoint_states = self._collect_strategy_checkpoint_state_dicts()
+        processor_checkpoint_states = self._collect_embeddings_processor_checkpoint_state_dicts()
+        self._save_phase2_accelerator_state(save_dir)
 
         if not IS_MAIN_PROCESS:
             self._last_saved_step = self._global_step
@@ -2196,6 +3902,7 @@ class LtxvTrainer:
         auxiliary_state_dict = self._collect_auxiliary_checkpoint_state(
             save_dtype,
             precollected_strategy_states=strategy_checkpoint_states,
+            precollected_processor_states=processor_checkpoint_states,
         )
 
         # For LoRA: extract only adapter weights; for full: use as-is
@@ -2235,6 +3942,11 @@ class LtxvTrainer:
                 f"training_strategy.{name}."
                 for name in self._training_strategy.get_trainable_modules()
             )
+            if self._is_semantic_flow_phase2():
+                required_prefixes += (
+                    "embeddings_processor.feature_extractor.",
+                    "embeddings_processor.video_connector.",
+                )
             self._atomic_save_safetensors(
                 full_state_dict,
                 saved_weights_path,
@@ -2345,6 +4057,19 @@ class LtxvTrainer:
             "metadata_global_step": metadata.get("global_step"),
             "config_path": str((Path(self._config.output_dir) / "training_config.yaml").resolve()),
         }
+        if self._is_semantic_flow_phase2():
+            payload.update(
+                {
+                    "training_phase": "phase2",
+                    "parent_checkpoint_step": int(metadata["parent_checkpoint_step"]),
+                    "effective_total_step": int(metadata["effective_total_step"]),
+                    "bridge_key_count": int(metadata["bridge_key_count"]),
+                    "bridge_parameter_count": int(metadata["bridge_parameter_count"]),
+                    "accelerator_state_path": str(
+                        self._last_phase2_accelerator_state_path.resolve()
+                    ),
+                }
+            )
         temporary_path = Path(f"{marker_path}.tmp.{os.getpid()}")
         try:
             with temporary_path.open("w", encoding="utf-8") as handle:
@@ -2366,11 +4091,202 @@ class LtxvTrainer:
             for name, module in self._training_strategy.get_trainable_modules().items()
         }
 
+    def _collect_embeddings_processor_checkpoint_state_dicts(
+        self,
+    ) -> dict[str, dict[str, Tensor]]:
+        if not self._train_embeddings_processor:
+            return {}
+        return {
+            name: self._accelerator.get_state_dict(module)
+            for name, module in self._embeddings_processor_trainable_modules.items()
+        }
+
+    def _save_phase2_accelerator_state(self, save_dir: Path) -> Path | None:
+        if (
+            not self._is_semantic_flow_phase2()
+            or self._config.checkpoints.save_training_state == "off"
+        ):
+            return None
+        state_path = save_dir / f"accelerator_state_step_{self._global_step:05d}"
+        partial_path = Path(f"{state_path}.partial")
+        rank = int(self._accelerator.process_index)
+        world_size = int(self._accelerator.num_processes)
+        is_main_process = bool(self._accelerator.is_main_process)
+        optimizer_group_names = [
+            str(group.get("name", ""))
+            for group in self._optimizer.param_groups
+        ]
+        if optimizer_group_names != list(PHASE2_OPTIMIZER_GROUP_NAMES):
+            raise RuntimeError(
+                "Cannot save Phase 2 distributed optimizer state with invalid "
+                f"groups: {optimizer_group_names}"
+            )
+
+        local_error: BaseException | None = None
+        if is_main_process:
+            try:
+                state_path.parent.mkdir(parents=True, exist_ok=True)
+                if partial_path.exists():
+                    shutil.rmtree(partial_path)
+                if state_path.exists():
+                    marker_path = state_path.parent / (
+                        f"checkpoint_step_{self._global_step:05d}.ready.json"
+                    )
+                    if marker_path.exists():
+                        raise RuntimeError(
+                            "Refusing to replace a published Phase 2 distributed "
+                            f"state: {state_path}"
+                        )
+                    shutil.rmtree(state_path)
+                partial_path.mkdir()
+                self._fsync_directory(partial_path.parent)
+            except Exception as exc:
+                local_error = exc
+        if not self._phase2_all_ranks_succeeded(local_error):
+            detail = f": {local_error}" if local_error is not None else ""
+            raise RuntimeError(
+                "Could not initialize Phase 2 distributed optimizer state "
+                f"save on rank 0{detail}"
+            ) from local_error
+        self._accelerator.wait_for_everyone()
+
+        rank_path = partial_path / f"optimizer_rank_{rank:05d}.pt"
+        temporary_rank_path = Path(f"{rank_path}.tmp.{os.getpid()}")
+        local_error = None
+        try:
+            scaler = getattr(self._accelerator, "scaler", None)
+            cuda_device = self._accelerator_cuda_device()
+            if self._phase2_optimizer_state_cpu_offload_enabled():
+                self._offload_phase2_optimizer_state_to_cpu()
+                if cuda_device is not None:
+                    torch.cuda.synchronize(cuda_device)
+                    torch.cuda.empty_cache()
+                self._assert_phase2_optimizer_moments_on_cpu(
+                    context="checkpoint serialization",
+                )
+            optimizer_state_dict = self._optimizer.state_dict()
+            if self._phase2_optimizer_state_cpu_offload_enabled():
+                non_cpu_optimizer_tensors = [
+                    tensor
+                    for tensor in self._iter_state_tensors(
+                        optimizer_state_dict["state"]
+                    )
+                    if tensor.device.type != "cpu"
+                ]
+                if non_cpu_optimizer_tensors:
+                    raise RuntimeError(
+                        "Phase 2 checkpoint optimizer state contains "
+                        f"{len(non_cpu_optimizer_tensors)} non-CPU tensors"
+                    )
+            payload = {
+                "format_version": PHASE2_DISTRIBUTED_STATE_FORMAT_VERSION,
+                "global_step": self._global_step,
+                "rank": rank,
+                "world_size": world_size,
+                "optimizer_group_names": optimizer_group_names,
+                "optimizer_state_dict": optimizer_state_dict,
+                "torch_rng_state": torch.random.get_rng_state(),
+                "cuda_rng_state": (
+                    torch.cuda.get_rng_state(cuda_device)
+                    if cuda_device is not None
+                    else None
+                ),
+                "python_rng_state": random.getstate(),
+                "numpy_rng_state": np.random.get_state(),
+                "grad_scaler_state": (
+                    scaler.state_dict() if scaler is not None else None
+                ),
+            }
+            torch.save(payload, temporary_rank_path)
+            self._fsync_file(temporary_rank_path)
+            if temporary_rank_path.stat().st_size <= 0:
+                raise RuntimeError(
+                    f"Phase 2 rank-state temporary file is empty: {temporary_rank_path}"
+                )
+            os.replace(temporary_rank_path, rank_path)
+            self._fsync_directory(partial_path)
+        except Exception as exc:
+            temporary_rank_path.unlink(missing_ok=True)
+            local_error = exc
+        all_rank_files_saved = self._phase2_all_ranks_succeeded(local_error)
+        if not all_rank_files_saved:
+            self._accelerator.wait_for_everyone()
+            if is_main_process:
+                shutil.rmtree(partial_path, ignore_errors=True)
+            self._accelerator.wait_for_everyone()
+            detail = f": {local_error}" if local_error is not None else ""
+            raise RuntimeError(
+                "Phase 2 distributed optimizer state save failed on at least "
+                f"one rank{detail}"
+            ) from local_error
+
+        self._accelerator.wait_for_everyone()
+        local_error = None
+        if is_main_process:
+            manifest_tmp_path = partial_path / "manifest.json.tmp"
+            try:
+                files: dict[str, dict[str, Any]] = {}
+                for file_rank in range(world_size):
+                    file_path = partial_path / (
+                        f"optimizer_rank_{file_rank:05d}.pt"
+                    )
+                    if not file_path.is_file() or file_path.stat().st_size <= 0:
+                        raise RuntimeError(
+                            "Phase 2 distributed optimizer rank file is "
+                            f"missing or empty: {file_path}"
+                        )
+                    files[str(file_rank)] = {
+                        "path": file_path.name,
+                        "size_bytes": file_path.stat().st_size,
+                        "sha256": sha256_file(file_path),
+                    }
+                manifest = {
+                    "format_version": PHASE2_DISTRIBUTED_STATE_FORMAT_VERSION,
+                    "global_step": self._global_step,
+                    "world_size": world_size,
+                    "optimizer_group_names": optimizer_group_names,
+                    "files": files,
+                }
+                with manifest_tmp_path.open("w", encoding="utf-8") as handle:
+                    json.dump(
+                        manifest,
+                        handle,
+                        ensure_ascii=False,
+                        indent=2,
+                        sort_keys=True,
+                    )
+                    handle.write("\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(manifest_tmp_path, partial_path / "manifest.json")
+                self._fsync_directory(partial_path)
+                os.replace(partial_path, state_path)
+                self._fsync_directory(state_path.parent)
+            except Exception as exc:
+                manifest_tmp_path.unlink(missing_ok=True)
+                local_error = exc
+        state_committed = self._phase2_all_ranks_succeeded(local_error)
+        if not state_committed:
+            self._accelerator.wait_for_everyone()
+            if is_main_process:
+                shutil.rmtree(partial_path, ignore_errors=True)
+            self._accelerator.wait_for_everyone()
+            detail = f": {local_error}" if local_error is not None else ""
+            raise RuntimeError(
+                "Could not commit Phase 2 distributed optimizer state "
+                f"manifest{detail}"
+            ) from local_error
+
+        self._accelerator.wait_for_everyone()
+        self._last_phase2_accelerator_state_path = state_path
+        return state_path
+
     def _collect_auxiliary_checkpoint_state(
         self,
         save_dtype: torch.dtype,
         *,
         precollected_strategy_states: dict[str, dict[str, Tensor]] | None = None,
+        precollected_processor_states: dict[str, dict[str, Tensor]] | None = None,
     ) -> dict[str, Tensor]:
         state_dict = self._training_strategy.get_extra_checkpoint_state_dict(
             self._accelerator,
@@ -2378,7 +4294,10 @@ class LtxvTrainer:
         )
 
         if self._train_embeddings_processor:
-            processor_state = self._collect_trainable_embeddings_processor_state()
+            processor_state = self._collect_trainable_embeddings_processor_state(
+                precollected_states=precollected_processor_states,
+            )
+            self._last_bridge_checkpoint_key_count = len(processor_state)
             state_dict.update({f"embeddings_processor.{key}": value for key, value in processor_state.items()})
         if self._train_text_encoder and self._text_encoder is not None:
             text_encoder_state = self._collect_trainable_text_encoder_state()
@@ -2386,12 +4305,43 @@ class LtxvTrainer:
 
         return {key: value.to(save_dtype) if isinstance(value, Tensor) else value for key, value in state_dict.items()}
 
-    def _collect_trainable_embeddings_processor_state(self) -> dict[str, Tensor]:
-        connector = self._embeddings_processor.video_connector
-        unwrapped = self._accelerator.unwrap_model(connector, keep_torch_compile=False)
-        trainable_names = {name for name, param in unwrapped.named_parameters() if param.requires_grad}
-        full_state = self._accelerator.get_state_dict(connector)
-        return {f"video_connector.{key}": value for key, value in full_state.items() if key in trainable_names}
+    def _collect_trainable_embeddings_processor_state(
+        self,
+        *,
+        precollected_states: dict[str, dict[str, Tensor]] | None = None,
+    ) -> dict[str, Tensor]:
+        collected: dict[str, Tensor] = {}
+        for module_name, module in self._embeddings_processor_trainable_modules.items():
+            unwrapped = self._accelerator.unwrap_model(module, keep_torch_compile=False)
+            trainable_names = {
+                name
+                for name, parameter in unwrapped.named_parameters()
+                if parameter.requires_grad
+            }
+            full_state = (
+                (precollected_states or {}).get(module_name)
+                if precollected_states is not None
+                else None
+            )
+            if full_state is None:
+                full_state = self._accelerator.get_state_dict(module)
+            selected = {
+                key: value
+                for key, value in full_state.items()
+                if key in trainable_names
+            }
+            missing = sorted(trainable_names - set(selected))
+            if missing:
+                raise RuntimeError(
+                    f"Trainable embedding-processor state is incomplete for {module_name}: {missing[:20]}"
+                )
+            collected.update(
+                {
+                    f"{module_name}.{key}": value
+                    for key, value in selected.items()
+                }
+            )
+        return collected
 
     def _collect_trainable_text_encoder_state(self) -> dict[str, Tensor]:
         get_strategy_state = getattr(self._training_strategy, "get_text_encoder_checkpoint_state_dict", None)
@@ -2493,6 +4443,22 @@ class LtxvTrainer:
             step = self._checkpoint_step(path)
             if step is not None:
                 markers_by_step[step] = path
+        accelerator_states_by_step: dict[int, Path] = {}
+        for path in save_dir.glob("accelerator_state_step_*"):
+            if path.name.endswith(".partial"):
+                if path.is_dir():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink(missing_ok=True)
+                logger.debug(
+                    f"Removed incomplete Phase 2 distributed state: {path}"
+                )
+                continue
+            if re.fullmatch(r"accelerator_state_step_\d+", path.name) is None:
+                continue
+            step = self._checkpoint_step(path)
+            if step is not None and path.is_dir():
+                accelerator_states_by_step[step] = path
 
         # Keep exactly one weight path per step, preferring the currently loaded path.
         selected_weights: dict[int, Path] = {}
@@ -2540,6 +4506,12 @@ class LtxvTrainer:
             if marker_path is not None:
                 marker_path.unlink(missing_ok=True)
                 logger.debug(f"Removed matching checkpoint ready marker: {marker_path}")
+            accelerator_state_path = accelerator_states_by_step.pop(step, None)
+            if accelerator_state_path is not None:
+                shutil.rmtree(accelerator_state_path)
+                logger.debug(
+                    f"Removed matching Phase 2 Accelerate state: {accelerator_state_path}"
+                )
 
         remaining_weights = {
             step: path
@@ -2556,6 +4528,13 @@ class LtxvTrainer:
                 marker_path.unlink(missing_ok=True)
                 markers_by_step.pop(step)
                 logger.debug(f"Removed orphan checkpoint ready marker: {marker_path}")
+        for step, accelerator_state_path in list(accelerator_states_by_step.items()):
+            if step not in remaining_weights or step not in states_by_step:
+                shutil.rmtree(accelerator_state_path)
+                accelerator_states_by_step.pop(step)
+                logger.debug(
+                    f"Removed orphan Phase 2 Accelerate state: {accelerator_state_path}"
+                )
 
         self._checkpoint_paths = [remaining_weights[step] for step in sorted(remaining_weights)]
         self._training_state_paths = [
@@ -2590,6 +4569,7 @@ class LtxvTrainer:
             else:
                 optimizer_state = self._optimizer.state_dict()
 
+        cuda_device = self._accelerator_cuda_device()
         state = TrainingState(
             global_step=self._global_step,
             config_fingerprint=ConfigFingerprint(
@@ -2600,7 +4580,11 @@ class LtxvTrainer:
             ),
             rng_states=RngStates(
                 torch_state=torch.random.get_rng_state(),
-                cuda_state=torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+                cuda_state=(
+                    torch.cuda.get_rng_state(cuda_device)
+                    if cuda_device is not None
+                    else None
+                ),
             ),
             lr_scheduler_state_dict=self._lr_scheduler.state_dict() if self._lr_scheduler is not None else None,
             optimizer_state_dict=optimizer_state,
@@ -2662,6 +4646,28 @@ class LtxvTrainer:
         """
         raw_metadata = self._training_strategy.get_checkpoint_metadata()
         raw_metadata["global_step"] = self._global_step
+        if self._is_semantic_flow_phase2():
+            parent_sha = self._training_strategy.phase2_parent_checkpoint_sha256
+            if not parent_sha:
+                raise RuntimeError("Phase 2 checkpoint metadata is missing the parent SHA256")
+            if self._last_bridge_checkpoint_key_count <= 0:
+                raise RuntimeError("Phase 2 checkpoint collected zero bridge tensors")
+            parent_step = int(self._training_strategy.config.parent_checkpoint_step)
+            raw_metadata.update(
+                {
+                    "dit_semantic_initial_lr": self._config.optimization.learning_rate,
+                    "conditioning_bridge_initial_lr": (
+                        self._config.optimization.bridge_learning_rate
+                        or self._config.optimization.learning_rate
+                    ),
+                    "phase2_local_global_step": self._global_step,
+                    "effective_total_step": parent_step + self._global_step,
+                    "bridge_key_count": self._last_bridge_checkpoint_key_count,
+                    "bridge_parameter_count": self._optimizer_group_parameter_counts[
+                        "conditioning_bridge"
+                    ],
+                }
+            )
         if self._config.text_encoder_lora.enabled:
             raw_metadata.update(
                 {

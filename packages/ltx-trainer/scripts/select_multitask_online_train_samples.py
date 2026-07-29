@@ -8,12 +8,12 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
+from ltx_trainer.online_inference.path_policy import assert_online_inference_output_path
 from ltx_trainer.online_inference.train_sample_selection import (
     SUPPORTED_TASKS,
     select_online_train_samples,
     write_selection_bundle,
 )
-from ltx_trainer.online_inference.path_policy import assert_online_inference_output_path
 
 app = typer.Typer(pretty_exceptions_enable=False, no_args_is_help=True)
 console = Console()

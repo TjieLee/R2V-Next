@@ -132,13 +132,14 @@ def encode_selected_sample_conditions(
         positive_prompt=str(sample["caption"]),
         negative_prompt=negative_prompt,
         need_negative=guidance.need_negative,
-        need_no_reference=guidance.need_reference,
+        need_no_reference=guidance.need_reference_comparison,
         reference_pixels_vae=references.reference_pixels_vae,
         reference_images_vlm=references.reference_images_vlm,
         width=int(sample["width"]),
         height=int(sample["height"]),
         num_frames=int(sample["num_frames"]),
         fps=float(sample["fps"]),
+        guidance_mode=guidance.guidance_mode,
     )
     conditions["conditions"] = conditions["positive_conditions"]
     conditions["reference_metadata"] = {
@@ -211,13 +212,14 @@ def encode_external_reference_only_conditions(
         positive_prompt=str(sample["caption"]),
         negative_prompt=negative_prompt,
         need_negative=guidance.need_negative,
-        need_no_reference=guidance.need_reference,
+        need_no_reference=guidance.need_reference_comparison,
         reference_pixels_vae=vae_references,
         reference_images_vlm=vlm_references,
         width=int(sample["width"]),
         height=int(sample["height"]),
         num_frames=int(sample["num_frames"]),
         fps=float(sample["fps"]),
+        guidance_mode=guidance.guidance_mode,
     )
     conditions["conditions"] = conditions["positive_conditions"]
     conditions["reference_metadata"] = {

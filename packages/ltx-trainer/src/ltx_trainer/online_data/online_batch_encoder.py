@@ -25,6 +25,7 @@ from ltx_core.multicond.visual_tokens import (
 )
 from ltx_core.text_encoders.gemma.config import GEMMA3_CONFIG_FOR_LTX
 from ltx_core.utils import find_matching_file
+from ltx_trainer import logger
 from ltx_trainer.config import OnlineEncodingConfig
 from ltx_trainer.online_data.anchor_geometry import (
     normalized_anchor_timestamps,
@@ -36,6 +37,8 @@ from ltx_trainer.online_data.transforms import (
     augment_target_frames,
     augmentation_seed,
 )
+from ltx_trainer.online_inference.semantic_guidance import GuidanceMode
+from ltx_trainer.training_strategies.semantic_flow import PHASE2_CONDITION_MODES
 
 
 class OnlineSampleEncodeError(RuntimeError):
@@ -83,6 +86,16 @@ class OnlineSampleEncodeError(RuntimeError):
         return payload
 
 
+def phase2_condition_axes(condition_mode: str) -> tuple[bool, bool, bool]:
+    if condition_mode not in PHASE2_CONDITION_MODES:
+        raise ValueError(f"Unsupported Phase 2 condition mode {condition_mode!r}")
+    axes = tuple(
+        value == "1"
+        for value in condition_mode.removeprefix("til_")
+    )
+    return axes[0], axes[1], axes[2]
+
+
 def _to_pil(image: Tensor) -> Image.Image:
     if image.dtype != torch.uint8 or image.ndim != 3 or image.shape[-1] != 3:
         raise ValueError(f"Expected uint8 [H,W,3] image, got {tuple(image.shape)} {image.dtype}")
@@ -94,6 +107,14 @@ def _materialize_frozen_tensor(value: Tensor) -> Tensor:
     if torch.is_inference(value):
         value = value.clone()
     return value.detach()
+
+
+def _zero_condition_tensors(conditions: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy with every tensor condition replaced by zeros."""
+    return {
+        key: torch.zeros_like(value) if isinstance(value, Tensor) else value
+        for key, value in conditions.items()
+    }
 
 
 def _build_messages(
@@ -157,6 +178,8 @@ class OnlineBatchEncoder:
             "float32": torch.float32,
         }[config.encoder_dtype]
         self.last_dtype_diagnostics: dict[str, str] = {}
+        self.last_hidden_state_diagnostics: dict[str, Any] = {}
+        self._phase2_hidden_state_shape_logged = False
 
         tokenizer_root = str(find_matching_file(text_encoder_path, "tokenizer.model").parent)
         processor_root = str(find_matching_file(text_encoder_path, "preprocessor_config.json").parent)
@@ -229,11 +252,22 @@ class OnlineBatchEncoder:
             global_seed=global_seed,
             strategy_config=strategy_config,
         )
-        drop_reference = condition_mode in {"drop_reference_all", "drop_all"}
-        drop_text = condition_mode in {"drop_text", "drop_all"}
-        if drop_reference:
-            reference_pixels_vae = [[]]
-            reference_images_vlm = [[]]
+        phase2 = getattr(strategy_config, "training_phase", "phase1") == "phase2"
+        if phase2:
+            if condition_mode not in PHASE2_CONDITION_MODES:
+                raise RuntimeError(f"Unsupported Phase 2 condition mode {condition_mode!r}")
+            t_active, i_active, l_active = phase2_condition_axes(condition_mode)
+            if not i_active:
+                reference_images_vlm = [[]]
+            if not l_active:
+                reference_pixels_vae = [[]]
+            drop_text = not t_active
+        else:
+            drop_reference = condition_mode in {"drop_reference_all", "drop_all"}
+            drop_text = condition_mode in {"drop_text", "drop_all"}
+            if drop_reference:
+                reference_pixels_vae = [[]]
+                reference_images_vlm = [[]]
         references = self._reference_images(reference_images_vlm[0])
         caption = "" if drop_text else str(raw_batch["caption"][0])
 
@@ -252,15 +286,15 @@ class OnlineBatchEncoder:
             reference_images=references,
             task=task,
             sample_key=str(raw_batch["sample_key"][0]),
+            defer_feature_extractor=phase2,
         )
         metrics["gemma_prefix_ms"] = (time.perf_counter() - prefix_started) * 1000.0
 
         evidence_started = time.perf_counter()
         if condition_mode == "drop_all":
-            conditions = {
-                key: torch.zeros_like(value) if isinstance(value, Tensor) else value
-                for key, value in conditions.items()
-            }
+            if phase2:
+                raise RuntimeError("Phase 2 must not use the Phase 1 drop_all condition")
+            conditions = _zero_condition_tensors(conditions)
         evidence = self._encode_gt_evidence(raw_batch)
         metrics["gemma_evidence_ms"] = (time.perf_counter() - evidence_started) * 1000.0
         semantic_teacher_inputs = {**prefix_inputs, **evidence}
@@ -315,7 +349,7 @@ class OnlineBatchEncoder:
             "reference_metadata": bundle["reference_metadata"],
         }
 
-    def encode_inference_guidance_bundle_from_references(
+    def encode_inference_guidance_bundle_from_references(  # noqa: PLR0912, PLR0913
         self,
         *,
         task: str,
@@ -329,10 +363,19 @@ class OnlineBatchEncoder:
         height: int,
         num_frames: int,
         fps: float,
+        guidance_mode: GuidanceMode = "positive_ref",
     ) -> dict[str, Any]:
-        """Encode cached P/N/Q conditions and one shared reference latent set."""
+        """Encode guidance conditions and one shared reference latent set."""
         if task not in {IMAGE_TASK, VIDEO_TASK}:
             raise ValueError(f"Unsupported online inference task {task!r}")
+        if guidance_mode not in {
+            "positive_ref",
+            "debiased_ref",
+            "latent_ref",
+            "negative_no_vlm_positive_ref",
+            "negative_no_vlm_latent_ref",
+        }:
+            raise ValueError(f"Unsupported guidance mode {guidance_mode!r}")
         expected_geometry = (
             self.config.width,
             self.config.height,
@@ -363,27 +406,67 @@ class OnlineBatchEncoder:
             sample_key="inference-positive",
         )
         negative_conditions = None
+        negative_no_vlm_conditions = None
         if need_negative:
-            negative_conditions, _ = self._encode_prefix(
-                caption=str(negative_prompt),
-                reference_images=references,
-                task=task,
-                sample_key="inference-negative",
-            )
+            if guidance_mode in {
+                "negative_no_vlm_positive_ref",
+                "negative_no_vlm_latent_ref",
+            }:
+                negative_no_vlm_conditions, _ = self._encode_prefix(
+                    caption=str(negative_prompt),
+                    reference_images=[],
+                    task=task,
+                    sample_key="inference-negative-no-vlm",
+                )
+            else:
+                negative_conditions, _ = self._encode_prefix(
+                    caption=str(negative_prompt),
+                    reference_images=(
+                        references
+                        if guidance_mode in {"positive_ref", "latent_ref"}
+                        else []
+                    ),
+                    task=task,
+                    sample_key=(
+                        "inference-negative"
+                        if guidance_mode in {"positive_ref", "latent_ref"}
+                        else "inference-negative-no-reference"
+                    ),
+                )
         no_reference_conditions = None
-        if need_no_reference:
+        empty_reference_conditions = None
+        empty_no_reference_conditions = None
+        if need_no_reference and guidance_mode in {
+            "positive_ref",
+            "negative_no_vlm_positive_ref",
+        }:
             no_reference_conditions, _ = self._encode_prefix(
                 caption=positive_prompt,
                 reference_images=[],
                 task=task,
                 sample_key="inference-no-reference",
             )
+        elif need_no_reference and guidance_mode == "debiased_ref":
+            empty_reference_conditions, _ = self._encode_prefix(
+                caption="",
+                reference_images=references,
+                task=task,
+                sample_key="inference-empty-reference",
+            )
+            empty_no_reference_conditions, _ = self._encode_prefix(
+                caption="",
+                reference_images=[],
+                task=task,
+                sample_key="inference-empty-no-reference",
+            )
+            empty_no_reference_conditions = _zero_condition_tensors(
+                empty_no_reference_conditions
+            )
         result = {
             "task": task,
             "reference_latents": reference_latents,
             "positive_conditions": positive_conditions,
             "negative_conditions": negative_conditions,
-            "no_reference_conditions": no_reference_conditions,
             "reference_metadata": {
                 "reference_count": len(references),
                 "reference_order": list(range(len(references))),
@@ -396,6 +479,23 @@ class OnlineBatchEncoder:
                 "semantic_initialization": "noise",
             },
         }
+        if guidance_mode in {
+            "negative_no_vlm_positive_ref",
+            "negative_no_vlm_latent_ref",
+        }:
+            result["negative_no_vlm_conditions"] = negative_no_vlm_conditions
+        if guidance_mode in {
+            "positive_ref",
+            "negative_no_vlm_positive_ref",
+        }:
+            result["no_reference_conditions"] = no_reference_conditions
+        elif guidance_mode == "debiased_ref":
+            result.update(
+                {
+                    "empty_reference_conditions": empty_reference_conditions,
+                    "empty_no_reference_conditions": empty_no_reference_conditions,
+                }
+            )
         forbidden = {"target_pixels", "latents", "semantic_teacher_inputs", "evidence_tokens"}
         leaked = sorted(forbidden & result.keys())
         if leaked:
@@ -478,6 +578,7 @@ class OnlineBatchEncoder:
         reference_images: list[Image.Image],
         task: str,
         sample_key: str,
+        defer_feature_extractor: bool = False,
     ) -> tuple[dict[str, Tensor], dict[str, Tensor]]:
         processed, reference_segment_mask, image_token_mask = self._process_multimodal_prefix(
             caption=caption,
@@ -510,7 +611,8 @@ class OnlineBatchEncoder:
         feature_extractor = getattr(self.embeddings_processor, "feature_extractor", None)
         if feature_extractor is None:
             raise RuntimeError("Online prefix encoding requires embeddings_processor.feature_extractor")
-        feature_extractor.requires_grad_(False).eval()
+        if not defer_feature_extractor:
+            feature_extractor.requires_grad_(False).eval()
         language_model.eval()
         prefix_reference_segment_mask = reference_segment_mask.to(device=self.device).unsqueeze(0)
         prefix_image_token_mask = image_token_mask.to(device=self.device).unsqueeze(0)
@@ -536,17 +638,60 @@ class OnlineBatchEncoder:
                 return_dict=True,
                 use_cache=False,
             )
+        if defer_feature_extractor:
+            selected_hidden_states, selected_indices = self._select_feature_hidden_states(
+                outputs.hidden_states,
+                feature_extractor,
+            )
+            materialized_hidden_states = tuple(
+                _materialize_frozen_tensor(value)
+                for value in selected_hidden_states
+            )
+            total_bytes = sum(
+                value.numel() * value.element_size()
+                for value in materialized_hidden_states
+            )
+            self.last_hidden_state_diagnostics = {
+                "selected_hidden_layer_indices": selected_indices,
+                "selected_hidden_state_count": len(materialized_hidden_states),
+                "selected_hidden_state_shapes": [
+                    list(value.shape)
+                    for value in materialized_hidden_states
+                ],
+                "selected_hidden_state_total_bytes": total_bytes,
+            }
+            if not self._phase2_hidden_state_shape_logged:
+                logger.info(
+                    "Phase 2 frozen VLM bridge input: selected_hidden_layer_indices=%s "
+                    "selected_hidden_state_count=%d selected_hidden_state_shapes=%s "
+                    "selected_hidden_state_total_bytes=%d",
+                    selected_indices,
+                    len(materialized_hidden_states),
+                    self.last_hidden_state_diagnostics["selected_hidden_state_shapes"],
+                    total_bytes,
+                )
+                self._phase2_hidden_state_shape_logged = True
+            conditions = {
+                "frozen_vlm_hidden_states": materialized_hidden_states,
+                "prompt_attention_mask": attention_mask,
+            }
+        else:
             hidden_states = self._align_hidden_states(outputs.hidden_states, feature_extractor)
-            video_features, audio_features = feature_extractor(hidden_states, attention_mask, "right")
-        video_features = _materialize_frozen_tensor(video_features)
-        if audio_features is not None:
-            audio_features = _materialize_frozen_tensor(audio_features)
-        conditions = {
-            "video_prompt_embeds": video_features,
-            "prompt_attention_mask": attention_mask,
-        }
-        if audio_features is not None:
-            conditions["audio_prompt_embeds"] = audio_features
+            with torch.inference_mode(), self._frozen_encode_autocast():
+                video_features, audio_features = feature_extractor(
+                    hidden_states,
+                    attention_mask,
+                    "right",
+                )
+            video_features = _materialize_frozen_tensor(video_features)
+            if audio_features is not None:
+                audio_features = _materialize_frozen_tensor(audio_features)
+            conditions = {
+                "video_prompt_embeds": video_features,
+                "prompt_attention_mask": attention_mask,
+            }
+            if audio_features is not None:
+                conditions["audio_prompt_embeds"] = audio_features
         teacher_prefix = {
             "prefix_inputs_embeds": inputs_embeds.detach(),
             "prefix_attention_mask": attention_mask,
@@ -753,6 +898,41 @@ class OnlineBatchEncoder:
             return [align(value) for value in hidden_states]
         return align(hidden_states)
 
+    @staticmethod
+    def _select_feature_hidden_states(
+        hidden_states: Any,
+        feature_extractor: nn.Module,
+    ) -> tuple[tuple[Tensor, ...], list[int]]:
+        if not isinstance(hidden_states, (tuple, list)) or not hidden_states:
+            raise RuntimeError("Gemma did not return the hidden-state tuple required by the feature extractor")
+        projection = getattr(
+            feature_extractor,
+            "video_aggregate_embed",
+            getattr(feature_extractor, "aggregate_embed", None),
+        )
+        projection_in_features = getattr(projection, "in_features", None)
+        for attribute in ("module", "_fsdp_wrapped_module"):
+            if projection_in_features is not None:
+                break
+            projection = getattr(projection, attribute, projection)
+            projection_in_features = getattr(projection, "in_features", None)
+        if projection_in_features is None:
+            raise RuntimeError("Cannot determine Phase 2 feature-extractor hidden-layer contract")
+        hidden_dim = int(hidden_states[0].shape[-1])
+        if int(projection_in_features) % hidden_dim:
+            raise RuntimeError(
+                "Feature extractor input width is not divisible by Gemma hidden width: "
+                f"projection={projection_in_features}, hidden={hidden_dim}"
+            )
+        required_layers = int(projection_in_features) // hidden_dim
+        if len(hidden_states) != required_layers:
+            raise RuntimeError(
+                "Gemma hidden-state count differs from the pretrained feature-extractor contract: "
+                f"expected={required_layers}, actual={len(hidden_states)}"
+            )
+        indices = list(range(required_layers))
+        return tuple(hidden_states), indices
+
     def _frozen_encode_autocast(self) -> Any:
         if self.device.type == "cuda" and self.dtype in {torch.bfloat16, torch.float16}:
             return torch.autocast(device_type="cuda", dtype=self.dtype)
@@ -798,6 +978,17 @@ class OnlineBatchEncoder:
         )
         generator = torch.Generator(device="cpu").manual_seed(seed)
         draw = float(torch.rand((), generator=generator).item())
+        if getattr(strategy_config, "training_phase", "phase1") == "phase2":
+            probabilities = tuple(
+                (name, strategy_config.phase2_condition_probabilities[name])
+                for name in PHASE2_CONDITION_MODES
+            )
+            cumulative = 0.0
+            for name, probability in probabilities:
+                cumulative += float(probability)
+                if draw < cumulative:
+                    return name
+            return "til_000"
         probabilities = (
             ("full", strategy_config.condition_full_p),
             ("drop_text", strategy_config.condition_drop_text_p),

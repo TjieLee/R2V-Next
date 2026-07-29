@@ -341,6 +341,12 @@ class OptimizationConfig(ConfigBaseModel):
         description="Learning rate for optimization",
     )
 
+    bridge_learning_rate: float | None = Field(
+        default=None,
+        gt=0.0,
+        description="Optional Semantic Flow Phase 2 conditioning-bridge learning rate.",
+    )
+
     steps: int = Field(
         default=3000,
         description="Number of training steps",
@@ -968,5 +974,17 @@ class LtxTrainerConfig(ConfigBaseModel):
                 raise ValueError("online and semantic_flow vlm_teacher_max_length values must match")
             if online.anchor_frame_ratio != self.training_strategy.anchor_frame_ratio:
                 raise ValueError("online and semantic_flow anchor_frame_ratio values must match")
+            if (
+                self.training_strategy.training_phase == "phase2"
+                and not self.model.load_checkpoint
+            ):
+                raise ValueError("semantic_flow phase2 requires an explicit initialization checkpoint")
+            if (
+                self.training_strategy.training_phase == "phase1"
+                and self.optimization.bridge_learning_rate is not None
+            ):
+                raise ValueError(
+                    "optimization.bridge_learning_rate is only valid for semantic_flow phase2"
+                )
 
         return self
