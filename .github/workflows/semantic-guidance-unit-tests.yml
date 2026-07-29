@@ -1,0 +1,56 @@
+name: Semantic Guidance Unit Tests
+
+on:
+  pull_request:
+    paths:
+      - "packages/ltx-trainer/scripts/infer_external_r2v_eval.py"
+      - "packages/ltx-trainer/scripts/infer_multitask_online_train_samples.py"
+      - "packages/ltx-trainer/src/ltx_trainer/online_data/online_batch_encoder.py"
+      - "packages/ltx-trainer/src/ltx_trainer/online_inference/checkpoint_runtime.py"
+      - "packages/ltx-trainer/src/ltx_trainer/online_inference/semantic_guidance.py"
+      - "packages/ltx-trainer/src/ltx_trainer/training_strategies/semantic_flow.py"
+      - "packages/ltx-trainer/tests/test_semantic_guidance.py"
+      - ".github/workflows/semantic-guidance-unit-tests.yml"
+  push:
+    branches:
+      - agent/multimodal-ref-guidance
+    paths:
+      - "packages/ltx-trainer/scripts/infer_external_r2v_eval.py"
+      - "packages/ltx-trainer/scripts/infer_multitask_online_train_samples.py"
+      - "packages/ltx-trainer/src/ltx_trainer/online_data/online_batch_encoder.py"
+      - "packages/ltx-trainer/src/ltx_trainer/online_inference/checkpoint_runtime.py"
+      - "packages/ltx-trainer/src/ltx_trainer/online_inference/semantic_guidance.py"
+      - "packages/ltx-trainer/src/ltx_trainer/training_strategies/semantic_flow.py"
+      - "packages/ltx-trainer/tests/test_semantic_guidance.py"
+      - ".github/workflows/semantic-guidance-unit-tests.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: semantic-guidance-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  semantic-guidance-unit-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install CPU test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e packages/ltx-core -e packages/ltx-trainer
+
+      - name: Run semantic guidance tests
+        run: |
+          python -m pytest -q packages/ltx-trainer/tests/test_semantic_guidance.py
