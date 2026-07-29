@@ -435,9 +435,17 @@ class OnlineInferenceRuntime:
             )
         negative = None
         if guidance.need_negative:
-            raw_negative = encoded.get("negative_conditions")
+            negative_condition_key = (
+                "negative_no_vlm_conditions"
+                if guidance.uses_no_vlm_negative
+                else "negative_conditions"
+            )
+            raw_negative = encoded.get(negative_condition_key)
             if raw_negative is None:
-                raise ValueError("CFG is enabled but negative conditions were not encoded")
+                branch_name = "N_I0" if guidance.uses_no_vlm_negative else "N"
+                raise ValueError(
+                    f"CFG is enabled but {branch_name} conditions were not encoded"
+                )
             if not str(negative_prompt or "").strip():
                 raise ValueError("CFG is enabled but the negative prompt is empty")
             negative = branch_state(
@@ -449,7 +457,7 @@ class OnlineInferenceRuntime:
         no_latent_reference = None
         empty_reference = None
         empty_no_reference = None
-        if guidance.need_reference and guidance.guidance_mode == "positive_ref":
+        if guidance.need_reference and guidance.uses_q_reference_comparison:
             raw_no_reference = encoded.get("no_reference_conditions")
             if raw_no_reference is None:
                 raise ValueError("Reference guidance is enabled but Q conditions were not encoded")
@@ -462,7 +470,7 @@ class OnlineInferenceRuntime:
                 self.connector_conditions(raw_no_reference),
                 reference_latents=no_ref_latents,
             )
-        elif guidance.need_reference and guidance.guidance_mode == "latent_ref":
+        elif guidance.need_reference and guidance.uses_ql_reference_comparison:
             no_ref_latents = dict(encoded["reference_latents"])
             no_ref_latents["ref_valid_mask"] = torch.zeros_like(
                 encoded["reference_latents"]["ref_valid_mask"],

@@ -372,6 +372,8 @@ class OnlineBatchEncoder:
             "positive_ref",
             "debiased_ref",
             "latent_ref",
+            "negative_no_vlm_positive_ref",
+            "negative_no_vlm_latent_ref",
         }:
             raise ValueError(f"Unsupported guidance mode {guidance_mode!r}")
         expected_geometry = (
@@ -404,25 +406,40 @@ class OnlineBatchEncoder:
             sample_key="inference-positive",
         )
         negative_conditions = None
+        negative_no_vlm_conditions = None
         if need_negative:
-            negative_conditions, _ = self._encode_prefix(
-                caption=str(negative_prompt),
-                reference_images=(
-                    references
-                    if guidance_mode in {"positive_ref", "latent_ref"}
-                    else []
-                ),
-                task=task,
-                sample_key=(
-                    "inference-negative"
-                    if guidance_mode in {"positive_ref", "latent_ref"}
-                    else "inference-negative-no-reference"
-                ),
-            )
+            if guidance_mode in {
+                "negative_no_vlm_positive_ref",
+                "negative_no_vlm_latent_ref",
+            }:
+                negative_no_vlm_conditions, _ = self._encode_prefix(
+                    caption=str(negative_prompt),
+                    reference_images=[],
+                    task=task,
+                    sample_key="inference-negative-no-vlm",
+                )
+            else:
+                negative_conditions, _ = self._encode_prefix(
+                    caption=str(negative_prompt),
+                    reference_images=(
+                        references
+                        if guidance_mode in {"positive_ref", "latent_ref"}
+                        else []
+                    ),
+                    task=task,
+                    sample_key=(
+                        "inference-negative"
+                        if guidance_mode in {"positive_ref", "latent_ref"}
+                        else "inference-negative-no-reference"
+                    ),
+                )
         no_reference_conditions = None
         empty_reference_conditions = None
         empty_no_reference_conditions = None
-        if need_no_reference and guidance_mode == "positive_ref":
+        if need_no_reference and guidance_mode in {
+            "positive_ref",
+            "negative_no_vlm_positive_ref",
+        }:
             no_reference_conditions, _ = self._encode_prefix(
                 caption=positive_prompt,
                 reference_images=[],
@@ -462,7 +479,15 @@ class OnlineBatchEncoder:
                 "semantic_initialization": "noise",
             },
         }
-        if guidance_mode == "positive_ref":
+        if guidance_mode in {
+            "negative_no_vlm_positive_ref",
+            "negative_no_vlm_latent_ref",
+        }:
+            result["negative_no_vlm_conditions"] = negative_no_vlm_conditions
+        if guidance_mode in {
+            "positive_ref",
+            "negative_no_vlm_positive_ref",
+        }:
             result["no_reference_conditions"] = no_reference_conditions
         elif guidance_mode == "debiased_ref":
             result.update(

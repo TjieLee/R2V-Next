@@ -16,7 +16,13 @@ from ltx_core.guidance.perturbations import (
     PerturbationType,
 )
 
-GuidanceMode = Literal["positive_ref", "debiased_ref", "latent_ref"]
+GuidanceMode = Literal[
+    "positive_ref",
+    "debiased_ref",
+    "latent_ref",
+    "negative_no_vlm_positive_ref",
+    "negative_no_vlm_latent_ref",
+]
 
 
 @dataclass(frozen=True)
@@ -35,10 +41,13 @@ class SemanticGuidanceConfig:
             "positive_ref",
             "debiased_ref",
             "latent_ref",
+            "negative_no_vlm_positive_ref",
+            "negative_no_vlm_latent_ref",
         }:
             raise ValueError(
-                "guidance_mode must be 'positive_ref', 'debiased_ref', or "
-                "'latent_ref', "
+                "guidance_mode must be 'positive_ref', 'debiased_ref', "
+                "'latent_ref', 'negative_no_vlm_positive_ref', or "
+                "'negative_no_vlm_latent_ref', "
                 f"got {self.guidance_mode!r}"
             )
         values = {
@@ -85,14 +94,35 @@ class SemanticGuidanceConfig:
         )
 
     @property
+    def uses_no_vlm_negative(self) -> bool:
+        return self.guidance_mode in {
+            "negative_no_vlm_positive_ref",
+            "negative_no_vlm_latent_ref",
+        }
+
+    @property
+    def uses_q_reference_comparison(self) -> bool:
+        return self.guidance_mode in {
+            "positive_ref",
+            "negative_no_vlm_positive_ref",
+        }
+
+    @property
+    def uses_ql_reference_comparison(self) -> bool:
+        return self.guidance_mode in {
+            "latent_ref",
+            "negative_no_vlm_latent_ref",
+        }
+
+    @property
     def need_reference_comparison(self) -> bool:
-        if self.guidance_mode in {"positive_ref", "latent_ref"}:
+        if self.guidance_mode != "debiased_ref":
             return self.need_reference
         return self.need_control_pair
 
     @property
     def transformer_forwards_per_step(self) -> int:
-        if self.guidance_mode in {"positive_ref", "latent_ref"}:
+        if self.guidance_mode != "debiased_ref":
             return (
                 1
                 + int(self.need_negative)
@@ -110,11 +140,11 @@ class SemanticGuidanceConfig:
     def enabled_branches(self) -> tuple[str, ...]:
         branches = ["P"]
         if self.need_negative:
-            branches.append("N")
-        if self.guidance_mode == "positive_ref":
+            branches.append("N_I0" if self.uses_no_vlm_negative else "N")
+        if self.uses_q_reference_comparison:
             if self.need_reference:
                 branches.append("Q")
-        elif self.guidance_mode == "latent_ref":
+        elif self.uses_ql_reference_comparison:
             if self.need_reference:
                 branches.append("QL")
         elif self.need_control_pair:
@@ -184,6 +214,48 @@ class SemanticGuidanceConfig:
                     "Q_latent_text": "positive",
                     "Q_latent_vlm_references": "present",
                     "Q_latent_reference_latents": "absent",
+                    "reference_guidance_target": "dit_reference_latent_effect",
+                }
+            )
+        elif self.guidance_mode == "negative_no_vlm_positive_ref":
+            metadata.update(
+                {
+                    "cfg_formula": "N_I0 + cfg*(P-N_I0)",
+                    "ref_formula": "ref*(P-Q)",
+                    "stg_formula": "stg*(P-S)",
+                    "P_text": "positive",
+                    "P_vlm_references": "present",
+                    "P_reference_latents": "present",
+                    "N_I0_text": "negative",
+                    "N_I0_vlm_references": "absent",
+                    "N_I0_reference_latents": "present",
+                    "Q_text": "positive",
+                    "Q_vlm_references": "absent",
+                    "Q_reference_latents": "absent",
+                    "negative_branch_condition_axes": "T_negative_I0_L1",
+                    "reference_comparison_branch": "Q",
+                    "reference_guidance_target": (
+                        "vlm_and_latent_reference_effect"
+                    ),
+                }
+            )
+        elif self.guidance_mode == "negative_no_vlm_latent_ref":
+            metadata.update(
+                {
+                    "cfg_formula": "N_I0 + cfg*(P-N_I0)",
+                    "ref_formula": "ref*(P-QL)",
+                    "stg_formula": "stg*(P-S)",
+                    "P_text": "positive",
+                    "P_vlm_references": "present",
+                    "P_reference_latents": "present",
+                    "N_I0_text": "negative",
+                    "N_I0_vlm_references": "absent",
+                    "N_I0_reference_latents": "present",
+                    "QL_text": "positive",
+                    "QL_vlm_references": "present",
+                    "QL_reference_latents": "absent",
+                    "negative_branch_condition_axes": "T_negative_I0_L1",
+                    "reference_comparison_branch": "QL",
                     "reference_guidance_target": "dit_reference_latent_effect",
                 }
             )
@@ -336,7 +408,7 @@ def combine_guided_denoised(  # noqa: PLR0912
     }
     if mismatched:
         raise ValueError(f"Guidance branch shapes differ from positive {tuple(expected)}: {mismatched}")
-    if config.guidance_mode in {"positive_ref", "latent_ref"}:
+    if config.guidance_mode != "debiased_ref":
         if config.need_negative:
             if negative is None:
                 raise ValueError("negative denoised prediction is required when CFG is enabled")
@@ -344,18 +416,22 @@ def combine_guided_denoised(  # noqa: PLR0912
         else:
             guided = positive
         if config.need_reference:
-            if config.guidance_mode == "positive_ref":
+            if config.uses_q_reference_comparison:
                 if no_reference is None:
                     raise ValueError(
                         "Q denoised prediction is required for reference guidance"
                     )
                 reference_comparison = no_reference
-            else:
+            elif config.uses_ql_reference_comparison:
                 if no_latent_reference is None:
                     raise ValueError(
                         "QL denoised prediction is required for latent reference guidance"
                     )
                 reference_comparison = no_latent_reference
+            else:
+                raise RuntimeError(
+                    f"Unsupported reference comparison mode {config.guidance_mode!r}"
+                )
             guided = guided + config.ref_guidance_scale * (
                 positive - reference_comparison
             )
