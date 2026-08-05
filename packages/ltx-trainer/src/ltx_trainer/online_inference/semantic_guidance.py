@@ -22,6 +22,7 @@ GuidanceMode = Literal[
     "latent_ref",
     "negative_no_vlm_positive_ref",
     "negative_no_vlm_latent_ref",
+    "standard_negative_latent_ref",
 ]
 
 
@@ -43,11 +44,13 @@ class SemanticGuidanceConfig:
             "latent_ref",
             "negative_no_vlm_positive_ref",
             "negative_no_vlm_latent_ref",
+            "standard_negative_latent_ref",
         }:
             raise ValueError(
                 "guidance_mode must be 'positive_ref', 'debiased_ref', "
                 "'latent_ref', 'negative_no_vlm_positive_ref', or "
-                "'negative_no_vlm_latent_ref', "
+                "'negative_no_vlm_latent_ref', or "
+                "'standard_negative_latent_ref', "
                 f"got {self.guidance_mode!r}"
             )
         values = {
@@ -98,7 +101,20 @@ class SemanticGuidanceConfig:
         return self.guidance_mode in {
             "negative_no_vlm_positive_ref",
             "negative_no_vlm_latent_ref",
+            "standard_negative_latent_ref",
         }
+
+    @property
+    def uses_standard_drop_all_negative(self) -> bool:
+        return self.guidance_mode == "standard_negative_latent_ref"
+
+    @property
+    def negative_branch_name(self) -> str:
+        if self.uses_standard_drop_all_negative:
+            return "N0"
+        if self.uses_no_vlm_negative:
+            return "N_I0"
+        return "N"
 
     @property
     def uses_q_reference_comparison(self) -> bool:
@@ -112,6 +128,7 @@ class SemanticGuidanceConfig:
         return self.guidance_mode in {
             "latent_ref",
             "negative_no_vlm_latent_ref",
+            "standard_negative_latent_ref",
         }
 
     @property
@@ -140,7 +157,7 @@ class SemanticGuidanceConfig:
     def enabled_branches(self) -> tuple[str, ...]:
         branches = ["P"]
         if self.need_negative:
-            branches.append("N_I0" if self.uses_no_vlm_negative else "N")
+            branches.append(self.negative_branch_name)
         if self.uses_q_reference_comparison:
             if self.need_reference:
                 branches.append("Q")
@@ -233,6 +250,8 @@ class SemanticGuidanceConfig:
                     "Q_vlm_references": "absent",
                     "Q_reference_latents": "absent",
                     "negative_branch_condition_axes": "T_negative_I0_L1",
+                    "negative_branch_vlm_references": "absent",
+                    "negative_branch_reference_latents": "present",
                     "reference_comparison_branch": "Q",
                     "reference_guidance_target": (
                         "vlm_and_latent_reference_effect"
@@ -255,6 +274,30 @@ class SemanticGuidanceConfig:
                     "QL_vlm_references": "present",
                     "QL_reference_latents": "absent",
                     "negative_branch_condition_axes": "T_negative_I0_L1",
+                    "negative_branch_vlm_references": "absent",
+                    "negative_branch_reference_latents": "present",
+                    "reference_comparison_branch": "QL",
+                    "reference_guidance_target": "dit_reference_latent_effect",
+                }
+            )
+        elif self.guidance_mode == "standard_negative_latent_ref":
+            metadata.update(
+                {
+                    "cfg_formula": "N0 + cfg*(P-N0)",
+                    "ref_formula": "ref*(P-QL)",
+                    "stg_formula": "stg*(P-S)",
+                    "P_text": "positive",
+                    "P_vlm_references": "present",
+                    "P_reference_latents": "present",
+                    "N0_text": "negative",
+                    "N0_vlm_references": "absent",
+                    "N0_reference_latents": "absent",
+                    "QL_text": "positive",
+                    "QL_vlm_references": "present",
+                    "QL_reference_latents": "absent",
+                    "negative_branch_condition_axes": "T_negative_I0_L0",
+                    "negative_branch_vlm_references": "absent",
+                    "negative_branch_reference_latents": "absent",
                     "reference_comparison_branch": "QL",
                     "reference_guidance_target": "dit_reference_latent_effect",
                 }

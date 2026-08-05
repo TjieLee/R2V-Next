@@ -1362,7 +1362,8 @@ class SemanticFlowStrategy(TrainingStrategy):
             ):
                 raise ValueError("Guidance branches differ in generated-span attention layout")
         if (
-            guidance.guidance_mode != "debiased_ref"
+            guidance.guidance_mode
+            not in {"debiased_ref", "standard_negative_latent_ref"}
             and states.negative is not None
             and not torch.equal(
                 states.negative.modality.latent[:, :ref_end],
@@ -1371,7 +1372,8 @@ class SemanticFlowStrategy(TrainingStrategy):
         ):
             raise ValueError("P and N must share reference latents")
         if (
-            guidance.guidance_mode != "debiased_ref"
+            guidance.guidance_mode
+            not in {"debiased_ref", "standard_negative_latent_ref"}
             and states.negative is not None
         ):
             for name in ("attention_mask", "entity_ids"):
@@ -1380,6 +1382,15 @@ class SemanticFlowStrategy(TrainingStrategy):
                     getattr(positive.modality, name),
                 ):
                     raise ValueError(f"P and N must share {name}")
+        if guidance.uses_standard_drop_all_negative and guidance.need_negative:
+            assert states.negative is not None
+            negative = states.negative.modality
+            if torch.count_nonzero(negative.latent[:, :ref_end]).item():
+                raise ValueError("N0 reference tokens must be zero")
+            if negative.attention_mask[:, ref_end:, :ref_end].any():
+                raise ValueError(
+                    "N0 generated tokens must not attend to reference tokens"
+                )
         if guidance.need_reference and guidance.uses_q_reference_comparison:
             assert states.no_reference is not None
             if torch.count_nonzero(states.no_reference.modality.latent[:, :ref_end]).item():
