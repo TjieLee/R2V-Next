@@ -436,7 +436,7 @@ class OnlineInferenceRuntime:
 
         no_ref_latents = None
         if guidance.need_control_pair or (
-            guidance.need_negative and guidance.uses_standard_drop_all_negative
+            guidance.need_negative and guidance.uses_drop_all_negative
         ):
             no_ref_latents = inactive_reference_latents()
         negative = None
@@ -463,7 +463,22 @@ class OnlineInferenceRuntime:
         no_latent_reference = None
         empty_reference = None
         empty_no_reference = None
-        if guidance.need_reference and guidance.uses_q_reference_comparison:
+        if guidance.uses_factorized_til_guidance:
+            raw_no_reference = encoded.get("no_reference_conditions")
+            if raw_no_reference is None:
+                raise ValueError(
+                    "Factorized T/I/L guidance requires T conditions"
+                )
+            assert no_ref_latents is not None
+            no_reference = branch_state(
+                self.connector_conditions(raw_no_reference),
+                reference_latents=no_ref_latents,
+            )
+            no_latent_reference = branch_state(
+                connected_positive_conditions,
+                reference_latents=no_ref_latents,
+            )
+        elif guidance.need_reference and guidance.uses_q_reference_comparison:
             raw_no_reference = encoded.get("no_reference_conditions")
             if raw_no_reference is None:
                 raise ValueError("Reference guidance is enabled but Q conditions were not encoded")

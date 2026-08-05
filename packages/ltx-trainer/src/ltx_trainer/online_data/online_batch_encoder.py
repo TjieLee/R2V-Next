@@ -375,6 +375,7 @@ class OnlineBatchEncoder:
             "negative_no_vlm_positive_ref",
             "negative_no_vlm_latent_ref",
             "standard_negative_latent_ref",
+            "factorized_til_guidance",
         }:
             raise ValueError(f"Unsupported guidance mode {guidance_mode!r}")
         expected_geometry = (
@@ -413,6 +414,7 @@ class OnlineBatchEncoder:
                 "negative_no_vlm_positive_ref",
                 "negative_no_vlm_latent_ref",
                 "standard_negative_latent_ref",
+                "factorized_til_guidance",
             }:
                 negative_no_vlm_conditions, _ = self._encode_prefix(
                     caption=str(negative_prompt),
@@ -441,6 +443,7 @@ class OnlineBatchEncoder:
         if need_no_reference and guidance_mode in {
             "positive_ref",
             "negative_no_vlm_positive_ref",
+            "factorized_til_guidance",
         }:
             no_reference_conditions, _ = self._encode_prefix(
                 caption=positive_prompt,
@@ -485,11 +488,13 @@ class OnlineBatchEncoder:
             "negative_no_vlm_positive_ref",
             "negative_no_vlm_latent_ref",
             "standard_negative_latent_ref",
+            "factorized_til_guidance",
         }:
             result["negative_no_vlm_conditions"] = negative_no_vlm_conditions
         if guidance_mode in {
             "positive_ref",
             "negative_no_vlm_positive_ref",
+            "factorized_til_guidance",
         }:
             result["no_reference_conditions"] = no_reference_conditions
         elif guidance_mode == "debiased_ref":

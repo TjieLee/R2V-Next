@@ -103,10 +103,14 @@ def main(
         help=(
             "Guidance mode: positive_ref, debiased_ref, latent_ref, "
             "negative_no_vlm_positive_ref, negative_no_vlm_latent_ref, or "
-            "standard_negative_latent_ref."
+            "standard_negative_latent_ref, or factorized_til_guidance. "
+            "In factorized_til_guidance, --guidance-scale controls text, "
+            "--vlm-guidance-scale controls VLM reference images, and "
+            "--ref-guidance-scale controls reference latents."
         ),
     ),
     guidance_scale: float = typer.Option(4.0, "--guidance-scale"),
+    vlm_guidance_scale: float = typer.Option(1.0, "--vlm-guidance-scale"),
     ref_guidance_scale: float = typer.Option(1.0, "--ref-guidance-scale"),
     guidance_rescale: float = typer.Option(0.7, "--guidance-rescale"),
     stg_scale: float = typer.Option(0.0, "--stg-scale"),
@@ -127,6 +131,7 @@ def main(
         guidance = SemanticGuidanceConfig(
             guidance_mode=guidance_mode,
             guidance_scale=guidance_scale,
+            vlm_guidance_scale=vlm_guidance_scale,
             ref_guidance_scale=ref_guidance_scale,
             guidance_rescale=guidance_rescale,
             stg_scale=stg_scale,
