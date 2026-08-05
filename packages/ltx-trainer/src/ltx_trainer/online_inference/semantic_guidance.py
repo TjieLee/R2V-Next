@@ -23,6 +23,7 @@ GuidanceMode = Literal[
     "negative_no_vlm_positive_ref",
     "negative_no_vlm_latent_ref",
     "standard_negative_latent_ref",
+    "factorized_til_guidance",
 ]
 
 
@@ -36,6 +37,7 @@ class SemanticGuidanceConfig:
     guidance_rescale: float = 0.7
     stg_scale: float = 0.0
     stg_blocks: tuple[int, ...] = (28,)
+    vlm_guidance_scale: float = 1.0
 
     def __post_init__(self) -> None:
         if self.guidance_mode not in {
@@ -45,16 +47,19 @@ class SemanticGuidanceConfig:
             "negative_no_vlm_positive_ref",
             "negative_no_vlm_latent_ref",
             "standard_negative_latent_ref",
+            "factorized_til_guidance",
         }:
             raise ValueError(
                 "guidance_mode must be 'positive_ref', 'debiased_ref', "
                 "'latent_ref', 'negative_no_vlm_positive_ref', or "
                 "'negative_no_vlm_latent_ref', or "
-                "'standard_negative_latent_ref', "
+                "'standard_negative_latent_ref', or "
+                "'factorized_til_guidance', "
                 f"got {self.guidance_mode!r}"
             )
         values = {
             "guidance_scale": self.guidance_scale,
+            "vlm_guidance_scale": self.vlm_guidance_scale,
             "ref_guidance_scale": self.ref_guidance_scale,
             "guidance_rescale": self.guidance_rescale,
             "stg_scale": self.stg_scale,
@@ -64,8 +69,15 @@ class SemanticGuidanceConfig:
             raise ValueError(f"Guidance scales must be finite: {non_finite}")
         if self.guidance_scale < 1.0:
             raise ValueError("guidance_scale must be >= 1.0")
+        if self.vlm_guidance_scale < 0.0:
+            raise ValueError("vlm_guidance_scale must be >= 0.0")
         if self.ref_guidance_scale < 0.0:
             raise ValueError("ref_guidance_scale must be >= 0.0")
+        if not self.uses_factorized_til_guidance and self.vlm_guidance_scale != 1.0:
+            raise ValueError(
+                "vlm_guidance_scale must remain 1.0 outside "
+                "factorized_til_guidance"
+            )
         if not 0.0 <= self.guidance_rescale <= 1.0:
             raise ValueError("guidance_rescale must be between 0.0 and 1.0")
         if self.stg_scale < 0.0:
@@ -79,7 +91,7 @@ class SemanticGuidanceConfig:
 
     @property
     def need_negative(self) -> bool:
-        return self.guidance_scale != 1.0
+        return self.uses_factorized_til_guidance or self.guidance_scale != 1.0
 
     @property
     def need_reference(self) -> bool:
@@ -97,11 +109,16 @@ class SemanticGuidanceConfig:
         )
 
     @property
+    def uses_factorized_til_guidance(self) -> bool:
+        return self.guidance_mode == "factorized_til_guidance"
+
+    @property
     def uses_no_vlm_negative(self) -> bool:
         return self.guidance_mode in {
             "negative_no_vlm_positive_ref",
             "negative_no_vlm_latent_ref",
             "standard_negative_latent_ref",
+            "factorized_til_guidance",
         }
 
     @property
@@ -109,8 +126,15 @@ class SemanticGuidanceConfig:
         return self.guidance_mode == "standard_negative_latent_ref"
 
     @property
+    def uses_drop_all_negative(self) -> bool:
+        return (
+            self.uses_standard_drop_all_negative
+            or self.uses_factorized_til_guidance
+        )
+
+    @property
     def negative_branch_name(self) -> str:
-        if self.uses_standard_drop_all_negative:
+        if self.uses_drop_all_negative:
             return "N0"
         if self.uses_no_vlm_negative:
             return "N_I0"
@@ -133,12 +157,22 @@ class SemanticGuidanceConfig:
 
     @property
     def need_reference_comparison(self) -> bool:
+        if self.uses_factorized_til_guidance:
+            return True
         if self.guidance_mode != "debiased_ref":
             return self.need_reference
         return self.need_control_pair
 
     @property
+    def need_positive_no_vlm_condition(self) -> bool:
+        return self.uses_factorized_til_guidance or (
+            self.uses_q_reference_comparison and self.need_reference
+        )
+
+    @property
     def transformer_forwards_per_step(self) -> int:
+        if self.uses_factorized_til_guidance:
+            return 4 + int(self.need_stg)
         if self.guidance_mode != "debiased_ref":
             return (
                 1
@@ -155,6 +189,11 @@ class SemanticGuidanceConfig:
 
     @property
     def enabled_branches(self) -> tuple[str, ...]:
+        if self.uses_factorized_til_guidance:
+            branches = ["P", "N0", "T", "I"]
+            if self.need_stg:
+                branches.append("S")
+            return tuple(branches)
         branches = ["P"]
         if self.need_negative:
             branches.append(self.negative_branch_name)
@@ -187,7 +226,29 @@ class SemanticGuidanceConfig:
             "rescale_statistics_segment": "target_video",
             "rescale_application_segment": "semantic_and_target",
         }
-        if self.guidance_mode == "positive_ref":
+        if self.uses_factorized_til_guidance:
+            metadata.update(
+                {
+                    "guidance_formula": (
+                        "N0 + text*(T-N0) + vlm*(I-T) + "
+                        "latent*(P-I) + stg*(P-S)"
+                    ),
+                    "text_guidance_scale": self.guidance_scale,
+                    "vlm_guidance_scale": self.vlm_guidance_scale,
+                    "latent_guidance_scale": self.ref_guidance_scale,
+                    "condition_factorization": "T_I_L_incremental_v1",
+                    "negative_branch": "N0",
+                    "text_only_branch": "T",
+                    "vlm_branch": "I",
+                    "full_positive_branch": "P",
+                    "stg_branch": "S",
+                    "N0_condition_axes": "T_negative_I0_L0",
+                    "T_condition_axes": "T_positive_I0_L0",
+                    "I_condition_axes": "T_positive_I1_L0",
+                    "P_condition_axes": "T_positive_I1_L1",
+                }
+            )
+        elif self.guidance_mode == "positive_ref":
             metadata.update(
                 {
                     "cfg_formula": "N + cfg*(P-N), P/N share reference images and reference latents",
@@ -451,6 +512,36 @@ def combine_guided_denoised(  # noqa: PLR0912
     }
     if mismatched:
         raise ValueError(f"Guidance branch shapes differ from positive {tuple(expected)}: {mismatched}")
+    if config.uses_factorized_til_guidance:
+        required = {
+            "negative": negative,
+            "no_reference": no_reference,
+            "no_latent_reference": no_latent_reference,
+        }
+        missing = [name for name, value in required.items() if value is None]
+        if missing:
+            raise ValueError(
+                "Factorized T/I/L guidance requires N0, T, and I denoised "
+                f"predictions; missing {missing}"
+            )
+        assert negative is not None
+        assert no_reference is not None
+        assert no_latent_reference is not None
+        guided = negative
+        guided = guided + config.guidance_scale * (
+            no_reference - negative
+        )
+        guided = guided + config.vlm_guidance_scale * (
+            no_latent_reference - no_reference
+        )
+        guided = guided + config.ref_guidance_scale * (
+            positive - no_latent_reference
+        )
+        if config.need_stg:
+            if stg is None:
+                raise ValueError("STG denoised prediction is required when STG is enabled")
+            guided = guided + config.stg_scale * (positive - stg)
+        return guided
     if config.guidance_mode != "debiased_ref":
         if config.need_negative:
             if negative is None:

@@ -1184,7 +1184,8 @@ class SemanticFlowStrategy(TrainingStrategy):
     ) -> tuple[Tensor, Tensor]:
         """Guide one canonical semantic/video trajectory with cached condition branches."""
         if (
-            guidance.guidance_scale == 1.0
+            not guidance.uses_factorized_til_guidance
+            and guidance.guidance_scale == 1.0
             and guidance.ref_guidance_scale == 0.0
             and guidance.stg_scale == 0.0
             and guidance.guidance_rescale == 0.0
@@ -1267,7 +1268,14 @@ class SemanticFlowStrategy(TrainingStrategy):
             denoised_no_latent_reference = None
             denoised_empty_reference = None
             denoised_empty_no_reference = None
-            if guidance.uses_q_reference_comparison:
+            if guidance.uses_factorized_til_guidance:
+                assert states.no_reference is not None
+                assert states.no_latent_reference is not None
+                denoised_no_reference = predict(states.no_reference)
+                denoised_no_latent_reference = predict(
+                    states.no_latent_reference
+                )
+            elif guidance.uses_q_reference_comparison:
                 if guidance.need_reference:
                     denoised_no_reference = predict(states.no_reference)
             elif guidance.uses_ql_reference_comparison:
@@ -1318,7 +1326,13 @@ class SemanticFlowStrategy(TrainingStrategy):
             if states.negative is None:
                 raise ValueError("CFG requires a negative inference state")
             required.append(states.negative)
-        if guidance.uses_q_reference_comparison:
+        if guidance.uses_factorized_til_guidance:
+            if states.no_reference is None or states.no_latent_reference is None:
+                raise ValueError(
+                    "Factorized T/I/L guidance requires T and I inference states"
+                )
+            required.extend((states.no_reference, states.no_latent_reference))
+        elif guidance.uses_q_reference_comparison:
             if guidance.need_reference:
                 if states.no_reference is None:
                     raise ValueError("Reference guidance requires a Q inference state")
@@ -1363,7 +1377,11 @@ class SemanticFlowStrategy(TrainingStrategy):
                 raise ValueError("Guidance branches differ in generated-span attention layout")
         if (
             guidance.guidance_mode
-            not in {"debiased_ref", "standard_negative_latent_ref"}
+            not in {
+                "debiased_ref",
+                "standard_negative_latent_ref",
+                "factorized_til_guidance",
+            }
             and states.negative is not None
             and not torch.equal(
                 states.negative.modality.latent[:, :ref_end],
@@ -1373,7 +1391,11 @@ class SemanticFlowStrategy(TrainingStrategy):
             raise ValueError("P and N must share reference latents")
         if (
             guidance.guidance_mode
-            not in {"debiased_ref", "standard_negative_latent_ref"}
+            not in {
+                "debiased_ref",
+                "standard_negative_latent_ref",
+                "factorized_til_guidance",
+            }
             and states.negative is not None
         ):
             for name in ("attention_mask", "entity_ids"):
@@ -1382,7 +1404,7 @@ class SemanticFlowStrategy(TrainingStrategy):
                     getattr(positive.modality, name),
                 ):
                     raise ValueError(f"P and N must share {name}")
-        if guidance.uses_standard_drop_all_negative and guidance.need_negative:
+        if guidance.uses_drop_all_negative and guidance.need_negative:
             assert states.negative is not None
             negative = states.negative.modality
             if torch.count_nonzero(negative.latent[:, :ref_end]).item():
@@ -1391,6 +1413,29 @@ class SemanticFlowStrategy(TrainingStrategy):
                 raise ValueError(
                     "N0 generated tokens must not attend to reference tokens"
                 )
+        if guidance.uses_factorized_til_guidance:
+            assert states.no_reference is not None
+            assert states.no_latent_reference is not None
+            for name, branch in (
+                ("T", states.no_reference),
+                ("I", states.no_latent_reference),
+            ):
+                modality = branch.modality
+                if torch.count_nonzero(modality.latent[:, :ref_end]).item():
+                    raise ValueError(f"{name} reference tokens must be zero")
+                if modality.attention_mask[:, ref_end:, :ref_end].any():
+                    raise ValueError(
+                        f"{name} generated tokens must not attend to reference tokens"
+                    )
+            no_latent_reference = states.no_latent_reference.modality
+            if not torch.equal(
+                no_latent_reference.context,
+                positive.modality.context,
+            ) or not torch.equal(
+                no_latent_reference.context_mask,
+                positive.modality.context_mask,
+            ):
+                raise ValueError("P and I must share the same VLM condition")
         if guidance.need_reference and guidance.uses_q_reference_comparison:
             assert states.no_reference is not None
             if torch.count_nonzero(states.no_reference.modality.latent[:, :ref_end]).item():
