@@ -426,13 +426,19 @@ class OnlineInferenceRuntime:
                 target_noise=target_noise,
             )
 
-        no_ref_latents = None
-        if guidance.need_control_pair:
-            no_ref_latents = dict(encoded["reference_latents"])
-            no_ref_latents["ref_valid_mask"] = torch.zeros_like(
+        def inactive_reference_latents() -> dict[str, Tensor]:
+            latents = dict(encoded["reference_latents"])
+            latents["ref_valid_mask"] = torch.zeros_like(
                 encoded["reference_latents"]["ref_valid_mask"],
                 dtype=torch.bool,
             )
+            return latents
+
+        no_ref_latents = None
+        if guidance.need_control_pair or (
+            guidance.need_negative and guidance.uses_standard_drop_all_negative
+        ):
+            no_ref_latents = inactive_reference_latents()
         negative = None
         if guidance.need_negative:
             negative_condition_key = (
@@ -442,9 +448,9 @@ class OnlineInferenceRuntime:
             )
             raw_negative = encoded.get(negative_condition_key)
             if raw_negative is None:
-                branch_name = "N_I0" if guidance.uses_no_vlm_negative else "N"
                 raise ValueError(
-                    f"CFG is enabled but {branch_name} conditions were not encoded"
+                    "CFG is enabled but "
+                    f"{guidance.negative_branch_name} conditions were not encoded"
                 )
             if not str(negative_prompt or "").strip():
                 raise ValueError("CFG is enabled but the negative prompt is empty")
@@ -461,21 +467,13 @@ class OnlineInferenceRuntime:
             raw_no_reference = encoded.get("no_reference_conditions")
             if raw_no_reference is None:
                 raise ValueError("Reference guidance is enabled but Q conditions were not encoded")
-            no_ref_latents = dict(encoded["reference_latents"])
-            no_ref_latents["ref_valid_mask"] = torch.zeros_like(
-                encoded["reference_latents"]["ref_valid_mask"],
-                dtype=torch.bool,
-            )
+            no_ref_latents = inactive_reference_latents()
             no_reference = branch_state(
                 self.connector_conditions(raw_no_reference),
                 reference_latents=no_ref_latents,
             )
         elif guidance.need_reference and guidance.uses_ql_reference_comparison:
-            no_ref_latents = dict(encoded["reference_latents"])
-            no_ref_latents["ref_valid_mask"] = torch.zeros_like(
-                encoded["reference_latents"]["ref_valid_mask"],
-                dtype=torch.bool,
-            )
+            no_ref_latents = inactive_reference_latents()
             no_latent_reference = branch_state(
                 connected_positive_conditions,
                 reference_latents=no_ref_latents,

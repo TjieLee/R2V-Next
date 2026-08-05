@@ -104,7 +104,8 @@ def main(
         "--guidance-mode",
         help=(
             "Guidance mode: positive_ref, debiased_ref, latent_ref, "
-            "negative_no_vlm_positive_ref, or negative_no_vlm_latent_ref."
+            "negative_no_vlm_positive_ref, negative_no_vlm_latent_ref, or "
+            "standard_negative_latent_ref."
         ),
     ),
     guidance_scale: float = typer.Option(4.0, "--guidance-scale"),

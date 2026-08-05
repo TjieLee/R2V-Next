@@ -374,6 +374,7 @@ class OnlineBatchEncoder:
             "latent_ref",
             "negative_no_vlm_positive_ref",
             "negative_no_vlm_latent_ref",
+            "standard_negative_latent_ref",
         }:
             raise ValueError(f"Unsupported guidance mode {guidance_mode!r}")
         expected_geometry = (
@@ -411,6 +412,7 @@ class OnlineBatchEncoder:
             if guidance_mode in {
                 "negative_no_vlm_positive_ref",
                 "negative_no_vlm_latent_ref",
+                "standard_negative_latent_ref",
             }:
                 negative_no_vlm_conditions, _ = self._encode_prefix(
                     caption=str(negative_prompt),
@@ -482,6 +484,7 @@ class OnlineBatchEncoder:
         if guidance_mode in {
             "negative_no_vlm_positive_ref",
             "negative_no_vlm_latent_ref",
+            "standard_negative_latent_ref",
         }:
             result["negative_no_vlm_conditions"] = negative_no_vlm_conditions
         if guidance_mode in {
