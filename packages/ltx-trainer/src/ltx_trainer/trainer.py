@@ -185,6 +185,15 @@ def _enforce_semantic_flow_fsdp_runtime_safety(config: LtxTrainerConfig, acceler
             f"Full-DiT {strategy_label} training requires FSDP FULL_STATE_DICT checkpoint collection. "
             f"Configured FSDP state-dict type is {state_dict_type!r}."
         )
+    if strategy_name == "semantic_repae":
+        required_world_size = int(config.training_strategy.required_fsdp_world_size)
+        configured_world_size = int(accelerator.num_processes)
+        if configured_world_size != required_world_size:
+            raise RuntimeError(
+                "Full-DiT semantic REPA-E training requires exactly "
+                f"{required_world_size} FSDP processes; configured "
+                f"num_processes={configured_world_size}"
+            )
 
 
 def _find_scalar_trainable_parameters(

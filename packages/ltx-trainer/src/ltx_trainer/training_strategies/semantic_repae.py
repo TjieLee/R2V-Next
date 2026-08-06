@@ -63,6 +63,7 @@ class SemanticRepaEConfig(TrainingStrategyConfigBase):
     conditions_dir: str = "conditions"
     max_ref_images_per_sample: int = Field(default=4, ge=1, le=MAX_REFERENCE_ENTITIES)
     reference_rope_mode: Literal["negative_adjacent_shifted_hw"] = "negative_adjacent_shifted_hw"
+    required_fsdp_world_size: Literal[8] = 8
 
     semantic_anchor_count: int = Field(default=8, ge=1)
     semantic_grid_size: int = Field(default=16, ge=1)
@@ -615,6 +616,7 @@ class SemanticRepaEStrategy(SemanticFlowStrategy):
             "gemma_dim": self._gemma_dim,
             "semantic_anchor_count": self.config.semantic_anchor_count,
             "semantic_tokens_per_frame": self.config.semantic_tokens_per_frame,
+            "required_fsdp_world_size": self.config.required_fsdp_world_size,
             "semantic_repa_block": self.config.semantic_repa_block,
             "semantic_teacher_gradient": "frozen_no_grad",
             "token_sequence": ["reference", "semantic", "target"],

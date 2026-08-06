@@ -26,7 +26,12 @@ from ltx_core.types import VideoLatentShape
 from ltx_trainer.config import LtxTrainerConfig
 from ltx_trainer.online_data import path_safety
 from ltx_trainer.online_data.adapters.base import CanonicalR2VSource
+from ltx_trainer.online_data.constants import IMAGE_TASK, VIDEO_TASK
 from ltx_trainer.online_data.manifest import prepare_canonical_r2v_record
+from ltx_trainer.online_data.online_batch_encoder import (
+    _build_messages,
+    load_semantic_system_prompts,
+)
 from ltx_trainer.online_inference.checkpoint_runtime import (
     CheckpointAuditError,
     REPAE_STRATEGY_CHECKPOINT_PREFIXES,
@@ -547,17 +552,73 @@ def test_repae_strategy_is_independent_and_registered() -> None:
     assert not hasattr(config, "training_phase")
     assert not hasattr(config, "parent_checkpoint_step")
     assert not hasattr(config, "target_fps")
-    assert strategy.get_checkpoint_metadata()["architecture"] == "semantic_repae_v1"
+    assert config.required_fsdp_world_size == 8
+    metadata = strategy.get_checkpoint_metadata()
+    assert metadata["architecture"] == "semantic_repae_v1"
+    assert metadata["required_fsdp_world_size"] == 8
+    with pytest.raises(ValueError, match="required_fsdp_world_size"):
+        SemanticRepaEConfig(required_fsdp_world_size=4)  # type: ignore[arg-type]
 
 
 def test_repae_full_dit_requires_fsdp_full_shard_runtime() -> None:
     config = SimpleNamespace(
-        training_strategy=SimpleNamespace(name="semantic_repae"),
+        training_strategy=SemanticRepaEConfig(),
         model=SimpleNamespace(training_mode="full"),
     )
     accelerator = SimpleNamespace(distributed_type=DistributedType.NO)
     with pytest.raises(RuntimeError, match="semantic REPA-E.*FSDP FULL_SHARD"):
         _enforce_semantic_flow_fsdp_runtime_safety(config, accelerator)
+
+
+def _full_shard_accelerator(num_processes: int) -> SimpleNamespace:
+    plugin = SimpleNamespace(
+        fsdp_version=1,
+        sharding_strategy=SimpleNamespace(name="FULL_SHARD"),
+        state_dict_type=SimpleNamespace(name="FULL_STATE_DICT"),
+    )
+    return SimpleNamespace(
+        distributed_type=DistributedType.FSDP,
+        num_processes=num_processes,
+        state=SimpleNamespace(fsdp_plugin=plugin),
+    )
+
+
+@pytest.mark.parametrize("num_processes", [1, 2, 4, 7, 16])
+def test_repae_full_dit_rejects_any_non_eight_process_world_size(
+    num_processes: int,
+) -> None:
+    config = SimpleNamespace(
+        training_strategy=SemanticRepaEConfig(),
+        model=SimpleNamespace(training_mode="full"),
+    )
+    with pytest.raises(
+        RuntimeError,
+        match=rf"requires exactly 8 FSDP processes; configured num_processes={num_processes}",
+    ):
+        _enforce_semantic_flow_fsdp_runtime_safety(
+            config,
+            _full_shard_accelerator(num_processes),
+        )
+
+
+def test_repae_full_dit_accepts_eight_processes_without_restricting_semantic_flow() -> None:
+    repae_config = SimpleNamespace(
+        training_strategy=SemanticRepaEConfig(),
+        model=SimpleNamespace(training_mode="full"),
+    )
+    _enforce_semantic_flow_fsdp_runtime_safety(
+        repae_config,
+        _full_shard_accelerator(8),
+    )
+
+    semantic_flow_config = SimpleNamespace(
+        training_strategy=SimpleNamespace(name="semantic_flow"),
+        model=SimpleNamespace(training_mode="full"),
+    )
+    _enforce_semantic_flow_fsdp_runtime_safety(
+        semantic_flow_config,
+        _full_shard_accelerator(4),
+    )
 
 
 class _TinyCheckpointTransformer(nn.Module):
@@ -635,6 +696,10 @@ def test_repae_production_config_parses_with_correct_worktree_and_no_augmentatio
         )
     )
     assert source_data_config["online_augmentation"]["enabled"] is False
+    source_sampling = source_data_config["online_sampling"]
+    assert source_sampling["image_ratio"] == pytest.approx(0.15)
+    assert source_sampling["video_ratio"] == pytest.approx(0.85)
+    assert source_sampling["image_ratio"] + source_sampling["video_ratio"] == pytest.approx(1.0)
 
     payload = yaml.safe_load(raw_text)
     data_config = tmp_path / "multitask.yaml"
@@ -655,14 +720,66 @@ def test_repae_production_config_parses_with_correct_worktree_and_no_augmentatio
 
     parsed = LtxTrainerConfig(**payload)
     assert isinstance(parsed.training_strategy, SemanticRepaEConfig)
+    assert parsed.training_strategy.required_fsdp_world_size == 8
     assert parsed.training_strategy.semantic_anchor_count == 8
     assert parsed.model.training_mode == "full"
     assert parsed.data.online_encoding is not None
     assert parsed.data.online_encoding.augmentation.enabled is False
+    assert parsed.data.online_encoding.image_ratio == pytest.approx(0.15)
+    assert parsed.data.online_encoding.video_ratio == pytest.approx(0.85)
+    assert (
+        parsed.data.online_encoding.image_ratio
+        + parsed.data.online_encoding.video_ratio
+    ) == pytest.approx(1.0)
+    assert parsed.data.online_encoding.image_ratio == pytest.approx(
+        source_sampling["image_ratio"]
+    )
+    assert parsed.data.online_encoding.video_ratio == pytest.approx(
+        source_sampling["video_ratio"]
+    )
     assert parsed.optimization.learning_rate == pytest.approx(5.0e-6)
     assert parsed.optimization.bridge_learning_rate == pytest.approx(3.0e-6)
     assert parsed.optimization.semantic_learning_rate == pytest.approx(1.0e-5)
     assert parsed.optimization.repa_learning_rate == pytest.approx(1.0e-5)
+
+
+def test_repae_task_specific_system_prompts_and_messages_are_distinct() -> None:
+    prompts = load_semantic_system_prompts()
+    assert set(prompts) == {IMAGE_TASK, VIDEO_TASK}
+    i2i_prompt = prompts[IMAGE_TASK]
+    r2v_prompt = prompts[VIDEO_TASK]
+    assert i2i_prompt != r2v_prompt
+
+    i2i_lower = i2i_prompt.lower()
+    assert "image editing" in i2i_lower
+    assert "single edited image" in i2i_lower
+    assert "not as video frames" in i2i_lower
+    assert "temporal motion" in i2i_lower
+    assert "camera movement" in i2i_lower
+    assert "video actions" in i2i_lower
+    assert "left-right layout" in i2i_lower
+    assert "background content" in i2i_lower
+    assert "video action" in r2v_prompt.lower()
+
+    i2i_messages = _build_messages(
+        i2i_prompt,
+        "replace the shirt color",
+        1,
+        task=IMAGE_TASK,
+    )
+    r2v_messages = _build_messages(
+        r2v_prompt,
+        "the subject walks forward",
+        1,
+        task=VIDEO_TASK,
+    )
+    assert i2i_messages[0]["content"] == i2i_prompt
+    assert i2i_messages[0]["content"] != r2v_prompt
+    assert r2v_messages[0]["content"] == r2v_prompt
+    i2i_user_text = i2i_messages[1]["content"][-1]["text"]
+    r2v_user_text = r2v_messages[1]["content"][-1]["text"]
+    assert i2i_user_text == "Image editing instruction: replace the shirt color"
+    assert r2v_user_text == "User Raw Input Prompt: the subject walks forward."
 
 
 def test_repae_checkpoint_round_trip_covers_all_trainable_components(tmp_path: Path) -> None:

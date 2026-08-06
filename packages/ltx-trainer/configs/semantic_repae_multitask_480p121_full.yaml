@@ -1,4 +1,5 @@
 # Single-stage semantic REPA-E training. Production writes stay under /mnt/workspace/litengjie.
+# Run model smoke only with 8-GPU FSDP; 2-GPU and 4-GPU semantic REPA-E model smokes can OOM.
 model:
   model_path: "/mnt/workspace/litengjie/LTX-2/models/LTX-2.3/ltx-2.3-22b-dev.safetensors"
   text_encoder_path: "/mnt/workspace/litengjie/LTX-2/models/gemma-3-12b-it-qat-q4_0-unquantized"
@@ -12,6 +13,7 @@ training_strategy:
   name: "semantic_repae"
   max_ref_images_per_sample: 4
   reference_rope_mode: "negative_adjacent_shifted_hw"
+  required_fsdp_world_size: 8
   semantic_anchor_count: 8
   semantic_grid_size: 16
   semantic_tokens_per_frame: 256
@@ -76,8 +78,8 @@ data:
     prefetch_factor: 2
     cpu_transform_chunk_frames: 4
     max_ref_images: 4
-    image_ratio: 0.30
-    video_ratio: 0.70
+    image_ratio: 0.15
+    video_ratio: 0.85
     runtime_max_retries: 8
     runtime_reject_log_dir: "/mnt/workspace/litengjie/jd_ltx_multitask_online_480p121/semantic_repae_v1_single_stage/logs/runtime_rejects"
     augmentation:

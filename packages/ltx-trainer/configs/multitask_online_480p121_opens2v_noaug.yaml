@@ -16,8 +16,8 @@ datasets:
     semantic_anchor_count: 8
 
 online_sampling:
-  image_ratio: 0.30
-  video_ratio: 0.70
+  image_ratio: 0.15
+  video_ratio: 0.85
   video_source_ratios:
     r2v_opens2v: 1.0
 

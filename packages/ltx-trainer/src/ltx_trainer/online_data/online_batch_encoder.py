@@ -117,6 +117,28 @@ def _zero_condition_tensors(conditions: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def load_semantic_system_prompts() -> dict[str, str]:
+    """Load the task-specific semantic prompts used by online training and inference."""
+    prompt_root = (
+        Path(__file__).resolve().parents[4]
+        / "ltx-core"
+        / "src"
+        / "ltx_core"
+        / "text_encoders"
+        / "gemma"
+        / "encoders"
+        / "prompts"
+    )
+    return {
+        IMAGE_TASK: (prompt_root / "gemma_i2i_semantic_system_prompt.txt").read_text(
+            encoding="utf-8"
+        ),
+        VIDEO_TASK: (prompt_root / "gemma_r2v_semantic_system_prompt.txt").read_text(
+            encoding="utf-8"
+        ),
+    }
+
+
 def _build_messages(
     system_prompt: str,
     user_prompt: str,
@@ -194,20 +216,7 @@ class OnlineBatchEncoder:
             use_fast=False,
         )
         self.processor = Gemma3Processor(image_processor=self.image_processor, tokenizer=self.tokenizer)
-        prompt_root = (
-            Path(__file__).resolve().parents[4]
-            / "ltx-core"
-            / "src"
-            / "ltx_core"
-            / "text_encoders"
-            / "gemma"
-            / "encoders"
-            / "prompts"
-        )
-        self.system_prompts = {
-            IMAGE_TASK: (prompt_root / "gemma_i2i_semantic_system_prompt.txt").read_text(encoding="utf-8"),
-            VIDEO_TASK: (prompt_root / "gemma_r2v_semantic_system_prompt.txt").read_text(encoding="utf-8"),
-        }
+        self.system_prompts = load_semantic_system_prompts()
         self.vae_encoder.requires_grad_(False).eval()
         self._keep_frozen_modules_eval()
 
