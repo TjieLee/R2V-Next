@@ -1893,6 +1893,98 @@ def test_factorized_til_validation_rejects_mismatched_i_context() -> None:
         )
 
 
+@pytest.mark.parametrize("use_compact_r_mask", [False, True])
+def test_debiased_validation_accepts_semantically_full_pr_attention_masks(
+    use_compact_r_mask: bool,
+) -> None:
+    config = SemanticGuidanceConfig(
+        guidance_mode="debiased_ref",
+        guidance_rescale=0.0,
+    )
+    strategy, states = _state_bundle(config)
+    assert states.positive.modality.attention_mask is None
+    assert states.empty_reference is not None
+    empty_reference = states.empty_reference
+    assert empty_reference.modality.attention_mask is None
+    if use_compact_r_mask:
+        empty_reference = replace(
+            empty_reference,
+            modality=replace(
+                empty_reference.modality,
+                attention_mask=torch.ones(
+                    (
+                        empty_reference.modality.latent.shape[0],
+                        1,
+                        empty_reference.modality.latent.shape[1],
+                    ),
+                    dtype=torch.bool,
+                ),
+            ),
+        )
+
+    strategy.validate_guidance_state_bundle(
+        replace(states, empty_reference=empty_reference),
+        config,
+    )
+
+
+def test_debiased_validation_rejects_r_masked_reference_key() -> None:
+    config = SemanticGuidanceConfig(
+        guidance_mode="debiased_ref",
+        guidance_rescale=0.0,
+    )
+    strategy, states = _state_bundle(config)
+    assert states.empty_reference is not None
+    empty_reference = states.empty_reference
+    attention_mask = torch.ones(
+        (
+            empty_reference.modality.latent.shape[0],
+            1,
+            empty_reference.modality.latent.shape[1],
+        ),
+        dtype=torch.bool,
+    )
+    attention_mask[:, :, 0] = False
+    changed = replace(
+        empty_reference,
+        modality=replace(
+            empty_reference.modality,
+            attention_mask=attention_mask,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="P and R must share attention_mask"):
+        strategy.validate_guidance_state_bundle(
+            replace(states, empty_reference=changed),
+            config,
+        )
+
+
+def test_debiased_validation_rejects_r_entity_id_mismatch() -> None:
+    config = SemanticGuidanceConfig(
+        guidance_mode="debiased_ref",
+        guidance_rescale=0.0,
+    )
+    strategy, states = _state_bundle(config)
+    assert states.empty_reference is not None
+    empty_reference = states.empty_reference
+    entity_ids = empty_reference.modality.entity_ids.clone()
+    entity_ids[:, 0] += 1
+    changed = replace(
+        empty_reference,
+        modality=replace(
+            empty_reference.modality,
+            entity_ids=entity_ids,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="P and R must share entity_ids"):
+        strategy.validate_guidance_state_bundle(
+            replace(states, empty_reference=changed),
+            config,
+        )
+
+
 def test_runtime_builds_debiased_reference_states_from_one_noise_set() -> None:
     strategy = SemanticFlowStrategy(SemanticFlowConfig(max_ref_images_per_sample=1))
     strategy._semantic_dim = 128

@@ -1584,17 +1584,26 @@ class SemanticFlowStrategy(TrainingStrategy):
                     )
             if guidance.need_control_pair:
                 assert states.empty_reference is not None
+                empty_reference_modality = states.empty_reference.modality
+                positive_modality = positive.modality
                 if not torch.equal(
-                    states.empty_reference.modality.latent[:, :ref_end],
-                    positive.modality.latent[:, :ref_end],
+                    empty_reference_modality.latent[:, :ref_end],
+                    positive_modality.latent[:, :ref_end],
                 ):
                     raise ValueError("P and R must share reference latents")
-                for name in ("attention_mask", "entity_ids"):
-                    if not torch.equal(
-                        getattr(states.empty_reference.modality, name),
-                        getattr(positive.modality, name),
-                    ):
-                        raise ValueError(f"P and R must share {name}")
+                if not _attention_key_spans_equal(
+                    empty_reference_modality.attention_mask,
+                    positive_modality.attention_mask,
+                    key_start=0,
+                    key_end=offsets["target_end"],
+                    query_start=0,
+                ):
+                    raise ValueError("P and R must share attention_mask")
+                if not torch.equal(
+                    empty_reference_modality.entity_ids,
+                    positive_modality.entity_ids,
+                ):
+                    raise ValueError("P and R must share entity_ids")
 
     def get_checkpoint_metadata(self) -> dict[str, Any]:
         appended = self.config.reference_rope_mode == "appended_time_shifted_width"

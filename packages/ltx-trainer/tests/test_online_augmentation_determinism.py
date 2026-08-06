@@ -5,6 +5,7 @@ from ltx_trainer.online_data.transforms import (
     augment_reference_image,
     augment_target_frames,
     augmentation_seed,
+    deterministic_resize_center_crop,
 )
 
 
@@ -77,7 +78,14 @@ def test_reference_augmentation_is_deterministic_and_shared_ready() -> None:
 
 def test_disabled_augmentation_is_step_independent_and_never_flips_reference() -> None:
     config = OnlineAugmentationConfig(enabled=False)
-    frames = _pattern().unsqueeze(0).repeat(3, 1, 1, 1)
+    source = _pattern()
+    frames = source.unsqueeze(0).repeat(3, 1, 1, 1)
+    expected_reference = deterministic_resize_center_crop(
+        source.unsqueeze(0),
+        target_height=24,
+        target_width=40,
+        chunk_frames=1,
+    )[0]
     first = augment_target_frames(
         frames,
         seed=1,
@@ -95,12 +103,23 @@ def test_disabled_augmentation_is_step_independent_and_never_flips_reference() -
         chunk_frames=2,
     )
     reference = augment_reference_image(
-        _pattern(),
+        source,
         seed=9999,
         config=config,
         target_height=24,
         target_width=40,
     )
+    reference_second = augment_reference_image(
+        source,
+        seed=1,
+        config=config,
+        target_height=24,
+        target_width=40,
+    )
 
+    assert torch.equal(first, frames)
+    assert torch.equal(second, frames)
     assert torch.equal(first, second)
-    assert torch.equal(reference, first[0])
+    assert torch.equal(reference, expected_reference)
+    assert torch.equal(reference_second, expected_reference)
+    assert reference.shape == (24, 40, 3)
