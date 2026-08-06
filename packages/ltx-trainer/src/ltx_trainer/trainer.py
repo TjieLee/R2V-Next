@@ -8,7 +8,7 @@ import re
 import shutil
 import time
 import warnings
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -101,6 +101,68 @@ PHASE2_ADAM_MOMENT_KEYS = (
     "exp_avg_sq",
     "max_exp_avg_sq",
 )
+
+_STRATEGY_LOSS_COMPONENTS = (
+    (
+        "Video flow",
+        "V",
+        "train/loss_video_flow",
+        "train/loss_video_flow_weighted",
+    ),
+    (
+        "Semantic flow",
+        "S",
+        "train/loss_semantic_flow",
+        "train/loss_semantic_flow_weighted",
+    ),
+    (
+        "Projection REPA",
+        "P-REPA",
+        "train/loss_semantic_projection_repa",
+        "train/loss_semantic_projection_repa_weighted",
+    ),
+    (
+        "DiT REPA",
+        "D-REPA",
+        "train/loss_semantic_dit_repa",
+        "train/loss_semantic_dit_repa_weighted",
+    ),
+    (
+        "Reconstruction",
+        "Recon",
+        "train/loss_semantic_reconstruction",
+        None,
+    ),
+    (
+        "Alignment",
+        "Align",
+        "train/loss_semantic_alignment",
+        None,
+    ),
+)
+
+
+def format_strategy_loss_components(
+    strategy_metrics: Mapping[str, float],
+    *,
+    compact: bool,
+) -> str:
+    """Format the loss components present in a strategy's latest metrics."""
+    components: list[str] = []
+    for label, compact_label, raw_key, weighted_key in _STRATEGY_LOSS_COMPONENTS:
+        raw_value = strategy_metrics.get(raw_key)
+        if raw_value is None:
+            continue
+        if compact:
+            components.append(f"{compact_label} {raw_value:.4f}")
+            continue
+        component = f"{label}: {raw_value:.4f}"
+        if weighted_key is not None:
+            weighted_value = strategy_metrics.get(weighted_key)
+            if weighted_value is not None:
+                component += f" (weighted: {weighted_value:.4f})"
+        components.append(component)
+    return (" | " if compact else ", ").join(components)
 
 
 def _normalize_fsdp_config_value(value: Any) -> str | None:
@@ -562,6 +624,14 @@ class LtxvTrainer:
                         loss=step_loss,
                         lr=current_lr,
                         step_time=step_time,
+                        loss_components=(
+                            format_strategy_loss_components(
+                                strategy_metrics,
+                                compact=True,
+                            )
+                            if is_optimization_step
+                            else None
+                        ),
                         advance=is_optimization_step,
                     )
 
@@ -593,21 +663,24 @@ class LtxvTrainer:
                             total_time = f"{total_estimated // 3600:.0f}h {(total_estimated % 3600) // 60:.0f}m"
                         else:
                             total_time = "calculating..."
-                        video_text = self._format_optional_metric(strategy_metrics, "train/loss_video_flow")
-                        semantic_text = self._format_optional_metric(strategy_metrics, "train/loss_semantic_flow")
-                        reconstruction_text = self._format_optional_metric(
-                            strategy_metrics, "train/loss_semantic_reconstruction"
-                        )
-                        alignment_text = self._format_optional_metric(
-                            strategy_metrics, "train/loss_semantic_alignment"
-                        )
-                        logger.info(
+                        log_parts = [
                             f"Step {self._global_step}/{cfg.optimization.steps} - "
-                            f"Total: {step_loss:.4f}, Video flow: {video_text}, Semantic flow: {semantic_text}, "
-                            f"Reconstruction: {reconstruction_text}, Alignment: {alignment_text}, "
-                            f"LR: {current_lr:.2e}, "
-                            f"Time/Step: {step_time:.2f}s, Total Time: {total_time}",
+                            f"Total: {step_loss:.4f}"
+                        ]
+                        loss_components = format_strategy_loss_components(
+                            strategy_metrics,
+                            compact=False,
                         )
+                        if loss_components:
+                            log_parts.append(loss_components)
+                        log_parts.extend(
+                            [
+                                f"LR: {current_lr:.2e}",
+                                f"Time/Step: {step_time:.2f}s",
+                                f"Total Time: {total_time}",
+                            ]
+                        )
+                        logger.info(", ".join(log_parts))
 
                     # Sample GPU memory periodically
                     if micro_step % MEMORY_CHECK_INTERVAL == 0:
@@ -4937,8 +5010,3 @@ class LtxvTrainer:
         """Log metrics to Weights & Biases."""
         if self._wandb_run is not None:
             self._wandb_run.log(metrics)
-
-    @staticmethod
-    def _format_optional_metric(metrics: dict[str, float], name: str) -> str:
-        value = metrics.get(name)
-        return "n/a" if value is None else f"{value:.4f}"

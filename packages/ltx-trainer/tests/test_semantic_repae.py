@@ -40,6 +40,7 @@ from ltx_trainer.online_inference.checkpoint_runtime import (
     read_checkpoint_metadata,
 )
 from ltx_trainer.training_strategies import get_training_strategy
+from ltx_trainer.training_strategies.base_strategy import ModelInputs
 from ltx_trainer.training_strategies.semantic_flow import (
     TYPE_REFERENCE,
     TYPE_SEMANTIC,
@@ -432,6 +433,72 @@ def test_repae_teacher_projection_and_both_projectors_receive_gradients() -> Non
     assert any(parameter.grad is not None for parameter in semantic_repa.parameters())
     assert any(parameter.grad is not None for parameter in dit_repa.parameters())
     assert dit_hidden.grad is not None
+
+
+def test_repae_loss_metrics_report_raw_and_weighted_contributions() -> None:
+    config = SemanticRepaEConfig()
+    strategy = SemanticRepaEStrategy(config)
+    strategy._semantic_input_projection = nn.Identity()  # type: ignore[assignment]
+    strategy._semantic_repa_projector = nn.Identity()  # type: ignore[assignment]
+    strategy._dit_repa_projector = nn.Identity()  # type: ignore[assignment]
+
+    batch_size, feature_dim = 2, 4
+    reference_end, semantic_end, target_end = 1, 3, 5
+    video_pred = torch.randn(batch_size, target_end, feature_dim, requires_grad=True)
+    projection_prediction = torch.randn(batch_size, 2, feature_dim, requires_grad=True)
+    repa_target = torch.randn(batch_size, 2, feature_dim)
+    captured = torch.randn(batch_size, 2, feature_dim, requires_grad=True)
+    strategy._consume_dit_capture = lambda: captured  # type: ignore[method-assign]
+    inputs = ModelInputs(
+        video=None,
+        audio=None,
+        video_targets=torch.randn(batch_size, 2, feature_dim),
+        audio_targets=None,
+        video_loss_mask=torch.ones(batch_size, 2, dtype=torch.bool),
+        audio_loss_mask=None,
+        semantic_targets=torch.randn(batch_size, 2, feature_dim),
+        semantic_loss_mask=torch.ones(batch_size, 2, dtype=torch.bool),
+        semantic_projection_repa_prediction=projection_prediction,
+        semantic_repa_target=repa_target,
+        sequence_offsets={
+            "reference_end": reference_end,
+            "semantic_end": semantic_end,
+            "target_end": target_end,
+        },
+    )
+
+    total = strategy.compute_loss(video_pred, None, inputs)
+    metrics = strategy.get_last_training_metrics()
+    metric_contracts = (
+        (
+            "train/loss_video_flow",
+            "train/loss_video_flow_weighted",
+            config.video_flow_weight,
+        ),
+        (
+            "train/loss_semantic_flow",
+            "train/loss_semantic_flow_weighted",
+            config.semantic_flow_weight,
+        ),
+        (
+            "train/loss_semantic_projection_repa",
+            "train/loss_semantic_projection_repa_weighted",
+            config.semantic_projection_repa_weight,
+        ),
+        (
+            "train/loss_semantic_dit_repa",
+            "train/loss_semantic_dit_repa_weighted",
+            config.semantic_dit_repa_weight,
+        ),
+    )
+    for raw_key, weighted_key, weight in metric_contracts:
+        assert raw_key in metrics
+        assert weighted_key in metrics
+        torch.testing.assert_close(metrics[weighted_key], metrics[raw_key] * weight)
+
+    weighted_total = sum(metrics[weighted_key] for _, weighted_key, _ in metric_contracts)
+    torch.testing.assert_close(weighted_total, total.detach().mean())
+    assert all(not metric.requires_grad and metric.grad_fn is None for metric in metrics.values())
 
 
 class _TinyGemmaLanguageModel(nn.Module):

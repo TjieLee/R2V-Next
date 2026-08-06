@@ -588,11 +588,19 @@ class SemanticRepaEStrategy(SemanticFlowStrategy):
             dit_projector(captured),
             inputs.semantic_repa_target,
         )
+        weighted_video_loss = self.config.video_flow_weight * video_loss
+        weighted_semantic_loss = self.config.semantic_flow_weight * semantic_loss
+        weighted_projection_repa_loss = (
+            self.config.semantic_projection_repa_weight * projection_repa_loss
+        )
+        weighted_dit_repa_loss = (
+            self.config.semantic_dit_repa_weight * dit_repa_loss
+        )
         total = (
-            self.config.video_flow_weight * video_loss
-            + self.config.semantic_flow_weight * semantic_loss
-            + self.config.semantic_projection_repa_weight * projection_repa_loss
-            + self.config.semantic_dit_repa_weight * dit_repa_loss
+            weighted_video_loss
+            + weighted_semantic_loss
+            + weighted_projection_repa_loss
+            + weighted_dit_repa_loss
         )
         self._last_training_metrics.update(
             {
@@ -600,6 +608,14 @@ class SemanticRepaEStrategy(SemanticFlowStrategy):
                 "train/loss_semantic_flow": semantic_loss.detach().mean(),
                 "train/loss_semantic_projection_repa": projection_repa_loss.detach().mean(),
                 "train/loss_semantic_dit_repa": dit_repa_loss.detach().mean(),
+                "train/loss_video_flow_weighted": weighted_video_loss.detach().mean(),
+                "train/loss_semantic_flow_weighted": weighted_semantic_loss.detach().mean(),
+                "train/loss_semantic_projection_repa_weighted": (
+                    weighted_projection_repa_loss.detach().mean()
+                ),
+                "train/loss_semantic_dit_repa_weighted": (
+                    weighted_dit_repa_loss.detach().mean()
+                ),
             }
         )
         return total

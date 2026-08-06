@@ -125,6 +125,7 @@ class TrainingProgress:
         loss: float,
         lr: float,
         step_time: float,
+        loss_components: str | None = None,
         advance: bool = True,
     ) -> None:
         """Update the training progress display.
@@ -132,12 +133,22 @@ class TrainingProgress:
             loss: Current training loss
             lr: Current learning rate
             step_time: Time taken for this step in seconds
+            loss_components: Optional compact strategy-specific loss display
             advance: Whether to advance the progress by one step
         """
         if self._progress is None or self._train_task is None:
             return
 
-        info = f"Loss: {loss:.4f} | LR: {lr:.2e} | {step_time:.2f}s/step"
+        parts = [f"Loss: {loss:.4f}"]
+        if loss_components:
+            parts.append(loss_components)
+        parts.extend(
+            [
+                f"LR: {lr:.2e}",
+                f"{step_time:.2f}s/step",
+            ]
+        )
+        info = " | ".join(parts)
         self._progress.update(
             self._train_task,
             advance=1 if advance else 0,
