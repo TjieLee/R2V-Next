@@ -73,3 +73,34 @@ def test_reference_augmentation_is_deterministic_and_shared_ready() -> None:
     assert torch.equal(first, second)
     assert first.shape == (24, 40, 3)
     assert first.dtype == torch.uint8
+
+
+def test_disabled_augmentation_is_step_independent_and_never_flips_reference() -> None:
+    config = OnlineAugmentationConfig(enabled=False)
+    frames = _pattern().unsqueeze(0).repeat(3, 1, 1, 1)
+    first = augment_target_frames(
+        frames,
+        seed=1,
+        config=config,
+        target_height=24,
+        target_width=40,
+        chunk_frames=2,
+    )
+    second = augment_target_frames(
+        frames,
+        seed=9999,
+        config=config,
+        target_height=24,
+        target_width=40,
+        chunk_frames=2,
+    )
+    reference = augment_reference_image(
+        _pattern(),
+        seed=9999,
+        config=config,
+        target_height=24,
+        target_width=40,
+    )
+
+    assert torch.equal(first, second)
+    assert torch.equal(reference, first[0])

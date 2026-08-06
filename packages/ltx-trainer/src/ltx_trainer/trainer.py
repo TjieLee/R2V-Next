@@ -150,33 +150,38 @@ def _read_fsdp_state_dict_type_name(accelerator: Accelerator) -> str | None:
 
 
 def _enforce_semantic_flow_fsdp_runtime_safety(config: LtxTrainerConfig, accelerator: Accelerator) -> None:
-    if not (config.training_strategy.name == "semantic_flow" and config.model.training_mode == "full"):
+    if not (
+        config.training_strategy.name in {"semantic_flow", "semantic_repae"}
+        and config.model.training_mode == "full"
+    ):
         return
+    strategy_name = config.training_strategy.name
+    strategy_label = "semantic-flow" if strategy_name == "semantic_flow" else "semantic REPA-E"
     if accelerator.distributed_type != DistributedType.FSDP:
         raise RuntimeError(
-            "Full-DiT semantic-flow training requires Accelerate FSDP FULL_SHARD. "
+            f"Full-DiT {strategy_label} training requires Accelerate FSDP FULL_SHARD. "
             "Plain DDP and single-process full training are disabled to prevent OOM."
         )
     fsdp_version = _read_fsdp_version_name(accelerator)
     if fsdp_version not in {"1", "FSDP1"}:
         raise RuntimeError(
-            "Full-DiT semantic-flow training currently supports only FSDP1. "
+            f"Full-DiT {strategy_label} training currently supports only FSDP1. "
             f"Configured FSDP version is {fsdp_version!r}."
         )
     sharding_strategy = _read_fsdp_sharding_strategy_name(accelerator)
     if sharding_strategy is None:
-        raise RuntimeError("Unable to identify FSDP sharding strategy; refusing to load semantic-flow models.")
+        raise RuntimeError(f"Unable to identify FSDP sharding strategy; refusing to load {strategy_label} models.")
     if sharding_strategy != "FULL_SHARD":
         raise RuntimeError(
-            "Full-DiT semantic-flow training requires Accelerate FSDP FULL_SHARD. "
+            f"Full-DiT {strategy_label} training requires Accelerate FSDP FULL_SHARD. "
             f"Configured FSDP sharding strategy is {sharding_strategy!r}."
         )
     state_dict_type = _read_fsdp_state_dict_type_name(accelerator)
     if state_dict_type is None:
-        raise RuntimeError("Unable to identify FSDP state-dict type; refusing to load semantic-flow models.")
+        raise RuntimeError(f"Unable to identify FSDP state-dict type; refusing to load {strategy_label} models.")
     if state_dict_type != "FULL_STATE_DICT":
         raise RuntimeError(
-            "Full-DiT semantic-flow training requires FSDP FULL_STATE_DICT checkpoint collection. "
+            f"Full-DiT {strategy_label} training requires FSDP FULL_STATE_DICT checkpoint collection. "
             f"Configured FSDP state-dict type is {state_dict_type!r}."
         )
 
@@ -902,6 +907,10 @@ class LtxvTrainer:
     def _is_semantic_flow_phase2(self) -> bool:
         strategy_config = getattr(self._training_strategy, "config", None)
         return getattr(strategy_config, "training_phase", "phase1") == "phase2"
+
+    def _is_semantic_repae(self) -> bool:
+        strategy_config = getattr(self._training_strategy, "config", None)
+        return getattr(strategy_config, "name", None) == "semantic_repae"
 
     def _phase2_optimizer_state_cpu_offload_enabled(self) -> bool:
         data_config = getattr(self._config, "data", None)
@@ -3053,6 +3062,9 @@ class LtxvTrainer:
             set_text_encoder = getattr(self._training_strategy, "set_text_encoder", None)
             if callable(set_text_encoder):
                 set_text_encoder(self._text_encoder)
+        set_transformer = getattr(self._training_strategy, "set_transformer", None)
+        if callable(set_transformer):
+            set_transformer(self._transformer)
 
         self._accumulation_models = []
         if self._train_transformer:
@@ -3420,7 +3432,68 @@ class LtxvTrainer:
         lr = opt_cfg.learning_rate
         optimizer_parameters: Any = self._trainable_params
         phase2_parameter_names_by_group: dict[str, list[str]] = {}
-        if self._is_semantic_flow_phase2():
+        if self._is_semantic_repae():
+            strategy_modules = self._training_strategy.get_trainable_modules()
+            expected_strategy_modules = {
+                "semantic_input_projection",
+                "semantic_repa_projector",
+                "dit_repa_projector",
+            }
+            if set(strategy_modules) != expected_strategy_modules:
+                raise RuntimeError(
+                    "semantic REPA-E optimizer modules are incomplete: "
+                    f"expected={sorted(expected_strategy_modules)}, actual={sorted(strategy_modules)}"
+                )
+            dit = self._deduplicate_parameters(
+                [parameter for parameter in self._transformer.parameters() if parameter.requires_grad]
+            )
+            conditioning_bridge = self._deduplicate_parameters(
+                [
+                    parameter
+                    for module in self._embeddings_processor_trainable_modules.values()
+                    for parameter in module.parameters()
+                    if parameter.requires_grad
+                ]
+            )
+            semantic_projection = self._deduplicate_parameters(
+                [
+                    parameter
+                    for parameter in strategy_modules["semantic_input_projection"].parameters()
+                    if parameter.requires_grad
+                ]
+            )
+            repa_projectors = self._deduplicate_parameters(
+                [
+                    parameter
+                    for name in ("semantic_repa_projector", "dit_repa_projector")
+                    for parameter in strategy_modules[name].parameters()
+                    if parameter.requires_grad
+                ]
+            )
+            grouped = dit + conditioning_bridge + semantic_projection + repa_projectors
+            if {id(parameter) for parameter in grouped} != {
+                id(parameter) for parameter in self._trainable_params
+            }:
+                raise RuntimeError("semantic REPA-E optimizer groups do not cover the trainable parameter set")
+            optimizer_parameters = [
+                {"name": "dit", "params": dit, "lr": opt_cfg.learning_rate},
+                {
+                    "name": "conditioning_bridge",
+                    "params": conditioning_bridge,
+                    "lr": opt_cfg.bridge_learning_rate or opt_cfg.learning_rate,
+                },
+                {
+                    "name": "semantic_projection",
+                    "params": semantic_projection,
+                    "lr": opt_cfg.semantic_learning_rate or opt_cfg.learning_rate,
+                },
+                {
+                    "name": "repa_projectors",
+                    "params": repa_projectors,
+                    "lr": opt_cfg.repa_learning_rate or opt_cfg.learning_rate,
+                },
+            ]
+        elif self._is_semantic_flow_phase2():
             strategy_modules = self._training_strategy.get_trainable_modules()
             dit_semantic = self._deduplicate_parameters(
                 [
@@ -3527,6 +3600,15 @@ class LtxvTrainer:
 
         # noinspection PyTypeChecker
         self._optimizer, self._lr_scheduler = self._accelerator.prepare(optimizer, lr_scheduler)
+        if self._is_semantic_repae():
+            logger.info(
+                "semantic REPA-E optimizer learning rates: dit=%g conditioning_bridge=%g "
+                "semantic_projection=%g repa_projectors=%g",
+                opt_cfg.learning_rate,
+                opt_cfg.bridge_learning_rate or opt_cfg.learning_rate,
+                opt_cfg.semantic_learning_rate or opt_cfg.learning_rate,
+                opt_cfg.repa_learning_rate or opt_cfg.learning_rate,
+            )
         if self._is_semantic_flow_phase2():
             self._phase2_optimizer_parameter_names = {}
             for group in self._optimizer.param_groups:
@@ -3942,7 +4024,7 @@ class LtxvTrainer:
                 f"training_strategy.{name}."
                 for name in self._training_strategy.get_trainable_modules()
             )
-            if self._is_semantic_flow_phase2():
+            if self._train_embeddings_processor:
                 required_prefixes += (
                     "embeddings_processor.feature_extractor.",
                     "embeddings_processor.video_connector.",

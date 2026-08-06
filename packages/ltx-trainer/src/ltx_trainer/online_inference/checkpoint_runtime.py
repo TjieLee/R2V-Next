@@ -55,6 +55,20 @@ SEMANTIC_TRANSFORMER_CHECKPOINT_PREFIXES = (
     "semantic_norm_out.",
     "semantic_proj_out.",
 )
+REPAE_STRATEGY_CHECKPOINT_PREFIXES = (
+    "training_strategy.semantic_input_projection.",
+    "training_strategy.semantic_repa_projector.",
+    "training_strategy.dit_repa_projector.",
+    "embeddings_processor.feature_extractor.",
+    "embeddings_processor.video_connector.",
+)
+REPAE_TRANSFORMER_CHECKPOINT_PREFIXES = (
+    "semantic_repae_reference_type_embedding.",
+    "semantic_repae_reference_slot_embedding.",
+    "semantic_repae_semantic_type_embedding.",
+    "semantic_norm_out.",
+    "semantic_proj_out.",
+)
 
 
 class CheckpointAuditError(RuntimeError):
@@ -150,12 +164,18 @@ def audit_checkpoint(path: Path) -> dict[str, Any]:
             shapes = {key: list(handle.get_slice(key).get_shape()) for key in keys}
     except Exception as exc:
         raise CheckpointAuditError(f"Invalid safetensors checkpoint {resolved}: {exc}") from exc
-    strategy_prefixes = (
-        SEMANTIC_V1_STRATEGY_CHECKPOINT_PREFIXES
-        if metadata.get("architecture") == "semantic_flow_v1"
-        else SEMANTIC_STRATEGY_CHECKPOINT_PREFIXES
-    )
-    semantic_prefixes = strategy_prefixes + SEMANTIC_TRANSFORMER_CHECKPOINT_PREFIXES
+    architecture = metadata.get("architecture")
+    if architecture == "semantic_repae_v1":
+        strategy_prefixes = REPAE_STRATEGY_CHECKPOINT_PREFIXES
+        transformer_prefixes = REPAE_TRANSFORMER_CHECKPOINT_PREFIXES
+    else:
+        strategy_prefixes = (
+            SEMANTIC_V1_STRATEGY_CHECKPOINT_PREFIXES
+            if architecture == "semantic_flow_v1"
+            else SEMANTIC_STRATEGY_CHECKPOINT_PREFIXES
+        )
+        transformer_prefixes = SEMANTIC_TRANSFORMER_CHECKPOINT_PREFIXES
+    semantic_prefixes = strategy_prefixes + transformer_prefixes
     missing = [prefix for prefix in semantic_prefixes if not any(key.startswith(prefix) for key in keys)]
     if missing:
         raise CheckpointAuditError(f"Checkpoint is missing semantic modules: {missing}")
@@ -172,7 +192,7 @@ def audit_checkpoint(path: Path) -> dict[str, Any]:
         "checkpoint_shapes": shapes,
         "metadata": metadata,
         "semantic_module_prefixes": list(strategy_prefixes),
-        "semantic_transformer_prefixes": list(SEMANTIC_TRANSFORMER_CHECKPOINT_PREFIXES),
+        "semantic_transformer_prefixes": list(transformer_prefixes),
         "required_missing_keys": [],
         "unexpected_checkpoint_keys": [],
     }
@@ -205,17 +225,26 @@ def validate_reference_rope_checkpoint_metadata(
     expected_mode: str,
     allow_legacy: bool = False,
 ) -> None:
-    required = {
-        "reference_rope_layout_version": "2",
-        "reference_rope_mode": expected_mode,
-        "reference_rope_temporal_slots": (
-            "fixed_after_target" if expected_mode == "appended_time_shifted_width" else "native_overlap"
-        ),
-        "reference_rope_spatial_shift": (
-            "width_adjacent" if expected_mode == "appended_time_shifted_width" else "native_overlap"
-        ),
-        "semantic_rope_mode": "target_interpolated_8x8",
-    }
+    if expected_mode == "negative_adjacent_shifted_hw":
+        required = {
+            "reference_rope_layout_version": "3",
+            "reference_rope_mode": expected_mode,
+            "reference_rope_temporal_slots": "shared_negative_adjacent",
+            "reference_rope_spatial_shift": "height_width_adjacent",
+            "semantic_rope_mode": "target_interpolated_16x16",
+        }
+    else:
+        required = {
+            "reference_rope_layout_version": "2",
+            "reference_rope_mode": expected_mode,
+            "reference_rope_temporal_slots": (
+                "fixed_after_target" if expected_mode == "appended_time_shifted_width" else "native_overlap"
+            ),
+            "reference_rope_spatial_shift": (
+                "width_adjacent" if expected_mode == "appended_time_shifted_width" else "native_overlap"
+            ),
+            "semantic_rope_mode": "target_interpolated_8x8",
+        }
     present = set(required) & set(metadata)
     if not present:
         if allow_legacy and expected_mode == "native_overlap":
@@ -376,10 +405,17 @@ class OnlineInferenceRuntime:
         )
         target_shape = VideoLatentShape.from_pixel_shape(pixel_shape)
         task = str(encoded["task"])
-        semantic_frames = 1 if task == IMAGE_TASK else max(
-            1,
-            round(int(num_frames) * self.strategy.config.anchor_frame_ratio),
-        )
+        semantic_frame_count = getattr(self.strategy, "semantic_frame_count_for_task", None)
+        if callable(semantic_frame_count):
+            semantic_frames = semantic_frame_count(
+                task=task,
+                pixel_frame_count=int(num_frames),
+            )
+        else:
+            semantic_frames = 1 if task == IMAGE_TASK else max(
+                1,
+                round(int(num_frames) * self.strategy.config.anchor_frame_ratio),
+            )
         blocks = getattr(self.transformer, "transformer_blocks", None)
         if blocks is None and guidance.need_stg:
             raise ValueError("Semantic guidance requires transformer.transformer_blocks")
@@ -571,10 +607,17 @@ def load_online_inference_runtime(
         expected_mode=strategy.config.reference_rope_mode,
         allow_legacy=allow_legacy_reference_rope,
     )
-    validate_semantic_flow_checkpoint_architecture(
-        audit["metadata"],
-        allow_v1_warm_start=True,
-    )
+    if strategy.config.name == "semantic_repae":
+        if audit["metadata"].get("architecture") != "semantic_repae_v1":
+            raise CheckpointAuditError(
+                "Unsupported semantic REPA-E checkpoint architecture: "
+                f"{audit['metadata'].get('architecture')!r}"
+            )
+    else:
+        validate_semantic_flow_checkpoint_architecture(
+            audit["metadata"],
+            allow_v1_warm_start=True,
+        )
     if ready_marker is not None:
         expected_sha = ready_marker.get("checkpoint_sha256")
         if expected_sha and snapshot.sha256 != str(expected_sha):
@@ -598,7 +641,10 @@ def load_online_inference_runtime(
         state,
         checkpoint_metadata=audit["metadata"],
     )
-    if audit["metadata"].get("training_phase") == "phase2":
+    if (
+        audit["metadata"].get("training_phase") == "phase2"
+        or strategy.config.name == "semantic_repae"
+    ):
         validate_and_load_phase2_bridge_state(embeddings_processor, state)
     transformer_state = {
         key: value

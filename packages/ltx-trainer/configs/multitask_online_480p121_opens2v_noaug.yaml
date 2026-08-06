@@ -1,0 +1,25 @@
+# Semantic REPA-E source mix. Raw source paths remain read-only.
+data_root: null
+
+datasets:
+  - name: "i2i_train"
+    task: "i2i"
+    dataset_type: "I2IDataset"
+    ann_path: "/mnt/workspace/liutao/data_process_one2x/r2i_train_data.jsonl"
+    data_root: null
+
+  - name: "r2v_opens2v"
+    task: "r2v"
+    dataset_type: "OpenS2VDataset"
+    ann_path: "/mnt/workspace/liutao/data_process_one2x/opens2v_train_data.parquet"
+    data_root: null
+    semantic_anchor_count: 8
+
+online_sampling:
+  image_ratio: 0.30
+  video_ratio: 0.70
+  video_source_ratios:
+    r2v_opens2v: 1.0
+
+online_augmentation:
+  enabled: false

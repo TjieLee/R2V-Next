@@ -758,6 +758,7 @@ def _iter_canonical_rows_with_bounded_probes(
     batch_size: int,
     validation_cache: _MediaValidationCache,
     progress: _ManifestProgress | None = None,
+    semantic_anchor_count: int | None = None,
 ) -> Iterator[tuple[str, PreparedCanonicalR2VRecord | None, ManifestReject | None]]:
     """Normalize R2V rows, probe canonical paths in bounded parallel batches, and preserve order."""
     for row_batch in _batched(rows, batch_size):
@@ -818,6 +819,7 @@ def _iter_canonical_rows_with_bounded_probes(
                     canonical,
                     manifest_seed=manifest_seed,
                     anchor_frame_ratio=anchor_frame_ratio,
+                    semantic_anchor_count=semantic_anchor_count,
                     video_header=header,
                     target_path_validated=True,
                 )
@@ -1077,6 +1079,11 @@ def main(  # noqa: PLR0913, PLR0915
                         adapter_config=adapter_config,
                         manifest_seed=manifest_seed,
                         anchor_frame_ratio=float(dataset.get("anchor_frame_ratio", 0.10)),
+                        semantic_anchor_count=(
+                            int(dataset["semantic_anchor_count"])
+                            if dataset.get("semantic_anchor_count") is not None
+                            else None
+                        ),
                         executor=executor,
                         batch_size=media_batch_size,
                         validation_cache=validation_cache,

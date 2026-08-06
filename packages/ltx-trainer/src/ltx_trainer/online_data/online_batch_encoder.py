@@ -253,9 +253,10 @@ class OnlineBatchEncoder:
             strategy_config=strategy_config,
         )
         phase2 = getattr(strategy_config, "training_phase", "phase1") == "phase2"
-        if phase2:
+        factorized_til = phase2 or getattr(strategy_config, "name", None) == "semantic_repae"
+        if factorized_til:
             if condition_mode not in PHASE2_CONDITION_MODES:
-                raise RuntimeError(f"Unsupported Phase 2 condition mode {condition_mode!r}")
+                raise RuntimeError(f"Unsupported T/I/L condition mode {condition_mode!r}")
             t_active, i_active, l_active = phase2_condition_axes(condition_mode)
             if not i_active:
                 reference_images_vlm = [[]]
@@ -286,14 +287,14 @@ class OnlineBatchEncoder:
             reference_images=references,
             task=task,
             sample_key=str(raw_batch["sample_key"][0]),
-            defer_feature_extractor=phase2,
+            defer_feature_extractor=factorized_til,
         )
         metrics["gemma_prefix_ms"] = (time.perf_counter() - prefix_started) * 1000.0
 
         evidence_started = time.perf_counter()
         if condition_mode == "drop_all":
-            if phase2:
-                raise RuntimeError("Phase 2 must not use the Phase 1 drop_all condition")
+            if factorized_til:
+                raise RuntimeError("Factorized T/I/L encoding must not use the legacy drop_all condition")
             conditions = _zero_condition_tensors(conditions)
         evidence = self._encode_gt_evidence(raw_batch)
         metrics["gemma_evidence_ms"] = (time.perf_counter() - evidence_started) * 1000.0
@@ -722,7 +723,13 @@ class OnlineBatchEncoder:
                 f"actual={indices}, expected={expected_indices}, "
                 f"frame_count={frame_count}"
             )
-        selected = target_pixels[0, indices]
+        expected_selected = target_pixels[0, indices]
+        teacher_pixels = raw_batch.get("semantic_teacher_pixels")
+        selected = teacher_pixels[0] if isinstance(teacher_pixels, Tensor) else expected_selected
+        if selected.shape != expected_selected.shape or not torch.equal(selected, expected_selected):
+            raise RuntimeError(
+                "Semantic teacher pixels must be the exact augmented target anchor frames"
+            )
         processed = self.image_processor(images=[_to_pil(frame) for frame in selected], return_tensors="pt")
         pixel_values = processed["pixel_values"].to(device=self.device, dtype=self.dtype)
         self._keep_frozen_modules_eval()
@@ -994,6 +1001,13 @@ class OnlineBatchEncoder:
             cumulative = 0.0
             for name, probability in probabilities:
                 cumulative += float(probability)
+                if draw < cumulative:
+                    return name
+            return "til_000"
+        if getattr(strategy_config, "name", None) == "semantic_repae":
+            cumulative = 0.0
+            for name in PHASE2_CONDITION_MODES:
+                cumulative += float(strategy_config.condition_probabilities[name])
                 if draw < cumulative:
                     return name
             return "til_000"

@@ -215,6 +215,9 @@ class SemanticFlowStrategy(TrainingStrategy):
     def train_embeddings_processor(self) -> bool:
         return self.config.training_phase == "phase2"
 
+    def semantic_tokens_per_frame(self) -> int:
+        return SEMANTIC_TOKENS_PER_FRAME
+
     def attach_models(
         self,
         *,
@@ -982,7 +985,7 @@ class SemanticFlowStrategy(TrainingStrategy):
             raise ValueError("semantic_noise and target_noise must be supplied together")
         semantic_shape = (
             batch_size,
-            semantic_frame_count * SEMANTIC_TOKENS_PER_FRAME,
+            semantic_frame_count * self.semantic_tokens_per_frame(),
             self._semantic_dim,
         )
         if semantic_noise is None or target_noise is None:
@@ -1722,6 +1725,18 @@ class SemanticFlowStrategy(TrainingStrategy):
             ref_w_min = positions[:, :, 2, :, 0].amin(dim=2)
             w_shift = target_w_max[:, None] - ref_w_min
             positions[:, :, 2] = positions[:, :, 2] + w_shift[:, :, None, None]
+        elif self.config.reference_rope_mode == "negative_adjacent_shifted_hw":
+            target_fps = float(getattr(self.config, "target_fps", DEFAULT_FPS))
+            if not math.isfinite(target_fps) or target_fps <= 0.0:
+                raise ValueError(f"target_fps must be finite and positive, got {target_fps}")
+            positions[:, :, 0, :, 0] = -1.0 / target_fps
+            positions[:, :, 0, :, 1] = 0.0
+            target_h_max = target_positions[:, 1, :, 1].amax(dim=1).to(dtype=positions.dtype)
+            target_w_max = target_positions[:, 2, :, 1].amax(dim=1).to(dtype=positions.dtype)
+            ref_h_min = positions[:, :, 1, :, 0].amin(dim=2)
+            ref_w_min = positions[:, :, 2, :, 0].amin(dim=2)
+            positions[:, :, 1] += (target_h_max[:, None] - ref_h_min)[:, :, None, None]
+            positions[:, :, 2] += (target_w_max[:, None] - ref_w_min)[:, :, None, None]
         positions = positions.permute(0, 2, 1, 3, 4).reshape(batch_size, 3, -1, 2)
 
         token_valid = ref_valid[:, :, None].expand(-1, -1, tokens_per_reference).reshape(batch_size, -1)

@@ -150,6 +150,11 @@ class LTXModel(torch.nn.Module):
         self.semantic_proj_out: torch.nn.Linear | None = None
         self.semantic_token_type_id: int | None = None
         self.reference_token_type_id: int | None = None
+        self.semantic_repae_reference_type_embedding: torch.nn.Embedding | None = None
+        self.semantic_repae_reference_slot_embedding: torch.nn.Embedding | None = None
+        self.semantic_repae_semantic_type_embedding: torch.nn.Embedding | None = None
+        self._semantic_repae_capture_request: tuple[int, int, int] | None = None
+        self._semantic_repae_captured_hidden: torch.Tensor | None = None
 
     @property
     def _adaln_embedding_coefficient(self) -> int:
@@ -411,7 +416,104 @@ class LTXModel(torch.nn.Module):
         torch.nn.init.zeros_(self.semantic_position_adapter[2].weight)
         torch.nn.init.zeros_(self.semantic_position_adapter[2].bias)
 
+    def enable_semantic_repae_conditioning(
+        self,
+        *,
+        semantic_dim: int,
+        num_reference_slots: int = 4,
+        semantic_token_type_id: int = 1,
+        reference_token_type_id: int = 0,
+    ) -> None:
+        """Install REPA-E metadata adapters without changing target-token hidden states."""
+        if semantic_dim != self.patchify_proj.in_features:
+            raise ValueError(
+                f"semantic_dim={semantic_dim} must match video input token dim={self.patchify_proj.in_features}"
+            )
+        if self.semantic_repae_semantic_type_embedding is not None:
+            if self.semantic_proj_out is None or self.semantic_proj_out.out_features != semantic_dim:
+                raise ValueError("semantic REPA-E conditioning was initialized with a different dimension")
+            return
+        if self.semantic_token_type_embedding is not None:
+            raise RuntimeError("semantic flow and semantic REPA-E conditioning cannot be enabled together")
+        parameter = next(self.parameters())
+        device, dtype = parameter.device, parameter.dtype
+        self.semantic_repae_reference_type_embedding = torch.nn.Embedding(1, self.inner_dim).to(
+            device=device, dtype=dtype
+        )
+        self.semantic_repae_reference_slot_embedding = torch.nn.Embedding(
+            num_reference_slots, self.inner_dim
+        ).to(device=device, dtype=dtype)
+        self.semantic_repae_semantic_type_embedding = torch.nn.Embedding(1, self.inner_dim).to(
+            device=device, dtype=dtype
+        )
+        self.semantic_norm_out = torch.nn.RMSNorm(self.inner_dim, elementwise_affine=True).to(
+            device=device, dtype=dtype
+        )
+        self.semantic_proj_out = torch.nn.Linear(self.inner_dim, semantic_dim).to(device=device, dtype=dtype)
+        self.semantic_token_type_id = int(semantic_token_type_id)
+        self.reference_token_type_id = int(reference_token_type_id)
+
+    def configure_semantic_repae_capture(
+        self,
+        *,
+        block_index: int,
+        semantic_start: int,
+        semantic_end: int,
+    ) -> None:
+        """Capture one semantic span after one transformer block on the next forward."""
+        if not 0 <= block_index < len(self.transformer_blocks):
+            raise ValueError(f"semantic REPA-E capture block index is out of range: {block_index}")
+        if not 0 <= semantic_start < semantic_end:
+            raise ValueError(
+                f"invalid semantic REPA-E capture span [{semantic_start},{semantic_end})"
+            )
+        self._semantic_repae_capture_request = (block_index, semantic_start, semantic_end)
+        self._semantic_repae_captured_hidden = None
+
+    def consume_semantic_repae_capture(self) -> torch.Tensor:
+        """Return and clear the semantic-only intermediate captured by the last forward."""
+        captured = self._semantic_repae_captured_hidden
+        self._semantic_repae_captured_hidden = None
+        self._semantic_repae_capture_request = None
+        if captured is None:
+            raise RuntimeError("semantic REPA-E intermediate capture is missing")
+        return captured
+
+    def apply_video_token_metadata(self, video_args: TransformerArgs, video: Modality) -> TransformerArgs:
+        """Apply enabled token metadata adapters through a stable public interface."""
+        if self.semantic_repae_semantic_type_embedding is None:
+            return self._apply_semantic_flow_video_token_metadata(video_args, video)
+        if video.token_type_ids is None:
+            raise ValueError("semantic REPA-E conditioning requires token_type_ids")
+        if video.entity_ids is None:
+            raise ValueError("semantic REPA-E conditioning requires entity_ids")
+        if video.token_type_ids.shape != video_args.x.shape[:2]:
+            raise ValueError("token_type_ids must match the video token shape")
+        if video.entity_ids.shape != video_args.x.shape[:2]:
+            raise ValueError("entity_ids must match the video token shape")
+
+        x = video_args.x
+        reference_mask = video.token_type_ids == self.reference_token_type_id
+        semantic_mask = video.token_type_ids == self.semantic_token_type_id
+        reference_type = self.semantic_repae_reference_type_embedding.weight[0].to(dtype=x.dtype)
+        semantic_type = self.semantic_repae_semantic_type_embedding.weight[0].to(dtype=x.dtype)
+        slot_count = self.semantic_repae_reference_slot_embedding.num_embeddings
+        slot_ids = (video.entity_ids - 1).clamp(min=0, max=slot_count - 1)
+        slot = self.semantic_repae_reference_slot_embedding(slot_ids).to(dtype=x.dtype)
+        metadata = (
+            reference_mask.unsqueeze(-1).to(dtype=x.dtype) * (reference_type + slot)
+            + semantic_mask.unsqueeze(-1).to(dtype=x.dtype) * semantic_type
+        )
+        return replace(video_args, x=x + metadata)
+
     def _apply_video_token_metadata(self, video_args: TransformerArgs, video: Modality) -> TransformerArgs:
+        return self.apply_video_token_metadata(video_args, video)
+
+    def _apply_semantic_flow_video_token_metadata(
+        self,
+        video_args: TransformerArgs,
+        video: Modality,
+    ) -> TransformerArgs:
         x = video_args.x
         if video.token_type_ids is not None:
             if self.semantic_token_type_embedding is None:
@@ -481,6 +583,18 @@ class LTXModel(torch.nn.Module):
             else:
                 video, audio = block(video=video, audio=audio)
 
+            request = self._semantic_repae_capture_request
+            if request is not None and block_idx == request[0]:
+                if video is None:
+                    raise RuntimeError("semantic REPA-E capture requires an enabled video modality")
+                semantic_start, semantic_end = request[1:]
+                if semantic_end > video.x.shape[1]:
+                    raise RuntimeError(
+                        "semantic REPA-E capture span exceeds the video sequence: "
+                        f"end={semantic_end}, length={video.x.shape[1]}"
+                    )
+                self._semantic_repae_captured_hidden = video.x[:, semantic_start:semantic_end].clone()
+
         return video, audio
 
     def _process_output(
@@ -517,6 +631,7 @@ class LTXModel(torch.nn.Module):
             raise ValueError("Audio is not enabled for this model")
 
         video_args = self.video_args_preprocessor.prepare(video, audio) if video is not None else None
+        self._semantic_repae_captured_hidden = None
         if video_args is not None and video is not None:
             video_args = self._apply_video_token_metadata(video_args, video)
         audio_args = self.audio_args_preprocessor.prepare(audio, video) if audio is not None else None

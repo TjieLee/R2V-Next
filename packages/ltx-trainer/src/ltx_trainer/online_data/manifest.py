@@ -571,6 +571,7 @@ def prepare_canonical_r2v_record(
     *,
     manifest_seed: int,
     anchor_frame_ratio: float = 0.10,
+    semantic_anchor_count: int | None = None,
     video_header: Mapping[str, float | int],
     target_path_validated: bool = False,
 ) -> PreparedCanonicalR2VRecord:
@@ -635,7 +636,13 @@ def prepare_canonical_r2v_record(
         raise ManifestReject("insufficient_frames_for_121_at_24fps", "Source index plan is outside the clip")
 
     references = tuple(canonical.reference_paths)
-    num_anchors = max(1, round(VIDEO_NUM_FRAMES * anchor_frame_ratio))
+    if semantic_anchor_count is not None and semantic_anchor_count < 1:
+        raise ValueError("semantic_anchor_count must be positive when provided")
+    num_anchors = (
+        semantic_anchor_count
+        if semantic_anchor_count is not None
+        else max(1, round(VIDEO_NUM_FRAMES * anchor_frame_ratio))
+    )
     anchor_target_indices = uniform_anchor_indices(
         frame_count=VIDEO_NUM_FRAMES,
         anchor_count=num_anchors,
@@ -691,6 +698,7 @@ def build_canonical_r2v_record(
     *,
     manifest_seed: int,
     anchor_frame_ratio: float = 0.10,
+    semantic_anchor_count: int | None = None,
     video_header: Mapping[str, float | int] | None = None,
     image_validator: ImageValidator | None = None,
     target_path_validated: bool = False,
@@ -700,6 +708,7 @@ def build_canonical_r2v_record(
         canonical,
         manifest_seed=manifest_seed,
         anchor_frame_ratio=anchor_frame_ratio,
+        semantic_anchor_count=semantic_anchor_count,
         video_header=header,
         target_path_validated=target_path_validated,
     )
