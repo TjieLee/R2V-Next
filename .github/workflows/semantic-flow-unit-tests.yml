@@ -59,3 +59,9 @@ jobs:
             packages/ltx-trainer/tests/test_gemma3_attention_masks.py \
             packages/ltx-trainer/tests/test_online_latent_geometry.py \
             packages/ltx-trainer/tests/test_reference_rope_layout.py
+
+      - name: Run semantic REPA-E CPU tests
+        run: |
+          pytest -q \
+            packages/ltx-trainer/tests/test_semantic_repae.py \
+            packages/ltx-trainer/tests/test_online_augmentation_determinism.py

@@ -450,6 +450,11 @@ class LTXModel(torch.nn.Module):
             device=device, dtype=dtype
         )
         self.semantic_proj_out = torch.nn.Linear(self.inner_dim, semantic_dim).to(device=device, dtype=dtype)
+        torch.nn.init.zeros_(self.semantic_repae_reference_type_embedding.weight)
+        torch.nn.init.zeros_(self.semantic_repae_reference_slot_embedding.weight)
+        torch.nn.init.zeros_(self.semantic_repae_semantic_type_embedding.weight)
+        torch.nn.init.zeros_(self.semantic_proj_out.weight)
+        torch.nn.init.zeros_(self.semantic_proj_out.bias)
         self.semantic_token_type_id = int(semantic_token_type_id)
         self.reference_token_type_id = int(reference_token_type_id)
 

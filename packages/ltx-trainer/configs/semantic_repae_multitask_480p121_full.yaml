@@ -54,7 +54,7 @@ acceleration:
 
 data:
   encoding_mode: "online"
-  train_data_config: "/mnt/workspace/litengjie/R2V-Next-semantic-repae-codex/packages/ltx-trainer/configs/multitask_online_480p121_opens2v_noaug.yaml"
+  train_data_config: "/mnt/workspace/litengjie/R2V-Next-semantic-repae/packages/ltx-trainer/configs/multitask_online_480p121_opens2v_noaug.yaml"
   manifest_path: "/mnt/workspace/litengjie/jd_ltx_multitask_online_480p121/semantic_repae_v1_single_stage/manifests/train_i2i_opens2v_8anchors.jsonl"
   num_dataloader_workers: 2
   online_encoding:

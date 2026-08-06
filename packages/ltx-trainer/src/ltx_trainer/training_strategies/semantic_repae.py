@@ -36,6 +36,7 @@ from ltx_trainer.training_strategies.semantic_flow import (
     TYPE_SEMANTIC,
     TYPE_TARGET,
     SemanticFlowStrategy,
+    build_compact_valid_token_mask,
 )
 from ltx_trainer.training_strategies.semantic_flow_bridge import (
     configure_phase2_bridge_trainability,
@@ -62,7 +63,6 @@ class SemanticRepaEConfig(TrainingStrategyConfigBase):
     conditions_dir: str = "conditions"
     max_ref_images_per_sample: int = Field(default=4, ge=1, le=MAX_REFERENCE_ENTITIES)
     reference_rope_mode: Literal["negative_adjacent_shifted_hw"] = "negative_adjacent_shifted_hw"
-    target_fps: float = Field(default=24.0, gt=0.0)
 
     semantic_anchor_count: int = Field(default=8, ge=1)
     semantic_grid_size: int = Field(default=16, ge=1)
@@ -84,7 +84,6 @@ class SemanticRepaEConfig(TrainingStrategyConfigBase):
     @model_validator(mode="after")
     def _validate_repae_contract(self) -> "SemanticRepaEConfig":
         fixed_values = {
-            "target_fps": (self.target_fps, 24.0),
             "semantic_anchor_count": (self.semantic_anchor_count, 8),
             "semantic_grid_size": (self.semantic_grid_size, REPAE_SEMANTIC_GRID_SIZE),
             "semantic_tokens_per_frame": (
@@ -375,12 +374,12 @@ class SemanticRepaEStrategy(SemanticFlowStrategy):
                 inputs_embeds=inputs_embeds,
                 attention_mask=gemma_masks.as_mapping(),
                 position_ids=position_ids,
-                output_hidden_states=True,
+                output_hidden_states=False,
                 return_dict=True,
                 use_cache=False,
             )
         prefix_length = prefix_embeddings.shape[1]
-        teacher_hidden = outputs.hidden_states[-1][:, prefix_length:].reshape(
+        teacher_hidden = outputs.last_hidden_state[:, prefix_length:].reshape(
             batch_size,
             frame_count,
             EVIDENCE_TOKENS_PER_FRAME,
@@ -464,11 +463,7 @@ class SemanticRepaEStrategy(SemanticFlowStrategy):
             ],
             dim=1,
         )
-        attention_mask = valid_tokens[:, :, None] & valid_tokens[:, None, :]
-        invalid = ~valid_tokens
-        if invalid.any():
-            diagonal = torch.eye(sequence.shape[1], device=device, dtype=torch.bool).unsqueeze(0)
-            attention_mask |= diagonal & invalid[:, :, None]
+        attention_mask = build_compact_valid_token_mask(valid_tokens)
         token_type_ids = torch.cat(
             [
                 torch.full((batch_size, ref_length), TYPE_REFERENCE, device=device, dtype=torch.long),
@@ -636,11 +631,25 @@ class SemanticRepaEStrategy(SemanticFlowStrategy):
         *,
         checkpoint_metadata: dict[str, str] | None = None,
     ) -> None:
-        if (checkpoint_metadata or {}).get("architecture") not in {None, "semantic_repae_v1"}:
+        architecture = (checkpoint_metadata or {}).get("architecture")
+        if architecture not in {None, "semantic_repae_v1"}:
             raise RuntimeError(
                 "Unsupported semantic REPA-E checkpoint architecture: "
-                f"{(checkpoint_metadata or {}).get('architecture')!r}"
+                f"{architecture!r}"
             )
+        if architecture == "semantic_repae_v1":
+            required_prefixes = [
+                f"training_strategy.{name}." for name in self.get_trainable_modules()
+            ]
+            missing = [
+                prefix
+                for prefix in required_prefixes
+                if not any(key.startswith(prefix) for key in state_dict)
+            ]
+            if missing:
+                raise RuntimeError(
+                    f"Semantic REPA-E checkpoint is missing strategy modules: {missing}"
+                )
         TrainingStrategy.load_extra_checkpoint_state_dict(
             self,
             state_dict,

@@ -33,7 +33,8 @@ class Modality:
         context: Text conditioning embeddings from the prompt encoder.
         enabled: Whether this modality is active in the current forward pass.
         context_mask: Optional mask for the text context tokens.
-        attention_mask: Optional 2-D self-attention mask, shape ``(B, T, T)``.
+        attention_mask: Optional self-attention mask with shape ``(B, T, T)`` or
+            broadcastable key-valid shape ``(B, 1, T)``.
             Values in ``[0, 1]`` where ``1`` = full attention and ``0`` = no
             attention. ``None`` means unrestricted (full) attention between
             all tokens. Built incrementally by conditioning items; see

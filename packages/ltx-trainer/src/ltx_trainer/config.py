@@ -1020,8 +1020,6 @@ class LtxTrainerConfig(ConfigBaseModel):
                 raise ValueError("online and semantic_repae vlm_teacher_max_length values must match")
             if online.semantic_anchor_count != self.training_strategy.semantic_anchor_count:
                 raise ValueError("online and semantic_repae semantic_anchor_count values must match")
-            if online.video_fps != self.training_strategy.target_fps:
-                raise ValueError("online and semantic_repae target FPS values must match")
             if self.optimization.bridge_learning_rate is None:
                 raise ValueError("semantic_repae requires optimization.bridge_learning_rate")
             if self.optimization.semantic_learning_rate is None:

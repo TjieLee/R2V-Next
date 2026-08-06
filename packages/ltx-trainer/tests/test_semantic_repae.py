@@ -1,16 +1,21 @@
 from __future__ import annotations
 
+import inspect
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
+
 import pytest
 import torch
+import yaml
 from accelerate import DistributedType
+from safetensors.torch import load_file, save_file
 from torch import nn
 
 from ltx_core.guidance.perturbations import BatchedPerturbationConfig
 from ltx_core.model.transformer.modality import Modality
 from ltx_core.model.transformer.model import LTXModel
-from ltx_core.model.transformer.transformer_args import TransformerArgs
+from ltx_core.model.transformer.transformer_args import TransformerArgs, TransformerArgsPreprocessor
 from ltx_core.multicond.semantic_tokens import (
     EVIDENCE_TOKENS_PER_FRAME,
     SemanticInputProjection,
@@ -18,12 +23,32 @@ from ltx_core.multicond.semantic_tokens import (
     semantic_repa_loss,
 )
 from ltx_core.types import VideoLatentShape
+from ltx_trainer.config import LtxTrainerConfig
+from ltx_trainer.online_data import path_safety
 from ltx_trainer.online_data.adapters.base import CanonicalR2VSource
 from ltx_trainer.online_data.manifest import prepare_canonical_r2v_record
+from ltx_trainer.online_inference.checkpoint_runtime import (
+    CheckpointAuditError,
+    REPAE_STRATEGY_CHECKPOINT_PREFIXES,
+    REPAE_TRANSFORMER_CHECKPOINT_PREFIXES,
+    audit_checkpoint,
+    read_checkpoint_metadata,
+)
 from ltx_trainer.training_strategies import get_training_strategy
-from ltx_trainer.training_strategies.semantic_flow import TYPE_REFERENCE, TYPE_SEMANTIC, TYPE_TARGET
+from ltx_trainer.training_strategies.semantic_flow import (
+    TYPE_REFERENCE,
+    TYPE_SEMANTIC,
+    TYPE_TARGET,
+    SemanticFlowStrategy,
+    build_compact_valid_token_mask,
+)
+from ltx_trainer.training_strategies.semantic_flow_bridge import (
+    configure_phase2_bridge_trainability,
+    phase2_bridge_parameters,
+    validate_and_load_phase2_bridge_state,
+)
 from ltx_trainer.training_strategies.semantic_repae import SemanticRepaEConfig, SemanticRepaEStrategy
-from ltx_trainer.trainer import _enforce_semantic_flow_fsdp_runtime_safety
+from ltx_trainer.trainer import LtxvTrainer, _enforce_semantic_flow_fsdp_runtime_safety
 
 
 def _transformer_args(x: torch.Tensor) -> TransformerArgs:
@@ -70,6 +95,46 @@ def _bare_metadata_model(hidden_dim: int = 3) -> LTXModel:
         )
         model.semantic_repae_semantic_type_embedding.weight.fill_(20.0)
     return model
+
+
+def _initializable_metadata_model(hidden_dim: int = 3, semantic_dim: int = 4) -> LTXModel:
+    model = LTXModel.__new__(LTXModel)
+    nn.Module.__init__(model)
+    model.inner_dim = hidden_dim
+    model.patchify_proj = nn.Linear(semantic_dim, hidden_dim)
+    model.semantic_token_type_embedding = None
+    model.semantic_repae_reference_type_embedding = None
+    model.semantic_repae_reference_slot_embedding = None
+    model.semantic_repae_semantic_type_embedding = None
+    model.semantic_norm_out = None
+    model.semantic_proj_out = None
+    model.semantic_token_type_id = None
+    model.reference_token_type_id = None
+    return model
+
+
+def test_repae_new_metadata_and_velocity_head_are_zero_initialized() -> None:
+    model = _initializable_metadata_model()
+    model.enable_semantic_repae_conditioning(
+        semantic_dim=4,
+        num_reference_slots=4,
+        semantic_token_type_id=TYPE_SEMANTIC,
+        reference_token_type_id=TYPE_REFERENCE,
+    )
+
+    assert torch.count_nonzero(model.semantic_repae_reference_type_embedding.weight).item() == 0
+    assert torch.count_nonzero(model.semantic_repae_reference_slot_embedding.weight).item() == 0
+    assert torch.count_nonzero(model.semantic_repae_semantic_type_embedding.weight).item() == 0
+    assert torch.count_nonzero(model.semantic_proj_out.weight).item() == 0
+    assert torch.count_nonzero(model.semantic_proj_out.bias).item() == 0
+
+    before = torch.randn(1, 3, 3)
+    token_types = torch.tensor([[TYPE_REFERENCE, TYPE_SEMANTIC, TYPE_TARGET]])
+    after = model.apply_video_token_metadata(
+        _transformer_args(before),
+        _modality(token_types, torch.tensor([[1, 0, 0]]), hidden_dim=3),
+    ).x
+    torch.testing.assert_close(after[:, 2], before[:, 2], rtol=0.0, atol=0.0)
 
 
 def test_repae_metadata_changes_reference_and_semantic_but_not_target() -> None:
@@ -132,6 +197,42 @@ def test_repae_capture_keeps_only_requested_semantic_span_and_gradients() -> Non
     assert all(block.projection.weight.grad is not None for block in model.transformer_blocks)
 
 
+def test_repae_capture_survives_non_reentrant_gradient_checkpointing() -> None:
+    model = LTXModel.__new__(LTXModel)
+    nn.Module.__init__(model)
+    model.transformer_blocks = nn.ModuleList([_AddBlock(4), _AddBlock(4), _AddBlock(4)])
+    model.block_input_processor = _IdentityBlockInputProcessor()
+    model._enable_gradient_checkpointing = True
+    model._semantic_repae_capture_request = None
+    model._semantic_repae_captured_hidden = None
+    model.configure_semantic_repae_capture(block_index=1, semantic_start=2, semantic_end=5)
+    inputs = _transformer_args(torch.randn(1, 7, 4, requires_grad=True))
+
+    with torch.set_grad_enabled(True):
+        model._process_transformer_blocks(
+            inputs,
+            None,
+            BatchedPerturbationConfig.empty(1),
+        )
+        captured = model.consume_semantic_repae_capture()
+        assert captured.shape == (1, 3, 4)
+        assert captured.requires_grad
+        captured.square().mean().backward()
+
+    assert model.transformer_blocks[0].projection.weight.grad is not None
+    assert model.transformer_blocks[1].projection.weight.grad is not None
+    assert model._semantic_repae_capture_request is None
+    assert model._semantic_repae_captured_hidden is None
+
+    model._process_transformer_blocks(
+        _transformer_args(torch.randn(1, 7, 4, requires_grad=True)),
+        None,
+        BatchedPerturbationConfig.empty(1),
+    )
+    with pytest.raises(RuntimeError, match="capture is missing"):
+        model.consume_semantic_repae_capture()
+
+
 def test_repae_reference_rope_and_worst_case_sequence_geometry() -> None:
     strategy = SemanticRepaEStrategy(SemanticRepaEConfig())
     target_latents = torch.zeros(1, 128, 16, 15, 26)
@@ -159,7 +260,10 @@ def test_repae_reference_rope_and_worst_case_sequence_geometry() -> None:
 
     assert ref_tokens.shape[1] == 4 * 390
     assert ref_valid.all()
-    assert (ref_positions[:, 0, :, 0] <= 0).all()
+    torch.testing.assert_close(
+        ref_positions[:, 0, :, 0],
+        torch.full_like(ref_positions[:, 0, :, 0], -1.0 / 24.0),
+    )
     assert torch.equal(ref_positions[:, 0, :, 1], torch.zeros_like(ref_positions[:, 0, :, 1]))
     assert ref_positions[:, 1, :, 0].amin() >= target_positions[:, 1, :, 1].amax()
     assert ref_positions[:, 2, :, 0].amin() >= target_positions[:, 2, :, 1].amax()
@@ -177,6 +281,48 @@ def test_repae_reference_rope_and_worst_case_sequence_geometry() -> None:
     assert target_positions.shape[2] == 6240
     assert ref_tokens.shape[1] + semantic_positions.shape[2] + target_positions.shape[2] == 9848
     assert strategy.semantic_frame_count_for_task(task="i2i", pixel_frame_count=1) * 256 == 256
+
+    image_target = torch.zeros(1, 128, 1, 15, 26)
+    image_positions = strategy._get_video_positions(
+        num_frames=1,
+        height=15,
+        width=26,
+        batch_size=1,
+        fps=1.0,
+        device=torch.device("cpu"),
+    )
+    _tokens, image_ref_positions, _valid, _entities = strategy._reference_sequence(
+        reference_latents,
+        target_latents=image_target,
+        target_positions=image_positions,
+    )
+    torch.testing.assert_close(
+        image_ref_positions[:, 0, :, 0],
+        torch.full_like(image_ref_positions[:, 0, :, 0], -1.0),
+    )
+    assert torch.equal(
+        image_ref_positions[:, 0, :, 1],
+        torch.zeros_like(image_ref_positions[:, 0, :, 1]),
+    )
+
+    mixed_target_positions = target_positions.expand(2, -1, -1, -1).clone()
+    mixed_target_positions[1, 0] *= 24.0
+    _tokens, mixed_ref_positions, _valid, _entities = strategy._reference_sequence(
+        {
+            "latents": reference_latents["latents"].expand(2, -1, -1, -1, -1, -1).clone(),
+            "ref_valid_mask": torch.ones(2, 4, dtype=torch.bool),
+        },
+        target_latents=target_latents.expand(2, -1, -1, -1, -1).clone(),
+        target_positions=mixed_target_positions,
+    )
+    torch.testing.assert_close(
+        mixed_ref_positions[0, 0, :, 0],
+        torch.full_like(mixed_ref_positions[0, 0, :, 0], -1.0 / 24.0),
+    )
+    torch.testing.assert_close(
+        mixed_ref_positions[1, 0, :, 0],
+        torch.full_like(mixed_ref_positions[1, 0, :, 0], -1.0),
+    )
 
 
 def test_repae_inference_uses_training_sequence_offsets_positions_and_types() -> None:
@@ -210,6 +356,57 @@ def test_repae_inference_uses_training_sequence_offsets_positions_and_types() ->
     assert torch.equal(token_types[:, 1560:3608], torch.full((1, 2048), TYPE_SEMANTIC))
     assert torch.equal(token_types[:, 3608:], torch.full((1, 6240), TYPE_TARGET))
     assert state.modality.positions.shape == (1, 3, 9848, 2)
+    assert state.modality.attention_mask is None
+
+
+def test_repae_compact_attention_mask_masks_only_invalid_reference_keys() -> None:
+    assert build_compact_valid_token_mask(torch.ones(2, 5, dtype=torch.bool)) is None
+    valid = torch.tensor([[True, False, True], [True, True, False]])
+    compact = build_compact_valid_token_mask(valid)
+    assert compact is not None
+    assert compact.shape == (2, 1, 3)
+    assert torch.equal(compact[:, 0], valid)
+    additive = TransformerArgsPreprocessor._prepare_self_attention_mask(
+        object(),
+        compact,
+        torch.float32,
+    )
+    assert additive.shape == (2, 1, 1, 3)
+    assert torch.equal(additive[:, 0, 0] == 0, valid)
+
+    strategy = SemanticRepaEStrategy(SemanticRepaEConfig())
+    strategy._semantic_dim = 128
+    state = strategy.prepare_inference_state(
+        conditions={
+            "video_prompt_embeds": torch.zeros(1, 3, 32),
+            "prompt_attention_mask": torch.ones(1, 3),
+        },
+        reference_latents={
+            "latents": torch.zeros(1, 4, 128, 1, 15, 26),
+            "ref_valid_mask": torch.tensor([[True, False, True, False]]),
+        },
+        target_shape=VideoLatentShape(batch=1, channels=128, frames=16, height=15, width=26),
+        semantic_frame_count=8,
+        pixel_frame_count=121,
+        fps=24.0,
+        seed=7,
+    )
+    mask = state.modality.attention_mask
+    assert mask is not None
+    assert mask.shape == (1, 1, state.sequence_offsets["target_end"])
+    tokens_per_reference = state.sequence_offsets["reference_end"] // 4
+    assert mask[:, :, :tokens_per_reference].all()
+    assert not mask[:, :, tokens_per_reference : 2 * tokens_per_reference].any()
+    assert mask[:, :, 2 * tokens_per_reference : 3 * tokens_per_reference].all()
+    assert not mask[:, :, 3 * tokens_per_reference : 4 * tokens_per_reference].any()
+    assert mask[:, :, state.sequence_offsets["reference_end"] :].all()
+
+    training_source = inspect.getsource(SemanticRepaEStrategy.prepare_training_inputs)
+    inference_source = inspect.getsource(SemanticFlowStrategy.prepare_inference_state)
+    assert "build_compact_valid_token_mask" in training_source
+    assert "build_compact_valid_token_mask" in inference_source
+    assert "[:, :, None]" not in training_source
+    assert "[:, :, None]" not in inference_source
 
 
 def test_repae_teacher_projection_and_both_projectors_receive_gradients() -> None:
@@ -242,8 +439,15 @@ class _TinyGemmaLanguageModel(nn.Module):
     def get_input_embeddings(self) -> nn.Module:
         return self.embedding
 
-    def forward(self, *, inputs_embeds: torch.Tensor, **_kwargs) -> SimpleNamespace:
-        return SimpleNamespace(hidden_states=(inputs_embeds * self.scale,))
+    def forward(
+        self,
+        *,
+        inputs_embeds: torch.Tensor,
+        output_hidden_states: bool,
+        **_kwargs,
+    ) -> SimpleNamespace:
+        assert output_hidden_states is False
+        return SimpleNamespace(last_hidden_state=inputs_embeds * self.scale)
 
 
 class _TinyTextEncoder(nn.Module):
@@ -342,6 +546,7 @@ def test_repae_strategy_is_independent_and_registered() -> None:
     assert isinstance(strategy, SemanticRepaEStrategy)
     assert not hasattr(config, "training_phase")
     assert not hasattr(config, "parent_checkpoint_step")
+    assert not hasattr(config, "target_fps")
     assert strategy.get_checkpoint_metadata()["architecture"] == "semantic_repae_v1"
 
 
@@ -353,3 +558,262 @@ def test_repae_full_dit_requires_fsdp_full_shard_runtime() -> None:
     accelerator = SimpleNamespace(distributed_type=DistributedType.NO)
     with pytest.raises(RuntimeError, match="semantic REPA-E.*FSDP FULL_SHARD"):
         _enforce_semantic_flow_fsdp_runtime_safety(config, accelerator)
+
+
+class _TinyCheckpointTransformer(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.base = nn.Linear(4, 4)
+        self.semantic_repae_reference_type_embedding = nn.Embedding(1, 4)
+        self.semantic_repae_reference_slot_embedding = nn.Embedding(4, 4)
+        self.semantic_repae_semantic_type_embedding = nn.Embedding(1, 4)
+        self.semantic_norm_out = nn.RMSNorm(4, elementwise_affine=True)
+        self.semantic_proj_out = nn.Linear(4, 4)
+
+
+class _TinyFeatureExtractor(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.video_aggregate_embed = nn.Linear(4, 4)
+        self.frozen_projection = nn.Linear(4, 4)
+
+
+class _TinyEmbeddingsProcessor(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.feature_extractor = _TinyFeatureExtractor()
+        self.video_connector = nn.Linear(4, 4)
+        self.audio_connector = nn.Linear(4, 4)
+
+
+def _tiny_checkpoint_strategy() -> SemanticRepaEStrategy:
+    strategy = SemanticRepaEStrategy(
+        SemanticRepaEConfig(semantic_hidden_dim=8, repa_hidden_dim=8)
+    )
+    strategy._semantic_dim = 4
+    strategy._gemma_dim = 6
+    strategy._dit_hidden_dim = 4
+    strategy._semantic_input_projection = SemanticInputProjection(6, 4, hidden_dim=8)
+    strategy._semantic_repa_projector = SemanticRepaProjector(4, 6, hidden_dim=8)
+    strategy._dit_repa_projector = SemanticRepaProjector(4, 6, hidden_dim=8)
+    return strategy
+
+
+def _semantic_repae_checkpoint_fixture() -> tuple[
+    dict[str, torch.Tensor],
+    dict[str, str],
+    SemanticRepaEStrategy,
+    _TinyCheckpointTransformer,
+    _TinyEmbeddingsProcessor,
+]:
+    strategy = _tiny_checkpoint_strategy()
+    transformer = _TinyCheckpointTransformer()
+    processor = _TinyEmbeddingsProcessor()
+    state = {key: value.detach().clone() for key, value in transformer.state_dict().items()}
+    accelerator = SimpleNamespace(get_state_dict=lambda module: module.state_dict())
+    state.update(strategy.get_extra_checkpoint_state_dict(accelerator))
+    for item in phase2_bridge_parameters(processor):
+        state[f"embeddings_processor.{item.name}"] = item.parameter.detach().clone()
+    metadata = {key: str(value) for key, value in strategy.get_checkpoint_metadata().items()}
+    return state, metadata, strategy, transformer, processor
+
+
+def test_repae_production_config_parses_with_correct_worktree_and_no_augmentation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = Path(__file__).parents[1] / "configs" / "semantic_repae_multitask_480p121_full.yaml"
+    raw_text = config_path.read_text(encoding="utf-8")
+    stale_worktree = "R2V-Next-semantic-repae-" + "codex"
+    assert stale_worktree not in raw_text
+    assert "/mnt/workspace/litengjie/R2V-Next-semantic-repae/" in raw_text
+    assert "training_phase" not in raw_text
+    assert "parent_checkpoint_step" not in raw_text
+    source_data_config = yaml.safe_load(
+        (config_path.parent / "multitask_online_480p121_opens2v_noaug.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert source_data_config["online_augmentation"]["enabled"] is False
+
+    payload = yaml.safe_load(raw_text)
+    data_config = tmp_path / "multitask.yaml"
+    manifest = tmp_path / "manifest.jsonl"
+    model = tmp_path / "model.safetensors"
+    text_encoder = tmp_path / "text_encoder"
+    data_config.write_text("online_augmentation:\n  enabled: false\n", encoding="utf-8")
+    manifest.write_text("{}\n", encoding="utf-8")
+    model.write_bytes(b"fixture")
+    text_encoder.mkdir()
+    payload["model"]["model_path"] = str(model)
+    payload["model"]["text_encoder_path"] = str(text_encoder)
+    payload["data"]["train_data_config"] = str(data_config)
+    payload["data"]["manifest_path"] = str(manifest)
+    payload["data"]["online_encoding"]["runtime_reject_log_dir"] = str(tmp_path / "rejects")
+    payload["output_dir"] = str(tmp_path / "output")
+    monkeypatch.setattr(path_safety, "_ALLOWED_WRITE_ROOT", tmp_path)
+
+    parsed = LtxTrainerConfig(**payload)
+    assert isinstance(parsed.training_strategy, SemanticRepaEConfig)
+    assert parsed.training_strategy.semantic_anchor_count == 8
+    assert parsed.model.training_mode == "full"
+    assert parsed.data.online_encoding is not None
+    assert parsed.data.online_encoding.augmentation.enabled is False
+    assert parsed.optimization.learning_rate == pytest.approx(5.0e-6)
+    assert parsed.optimization.bridge_learning_rate == pytest.approx(3.0e-6)
+    assert parsed.optimization.semantic_learning_rate == pytest.approx(1.0e-5)
+    assert parsed.optimization.repa_learning_rate == pytest.approx(1.0e-5)
+
+
+def test_repae_checkpoint_round_trip_covers_all_trainable_components(tmp_path: Path) -> None:
+    state, metadata, _source_strategy, _source_transformer, _source_processor = (
+        _semantic_repae_checkpoint_fixture()
+    )
+    checkpoint = tmp_path / "model_weights_step_00001.safetensors"
+    save_file(state, checkpoint, metadata=metadata)
+
+    audit = audit_checkpoint(checkpoint)
+    assert audit["required_missing_keys"] == []
+    assert read_checkpoint_metadata(checkpoint) == metadata
+    assert metadata["architecture"] == "semantic_repae_v1"
+    assert metadata["training_regime"] == "single_stage_full"
+    assert metadata["reference_rope_mode"] == "negative_adjacent_shifted_hw"
+    assert metadata["semantic_anchor_count"] == "8"
+    assert metadata["semantic_tokens_per_frame"] == "256"
+
+    loaded = load_file(checkpoint, device="cpu")
+    target_strategy = _tiny_checkpoint_strategy()
+    target_transformer = _TinyCheckpointTransformer()
+    target_processor = _TinyEmbeddingsProcessor()
+    target_strategy.load_extra_checkpoint_state_dict(loaded, checkpoint_metadata=metadata)
+    validate_and_load_phase2_bridge_state(target_processor, loaded)
+    transformer_state = {
+        key: value
+        for key, value in loaded.items()
+        if not key.startswith("training_strategy.")
+        and not key.startswith("embeddings_processor.")
+    }
+    target_transformer.load_state_dict(transformer_state, strict=True)
+
+    for name, module in target_strategy.get_trainable_modules().items():
+        prefix = f"training_strategy.{name}."
+        for key, value in module.state_dict().items():
+            torch.testing.assert_close(value, loaded[f"{prefix}{key}"])
+    for key, value in target_transformer.state_dict().items():
+        torch.testing.assert_close(value, loaded[key])
+    for item in phase2_bridge_parameters(target_processor):
+        torch.testing.assert_close(item.parameter, loaded[f"embeddings_processor.{item.name}"])
+
+
+def test_repae_checkpoint_audit_fails_when_any_required_prefix_is_missing(tmp_path: Path) -> None:
+    state, metadata, _strategy, _transformer, _processor = _semantic_repae_checkpoint_fixture()
+    required = REPAE_STRATEGY_CHECKPOINT_PREFIXES + REPAE_TRANSFORMER_CHECKPOINT_PREFIXES
+    for index, prefix in enumerate(required):
+        incomplete = {key: value for key, value in state.items() if not key.startswith(prefix)}
+        checkpoint = tmp_path / f"missing_{index}_step_00001.safetensors"
+        save_file(incomplete, checkpoint, metadata=metadata)
+        with pytest.raises(CheckpointAuditError, match="missing semantic modules"):
+            audit_checkpoint(checkpoint)
+
+    missing_strategy = {
+        key: value
+        for key, value in state.items()
+        if not key.startswith("training_strategy.semantic_input_projection.")
+    }
+    with pytest.raises(RuntimeError, match="missing strategy modules"):
+        _tiny_checkpoint_strategy().load_extra_checkpoint_state_dict(
+            missing_strategy,
+            checkpoint_metadata=metadata,
+        )
+
+
+def test_repae_rejects_semantic_flow_checkpoint_and_is_runtime_compatible() -> None:
+    strategy = _tiny_checkpoint_strategy()
+    with pytest.raises(RuntimeError, match="Unsupported semantic REPA-E checkpoint architecture"):
+        strategy.load_extra_checkpoint_state_dict(
+            {},
+            checkpoint_metadata={"architecture": "semantic_flow_v2"},
+        )
+    assert isinstance(strategy, SemanticFlowStrategy)
+
+
+def test_repae_trainability_audit_assigns_every_parameter_to_exactly_one_group() -> None:
+    trainer = object.__new__(LtxvTrainer)
+    trainer._training_strategy = _tiny_checkpoint_strategy()
+    trainer._transformer = _TinyCheckpointTransformer()
+    trainer._embeddings_processor = _TinyEmbeddingsProcessor()
+    trainer._text_encoder = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 4))
+    trainer._online_vae_encoder = nn.Linear(4, 4)
+    trainer._text_encoder.requires_grad_(False)
+    trainer._online_vae_encoder.requires_grad_(False)
+    configure_phase2_bridge_trainability(trainer._embeddings_processor)
+    trainer._embeddings_processor_trainable_modules = (
+        trainer._training_strategy.get_embeddings_processor_trainable_modules(
+            trainer._embeddings_processor
+        )
+    )
+    strategy_modules = trainer._training_strategy.get_trainable_modules()
+    trainer._trainable_params = LtxvTrainer._deduplicate_parameters(
+        [
+            *[parameter for parameter in trainer._transformer.parameters() if parameter.requires_grad],
+            *[
+                parameter
+                for module in trainer._embeddings_processor_trainable_modules.values()
+                for parameter in module.parameters()
+                if parameter.requires_grad
+            ],
+            *[
+                parameter
+                for module in strategy_modules.values()
+                for parameter in module.parameters()
+                if parameter.requires_grad
+            ],
+        ]
+    )
+
+    trainer._validate_semantic_repae_trainability(strategy_modules)
+    groups = trainer._semantic_repae_trainable_parameter_groups(strategy_modules)
+    assert list(groups) == ["dit", "conditioning_bridge", "semantic_projection", "repa_projectors"]
+    grouped_ids = [id(parameter) for values in groups.values() for parameter in values]
+    assert len(grouped_ids) == len(set(grouped_ids)) == len(trainer._trainable_params)
+    transformer_by_name = dict(trainer._transformer.named_parameters())
+    dit_ids = {id(parameter) for parameter in groups["dit"]}
+    for name in (
+        "semantic_repae_reference_type_embedding.weight",
+        "semantic_repae_reference_slot_embedding.weight",
+        "semantic_repae_semantic_type_embedding.weight",
+        "semantic_norm_out.weight",
+        "semantic_proj_out.weight",
+        "semantic_proj_out.bias",
+    ):
+        assert id(transformer_by_name[name]) in dit_ids
+    assert all(parameter.requires_grad is False for parameter in trainer._text_encoder.parameters())
+    assert all(parameter.requires_grad is False for parameter in trainer._online_vae_encoder.parameters())
+    assert all(
+        parameter.requires_grad is False
+        for parameter in trainer._embeddings_processor.audio_connector.parameters()
+    )
+    trainer._config = SimpleNamespace(
+        optimization=SimpleNamespace(
+            learning_rate=5.0e-6,
+            bridge_learning_rate=3.0e-6,
+            semantic_learning_rate=1.0e-5,
+            repa_learning_rate=2.0e-5,
+            optimizer_type="adamw",
+        )
+    )
+    trainer._create_scheduler = lambda optimizer: torch.optim.lr_scheduler.LambdaLR(  # type: ignore[method-assign]
+        optimizer,
+        lr_lambda=lambda _step: 1.0,
+    )
+    trainer._accelerator = SimpleNamespace(prepare=lambda *values: values)
+    trainer._init_optimizer()
+    assert [group["name"] for group in trainer._optimizer.param_groups] == [
+        "dit",
+        "conditioning_bridge",
+        "semantic_projection",
+        "repa_projectors",
+    ]
+    assert [group["lr"] for group in trainer._optimizer.param_groups] == pytest.approx(
+        [5.0e-6, 3.0e-6, 1.0e-5, 2.0e-5]
+    )

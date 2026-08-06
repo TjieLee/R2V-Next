@@ -32,6 +32,37 @@ from ltx_trainer.training_strategies.semantic_flow import (
 )
 
 
+def _attention_allows_reference_keys(
+    attention_mask: torch.Tensor | None,
+    ref_end: int,
+) -> bool:
+    if attention_mask is None:
+        return ref_end > 0
+    query_slice = slice(None) if attention_mask.shape[1] == 1 else slice(ref_end, None)
+    return bool(attention_mask[:, query_slice, :ref_end].any().item())
+
+
+def _attention_key_spans_equal(
+    left: torch.Tensor | None,
+    right: torch.Tensor | None,
+    *,
+    key_start: int,
+) -> bool:
+    def span(mask: torch.Tensor | None) -> torch.Tensor | None:
+        if mask is None:
+            return None
+        query_slice = slice(None) if mask.shape[1] == 1 else slice(key_start, None)
+        return mask[:, query_slice, key_start:]
+
+    left_span = span(left)
+    right_span = span(right)
+    if left_span is None:
+        return right_span is None or bool(right_span.all().item())
+    if right_span is None:
+        return bool(left_span.all().item())
+    return torch.equal(left_span, right_span)
+
+
 def test_guidance_formula_and_forward_counts() -> None:
     positive = torch.tensor([[[5.0, 7.0]]])
     negative = torch.tensor([[[1.0, 2.0]]])
@@ -1363,7 +1394,7 @@ def test_standard_negative_validation_requires_inactive_reference_latents() -> N
     assert states.negative is not None
     ref_end = states.positive.sequence_offsets["reference_end"]
     assert torch.count_nonzero(states.negative.modality.latent[:, :ref_end]) == 0
-    assert not states.negative.modality.attention_mask[:, ref_end:, :ref_end].any()
+    assert not _attention_allows_reference_keys(states.negative.modality.attention_mask, ref_end)
 
     active_negative = replace(
         states.negative,
@@ -1487,7 +1518,7 @@ def test_runtime_builds_isolated_branches_from_one_reference_and_noise_set() -> 
         states.no_reference.modality.entity_ids[:, :ref_end],
         states.positive.modality.entity_ids[:, :ref_end],
     )
-    assert not states.no_reference.modality.attention_mask[:, ref_end:, :ref_end].any()
+    assert not _attention_allows_reference_keys(states.no_reference.modality.attention_mask, ref_end)
 
 
 def test_runtime_builds_latent_reference_state_from_positive_condition() -> None:
@@ -1558,7 +1589,7 @@ def test_runtime_builds_latent_reference_state_from_positive_condition() -> None
         states.positive.modality.latent[:, :ref_end],
     )
     assert torch.count_nonzero(q_latent.modality.latent[:, :ref_end]) == 0
-    assert not q_latent.modality.attention_mask[:, ref_end:, :ref_end].any()
+    assert not _attention_allows_reference_keys(q_latent.modality.attention_mask, ref_end)
     assert runtime.last_generation_geometry["guidance_mode"] == "latent_ref"
     assert runtime.last_generation_geometry["enabled_guidance_branches"] == [
         "P",
@@ -1636,11 +1667,12 @@ def test_runtime_builds_no_vlm_negative_with_active_reference_latents(
         states.negative.modality.entity_ids,
         states.positive.modality.entity_ids,
     )
-    assert torch.equal(
+    assert _attention_key_spans_equal(
         states.negative.modality.attention_mask,
         states.positive.modality.attention_mask,
+        key_start=0,
     )
-    assert states.negative.modality.attention_mask[:, ref_end:, :ref_end].any()
+    assert _attention_allows_reference_keys(states.negative.modality.attention_mask, ref_end)
     assert torch.all(states.negative.modality.context == -2.0)
     assert not torch.equal(
         states.negative.modality.context,
@@ -1665,7 +1697,7 @@ def test_runtime_builds_no_vlm_negative_with_active_reference_latents(
             is states.positive.modality.context_mask
         )
     assert torch.count_nonzero(comparison.modality.latent[:, :ref_end]) == 0
-    assert not comparison.modality.attention_mask[:, ref_end:, :ref_end].any()
+    assert not _attention_allows_reference_keys(comparison.modality.attention_mask, ref_end)
     assert torch.equal(
         comparison.modality.latent[:, ref_end:],
         states.positive.modality.latent[:, ref_end:],
@@ -1732,7 +1764,7 @@ def test_runtime_builds_standard_negative_drop_all_and_ql() -> None:
     for branch in (negative, ql):
         assert torch.equal(branch.latent[:, ref_end:], generated)
         assert torch.count_nonzero(branch.latent[:, :ref_end]) == 0
-        assert not branch.attention_mask[:, ref_end:, :ref_end].any()
+        assert not _attention_allows_reference_keys(branch.attention_mask, ref_end)
         for name in (
             "positions",
             "token_type_ids",
@@ -1810,7 +1842,7 @@ def test_runtime_builds_factorized_til_states_from_one_trajectory() -> None:
     for branch in (negative, text_only, vlm_only):
         assert torch.equal(branch.latent[:, ref_end:], generated)
         assert torch.count_nonzero(branch.latent[:, :ref_end]) == 0
-        assert not branch.attention_mask[:, ref_end:, :ref_end].any()
+        assert not _attention_allows_reference_keys(branch.attention_mask, ref_end)
         for name in (
             "positions",
             "token_type_ids",
@@ -1822,9 +1854,10 @@ def test_runtime_builds_factorized_til_states_from_one_trajectory() -> None:
             branch.entity_ids[:, ref_end:],
             positive.entity_ids[:, ref_end:],
         )
-        assert torch.equal(
-            branch.attention_mask[:, ref_end:, ref_end:],
-            positive.attention_mask[:, ref_end:, ref_end:],
+        assert _attention_key_spans_equal(
+            branch.attention_mask,
+            positive.attention_mask,
+            key_start=ref_end,
         )
     assert torch.all(negative.context == -2.0)
     assert torch.all(text_only.context == 0.25)
@@ -1920,7 +1953,7 @@ def test_runtime_builds_debiased_reference_states_from_one_noise_set() -> None:
     )
     for branch in (states.negative, states.empty_no_reference):
         assert torch.count_nonzero(branch.modality.latent[:, :ref_end]) == 0
-        assert not branch.modality.attention_mask[:, ref_end:, :ref_end].any()
+        assert not _attention_allows_reference_keys(branch.modality.attention_mask, ref_end)
     assert runtime.last_generation_geometry["guidance_mode"] == "debiased_ref"
     assert runtime.last_generation_geometry["guidance_branch_count"] == 4
     assert runtime.last_generation_geometry["transformer_forwards_per_step"] == 4

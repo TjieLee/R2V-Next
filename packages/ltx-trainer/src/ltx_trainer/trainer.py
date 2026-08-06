@@ -51,6 +51,7 @@ from ltx_trainer.model_loader import (
     load_video_vae_encoder,
 )
 from ltx_trainer.online_inference.checkpoint_runtime import (
+    REPAE_TRANSFORMER_CHECKPOINT_PREFIXES,
     checkpoint_contains_semantic_flow_modules,
     read_checkpoint_metadata,
     validate_reference_rope_checkpoint_metadata,
@@ -900,6 +901,7 @@ class LtxvTrainer:
             raise ValueError("No trainable parameters were found for the selected training strategy.")
 
         logger.debug(f"Trainable params count: {sum(p.numel() for p in self._trainable_params):,}")
+        self._validate_semantic_repae_trainability(strategy_modules)
         self._validate_phase2_trainability(strategy_modules)
         self._write_phase2_parameter_audit(strategy_modules)
         self._log_parameter_summary(strategy_modules)
@@ -1929,6 +1931,153 @@ class LtxvTrainer:
             f"{self._optimizer_group_parameter_counts['conditioning_bridge']:,}",
         )
 
+    def _semantic_repae_trainable_parameter_groups(
+        self,
+        strategy_modules: dict[str, torch.nn.Module] | None = None,
+    ) -> dict[str, list[nn.Parameter]]:
+        if strategy_modules is None:
+            strategy_modules = self._training_strategy.get_trainable_modules()
+        expected_modules = {
+            "semantic_input_projection",
+            "semantic_repa_projector",
+            "dit_repa_projector",
+        }
+        if set(strategy_modules) != expected_modules:
+            raise RuntimeError(
+                "semantic REPA-E trainable modules are incomplete: "
+                f"expected={sorted(expected_modules)}, actual={sorted(strategy_modules)}"
+            )
+        groups = {
+            "dit": self._deduplicate_parameters(
+                [parameter for parameter in self._transformer.parameters() if parameter.requires_grad]
+            ),
+            "conditioning_bridge": self._deduplicate_parameters(
+                [
+                    parameter
+                    for module in self._embeddings_processor_trainable_modules.values()
+                    for parameter in module.parameters()
+                    if parameter.requires_grad
+                ]
+            ),
+            "semantic_projection": self._deduplicate_parameters(
+                [
+                    parameter
+                    for parameter in strategy_modules["semantic_input_projection"].parameters()
+                    if parameter.requires_grad
+                ]
+            ),
+            "repa_projectors": self._deduplicate_parameters(
+                [
+                    parameter
+                    for name in ("semantic_repa_projector", "dit_repa_projector")
+                    for parameter in strategy_modules[name].parameters()
+                    if parameter.requires_grad
+                ]
+            ),
+        }
+        empty = [name for name, parameters in groups.items() if not parameters]
+        if empty:
+            raise RuntimeError(f"semantic REPA-E optimizer groups are empty: {empty}")
+        flattened = [parameter for parameters in groups.values() for parameter in parameters]
+        parameter_ids = [id(parameter) for parameter in flattened]
+        if len(parameter_ids) != len(set(parameter_ids)):
+            raise RuntimeError("semantic REPA-E trainable parameters overlap optimizer groups")
+        expected_ids = {id(parameter) for parameter in self._trainable_params}
+        if set(parameter_ids) != expected_ids:
+            raise RuntimeError("semantic REPA-E optimizer groups do not cover the trainable parameter set")
+        return groups
+
+    def _validate_semantic_repae_trainability(
+        self,
+        strategy_modules: dict[str, torch.nn.Module],
+    ) -> None:
+        if not self._is_semantic_repae():
+            return
+        frozen_transformer = [
+            name for name, parameter in self._transformer.named_parameters() if not parameter.requires_grad
+        ]
+        if frozen_transformer:
+            raise RuntimeError(
+                "semantic REPA-E requires the complete transformer to be trainable from step 0; "
+                f"frozen={frozen_transformer[:20]}"
+            )
+        transformer_names = dict(self._transformer.named_parameters())
+        required_dit_parameters = {
+            "semantic_repae_reference_type_embedding.weight",
+            "semantic_repae_reference_slot_embedding.weight",
+            "semantic_repae_semantic_type_embedding.weight",
+            "semantic_norm_out.weight",
+            "semantic_proj_out.weight",
+            "semantic_proj_out.bias",
+        }
+        missing_dit = sorted(required_dit_parameters - set(transformer_names))
+        if missing_dit:
+            raise RuntimeError(
+                f"semantic REPA-E transformer adapters are incomplete: {missing_dit}"
+            )
+        frozen_strategy = [
+            f"{module_name}.{parameter_name}"
+            for module_name, module in strategy_modules.items()
+            for parameter_name, parameter in module.named_parameters()
+            if not parameter.requires_grad
+        ]
+        if frozen_strategy:
+            raise RuntimeError(
+                "semantic REPA-E strategy modules must be trainable from step 0; "
+                f"frozen={frozen_strategy[:20]}"
+            )
+        expected_bridge = phase2_bridge_parameters(self._embeddings_processor)
+        frozen_bridge = [item.name for item in expected_bridge if not item.parameter.requires_grad]
+        if frozen_bridge:
+            raise RuntimeError(
+                f"semantic REPA-E conditioning bridge contains frozen parameters: {frozen_bridge[:20]}"
+            )
+        expected_bridge_ids = {id(item.parameter) for item in expected_bridge}
+        actual_bridge_ids = {
+            id(parameter)
+            for module in self._embeddings_processor_trainable_modules.values()
+            for parameter in module.parameters()
+            if parameter.requires_grad
+        }
+        if actual_bridge_ids != expected_bridge_ids:
+            raise RuntimeError(
+                "semantic REPA-E prepared bridge modules do not match the explicit allowlist"
+            )
+        if self._text_encoder is None or any(
+            parameter.requires_grad for parameter in self._text_encoder.parameters()
+        ):
+            raise RuntimeError("semantic REPA-E Gemma, vision tower, and multimodal projector must remain frozen")
+        online_vae = getattr(self, "_online_vae_encoder", None)
+        if online_vae is None or any(parameter.requires_grad for parameter in online_vae.parameters()):
+            raise RuntimeError("semantic REPA-E VAE encoder must remain frozen")
+        audio_connector = getattr(self._embeddings_processor, "audio_connector", None)
+        if isinstance(audio_connector, nn.Module) and any(
+            parameter.requires_grad for parameter in audio_connector.parameters()
+        ):
+            raise RuntimeError("semantic REPA-E audio connector must remain frozen")
+        unexpected_processor = [
+            name
+            for name, parameter in self._embeddings_processor.named_parameters()
+            if parameter.requires_grad and id(parameter) not in expected_bridge_ids
+        ]
+        if unexpected_processor:
+            raise RuntimeError(
+                "Unexpected semantic REPA-E trainable embeddings-processor parameters: "
+                f"{unexpected_processor[:20]}"
+            )
+        groups = self._semantic_repae_trainable_parameter_groups(strategy_modules)
+        self._optimizer_group_parameter_counts = {
+            name: sum(parameter.numel() for parameter in parameters)
+            for name, parameters in groups.items()
+        }
+        logger.info(
+            "semantic REPA-E trainability audit passed: %s",
+            ", ".join(
+                f"{name}={self._optimizer_group_parameter_counts[name]:,}"
+                for name in ("dit", "conditioning_bridge", "semantic_projection", "repa_projectors")
+            ),
+        )
+
     def _write_phase2_parameter_audit(
         self,
         strategy_modules: dict[str, torch.nn.Module],
@@ -2148,6 +2297,19 @@ class LtxvTrainer:
         logger.info("✅ Full model checkpoint loaded successfully")
 
     def _validate_full_checkpoint_metadata(self, checkpoint_path: Path) -> dict[str, str]:
+        if self._is_semantic_repae():
+            metadata = read_checkpoint_metadata(checkpoint_path)
+            validate_reference_rope_checkpoint_metadata(
+                metadata,
+                expected_mode=self._training_strategy.config.reference_rope_mode,
+                allow_legacy=False,
+            )
+            if metadata.get("architecture") != "semantic_repae_v1":
+                raise RuntimeError(
+                    "Unsupported semantic REPA-E checkpoint architecture: "
+                    f"{metadata.get('architecture')!r}"
+                )
+            return metadata
         if self._config.training_strategy.name != "semantic_flow":
             return read_checkpoint_metadata(checkpoint_path)
         if not checkpoint_contains_semantic_flow_modules(checkpoint_path):
@@ -2385,7 +2547,13 @@ class LtxvTrainer:
             for key, value in state_dict.items()
             if key.startswith("embeddings_processor.")
         }
-        if self._is_semantic_flow_phase2() and (checkpoint_metadata or {}).get(
+        if self._is_semantic_repae():
+            loaded = validate_and_load_phase2_bridge_state(
+                self._embeddings_processor,
+                state_dict,
+            )
+            logger.info("✅ Strictly loaded %d semantic REPA-E conditioning-bridge tensors", loaded)
+        elif self._is_semantic_flow_phase2() and (checkpoint_metadata or {}).get(
             "training_phase"
         ) == "phase2":
             loaded = validate_and_load_phase2_bridge_state(
@@ -3434,62 +3602,22 @@ class LtxvTrainer:
         phase2_parameter_names_by_group: dict[str, list[str]] = {}
         if self._is_semantic_repae():
             strategy_modules = self._training_strategy.get_trainable_modules()
-            expected_strategy_modules = {
-                "semantic_input_projection",
-                "semantic_repa_projector",
-                "dit_repa_projector",
-            }
-            if set(strategy_modules) != expected_strategy_modules:
-                raise RuntimeError(
-                    "semantic REPA-E optimizer modules are incomplete: "
-                    f"expected={sorted(expected_strategy_modules)}, actual={sorted(strategy_modules)}"
-                )
-            dit = self._deduplicate_parameters(
-                [parameter for parameter in self._transformer.parameters() if parameter.requires_grad]
-            )
-            conditioning_bridge = self._deduplicate_parameters(
-                [
-                    parameter
-                    for module in self._embeddings_processor_trainable_modules.values()
-                    for parameter in module.parameters()
-                    if parameter.requires_grad
-                ]
-            )
-            semantic_projection = self._deduplicate_parameters(
-                [
-                    parameter
-                    for parameter in strategy_modules["semantic_input_projection"].parameters()
-                    if parameter.requires_grad
-                ]
-            )
-            repa_projectors = self._deduplicate_parameters(
-                [
-                    parameter
-                    for name in ("semantic_repa_projector", "dit_repa_projector")
-                    for parameter in strategy_modules[name].parameters()
-                    if parameter.requires_grad
-                ]
-            )
-            grouped = dit + conditioning_bridge + semantic_projection + repa_projectors
-            if {id(parameter) for parameter in grouped} != {
-                id(parameter) for parameter in self._trainable_params
-            }:
-                raise RuntimeError("semantic REPA-E optimizer groups do not cover the trainable parameter set")
+            groups = self._semantic_repae_trainable_parameter_groups(strategy_modules)
             optimizer_parameters = [
-                {"name": "dit", "params": dit, "lr": opt_cfg.learning_rate},
+                {"name": "dit", "params": groups["dit"], "lr": opt_cfg.learning_rate},
                 {
                     "name": "conditioning_bridge",
-                    "params": conditioning_bridge,
+                    "params": groups["conditioning_bridge"],
                     "lr": opt_cfg.bridge_learning_rate or opt_cfg.learning_rate,
                 },
                 {
                     "name": "semantic_projection",
-                    "params": semantic_projection,
+                    "params": groups["semantic_projection"],
                     "lr": opt_cfg.semantic_learning_rate or opt_cfg.learning_rate,
                 },
                 {
                     "name": "repa_projectors",
-                    "params": repa_projectors,
+                    "params": groups["repa_projectors"],
                     "lr": opt_cfg.repa_learning_rate or opt_cfg.learning_rate,
                 },
             ]
@@ -4029,6 +4157,8 @@ class LtxvTrainer:
                     "embeddings_processor.feature_extractor.",
                     "embeddings_processor.video_connector.",
                 )
+            if self._is_semantic_repae():
+                required_prefixes += REPAE_TRANSFORMER_CHECKPOINT_PREFIXES
             self._atomic_save_safetensors(
                 full_state_dict,
                 saved_weights_path,

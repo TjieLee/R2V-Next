@@ -91,6 +91,82 @@ DEFAULT_PHASE2_CONDITION_PROBABILITIES = {
 }
 
 
+def build_compact_valid_token_mask(valid_tokens: Tensor) -> Tensor | None:
+    """Build a broadcastable key-valid mask without materializing ``[B,T,T]``."""
+    if valid_tokens.ndim != 2:
+        raise ValueError(
+            f"valid_tokens must have shape [B,T], got {tuple(valid_tokens.shape)}"
+        )
+    if valid_tokens.dtype != torch.bool:
+        raise TypeError(f"valid_tokens must be boolean, got {valid_tokens.dtype}")
+    if bool(valid_tokens.all().item()):
+        return None
+    return valid_tokens[:, None, :]
+
+
+def _attention_key_span(
+    attention_mask: Tensor | None,
+    *,
+    key_start: int,
+    key_end: int,
+    query_start: int,
+) -> Tensor | None:
+    if attention_mask is None:
+        return None
+    if attention_mask.ndim != 3:
+        raise ValueError(
+            "self-attention mask must be [B,1,T] or [B,T,T], "
+            f"got {tuple(attention_mask.shape)}"
+        )
+    query_slice = slice(None) if attention_mask.shape[1] == 1 else slice(query_start, None)
+    return attention_mask[:, query_slice, key_start:key_end]
+
+
+def _attention_key_spans_equal(
+    left: Tensor | None,
+    right: Tensor | None,
+    *,
+    key_start: int,
+    key_end: int,
+    query_start: int,
+) -> bool:
+    left_span = _attention_key_span(
+        left,
+        key_start=key_start,
+        key_end=key_end,
+        query_start=query_start,
+    )
+    right_span = _attention_key_span(
+        right,
+        key_start=key_start,
+        key_end=key_end,
+        query_start=query_start,
+    )
+    if left_span is None:
+        return right_span is None or bool(right_span.all().item())
+    if right_span is None:
+        return bool(left_span.all().item())
+    return torch.equal(left_span, right_span)
+
+
+def _attention_allows_any_key(
+    attention_mask: Tensor | None,
+    *,
+    key_start: int,
+    key_end: int,
+    query_start: int,
+) -> bool:
+    if key_start >= key_end:
+        return False
+    span = _attention_key_span(
+        attention_mask,
+        key_start=key_start,
+        key_end=key_end,
+        query_start=query_start,
+    )
+    return span is None or bool(span.any().item())
+
+
 @dataclass(frozen=True)
 class SemanticInferenceState:
     """All state needed to integrate reference/semantic/video tokens jointly."""
@@ -813,11 +889,7 @@ class SemanticFlowStrategy(TrainingStrategy):
             ],
             dim=1,
         )
-        attention_mask = valid_tokens[:, :, None] & valid_tokens[:, None, :]
-        invalid = ~valid_tokens
-        if invalid.any():
-            diagonal = torch.eye(sequence.shape[1], device=device, dtype=torch.bool).unsqueeze(0)
-            attention_mask |= diagonal & invalid[:, :, None]
+        attention_mask = build_compact_valid_token_mask(valid_tokens)
 
         token_type_ids = torch.cat(
             [
@@ -1052,11 +1124,7 @@ class SemanticFlowStrategy(TrainingStrategy):
             ],
             dim=1,
         )
-        attention_mask = valid[:, :, None] & valid[:, None, :]
-        invalid = ~valid
-        if invalid.any():
-            diagonal = torch.eye(sequence.shape[1], device=device, dtype=torch.bool).unsqueeze(0)
-            attention_mask |= diagonal & invalid[:, :, None]
+        attention_mask = build_compact_valid_token_mask(valid)
         token_type_ids = torch.cat(
             [
                 torch.full((batch_size, ref_length), TYPE_REFERENCE, device=device, dtype=torch.long),
@@ -1373,9 +1441,12 @@ class SemanticFlowStrategy(TrainingStrategy):
                 positive.modality.entity_ids[:, ref_end:],
             ):
                 raise ValueError("Guidance branches differ in generated-span entity_ids")
-            if not torch.equal(
-                branch.modality.attention_mask[:, ref_end:, ref_end:],
-                positive.modality.attention_mask[:, ref_end:, ref_end:],
+            if not _attention_key_spans_equal(
+                branch.modality.attention_mask,
+                positive.modality.attention_mask,
+                key_start=ref_end,
+                key_end=offsets["target_end"],
+                query_start=ref_end,
             ):
                 raise ValueError("Guidance branches differ in generated-span attention layout")
         if (
@@ -1401,18 +1472,30 @@ class SemanticFlowStrategy(TrainingStrategy):
             }
             and states.negative is not None
         ):
-            for name in ("attention_mask", "entity_ids"):
-                if not torch.equal(
-                    getattr(states.negative.modality, name),
-                    getattr(positive.modality, name),
-                ):
-                    raise ValueError(f"P and N must share {name}")
+            if not _attention_key_spans_equal(
+                states.negative.modality.attention_mask,
+                positive.modality.attention_mask,
+                key_start=0,
+                key_end=offsets["target_end"],
+                query_start=0,
+            ):
+                raise ValueError("P and N must share attention_mask")
+            if not torch.equal(
+                states.negative.modality.entity_ids,
+                positive.modality.entity_ids,
+            ):
+                raise ValueError("P and N must share entity_ids")
         if guidance.uses_drop_all_negative and guidance.need_negative:
             assert states.negative is not None
             negative = states.negative.modality
             if torch.count_nonzero(negative.latent[:, :ref_end]).item():
                 raise ValueError("N0 reference tokens must be zero")
-            if negative.attention_mask[:, ref_end:, :ref_end].any():
+            if _attention_allows_any_key(
+                negative.attention_mask,
+                key_start=0,
+                key_end=ref_end,
+                query_start=ref_end,
+            ):
                 raise ValueError(
                     "N0 generated tokens must not attend to reference tokens"
                 )
@@ -1426,7 +1509,12 @@ class SemanticFlowStrategy(TrainingStrategy):
                 modality = branch.modality
                 if torch.count_nonzero(modality.latent[:, :ref_end]).item():
                     raise ValueError(f"{name} reference tokens must be zero")
-                if modality.attention_mask[:, ref_end:, :ref_end].any():
+                if _attention_allows_any_key(
+                    modality.attention_mask,
+                    key_start=0,
+                    key_end=ref_end,
+                    query_start=ref_end,
+                ):
                     raise ValueError(
                         f"{name} generated tokens must not attend to reference tokens"
                     )
@@ -1444,7 +1532,12 @@ class SemanticFlowStrategy(TrainingStrategy):
             if torch.count_nonzero(states.no_reference.modality.latent[:, :ref_end]).item():
                 raise ValueError("Q reference tokens must be zero")
             attention = states.no_reference.modality.attention_mask
-            if attention[:, ref_end:, :ref_end].any():
+            if _attention_allows_any_key(
+                attention,
+                key_start=0,
+                key_end=ref_end,
+                query_start=ref_end,
+            ):
                 raise ValueError("Q generated tokens must not attend to reference tokens")
         if guidance.need_reference and guidance.uses_ql_reference_comparison:
             assert states.no_latent_reference is not None
@@ -1461,7 +1554,12 @@ class SemanticFlowStrategy(TrainingStrategy):
                 no_latent_reference.latent[:, :ref_end]
             ).item():
                 raise ValueError("QL reference tokens must be zero")
-            if no_latent_reference.attention_mask[:, ref_end:, :ref_end].any():
+            if _attention_allows_any_key(
+                no_latent_reference.attention_mask,
+                key_start=0,
+                key_end=ref_end,
+                query_start=ref_end,
+            ):
                 raise ValueError(
                     "QL generated tokens must not attend to reference tokens"
                 )
@@ -1475,7 +1573,12 @@ class SemanticFlowStrategy(TrainingStrategy):
                     continue
                 if torch.count_nonzero(branch.modality.latent[:, :ref_end]).item():
                     raise ValueError(f"{name} reference tokens must be zero")
-                if branch.modality.attention_mask[:, ref_end:, :ref_end].any():
+                if _attention_allows_any_key(
+                    branch.modality.attention_mask,
+                    key_start=0,
+                    key_end=ref_end,
+                    query_start=ref_end,
+                ):
                     raise ValueError(
                         f"{name} generated tokens must not attend to reference tokens"
                     )
@@ -1726,10 +1829,16 @@ class SemanticFlowStrategy(TrainingStrategy):
             w_shift = target_w_max[:, None] - ref_w_min
             positions[:, :, 2] = positions[:, :, 2] + w_shift[:, :, None, None]
         elif self.config.reference_rope_mode == "negative_adjacent_shifted_hw":
-            target_fps = float(getattr(self.config, "target_fps", DEFAULT_FPS))
-            if not math.isfinite(target_fps) or target_fps <= 0.0:
-                raise ValueError(f"target_fps must be finite and positive, got {target_fps}")
-            positions[:, :, 0, :, 0] = -1.0 / target_fps
+            target_t_start = target_positions[:, 0, :, 0].amin(dim=1)
+            first_interval_end = target_positions[:, 0, :, 1].amin(dim=1)
+            delta_t = first_interval_end - target_t_start
+            if not torch.isfinite(delta_t).all() or (delta_t <= 0).any():
+                raise ValueError(
+                    "Target first temporal interval must be finite and positive for "
+                    f"negative-adjacent reference RoPE, got {delta_t.tolist()}"
+                )
+            delta_t = delta_t.to(device=positions.device, dtype=positions.dtype)
+            positions[:, :, 0, :, 0] = -delta_t[:, None, None]
             positions[:, :, 0, :, 1] = 0.0
             target_h_max = target_positions[:, 1, :, 1].amax(dim=1).to(dtype=positions.dtype)
             target_w_max = target_positions[:, 2, :, 1].amax(dim=1).to(dtype=positions.dtype)
