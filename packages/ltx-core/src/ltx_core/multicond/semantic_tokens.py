@@ -223,6 +223,22 @@ def semantic_alignment_loss(prediction: Tensor, target: Tensor) -> Tensor:
     return cosine_distance.flatten(1).mean(dim=1)
 
 
+def semantic_projection_smooth_l1_loss(prediction: Tensor, target: Tensor) -> Tensor:
+    """Return per-sample float32 Smooth-L1 alignment loss."""
+    if prediction.shape != target.shape:
+        raise ValueError(
+            "semantic projection Smooth-L1 shapes differ: "
+            f"prediction={tuple(prediction.shape)}, target={tuple(target.shape)}"
+        )
+    element_loss = F.smooth_l1_loss(
+        prediction.float(),
+        target.detach().float(),
+        reduction="none",
+        beta=1.0,
+    )
+    return element_loss.flatten(1).mean(dim=1)
+
+
 def semantic_repa_loss(prediction: Tensor, target: Tensor) -> Tensor:
     """Return per-sample normalized cosine distance for REPA-E supervision."""
     if prediction.shape != target.shape:

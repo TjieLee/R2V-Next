@@ -11,6 +11,7 @@ import yaml
 from accelerate import DistributedType
 from safetensors.torch import load_file, save_file
 from torch import nn
+from torch.nn import functional as F
 
 from ltx_core.guidance.perturbations import BatchedPerturbationConfig
 from ltx_core.model.transformer.modality import Modality
@@ -20,6 +21,7 @@ from ltx_core.multicond.semantic_tokens import (
     EVIDENCE_TOKENS_PER_FRAME,
     SemanticInputProjection,
     SemanticRepaProjector,
+    semantic_projection_smooth_l1_loss,
     semantic_repa_loss,
 )
 from ltx_core.types import VideoLatentShape
@@ -415,6 +417,35 @@ def test_repae_compact_attention_mask_masks_only_invalid_reference_keys() -> Non
     assert "[:, :, None]" not in inference_source
 
 
+def test_semantic_projection_smooth_l1_matches_float32_reference_and_detaches_target() -> None:
+    prediction = torch.randn(2, 3, 5, dtype=torch.float64, requires_grad=True)
+    target = torch.randn(2, 3, 5, dtype=torch.float64, requires_grad=True)
+
+    actual = semantic_projection_smooth_l1_loss(prediction, target)
+    expected = F.smooth_l1_loss(
+        prediction.float(),
+        target.detach().float(),
+        reduction="none",
+        beta=1.0,
+    ).flatten(1).mean(dim=1)
+
+    assert actual.shape == (2,)
+    assert actual.dtype == torch.float32
+    torch.testing.assert_close(actual, expected)
+    actual.sum().backward()
+    assert prediction.grad is not None
+    assert torch.count_nonzero(prediction.grad).item() > 0
+    assert target.grad is None
+
+
+def test_semantic_projection_smooth_l1_rejects_shape_mismatch() -> None:
+    with pytest.raises(ValueError, match="semantic projection Smooth-L1 shapes differ"):
+        semantic_projection_smooth_l1_loss(
+            torch.zeros(2, 3, 4),
+            torch.zeros(2, 3, 5),
+        )
+
+
 def test_repae_teacher_projection_and_both_projectors_receive_gradients() -> None:
     teacher_parameter = nn.Parameter(torch.ones(1), requires_grad=False)
     teacher_hidden = torch.randn(2, 8, EVIDENCE_TOKENS_PER_FRAME, 12) * teacher_parameter
@@ -423,7 +454,10 @@ def test_repae_teacher_projection_and_both_projectors_receive_gradients() -> Non
     dit_repa = SemanticRepaProjector(10, 12, hidden_dim=16)
     semantic_clean = semantic_projection(teacher_hidden)
     dit_hidden = torch.randn(2, 8, EVIDENCE_TOKENS_PER_FRAME, 10, requires_grad=True)
-    loss = semantic_repa_loss(semantic_repa(semantic_clean), teacher_hidden.detach()).mean()
+    loss = semantic_projection_smooth_l1_loss(
+        semantic_repa(semantic_clean),
+        teacher_hidden.detach(),
+    ).mean()
     loss = loss + semantic_repa_loss(dit_repa(dit_hidden), teacher_hidden.detach()).mean()
     loss.backward()
 
@@ -507,6 +541,7 @@ class _TinyGemmaLanguageModel(nn.Module):
         self.embedding = nn.Embedding(8, hidden_dim)
         self.scale = nn.Parameter(torch.ones(1))
         self.config = SimpleNamespace(sliding_window=1024)
+        self.forward_calls = 0
 
     def get_input_embeddings(self) -> nn.Module:
         return self.embedding
@@ -519,6 +554,7 @@ class _TinyGemmaLanguageModel(nn.Module):
         **_kwargs,
     ) -> SimpleNamespace:
         assert output_hidden_states is False
+        self.forward_calls += 1
         return SimpleNamespace(last_hidden_state=inputs_embeds * self.scale)
 
 
@@ -543,6 +579,201 @@ class _TinyRepaETransformer(nn.Module):
 
     def enable_semantic_repae_conditioning(self, **_kwargs) -> None:
         self.enabled = True
+
+
+class _GradientRouteTransformer(nn.Module):
+    def __init__(self, hidden_dim: int = 12) -> None:
+        super().__init__()
+        self.patchify_proj = nn.Linear(128, hidden_dim)
+        self.transformer_blocks = nn.ModuleList(
+            [nn.Linear(hidden_dim, hidden_dim) for _ in range(16)]
+        )
+        self.proj_out = nn.Linear(hidden_dim, 128)
+        self.inner_dim = hidden_dim
+        self.forward_calls = 0
+        self._capture_request: tuple[int, int, int] | None = None
+        self._captured: torch.Tensor | None = None
+
+    def enable_semantic_repae_conditioning(self, **_kwargs) -> None:
+        pass
+
+    def configure_semantic_repae_capture(
+        self,
+        *,
+        block_index: int,
+        semantic_start: int,
+        semantic_end: int,
+    ) -> None:
+        self._capture_request = (block_index, semantic_start, semantic_end)
+
+    def forward(self, latent: torch.Tensor) -> torch.Tensor:
+        self.forward_calls += 1
+        hidden = self.patchify_proj(latent)
+        for block_index, block in enumerate(self.transformer_blocks):
+            hidden = hidden + 0.05 * torch.tanh(block(hidden))
+            if self._capture_request is not None and block_index == self._capture_request[0]:
+                _block, semantic_start, semantic_end = self._capture_request
+                self._captured = hidden[:, semantic_start:semantic_end]
+        return self.proj_out(hidden)
+
+    def consume_semantic_repae_capture(self) -> torch.Tensor:
+        if self._captured is None:
+            raise RuntimeError("semantic REPA-E capture is missing")
+        captured = self._captured
+        self._captured = None
+        self._capture_request = None
+        return captured
+
+
+class _FixedTimestepSampler:
+    @staticmethod
+    def sample_for(samples: torch.Tensor) -> torch.Tensor:
+        return torch.full(
+            (samples.shape[0],),
+            0.5,
+            device=samples.device,
+            dtype=samples.dtype,
+        )
+
+
+def _gradient_route_batch(gemma_dim: int) -> dict[str, object]:
+    return {
+        "semantic_teacher_inputs": {
+            "prefix_inputs_embeds": torch.randn(1, 2, gemma_dim),
+            "prefix_attention_mask": torch.ones(1, 2, dtype=torch.bool),
+            "prefix_image_token_mask": torch.zeros(1, 2, dtype=torch.bool),
+            "evidence_tokens": torch.randn(1, 1, EVIDENCE_TOKENS_PER_FRAME, gemma_dim),
+            "normalized_timestamps": torch.zeros(1, 1),
+        },
+        "latents": {
+            "latents": torch.randn(1, 128, 1, 1, 1),
+            "num_frames": torch.tensor([1]),
+            "height": torch.tensor([1]),
+            "width": torch.tensor([1]),
+            "fps": torch.tensor([1.0]),
+        },
+        "reference_latents": {
+            "latents": torch.randn(1, 1, 128, 1, 1, 1),
+            "ref_valid_mask": torch.ones(1, 1, dtype=torch.bool),
+        },
+        "conditions": {
+            "video_prompt_embeds": torch.randn(1, 2, gemma_dim),
+            "prompt_attention_mask": torch.ones(1, 2, dtype=torch.bool),
+        },
+        "task": [IMAGE_TASK],
+        "condition_mode": ["til_111"],
+    }
+
+
+def _has_nonzero_gradient(module: nn.Module) -> bool:
+    return any(
+        parameter.grad is not None and torch.count_nonzero(parameter.grad).item() > 0
+        for parameter in module.parameters()
+    )
+
+
+def _has_no_gradient(module: nn.Module) -> bool:
+    return all(
+        parameter.grad is None or torch.count_nonzero(parameter.grad).item() == 0
+        for parameter in module.parameters()
+    )
+
+
+def _run_repae_gradient_route(
+    *,
+    video_flow_weight: float,
+    semantic_flow_weight: float,
+    projection_weight: float,
+    dit_repa_weight: float,
+) -> tuple[SemanticRepaEStrategy, _GradientRouteTransformer]:
+    torch.manual_seed(1234)
+    gemma_dim = 8
+    language_model = _TinyGemmaLanguageModel(gemma_dim)
+    transformer = _GradientRouteTransformer()
+    strategy = SemanticRepaEStrategy(
+        SemanticRepaEConfig(
+            semantic_hidden_dim=16,
+            repa_hidden_dim=16,
+            video_flow_weight=video_flow_weight,
+            semantic_flow_weight=semantic_flow_weight,
+            semantic_projection_repa_weight=projection_weight,
+            semantic_dit_repa_weight=dit_repa_weight,
+        )
+    )
+    strategy.attach_models(
+        transformer=transformer,
+        embeddings_processor=nn.Identity(),
+        text_encoder=_TinyTextEncoder(language_model),
+    )
+    inputs = strategy.prepare_training_inputs(  # type: ignore[arg-type]
+        _gradient_route_batch(gemma_dim),
+        _FixedTimestepSampler(),
+    )
+    assert inputs.semantic_targets is not None and not inputs.semantic_targets.requires_grad
+    assert inputs.semantic_projection_repa_prediction is not None
+    assert inputs.semantic_projection_repa_prediction.requires_grad
+    assert inputs.video is not None
+    video_pred = transformer(inputs.video.latent)
+    strategy.compute_loss(video_pred, None, inputs).mean().backward()
+
+    assert language_model.forward_calls == 1
+    assert transformer.forward_calls == 1
+    return strategy, transformer
+
+
+@pytest.mark.parametrize(
+    ("video_flow_weight", "semantic_flow_weight"),
+    [(0.0, 1.0), (1.0, 0.0)],
+)
+def test_repae_flow_losses_stop_at_semantic_latent_boundary(
+    video_flow_weight: float,
+    semantic_flow_weight: float,
+) -> None:
+    strategy, transformer = _run_repae_gradient_route(
+        video_flow_weight=video_flow_weight,
+        semantic_flow_weight=semantic_flow_weight,
+        projection_weight=0.0,
+        dit_repa_weight=0.0,
+    )
+    modules = strategy.get_trainable_modules()
+
+    assert _has_nonzero_gradient(transformer)
+    assert _has_nonzero_gradient(transformer.proj_out)
+    assert _has_no_gradient(modules["semantic_input_projection"])
+    assert _has_no_gradient(modules["semantic_repa_projector"])
+    assert _has_no_gradient(modules["dit_repa_projector"])
+
+
+def test_repae_projection_alignment_updates_only_semantic_projection_path() -> None:
+    strategy, transformer = _run_repae_gradient_route(
+        video_flow_weight=0.0,
+        semantic_flow_weight=0.0,
+        projection_weight=1.0,
+        dit_repa_weight=0.0,
+    )
+    modules = strategy.get_trainable_modules()
+
+    assert _has_nonzero_gradient(modules["semantic_input_projection"])
+    assert _has_nonzero_gradient(modules["semantic_repa_projector"])
+    assert _has_no_gradient(transformer)
+    assert _has_no_gradient(modules["dit_repa_projector"])
+
+
+def test_repae_dit_alignment_updates_capture_path_but_not_semantic_projection() -> None:
+    strategy, transformer = _run_repae_gradient_route(
+        video_flow_weight=0.0,
+        semantic_flow_weight=0.0,
+        projection_weight=0.0,
+        dit_repa_weight=1.0,
+    )
+    modules = strategy.get_trainable_modules()
+
+    assert _has_nonzero_gradient(transformer.patchify_proj)
+    assert _has_nonzero_gradient(transformer.transformer_blocks[0])
+    assert _has_nonzero_gradient(transformer.transformer_blocks[15])
+    assert _has_nonzero_gradient(modules["dit_repa_projector"])
+    assert _has_no_gradient(modules["semantic_input_projection"])
+    assert _has_no_gradient(modules["semantic_repa_projector"])
 
 
 def test_repae_strategy_runs_gemma_teacher_under_no_grad_without_checkpoint_wrapping() -> None:
@@ -623,6 +854,9 @@ def test_repae_strategy_is_independent_and_registered() -> None:
     metadata = strategy.get_checkpoint_metadata()
     assert metadata["architecture"] == "semantic_repae_v1"
     assert metadata["required_fsdp_world_size"] == 8
+    assert metadata["semantic_flow_gradient_boundary"] == "detached_semantic_latent"
+    assert metadata["projection_alignment_loss"] == "smooth_l1_beta_1"
+    assert metadata["dit_repa_loss"] == "normalized_cosine_distance"
     with pytest.raises(ValueError, match="required_fsdp_world_size"):
         SemanticRepaEConfig(required_fsdp_world_size=4)  # type: ignore[arg-type]
 

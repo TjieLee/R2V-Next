@@ -18,6 +18,7 @@ from ltx_core.multicond.semantic_tokens import (
     SemanticInputProjection,
     SemanticRepaProjector,
     build_semantic_repae_teacher_attention_mask,
+    semantic_projection_smooth_l1_loss,
     semantic_repa_loss,
 )
 from ltx_trainer.online_data.constants import IMAGE_TASK, VIDEO_TASK
@@ -405,6 +406,9 @@ class SemanticRepaEStrategy(SemanticFlowStrategy):
         teacher = self.build_semantic_teacher_outputs(batch["semantic_teacher_inputs"])
         semantic_clean_grid = teacher["semantic_clean"]
         semantic_clean = semantic_clean_grid.flatten(1, 2)
+        # Projection alignment updates the semantic tokenizer. Flow/video/DiT losses
+        # stop at this semantic latent boundary and update only the joint DiT path.
+        semantic_clean_for_flow = semantic_clean.detach()
         latents = batch["latents"]
         target_latents = latents["latents"]
         target_tokens = self._video_patchifier.patchify(target_latents)
@@ -413,11 +417,14 @@ class SemanticRepaEStrategy(SemanticFlowStrategy):
         sigma = timestep_sampler.sample_for(target_tokens)
         sigma_expanded = sigma.view(batch_size, 1, 1)
         target_noise = torch.randn_like(target_tokens)
-        semantic_noise = torch.randn_like(semantic_clean)
+        semantic_noise = torch.randn_like(semantic_clean_for_flow)
         noisy_target = (1.0 - sigma_expanded) * target_tokens + sigma_expanded * target_noise
-        noisy_semantic = (1.0 - sigma_expanded) * semantic_clean + sigma_expanded * semantic_noise
+        noisy_semantic = (
+            (1.0 - sigma_expanded) * semantic_clean_for_flow
+            + sigma_expanded * semantic_noise
+        )
         video_flow_target = target_noise - target_tokens
-        semantic_flow_target = semantic_noise - semantic_clean
+        semantic_flow_target = semantic_noise - semantic_clean_for_flow
 
         target_fps = latents.get(
             "fps",
@@ -576,7 +583,7 @@ class SemanticRepaEStrategy(SemanticFlowStrategy):
         )
         if inputs.semantic_projection_repa_prediction is None or inputs.semantic_repa_target is None:
             raise ValueError("semantic_repae ModelInputs are missing REPA targets")
-        projection_repa_loss = semantic_repa_loss(
+        projection_repa_loss = semantic_projection_smooth_l1_loss(
             inputs.semantic_projection_repa_prediction,
             inputs.semantic_repa_target,
         )
@@ -635,6 +642,9 @@ class SemanticRepaEStrategy(SemanticFlowStrategy):
             "required_fsdp_world_size": self.config.required_fsdp_world_size,
             "semantic_repa_block": self.config.semantic_repa_block,
             "semantic_teacher_gradient": "frozen_no_grad",
+            "semantic_flow_gradient_boundary": "detached_semantic_latent",
+            "projection_alignment_loss": "smooth_l1_beta_1",
+            "dit_repa_loss": "normalized_cosine_distance",
             "token_sequence": ["reference", "semantic", "target"],
             "reference_rope_layout_version": 3,
             "reference_rope_mode": self.config.reference_rope_mode,
