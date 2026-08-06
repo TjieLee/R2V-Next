@@ -18,7 +18,12 @@ import torch
 import wandb
 import yaml
 from accelerate import Accelerator, DistributedType
-from accelerate.utils import DistributedDataParallelKwargs, gather_object, set_seed
+from accelerate.utils import (
+    DistributedDataParallelKwargs,
+    GradientAccumulationPlugin,
+    gather_object,
+    set_seed,
+)
 from peft import LoraConfig, get_peft_model, get_peft_model_state_dict, set_peft_model_state_dict
 from peft.tuners.tuners_utils import BaseTunerLayer
 from peft.utils import ModulesToSaveWrapper
@@ -3961,11 +3966,24 @@ class LtxvTrainer:
         # single-GPU runs. The probing cost is paid only on the first step.
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
 
+        # FSDP no_sync accumulates full-model gradients and can exceed device memory.
+        # Semantic REPA-E keeps the same logical accumulation/global batch size while
+        # synchronizing every microbatch so gradients remain sharded.
+        sync_each_batch = (
+            self._config.training_strategy.name == "semantic_repae"
+            and self._config.model.training_mode == "full"
+            and self._config.optimization.gradient_accumulation_steps > 1
+        )
+        gradient_accumulation_plugin = GradientAccumulationPlugin(
+            num_steps=self._config.optimization.gradient_accumulation_steps,
+            sync_each_batch=sync_each_batch,
+        )
+
         # All distributed setup (DDP/FSDP, number of processes, etc.) is controlled by
         # the user's Accelerate configuration (accelerate config / accelerate launch).
         self._accelerator = Accelerator(
             mixed_precision=self._config.acceleration.mixed_precision_mode,
-            gradient_accumulation_steps=self._config.optimization.gradient_accumulation_steps,
+            gradient_accumulation_plugin=gradient_accumulation_plugin,
             step_scheduler_with_optimizer=False,
             kwargs_handlers=[ddp_kwargs],
         )
