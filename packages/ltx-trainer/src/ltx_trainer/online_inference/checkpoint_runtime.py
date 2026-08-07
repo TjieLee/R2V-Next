@@ -225,12 +225,18 @@ def validate_reference_rope_checkpoint_metadata(
     expected_mode: str,
     allow_legacy: bool = False,
 ) -> None:
-    if expected_mode == "negative_adjacent_shifted_hw":
+    if expected_mode in {
+        "negative_adjacent_shifted_hw",
+        "negative_adjacent_aligned_hw",
+    }:
+        aligned = expected_mode == "negative_adjacent_aligned_hw"
         required = {
-            "reference_rope_layout_version": "3",
+            "reference_rope_layout_version": "4" if aligned else "3",
             "reference_rope_mode": expected_mode,
             "reference_rope_temporal_slots": "shared_negative_adjacent",
-            "reference_rope_spatial_shift": "height_width_adjacent",
+            "reference_rope_spatial_shift": (
+                "target_aligned" if aligned else "height_width_adjacent"
+            ),
             "semantic_rope_mode": "target_interpolated_16x16",
         }
     else:

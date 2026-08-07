@@ -35,12 +35,14 @@ from ltx_trainer.online_data.online_batch_encoder import (
     load_semantic_system_prompts,
 )
 from ltx_trainer.online_inference.checkpoint_runtime import (
-    CheckpointAuditError,
     REPAE_STRATEGY_CHECKPOINT_PREFIXES,
     REPAE_TRANSFORMER_CHECKPOINT_PREFIXES,
+    CheckpointAuditError,
     audit_checkpoint,
     read_checkpoint_metadata,
+    validate_reference_rope_checkpoint_metadata,
 )
+from ltx_trainer.trainer import LtxvTrainer, _enforce_semantic_flow_fsdp_runtime_safety
 from ltx_trainer.training_strategies import get_training_strategy
 from ltx_trainer.training_strategies.base_strategy import ModelInputs
 from ltx_trainer.training_strategies.semantic_flow import (
@@ -56,7 +58,6 @@ from ltx_trainer.training_strategies.semantic_flow_bridge import (
     validate_and_load_phase2_bridge_state,
 )
 from ltx_trainer.training_strategies.semantic_repae import SemanticRepaEConfig, SemanticRepaEStrategy
-from ltx_trainer.trainer import LtxvTrainer, _enforce_semantic_flow_fsdp_runtime_safety
 
 
 def _transformer_args(x: torch.Tensor) -> TransformerArgs:
@@ -273,8 +274,15 @@ def test_repae_reference_rope_and_worst_case_sequence_geometry() -> None:
         torch.full_like(ref_positions[:, 0, :, 0], -1.0 / 24.0),
     )
     assert torch.equal(ref_positions[:, 0, :, 1], torch.zeros_like(ref_positions[:, 0, :, 1]))
-    assert ref_positions[:, 1, :, 0].amin() >= target_positions[:, 1, :, 1].amax()
-    assert ref_positions[:, 2, :, 0].amin() >= target_positions[:, 2, :, 1].amax()
+    for axis in (1, 2):
+        torch.testing.assert_close(
+            ref_positions[:, axis, :, 0].amin(),
+            target_positions[:, axis, :, 0].amin(),
+        )
+        torch.testing.assert_close(
+            ref_positions[:, axis, :, 1].amax(),
+            target_positions[:, axis, :, 1].amax(),
+        )
     per_reference = ref_tokens.shape[1] // 4
     for reference_index in range(1, 4):
         torch.testing.assert_close(
@@ -331,6 +339,85 @@ def test_repae_reference_rope_and_worst_case_sequence_geometry() -> None:
         mixed_ref_positions[1, 0, :, 0],
         torch.full_like(mixed_ref_positions[1, 0, :, 0], -1.0),
     )
+
+
+def test_repae_aligned_reference_rope_scales_hw_without_offsets() -> None:
+    strategy = SemanticRepaEStrategy(SemanticRepaEConfig())
+    target_latents = torch.zeros(1, 128, 16, 15, 26)
+    target_positions = strategy._get_video_positions(
+        num_frames=16,
+        height=15,
+        width=26,
+        batch_size=1,
+        fps=24.0,
+        device=torch.device("cpu"),
+    )
+    references = {
+        "latents": torch.zeros(1, 2, 128, 1, 5, 13),
+        "ref_valid_mask": torch.ones(1, 2, dtype=torch.bool),
+    }
+    tokens, positions, valid, _entities = strategy._reference_sequence(
+        references,
+        target_latents=target_latents,
+        target_positions=target_positions,
+    )
+    tokens_per_reference = tokens.shape[1] // 2
+    blocks = positions.reshape(1, 3, 2, tokens_per_reference, 2)
+
+    assert valid.all()
+    torch.testing.assert_close(
+        blocks[:, 0, :, :, 0],
+        torch.full_like(blocks[:, 0, :, :, 0], -1.0 / 24.0),
+    )
+    assert torch.equal(blocks[:, 0, :, :, 1], torch.zeros_like(blocks[:, 0, :, :, 1]))
+    torch.testing.assert_close(
+        blocks[:, 0, 0],
+        blocks[:, 0, 1],
+    )
+    torch.testing.assert_close(
+        blocks[:, 0, :, :, 1].amax(),
+        target_positions[:, 0, :, 0].amin(),
+    )
+    for axis in (1, 2):
+        torch.testing.assert_close(
+            blocks[:, axis, :, :, 0].amin(),
+            target_positions[:, axis, :, 0].amin(),
+        )
+        torch.testing.assert_close(
+            blocks[:, axis, :, :, 1].amax(),
+            target_positions[:, axis, :, 1].amax(),
+        )
+
+
+def test_repae_shifted_reference_rope_preserves_v3_geometry() -> None:
+    strategy = SemanticRepaEStrategy(
+        SemanticRepaEConfig(reference_rope_mode="negative_adjacent_shifted_hw")
+    )
+    target_latents = torch.zeros(1, 128, 16, 15, 26)
+    target_positions = strategy._get_video_positions(
+        num_frames=16,
+        height=15,
+        width=26,
+        batch_size=1,
+        fps=24.0,
+        device=torch.device("cpu"),
+    )
+    _tokens, positions, _valid, _entities = strategy._reference_sequence(
+        {
+            "latents": torch.zeros(1, 2, 128, 1, 5, 13),
+            "ref_valid_mask": torch.ones(1, 2, dtype=torch.bool),
+        },
+        target_latents=target_latents,
+        target_positions=target_positions,
+    )
+
+    torch.testing.assert_close(
+        positions[:, 0, :, 0],
+        torch.full_like(positions[:, 0, :, 0], -1.0 / 24.0),
+    )
+    assert torch.equal(positions[:, 0, :, 1], torch.zeros_like(positions[:, 0, :, 1]))
+    assert positions[:, 1, :, 0].amin() >= target_positions[:, 1, :, 1].amax()
+    assert positions[:, 2, :, 0].amin() >= target_positions[:, 2, :, 1].amax()
 
 
 def test_repae_inference_uses_training_sequence_offsets_positions_and_types() -> None:
@@ -453,10 +540,12 @@ def test_repae_teacher_projection_and_both_projectors_receive_gradients() -> Non
     semantic_repa = SemanticRepaProjector(8, 12, hidden_dim=16)
     dit_repa = SemanticRepaProjector(10, 12, hidden_dim=16)
     semantic_clean = semantic_projection(teacher_hidden)
+    projection_prediction = semantic_repa(semantic_clean)
     dit_hidden = torch.randn(2, 8, EVIDENCE_TOKENS_PER_FRAME, 10, requires_grad=True)
-    loss = semantic_projection_smooth_l1_loss(
-        semantic_repa(semantic_clean),
-        teacher_hidden.detach(),
+    loss = (
+        semantic_repa_loss(projection_prediction, teacher_hidden)
+        + 0.1
+        * semantic_projection_smooth_l1_loss(projection_prediction, teacher_hidden)
     ).mean()
     loss = loss + semantic_repa_loss(dit_repa(dit_hidden), teacher_hidden.detach()).mean()
     loss.backward()
@@ -480,7 +569,7 @@ def test_repae_loss_metrics_report_raw_and_weighted_contributions() -> None:
     reference_end, semantic_end, target_end = 1, 3, 5
     video_pred = torch.randn(batch_size, target_end, feature_dim, requires_grad=True)
     projection_prediction = torch.randn(batch_size, 2, feature_dim, requires_grad=True)
-    repa_target = torch.randn(batch_size, 2, feature_dim)
+    repa_target = torch.randn(batch_size, 2, feature_dim, requires_grad=True)
     captured = torch.randn(batch_size, 2, feature_dim, requires_grad=True)
     strategy._consume_dit_capture = lambda: captured  # type: ignore[method-assign]
     inputs = ModelInputs(
@@ -501,8 +590,32 @@ def test_repae_loss_metrics_report_raw_and_weighted_contributions() -> None:
         },
     )
 
+    expected_projection_cosine = semantic_repa_loss(
+        projection_prediction,
+        repa_target,
+    )
+    expected_projection_smooth_l1 = semantic_projection_smooth_l1_loss(
+        projection_prediction,
+        repa_target,
+    )
+    expected_projection_total = (
+        expected_projection_cosine + 0.1 * expected_projection_smooth_l1
+    )
     total = strategy.compute_loss(video_pred, None, inputs)
     metrics = strategy.get_last_training_metrics()
+    assert total.shape == (batch_size,)
+    torch.testing.assert_close(
+        metrics["train/loss_semantic_projection_cosine"],
+        expected_projection_cosine.detach().mean(),
+    )
+    torch.testing.assert_close(
+        metrics["train/loss_semantic_projection_smooth_l1"],
+        expected_projection_smooth_l1.detach().mean(),
+    )
+    torch.testing.assert_close(
+        metrics["train/loss_semantic_projection_repa"],
+        expected_projection_total.detach().mean(),
+    )
     metric_contracts = (
         (
             "train/loss_video_flow",
@@ -533,6 +646,10 @@ def test_repae_loss_metrics_report_raw_and_weighted_contributions() -> None:
     weighted_total = sum(metrics[weighted_key] for _, weighted_key, _ in metric_contracts)
     torch.testing.assert_close(weighted_total, total.detach().mean())
     assert all(not metric.requires_grad and metric.grad_fn is None for metric in metrics.values())
+    total.sum().backward()
+    assert projection_prediction.grad is not None
+    assert torch.count_nonzero(projection_prediction.grad).item() > 0
+    assert repa_target.grad is None
 
 
 class _TinyGemmaLanguageModel(nn.Module):
@@ -855,7 +972,7 @@ def test_repae_strategy_is_independent_and_registered() -> None:
     assert metadata["architecture"] == "semantic_repae_v1"
     assert metadata["required_fsdp_world_size"] == 8
     assert metadata["semantic_flow_gradient_boundary"] == "detached_semantic_latent"
-    assert metadata["projection_alignment_loss"] == "smooth_l1_beta_1"
+    assert metadata["projection_alignment_loss"] == "cosine_plus_0p1_smooth_l1_beta_1"
     assert metadata["dit_repa_loss"] == "normalized_cosine_distance"
     with pytest.raises(ValueError, match="required_fsdp_world_size"):
         SemanticRepaEConfig(required_fsdp_world_size=4)  # type: ignore[arg-type]
@@ -1023,6 +1140,7 @@ def test_repae_production_config_parses_with_correct_worktree_and_no_augmentatio
     assert isinstance(parsed.training_strategy, SemanticRepaEConfig)
     assert parsed.training_strategy.required_fsdp_world_size == 8
     assert parsed.training_strategy.semantic_anchor_count == 8
+    assert parsed.training_strategy.reference_rope_mode == "negative_adjacent_aligned_hw"
     assert parsed.model.training_mode == "full"
     assert parsed.data.online_encoding is not None
     assert parsed.data.online_encoding.augmentation.enabled is False
@@ -1083,6 +1201,52 @@ def test_repae_task_specific_system_prompts_and_messages_are_distinct() -> None:
     assert r2v_user_text == "User Raw Input Prompt: the subject walks forward."
 
 
+def test_repae_reference_rope_checkpoint_metadata_validates_v3_and_v4() -> None:
+    shifted = {
+        key: str(value)
+        for key, value in SemanticRepaEStrategy(
+            SemanticRepaEConfig(reference_rope_mode="negative_adjacent_shifted_hw")
+        ).get_checkpoint_metadata().items()
+    }
+    aligned = {
+        key: str(value)
+        for key, value in SemanticRepaEStrategy(
+            SemanticRepaEConfig(reference_rope_mode="negative_adjacent_aligned_hw")
+        ).get_checkpoint_metadata().items()
+    }
+
+    assert shifted["reference_rope_layout_version"] == "3"
+    assert shifted["reference_rope_spatial_shift"] == "height_width_adjacent"
+    assert aligned["reference_rope_layout_version"] == "4"
+    assert aligned["reference_rope_spatial_shift"] == "target_aligned"
+    for metadata, mode in (
+        (shifted, "negative_adjacent_shifted_hw"),
+        (aligned, "negative_adjacent_aligned_hw"),
+    ):
+        validate_reference_rope_checkpoint_metadata(
+            metadata,
+            expected_mode=mode,
+        )
+
+    with pytest.raises(CheckpointAuditError, match="metadata mismatch"):
+        validate_reference_rope_checkpoint_metadata(
+            shifted,
+            expected_mode="negative_adjacent_aligned_hw",
+        )
+    with pytest.raises(CheckpointAuditError, match="metadata mismatch"):
+        validate_reference_rope_checkpoint_metadata(
+            aligned,
+            expected_mode="negative_adjacent_shifted_hw",
+        )
+    mismatched_spatial = dict(aligned)
+    mismatched_spatial["reference_rope_spatial_shift"] = "height_width_adjacent"
+    with pytest.raises(CheckpointAuditError, match="metadata mismatch"):
+        validate_reference_rope_checkpoint_metadata(
+            mismatched_spatial,
+            expected_mode="negative_adjacent_aligned_hw",
+        )
+
+
 def test_repae_checkpoint_round_trip_covers_all_trainable_components(tmp_path: Path) -> None:
     state, metadata, _source_strategy, _source_transformer, _source_processor = (
         _semantic_repae_checkpoint_fixture()
@@ -1095,7 +1259,9 @@ def test_repae_checkpoint_round_trip_covers_all_trainable_components(tmp_path: P
     assert read_checkpoint_metadata(checkpoint) == metadata
     assert metadata["architecture"] == "semantic_repae_v1"
     assert metadata["training_regime"] == "single_stage_full"
-    assert metadata["reference_rope_mode"] == "negative_adjacent_shifted_hw"
+    assert metadata["reference_rope_layout_version"] == "4"
+    assert metadata["reference_rope_mode"] == "negative_adjacent_aligned_hw"
+    assert metadata["reference_rope_spatial_shift"] == "target_aligned"
     assert metadata["semantic_anchor_count"] == "8"
     assert metadata["semantic_tokens_per_frame"] == "256"
 

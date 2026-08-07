@@ -63,7 +63,10 @@ class SemanticRepaEConfig(TrainingStrategyConfigBase):
     reference_latents_dir: str = "reference_latents"
     conditions_dir: str = "conditions"
     max_ref_images_per_sample: int = Field(default=4, ge=1, le=MAX_REFERENCE_ENTITIES)
-    reference_rope_mode: Literal["negative_adjacent_shifted_hw"] = "negative_adjacent_shifted_hw"
+    reference_rope_mode: Literal[
+        "negative_adjacent_shifted_hw",
+        "negative_adjacent_aligned_hw",
+    ] = "negative_adjacent_aligned_hw"
     required_fsdp_world_size: Literal[8] = 8
 
     semantic_anchor_count: int = Field(default=8, ge=1)
@@ -583,9 +586,16 @@ class SemanticRepaEStrategy(SemanticFlowStrategy):
         )
         if inputs.semantic_projection_repa_prediction is None or inputs.semantic_repa_target is None:
             raise ValueError("semantic_repae ModelInputs are missing REPA targets")
-        projection_repa_loss = semantic_projection_smooth_l1_loss(
+        projection_cosine_loss = semantic_repa_loss(
             inputs.semantic_projection_repa_prediction,
             inputs.semantic_repa_target,
+        )
+        projection_smooth_l1_loss = semantic_projection_smooth_l1_loss(
+            inputs.semantic_projection_repa_prediction,
+            inputs.semantic_repa_target,
+        )
+        projection_repa_loss = (
+            projection_cosine_loss + 0.1 * projection_smooth_l1_loss
         )
         _semantic_input, _semantic_projector, dit_projector = self._require_repae_modules()
         captured = self._consume_dit_capture()
@@ -614,6 +624,12 @@ class SemanticRepaEStrategy(SemanticFlowStrategy):
                 "train/loss_video_flow": video_loss.detach().mean(),
                 "train/loss_semantic_flow": semantic_loss.detach().mean(),
                 "train/loss_semantic_projection_repa": projection_repa_loss.detach().mean(),
+                "train/loss_semantic_projection_cosine": (
+                    projection_cosine_loss.detach().mean()
+                ),
+                "train/loss_semantic_projection_smooth_l1": (
+                    projection_smooth_l1_loss.detach().mean()
+                ),
                 "train/loss_semantic_dit_repa": dit_repa_loss.detach().mean(),
                 "train/loss_video_flow_weighted": weighted_video_loss.detach().mean(),
                 "train/loss_semantic_flow_weighted": weighted_semantic_loss.detach().mean(),
@@ -643,13 +659,21 @@ class SemanticRepaEStrategy(SemanticFlowStrategy):
             "semantic_repa_block": self.config.semantic_repa_block,
             "semantic_teacher_gradient": "frozen_no_grad",
             "semantic_flow_gradient_boundary": "detached_semantic_latent",
-            "projection_alignment_loss": "smooth_l1_beta_1",
+            "projection_alignment_loss": "cosine_plus_0p1_smooth_l1_beta_1",
             "dit_repa_loss": "normalized_cosine_distance",
             "token_sequence": ["reference", "semantic", "target"],
-            "reference_rope_layout_version": 3,
+            "reference_rope_layout_version": (
+                3
+                if self.config.reference_rope_mode == "negative_adjacent_shifted_hw"
+                else 4
+            ),
             "reference_rope_mode": self.config.reference_rope_mode,
             "reference_rope_temporal_slots": "shared_negative_adjacent",
-            "reference_rope_spatial_shift": "height_width_adjacent",
+            "reference_rope_spatial_shift": (
+                "height_width_adjacent"
+                if self.config.reference_rope_mode == "negative_adjacent_shifted_hw"
+                else "target_aligned"
+            ),
             "semantic_rope_mode": "target_interpolated_16x16",
         }
 

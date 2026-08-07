@@ -1837,7 +1837,10 @@ class SemanticFlowStrategy(TrainingStrategy):
             ref_w_min = positions[:, :, 2, :, 0].amin(dim=2)
             w_shift = target_w_max[:, None] - ref_w_min
             positions[:, :, 2] = positions[:, :, 2] + w_shift[:, :, None, None]
-        elif self.config.reference_rope_mode == "negative_adjacent_shifted_hw":
+        elif self.config.reference_rope_mode in {
+            "negative_adjacent_shifted_hw",
+            "negative_adjacent_aligned_hw",
+        }:
             target_t_start = target_positions[:, 0, :, 0].amin(dim=1)
             first_interval_end = target_positions[:, 0, :, 1].amin(dim=1)
             delta_t = first_interval_end - target_t_start
@@ -1849,12 +1852,13 @@ class SemanticFlowStrategy(TrainingStrategy):
             delta_t = delta_t.to(device=positions.device, dtype=positions.dtype)
             positions[:, :, 0, :, 0] = -delta_t[:, None, None]
             positions[:, :, 0, :, 1] = 0.0
-            target_h_max = target_positions[:, 1, :, 1].amax(dim=1).to(dtype=positions.dtype)
-            target_w_max = target_positions[:, 2, :, 1].amax(dim=1).to(dtype=positions.dtype)
-            ref_h_min = positions[:, :, 1, :, 0].amin(dim=2)
-            ref_w_min = positions[:, :, 2, :, 0].amin(dim=2)
-            positions[:, :, 1] += (target_h_max[:, None] - ref_h_min)[:, :, None, None]
-            positions[:, :, 2] += (target_w_max[:, None] - ref_w_min)[:, :, None, None]
+            if self.config.reference_rope_mode == "negative_adjacent_shifted_hw":
+                target_h_max = target_positions[:, 1, :, 1].amax(dim=1).to(dtype=positions.dtype)
+                target_w_max = target_positions[:, 2, :, 1].amax(dim=1).to(dtype=positions.dtype)
+                ref_h_min = positions[:, :, 1, :, 0].amin(dim=2)
+                ref_w_min = positions[:, :, 2, :, 0].amin(dim=2)
+                positions[:, :, 1] += (target_h_max[:, None] - ref_h_min)[:, :, None, None]
+                positions[:, :, 2] += (target_w_max[:, None] - ref_w_min)[:, :, None, None]
         positions = positions.permute(0, 2, 1, 3, 4).reshape(batch_size, 3, -1, 2)
 
         token_valid = ref_valid[:, :, None].expand(-1, -1, tokens_per_reference).reshape(batch_size, -1)

@@ -12,7 +12,7 @@ text_encoder_lora:
 training_strategy:
   name: "semantic_repae"
   max_ref_images_per_sample: 4
-  reference_rope_mode: "negative_adjacent_shifted_hw"
+  reference_rope_mode: "negative_adjacent_aligned_hw"
   required_fsdp_world_size: 8
   semantic_anchor_count: 8
   semantic_grid_size: 16
