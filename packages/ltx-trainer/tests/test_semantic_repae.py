@@ -57,7 +57,11 @@ from ltx_trainer.training_strategies.semantic_flow_bridge import (
     phase2_bridge_parameters,
     validate_and_load_phase2_bridge_state,
 )
-from ltx_trainer.training_strategies.semantic_repae import SemanticRepaEConfig, SemanticRepaEStrategy
+from ltx_trainer.training_strategies.semantic_repae import (
+    SemanticRepaEConfig,
+    SemanticRepaEStrategy,
+    scale_semantic_dit_input_gradient,
+)
 
 
 def _transformer_args(x: torch.Tensor) -> TransformerArgs:
@@ -390,9 +394,7 @@ def test_repae_aligned_reference_rope_scales_hw_without_offsets() -> None:
 
 
 def test_repae_shifted_reference_rope_preserves_v3_geometry() -> None:
-    strategy = SemanticRepaEStrategy(
-        SemanticRepaEConfig(reference_rope_mode="negative_adjacent_shifted_hw")
-    )
+    strategy = SemanticRepaEStrategy(SemanticRepaEConfig(reference_rope_mode="negative_adjacent_shifted_hw"))
     target_latents = torch.zeros(1, 128, 16, 15, 26)
     target_positions = strategy._get_video_positions(
         num_frames=16,
@@ -509,12 +511,16 @@ def test_semantic_projection_smooth_l1_matches_float32_reference_and_detaches_ta
     target = torch.randn(2, 3, 5, dtype=torch.float64, requires_grad=True)
 
     actual = semantic_projection_smooth_l1_loss(prediction, target)
-    expected = F.smooth_l1_loss(
-        prediction.float(),
-        target.detach().float(),
-        reduction="none",
-        beta=1.0,
-    ).flatten(1).mean(dim=1)
+    expected = (
+        F.smooth_l1_loss(
+            prediction.float(),
+            target.detach().float(),
+            reduction="none",
+            beta=1.0,
+        )
+        .flatten(1)
+        .mean(dim=1)
+    )
 
     assert actual.shape == (2,)
     assert actual.dtype == torch.float32
@@ -544,8 +550,7 @@ def test_repae_teacher_projection_and_both_projectors_receive_gradients() -> Non
     dit_hidden = torch.randn(2, 8, EVIDENCE_TOKENS_PER_FRAME, 10, requires_grad=True)
     loss = (
         semantic_repa_loss(projection_prediction, teacher_hidden)
-        + 0.1
-        * semantic_projection_smooth_l1_loss(projection_prediction, teacher_hidden)
+        + 0.1 * semantic_projection_smooth_l1_loss(projection_prediction, teacher_hidden)
     ).mean()
     loss = loss + semantic_repa_loss(dit_repa(dit_hidden), teacher_hidden.detach()).mean()
     loss.backward()
@@ -598,9 +603,7 @@ def test_repae_loss_metrics_report_raw_and_weighted_contributions() -> None:
         projection_prediction,
         repa_target,
     )
-    expected_projection_total = (
-        expected_projection_cosine + 0.1 * expected_projection_smooth_l1
-    )
+    expected_projection_total = expected_projection_cosine + 0.1 * expected_projection_smooth_l1
     total = strategy.compute_loss(video_pred, None, inputs)
     metrics = strategy.get_last_training_metrics()
     assert total.shape == (batch_size,)
@@ -615,6 +618,10 @@ def test_repae_loss_metrics_report_raw_and_weighted_contributions() -> None:
     torch.testing.assert_close(
         metrics["train/loss_semantic_projection_repa"],
         expected_projection_total.detach().mean(),
+    )
+    torch.testing.assert_close(
+        metrics["train/semantic_dit_input_gradient_scale"],
+        torch.tensor(config.semantic_dit_input_gradient_scale),
     )
     metric_contracts = (
         (
@@ -702,9 +709,7 @@ class _GradientRouteTransformer(nn.Module):
     def __init__(self, hidden_dim: int = 12) -> None:
         super().__init__()
         self.patchify_proj = nn.Linear(128, hidden_dim)
-        self.transformer_blocks = nn.ModuleList(
-            [nn.Linear(hidden_dim, hidden_dim) for _ in range(16)]
-        )
+        self.transformer_blocks = nn.ModuleList([nn.Linear(hidden_dim, hidden_dim) for _ in range(16)])
         self.proj_out = nn.Linear(hidden_dim, 128)
         self.inner_dim = hidden_dim
         self.forward_calls = 0
@@ -791,18 +796,45 @@ def _has_nonzero_gradient(module: nn.Module) -> bool:
 
 def _has_no_gradient(module: nn.Module) -> bool:
     return all(
-        parameter.grad is None or torch.count_nonzero(parameter.grad).item() == 0
-        for parameter in module.parameters()
+        parameter.grad is None or torch.count_nonzero(parameter.grad).item() == 0 for parameter in module.parameters()
     )
 
 
-def _run_repae_gradient_route(
+def _module_gradients(module: nn.Module) -> dict[str, torch.Tensor]:
+    return {
+        name: (torch.zeros_like(parameter) if parameter.grad is None else parameter.grad.detach().clone())
+        for name, parameter in module.named_parameters()
+    }
+
+
+def _assert_gradients_scaled(
+    actual: dict[str, torch.Tensor],
+    expected: dict[str, torch.Tensor],
+    scale: float,
+) -> None:
+    assert actual.keys() == expected.keys()
+    for name, actual_gradient in actual.items():
+        torch.testing.assert_close(
+            actual_gradient,
+            scale * expected[name],
+            rtol=5e-5,
+            atol=1e-7,
+        )
+
+
+def _prepare_repae_gradient_route(
     *,
     video_flow_weight: float,
     semantic_flow_weight: float,
     projection_weight: float,
     dit_repa_weight: float,
-) -> tuple[SemanticRepaEStrategy, _GradientRouteTransformer]:
+    semantic_dit_input_gradient_scale: float,
+) -> tuple[
+    SemanticRepaEStrategy,
+    _GradientRouteTransformer,
+    _TinyGemmaLanguageModel,
+    ModelInputs,
+]:
     torch.manual_seed(1234)
     gemma_dim = 8
     language_model = _TinyGemmaLanguageModel(gemma_dim)
@@ -815,6 +847,7 @@ def _run_repae_gradient_route(
             semantic_flow_weight=semantic_flow_weight,
             semantic_projection_repa_weight=projection_weight,
             semantic_dit_repa_weight=dit_repa_weight,
+            semantic_dit_input_gradient_scale=semantic_dit_input_gradient_scale,
         )
     )
     strategy.attach_models(
@@ -826,29 +859,123 @@ def _run_repae_gradient_route(
         _gradient_route_batch(gemma_dim),
         _FixedTimestepSampler(),
     )
-    assert inputs.semantic_targets is not None and not inputs.semantic_targets.requires_grad
+    assert inputs.semantic_targets is not None
+    assert not inputs.semantic_targets.requires_grad
     assert inputs.semantic_projection_repa_prediction is not None
     assert inputs.semantic_projection_repa_prediction.requires_grad
     assert inputs.video is not None
+    return strategy, transformer, language_model, inputs
+
+
+def _run_repae_gradient_route(
+    *,
+    video_flow_weight: float,
+    semantic_flow_weight: float,
+    projection_weight: float,
+    dit_repa_weight: float,
+    semantic_dit_input_gradient_scale: float = 0.1,
+) -> tuple[SemanticRepaEStrategy, _GradientRouteTransformer, torch.Tensor]:
+    strategy, transformer, language_model, inputs = _prepare_repae_gradient_route(
+        video_flow_weight=video_flow_weight,
+        semantic_flow_weight=semantic_flow_weight,
+        projection_weight=projection_weight,
+        dit_repa_weight=dit_repa_weight,
+        semantic_dit_input_gradient_scale=semantic_dit_input_gradient_scale,
+    )
     video_pred = transformer(inputs.video.latent)
-    strategy.compute_loss(video_pred, None, inputs).mean().backward()
+    loss = strategy.compute_loss(video_pred, None, inputs).mean()
+    loss.backward()
 
     assert language_model.forward_calls == 1
     assert transformer.forward_calls == 1
-    return strategy, transformer
+    return strategy, transformer, loss.detach()
 
 
-@pytest.mark.parametrize(
-    ("video_flow_weight", "semantic_flow_weight"),
-    [(0.0, 1.0), (1.0, 0.0)],
-)
-def test_repae_flow_losses_stop_at_semantic_latent_boundary(
-    video_flow_weight: float,
-    semantic_flow_weight: float,
-) -> None:
-    strategy, transformer = _run_repae_gradient_route(
-        video_flow_weight=video_flow_weight,
-        semantic_flow_weight=semantic_flow_weight,
+@pytest.mark.parametrize("alpha", [0.0, 0.1, 1.0])
+def test_repae_semantic_dit_gradient_gate_preserves_forward_values(alpha: float) -> None:
+    value = torch.randn(2, 3, 4, requires_grad=True)
+    detached = value.detach()
+    gated = scale_semantic_dit_input_gradient(value, alpha)
+    assert torch.equal(gated, detached)
+
+    sigma = torch.tensor([0.25, 0.75]).view(2, 1, 1)
+    semantic_noise = torch.randn_like(value)
+    noisy_semantic = (1.0 - sigma) * gated + sigma * semantic_noise
+    expected = (1.0 - sigma) * detached + sigma * semantic_noise
+    assert torch.equal(noisy_semantic, expected)
+
+
+def test_repae_prepared_flow_is_forward_equivalent_and_target_stays_detached() -> None:
+    prepared_latents: list[torch.Tensor] = []
+    semantic_targets: list[torch.Tensor] = []
+    for alpha in (0.0, 0.1, 1.0):
+        _strategy, transformer, language_model, inputs = _prepare_repae_gradient_route(
+            video_flow_weight=0.0,
+            semantic_flow_weight=1.0,
+            projection_weight=0.0,
+            dit_repa_weight=0.0,
+            semantic_dit_input_gradient_scale=alpha,
+        )
+        assert language_model.forward_calls == 1
+        assert transformer.forward_calls == 0
+        assert inputs.video is not None
+        assert inputs.semantic_targets is not None
+        assert not inputs.semantic_targets.requires_grad
+        prepared_latents.append(inputs.video.latent.detach().clone())
+        semantic_targets.append(inputs.semantic_targets.detach().clone())
+
+    for candidate in prepared_latents[1:]:
+        assert torch.equal(candidate, prepared_latents[0])
+    for candidate in semantic_targets[1:]:
+        assert torch.equal(candidate, semantic_targets[0])
+
+
+def test_repae_joint_dit_input_gradient_scales_without_scaling_dit() -> None:
+    runs = {
+        alpha: _run_repae_gradient_route(
+            video_flow_weight=0.0,
+            semantic_flow_weight=1.0,
+            projection_weight=0.0,
+            dit_repa_weight=0.0,
+            semantic_dit_input_gradient_scale=alpha,
+        )
+        for alpha in (0.0, 0.1, 1.0)
+    }
+    strategies = {alpha: run[0] for alpha, run in runs.items()}
+    transformers = {alpha: run[1] for alpha, run in runs.items()}
+    losses = {alpha: run[2] for alpha, run in runs.items()}
+    semantic_input_gradients = {
+        alpha: _module_gradients(strategy.get_trainable_modules()["semantic_input_projection"])
+        for alpha, strategy in strategies.items()
+    }
+
+    assert _has_no_gradient(strategies[0.0].get_trainable_modules()["semantic_input_projection"])
+    assert _has_nonzero_gradient(strategies[1.0].get_trainable_modules()["semantic_input_projection"])
+    _assert_gradients_scaled(semantic_input_gradients[0.0], semantic_input_gradients[1.0], 0.0)
+    _assert_gradients_scaled(semantic_input_gradients[0.1], semantic_input_gradients[1.0], 0.1)
+    assert torch.equal(losses[0.0], losses[0.1])
+    assert torch.equal(losses[0.1], losses[1.0])
+
+    for module_name in ("patchify_proj", "transformer_blocks.0", "proj_out"):
+        module_at_point_one = transformers[0.1].get_submodule(module_name)
+        module_at_one = transformers[1.0].get_submodule(module_name)
+        _assert_gradients_scaled(
+            _module_gradients(module_at_point_one),
+            _module_gradients(module_at_one),
+            1.0,
+        )
+    for strategy in strategies.values():
+        metrics = strategy.get_last_training_metrics()
+        torch.testing.assert_close(
+            metrics["train/loss_semantic_flow_weighted"],
+            metrics["train/loss_semantic_flow"],
+        )
+
+
+def test_repae_video_flow_still_updates_dit_with_unchanged_weight() -> None:
+    strategy, transformer, _loss = _run_repae_gradient_route(
+        video_flow_weight=1.0,
+        semantic_flow_weight=0.0,
         projection_weight=0.0,
         dit_repa_weight=0.0,
     )
@@ -861,27 +988,42 @@ def test_repae_flow_losses_stop_at_semantic_latent_boundary(
     assert _has_no_gradient(modules["dit_repa_projector"])
 
 
-def test_repae_projection_alignment_updates_only_semantic_projection_path() -> None:
-    strategy, transformer = _run_repae_gradient_route(
-        video_flow_weight=0.0,
-        semantic_flow_weight=0.0,
-        projection_weight=1.0,
-        dit_repa_weight=0.0,
-    )
-    modules = strategy.get_trainable_modules()
+def test_repae_projection_alignment_gradient_is_independent_of_dit_input_gate() -> None:
+    runs = {
+        alpha: _run_repae_gradient_route(
+            video_flow_weight=0.0,
+            semantic_flow_weight=0.0,
+            projection_weight=1.0,
+            dit_repa_weight=0.0,
+            semantic_dit_input_gradient_scale=alpha,
+        )
+        for alpha in (0.0, 0.1, 1.0)
+    }
+    baseline_modules = runs[1.0][0].get_trainable_modules()
+    for _alpha, (strategy, transformer, _loss) in runs.items():
+        modules = strategy.get_trainable_modules()
+        assert _has_nonzero_gradient(modules["semantic_input_projection"])
+        assert _has_nonzero_gradient(modules["semantic_repa_projector"])
+        assert _has_no_gradient(transformer)
+        assert _has_no_gradient(modules["dit_repa_projector"])
+        _assert_gradients_scaled(
+            _module_gradients(modules["semantic_input_projection"]),
+            _module_gradients(baseline_modules["semantic_input_projection"]),
+            1.0,
+        )
+        _assert_gradients_scaled(
+            _module_gradients(modules["semantic_repa_projector"]),
+            _module_gradients(baseline_modules["semantic_repa_projector"]),
+            1.0,
+        )
 
-    assert _has_nonzero_gradient(modules["semantic_input_projection"])
-    assert _has_nonzero_gradient(modules["semantic_repa_projector"])
-    assert _has_no_gradient(transformer)
-    assert _has_no_gradient(modules["dit_repa_projector"])
 
-
-def test_repae_dit_alignment_updates_capture_path_but_not_semantic_projection() -> None:
-    strategy, transformer = _run_repae_gradient_route(
+def test_repae_dit_alignment_updates_capture_and_scaled_semantic_input_path() -> None:
+    strategy, transformer, _loss = _run_repae_gradient_route(
         video_flow_weight=0.0,
         semantic_flow_weight=0.0,
         projection_weight=0.0,
-        dit_repa_weight=1.0,
+        dit_repa_weight=0.5,
     )
     modules = strategy.get_trainable_modules()
 
@@ -889,7 +1031,7 @@ def test_repae_dit_alignment_updates_capture_path_but_not_semantic_projection() 
     assert _has_nonzero_gradient(transformer.transformer_blocks[0])
     assert _has_nonzero_gradient(transformer.transformer_blocks[15])
     assert _has_nonzero_gradient(modules["dit_repa_projector"])
-    assert _has_no_gradient(modules["semantic_input_projection"])
+    assert _has_nonzero_gradient(modules["semantic_input_projection"])
     assert _has_no_gradient(modules["semantic_repa_projector"])
 
 
@@ -897,9 +1039,7 @@ def test_repae_strategy_runs_gemma_teacher_under_no_grad_without_checkpoint_wrap
     language_model = _TinyGemmaLanguageModel(hidden_dim=12)
     text_encoder = _TinyTextEncoder(language_model)
     transformer = _TinyRepaETransformer()
-    strategy = SemanticRepaEStrategy(
-        SemanticRepaEConfig(semantic_hidden_dim=16, repa_hidden_dim=16)
-    )
+    strategy = SemanticRepaEStrategy(SemanticRepaEConfig(semantic_hidden_dim=16, repa_hidden_dim=16))
     strategy.attach_models(
         transformer=transformer,
         embeddings_processor=nn.Identity(),
@@ -971,7 +1111,9 @@ def test_repae_strategy_is_independent_and_registered() -> None:
     metadata = strategy.get_checkpoint_metadata()
     assert metadata["architecture"] == "semantic_repae_v1"
     assert metadata["required_fsdp_world_size"] == 8
-    assert metadata["semantic_flow_gradient_boundary"] == "detached_semantic_latent"
+    assert metadata["semantic_dit_input_gradient_scale"] == 0.1
+    assert metadata["semantic_flow_gradient_boundary"] == "scaled_semantic_input_gradient_target_detached"
+    assert metadata["semantic_flow_target_gradient"] == "detached"
     assert metadata["projection_alignment_loss"] == "cosine_plus_0p1_smooth_l1_beta_1"
     assert metadata["dit_repa_loss"] == "normalized_cosine_distance"
     with pytest.raises(ValueError, match="required_fsdp_world_size"):
@@ -1066,9 +1208,7 @@ class _TinyEmbeddingsProcessor(nn.Module):
 
 
 def _tiny_checkpoint_strategy() -> SemanticRepaEStrategy:
-    strategy = SemanticRepaEStrategy(
-        SemanticRepaEConfig(semantic_hidden_dim=8, repa_hidden_dim=8)
-    )
+    strategy = SemanticRepaEStrategy(SemanticRepaEConfig(semantic_hidden_dim=8, repa_hidden_dim=8))
     strategy._semantic_dim = 4
     strategy._gemma_dim = 6
     strategy._dit_hidden_dim = 4
@@ -1109,9 +1249,7 @@ def test_repae_production_config_parses_with_correct_worktree_and_no_augmentatio
     assert "training_phase" not in raw_text
     assert "parent_checkpoint_step" not in raw_text
     source_data_config = yaml.safe_load(
-        (config_path.parent / "multitask_online_480p121_opens2v_noaug.yaml").read_text(
-            encoding="utf-8"
-        )
+        (config_path.parent / "multitask_online_480p121_opens2v_noaug.yaml").read_text(encoding="utf-8")
     )
     assert source_data_config["online_augmentation"]["enabled"] is False
     source_sampling = source_data_config["online_sampling"]
@@ -1141,21 +1279,21 @@ def test_repae_production_config_parses_with_correct_worktree_and_no_augmentatio
     assert parsed.training_strategy.required_fsdp_world_size == 8
     assert parsed.training_strategy.semantic_anchor_count == 8
     assert parsed.training_strategy.reference_rope_mode == "negative_adjacent_aligned_hw"
+    assert parsed.training_strategy.semantic_dit_input_gradient_scale == pytest.approx(0.1)
+    assert (
+        parsed.training_strategy.video_flow_weight,
+        parsed.training_strategy.semantic_flow_weight,
+        parsed.training_strategy.semantic_projection_repa_weight,
+        parsed.training_strategy.semantic_dit_repa_weight,
+    ) == pytest.approx((1.0, 1.0, 1.0, 0.5))
     assert parsed.model.training_mode == "full"
     assert parsed.data.online_encoding is not None
     assert parsed.data.online_encoding.augmentation.enabled is False
     assert parsed.data.online_encoding.image_ratio == pytest.approx(0.15)
     assert parsed.data.online_encoding.video_ratio == pytest.approx(0.85)
-    assert (
-        parsed.data.online_encoding.image_ratio
-        + parsed.data.online_encoding.video_ratio
-    ) == pytest.approx(1.0)
-    assert parsed.data.online_encoding.image_ratio == pytest.approx(
-        source_sampling["image_ratio"]
-    )
-    assert parsed.data.online_encoding.video_ratio == pytest.approx(
-        source_sampling["video_ratio"]
-    )
+    assert (parsed.data.online_encoding.image_ratio + parsed.data.online_encoding.video_ratio) == pytest.approx(1.0)
+    assert parsed.data.online_encoding.image_ratio == pytest.approx(source_sampling["image_ratio"])
+    assert parsed.data.online_encoding.video_ratio == pytest.approx(source_sampling["video_ratio"])
     assert parsed.optimization.learning_rate == pytest.approx(5.0e-6)
     assert parsed.optimization.bridge_learning_rate == pytest.approx(3.0e-6)
     assert parsed.optimization.semantic_learning_rate == pytest.approx(1.0e-5)
@@ -1204,15 +1342,15 @@ def test_repae_task_specific_system_prompts_and_messages_are_distinct() -> None:
 def test_repae_reference_rope_checkpoint_metadata_validates_v3_and_v4() -> None:
     shifted = {
         key: str(value)
-        for key, value in SemanticRepaEStrategy(
-            SemanticRepaEConfig(reference_rope_mode="negative_adjacent_shifted_hw")
-        ).get_checkpoint_metadata().items()
+        for key, value in SemanticRepaEStrategy(SemanticRepaEConfig(reference_rope_mode="negative_adjacent_shifted_hw"))
+        .get_checkpoint_metadata()
+        .items()
     }
     aligned = {
         key: str(value)
-        for key, value in SemanticRepaEStrategy(
-            SemanticRepaEConfig(reference_rope_mode="negative_adjacent_aligned_hw")
-        ).get_checkpoint_metadata().items()
+        for key, value in SemanticRepaEStrategy(SemanticRepaEConfig(reference_rope_mode="negative_adjacent_aligned_hw"))
+        .get_checkpoint_metadata()
+        .items()
     }
 
     assert shifted["reference_rope_layout_version"] == "3"
@@ -1248,9 +1386,7 @@ def test_repae_reference_rope_checkpoint_metadata_validates_v3_and_v4() -> None:
 
 
 def test_repae_checkpoint_round_trip_covers_all_trainable_components(tmp_path: Path) -> None:
-    state, metadata, _source_strategy, _source_transformer, _source_processor = (
-        _semantic_repae_checkpoint_fixture()
-    )
+    state, metadata, _source_strategy, _source_transformer, _source_processor = _semantic_repae_checkpoint_fixture()
     checkpoint = tmp_path / "model_weights_step_00001.safetensors"
     save_file(state, checkpoint, metadata=metadata)
 
@@ -1274,8 +1410,7 @@ def test_repae_checkpoint_round_trip_covers_all_trainable_components(tmp_path: P
     transformer_state = {
         key: value
         for key, value in loaded.items()
-        if not key.startswith("training_strategy.")
-        and not key.startswith("embeddings_processor.")
+        if not key.startswith("training_strategy.") and not key.startswith("embeddings_processor.")
     }
     target_transformer.load_state_dict(transformer_state, strict=True)
 
@@ -1300,9 +1435,7 @@ def test_repae_checkpoint_audit_fails_when_any_required_prefix_is_missing(tmp_pa
             audit_checkpoint(checkpoint)
 
     missing_strategy = {
-        key: value
-        for key, value in state.items()
-        if not key.startswith("training_strategy.semantic_input_projection.")
+        key: value for key, value in state.items() if not key.startswith("training_strategy.semantic_input_projection.")
     }
     with pytest.raises(RuntimeError, match="missing strategy modules"):
         _tiny_checkpoint_strategy().load_extra_checkpoint_state_dict(
@@ -1332,9 +1465,7 @@ def test_repae_trainability_audit_assigns_every_parameter_to_exactly_one_group()
     trainer._online_vae_encoder.requires_grad_(False)
     configure_phase2_bridge_trainability(trainer._embeddings_processor)
     trainer._embeddings_processor_trainable_modules = (
-        trainer._training_strategy.get_embeddings_processor_trainable_modules(
-            trainer._embeddings_processor
-        )
+        trainer._training_strategy.get_embeddings_processor_trainable_modules(trainer._embeddings_processor)
     )
     strategy_modules = trainer._training_strategy.get_trainable_modules()
     trainer._trainable_params = LtxvTrainer._deduplicate_parameters(
@@ -1374,8 +1505,7 @@ def test_repae_trainability_audit_assigns_every_parameter_to_exactly_one_group()
     assert all(parameter.requires_grad is False for parameter in trainer._text_encoder.parameters())
     assert all(parameter.requires_grad is False for parameter in trainer._online_vae_encoder.parameters())
     assert all(
-        parameter.requires_grad is False
-        for parameter in trainer._embeddings_processor.audio_connector.parameters()
+        parameter.requires_grad is False for parameter in trainer._embeddings_processor.audio_connector.parameters()
     )
     trainer._config = SimpleNamespace(
         optimization=SimpleNamespace(
@@ -1398,6 +1528,4 @@ def test_repae_trainability_audit_assigns_every_parameter_to_exactly_one_group()
         "semantic_projection",
         "repa_projectors",
     ]
-    assert [group["lr"] for group in trainer._optimizer.param_groups] == pytest.approx(
-        [5.0e-6, 3.0e-6, 1.0e-5, 2.0e-5]
-    )
+    assert [group["lr"] for group in trainer._optimizer.param_groups] == pytest.approx([5.0e-6, 3.0e-6, 1.0e-5, 2.0e-5])

@@ -24,6 +24,7 @@ training_strategy:
   semantic_flow_weight: 1.0
   semantic_projection_repa_weight: 1.0
   semantic_dit_repa_weight: 0.5
+  semantic_dit_input_gradient_scale: 0.1
   condition_probabilities:
     til_111: 0.50
     til_110: 0.10

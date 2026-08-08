@@ -56,6 +56,12 @@ DEFAULT_REPAE_CONDITION_PROBABILITIES = {
 }
 
 
+def scale_semantic_dit_input_gradient(value: Tensor, scale: float) -> Tensor:
+    """Preserve ``value`` exactly while scaling its upstream autograd Jacobian."""
+    detached = value.detach()
+    return detached + scale * (value - detached)
+
+
 class SemanticRepaEConfig(TrainingStrategyConfigBase):
     """Configuration for the independent single-stage semantic REPA-E route."""
 
@@ -82,6 +88,7 @@ class SemanticRepaEConfig(TrainingStrategyConfigBase):
     semantic_flow_weight: float = Field(default=1.0, ge=0.0)
     semantic_projection_repa_weight: float = Field(default=1.0, ge=0.0)
     semantic_dit_repa_weight: float = Field(default=0.5, ge=0.0)
+    semantic_dit_input_gradient_scale: float = Field(default=0.1, ge=0.0, le=1.0)
     condition_probabilities: dict[str, float] = Field(
         default_factory=lambda: dict(DEFAULT_REPAE_CONDITION_PROBABILITIES)
     )
@@ -96,11 +103,7 @@ class SemanticRepaEConfig(TrainingStrategyConfigBase):
                 REPAE_SEMANTIC_TOKENS_PER_FRAME,
             ),
         }
-        invalid = {
-            name: value
-            for name, (value, expected) in fixed_values.items()
-            if value != expected
-        }
+        invalid = {name: value for name, (value, expected) in fixed_values.items() if value != expected}
         if invalid:
             raise ValueError(f"semantic_repae_v1 fixed geometry mismatch: {invalid}")
         expected_keys = set(PHASE2_CONDITION_MODES)
@@ -115,9 +118,7 @@ class SemanticRepaEConfig(TrainingStrategyConfigBase):
         probability_sum = sum(self.condition_probabilities.values())
         if abs(probability_sum - 1.0) > 1.0e-6:
             raise ValueError(f"condition_probabilities must sum to 1.0, got {probability_sum}")
-        maximum_teacher_length = self.vlm_prefix_max_length + (
-            self.semantic_anchor_count * EVIDENCE_TOKENS_PER_FRAME
-        )
+        maximum_teacher_length = self.vlm_prefix_max_length + (self.semantic_anchor_count * EVIDENCE_TOKENS_PER_FRAME)
         if self.vlm_teacher_max_length < maximum_teacher_length:
             raise ValueError(
                 "vlm_teacher_max_length cannot hold the R2V evidence suffix: "
@@ -308,9 +309,9 @@ class SemanticRepaEStrategy(SemanticFlowStrategy):
         if audio_features is not None:
             prepared["audio_prompt_embeds"] = audio_features
         self._last_bridge_metrics = {
-            "train/bridge_input_rms": torch.stack(
-                [value.detach().float().pow(2).mean() for value in hidden_states]
-            ).mean().sqrt(),
+            "train/bridge_input_rms": torch.stack([value.detach().float().pow(2).mean() for value in hidden_states])
+            .mean()
+            .sqrt(),
             "train/bridge_feature_output_rms": video_features.detach().float().pow(2).mean().sqrt(),
         }
         return prepared
@@ -409,9 +410,11 @@ class SemanticRepaEStrategy(SemanticFlowStrategy):
         teacher = self.build_semantic_teacher_outputs(batch["semantic_teacher_inputs"])
         semantic_clean_grid = teacher["semantic_clean"]
         semantic_clean = semantic_clean_grid.flatten(1, 2)
-        # Projection alignment updates the semantic tokenizer. Flow/video/DiT losses
-        # stop at this semantic latent boundary and update only the joint DiT path.
-        semantic_clean_for_flow = semantic_clean.detach()
+        semantic_clean_detached = semantic_clean.detach()
+        semantic_clean_for_flow = scale_semantic_dit_input_gradient(
+            semantic_clean,
+            self.config.semantic_dit_input_gradient_scale,
+        )
         latents = batch["latents"]
         target_latents = latents["latents"]
         target_tokens = self._video_patchifier.patchify(target_latents)
@@ -422,12 +425,9 @@ class SemanticRepaEStrategy(SemanticFlowStrategy):
         target_noise = torch.randn_like(target_tokens)
         semantic_noise = torch.randn_like(semantic_clean_for_flow)
         noisy_target = (1.0 - sigma_expanded) * target_tokens + sigma_expanded * target_noise
-        noisy_semantic = (
-            (1.0 - sigma_expanded) * semantic_clean_for_flow
-            + sigma_expanded * semantic_noise
-        )
+        noisy_semantic = (1.0 - sigma_expanded) * semantic_clean_for_flow + sigma_expanded * semantic_noise
         video_flow_target = target_noise - target_tokens
-        semantic_flow_target = semantic_noise - semantic_clean_for_flow
+        semantic_flow_target = semantic_noise - semantic_clean_detached
 
         target_fps = latents.get(
             "fps",
@@ -594,9 +594,7 @@ class SemanticRepaEStrategy(SemanticFlowStrategy):
             inputs.semantic_projection_repa_prediction,
             inputs.semantic_repa_target,
         )
-        projection_repa_loss = (
-            projection_cosine_loss + 0.1 * projection_smooth_l1_loss
-        )
+        projection_repa_loss = projection_cosine_loss + 0.1 * projection_smooth_l1_loss
         _semantic_input, _semantic_projector, dit_projector = self._require_repae_modules()
         captured = self._consume_dit_capture()
         if captured.shape[1] != semantic_end - reference_end:
@@ -607,38 +605,25 @@ class SemanticRepaEStrategy(SemanticFlowStrategy):
         )
         weighted_video_loss = self.config.video_flow_weight * video_loss
         weighted_semantic_loss = self.config.semantic_flow_weight * semantic_loss
-        weighted_projection_repa_loss = (
-            self.config.semantic_projection_repa_weight * projection_repa_loss
-        )
-        weighted_dit_repa_loss = (
-            self.config.semantic_dit_repa_weight * dit_repa_loss
-        )
-        total = (
-            weighted_video_loss
-            + weighted_semantic_loss
-            + weighted_projection_repa_loss
-            + weighted_dit_repa_loss
-        )
+        weighted_projection_repa_loss = self.config.semantic_projection_repa_weight * projection_repa_loss
+        weighted_dit_repa_loss = self.config.semantic_dit_repa_weight * dit_repa_loss
+        total = weighted_video_loss + weighted_semantic_loss + weighted_projection_repa_loss + weighted_dit_repa_loss
         self._last_training_metrics.update(
             {
                 "train/loss_video_flow": video_loss.detach().mean(),
                 "train/loss_semantic_flow": semantic_loss.detach().mean(),
                 "train/loss_semantic_projection_repa": projection_repa_loss.detach().mean(),
-                "train/loss_semantic_projection_cosine": (
-                    projection_cosine_loss.detach().mean()
-                ),
-                "train/loss_semantic_projection_smooth_l1": (
-                    projection_smooth_l1_loss.detach().mean()
-                ),
+                "train/loss_semantic_projection_cosine": (projection_cosine_loss.detach().mean()),
+                "train/loss_semantic_projection_smooth_l1": (projection_smooth_l1_loss.detach().mean()),
                 "train/loss_semantic_dit_repa": dit_repa_loss.detach().mean(),
+                "train/semantic_dit_input_gradient_scale": torch.tensor(
+                    self.config.semantic_dit_input_gradient_scale,
+                    device=video_pred.device,
+                ),
                 "train/loss_video_flow_weighted": weighted_video_loss.detach().mean(),
                 "train/loss_semantic_flow_weighted": weighted_semantic_loss.detach().mean(),
-                "train/loss_semantic_projection_repa_weighted": (
-                    weighted_projection_repa_loss.detach().mean()
-                ),
-                "train/loss_semantic_dit_repa_weighted": (
-                    weighted_dit_repa_loss.detach().mean()
-                ),
+                "train/loss_semantic_projection_repa_weighted": (weighted_projection_repa_loss.detach().mean()),
+                "train/loss_semantic_dit_repa_weighted": (weighted_dit_repa_loss.detach().mean()),
             }
         )
         return total
@@ -658,14 +643,14 @@ class SemanticRepaEStrategy(SemanticFlowStrategy):
             "required_fsdp_world_size": self.config.required_fsdp_world_size,
             "semantic_repa_block": self.config.semantic_repa_block,
             "semantic_teacher_gradient": "frozen_no_grad",
-            "semantic_flow_gradient_boundary": "detached_semantic_latent",
+            "semantic_dit_input_gradient_scale": self.config.semantic_dit_input_gradient_scale,
+            "semantic_flow_gradient_boundary": ("scaled_semantic_input_gradient_target_detached"),
+            "semantic_flow_target_gradient": "detached",
             "projection_alignment_loss": "cosine_plus_0p1_smooth_l1_beta_1",
             "dit_repa_loss": "normalized_cosine_distance",
             "token_sequence": ["reference", "semantic", "target"],
             "reference_rope_layout_version": (
-                3
-                if self.config.reference_rope_mode == "negative_adjacent_shifted_hw"
-                else 4
+                3 if self.config.reference_rope_mode == "negative_adjacent_shifted_hw" else 4
             ),
             "reference_rope_mode": self.config.reference_rope_mode,
             "reference_rope_temporal_slots": "shared_negative_adjacent",
@@ -685,23 +670,12 @@ class SemanticRepaEStrategy(SemanticFlowStrategy):
     ) -> None:
         architecture = (checkpoint_metadata or {}).get("architecture")
         if architecture not in {None, "semantic_repae_v1"}:
-            raise RuntimeError(
-                "Unsupported semantic REPA-E checkpoint architecture: "
-                f"{architecture!r}"
-            )
+            raise RuntimeError(f"Unsupported semantic REPA-E checkpoint architecture: {architecture!r}")
         if architecture == "semantic_repae_v1":
-            required_prefixes = [
-                f"training_strategy.{name}." for name in self.get_trainable_modules()
-            ]
-            missing = [
-                prefix
-                for prefix in required_prefixes
-                if not any(key.startswith(prefix) for key in state_dict)
-            ]
+            required_prefixes = [f"training_strategy.{name}." for name in self.get_trainable_modules()]
+            missing = [prefix for prefix in required_prefixes if not any(key.startswith(prefix) for key in state_dict)]
             if missing:
-                raise RuntimeError(
-                    f"Semantic REPA-E checkpoint is missing strategy modules: {missing}"
-                )
+                raise RuntimeError(f"Semantic REPA-E checkpoint is missing strategy modules: {missing}")
         TrainingStrategy.load_extra_checkpoint_state_dict(
             self,
             state_dict,
