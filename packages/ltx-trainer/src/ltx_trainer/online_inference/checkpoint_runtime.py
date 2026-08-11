@@ -55,19 +55,17 @@ SEMANTIC_TRANSFORMER_CHECKPOINT_PREFIXES = (
     "semantic_norm_out.",
     "semantic_proj_out.",
 )
-REPAE_STRATEGY_CHECKPOINT_PREFIXES = (
-    "training_strategy.semantic_input_projection.",
-    "training_strategy.semantic_repa_projector.",
-    "training_strategy.dit_repa_projector.",
+SEMANTIC_VLM_STRATEGY_CHECKPOINT_PREFIXES = (
     "embeddings_processor.feature_extractor.",
     "embeddings_processor.video_connector.",
 )
-REPAE_TRANSFORMER_CHECKPOINT_PREFIXES = (
-    "semantic_repae_reference_type_embedding.",
-    "semantic_repae_reference_slot_embedding.",
-    "semantic_repae_semantic_type_embedding.",
+SEMANTIC_VLM_TRANSFORMER_CHECKPOINT_PREFIXES = (
+    "semantic_input_proj.",
+    "semantic_output_proj.",
     "semantic_norm_out.",
-    "semantic_proj_out.",
+    "reference_type_embedding.",
+    "reference_slot_embedding.",
+    "semantic_type_embedding.",
 )
 
 
@@ -166,8 +164,12 @@ def audit_checkpoint(path: Path) -> dict[str, Any]:
         raise CheckpointAuditError(f"Invalid safetensors checkpoint {resolved}: {exc}") from exc
     architecture = metadata.get("architecture")
     if architecture == "semantic_repae_v1":
-        strategy_prefixes = REPAE_STRATEGY_CHECKPOINT_PREFIXES
-        transformer_prefixes = REPAE_TRANSFORMER_CHECKPOINT_PREFIXES
+        raise CheckpointAuditError(
+            "Legacy semantic_repae_v1 checkpoints cannot initialize semantic_vlm_joint_flow_v1"
+        )
+    if architecture == "semantic_vlm_joint_flow_v1":
+        strategy_prefixes = SEMANTIC_VLM_STRATEGY_CHECKPOINT_PREFIXES
+        transformer_prefixes = SEMANTIC_VLM_TRANSFORMER_CHECKPOINT_PREFIXES
     else:
         strategy_prefixes = (
             SEMANTIC_V1_STRATEGY_CHECKPOINT_PREFIXES
@@ -211,7 +213,12 @@ def read_checkpoint_metadata(path: Path) -> dict[str, str]:
 def checkpoint_contains_semantic_flow_modules(path: Path) -> bool:
     """Return whether a checkpoint header contains any semantic-flow module."""
     resolved = path.expanduser().resolve()
-    prefixes = SEMANTIC_STRATEGY_CHECKPOINT_PREFIXES + SEMANTIC_TRANSFORMER_CHECKPOINT_PREFIXES
+    prefixes = (
+        SEMANTIC_STRATEGY_CHECKPOINT_PREFIXES
+        + SEMANTIC_TRANSFORMER_CHECKPOINT_PREFIXES
+        + SEMANTIC_VLM_STRATEGY_CHECKPOINT_PREFIXES
+        + SEMANTIC_VLM_TRANSFORMER_CHECKPOINT_PREFIXES
+    )
     try:
         with safe_open(resolved, framework="pt", device="cpu") as handle:
             return any(key.startswith(prefixes) for key in handle.keys())
@@ -448,8 +455,12 @@ class OnlineInferenceRuntime:
         ref_end = positive.sequence_offsets["reference_end"]
         semantic_end = positive.sequence_offsets["semantic_end"]
         target_end = positive.sequence_offsets["target_end"]
-        semantic_noise = positive.modality.latent[:, ref_end:semantic_end]
-        target_noise = positive.modality.latent[:, semantic_end:target_end]
+        semantic_noise = positive.modality.semantic_latent
+        if semantic_noise is None:
+            semantic_noise = positive.modality.latent[:, ref_end:semantic_end]
+            target_noise = positive.modality.latent[:, semantic_end:target_end]
+        else:
+            target_noise = positive.modality.latent
 
         def branch_state(
             conditions: dict[str, Tensor],
@@ -613,10 +624,10 @@ def load_online_inference_runtime(
         expected_mode=strategy.config.reference_rope_mode,
         allow_legacy=allow_legacy_reference_rope,
     )
-    if strategy.config.name == "semantic_repae":
-        if audit["metadata"].get("architecture") != "semantic_repae_v1":
+    if strategy.config.name == "semantic_vlm_flow":
+        if audit["metadata"].get("architecture") != "semantic_vlm_joint_flow_v1":
             raise CheckpointAuditError(
-                "Unsupported semantic REPA-E checkpoint architecture: "
+                "Unsupported semantic VLM flow checkpoint architecture: "
                 f"{audit['metadata'].get('architecture')!r}"
             )
     else:
@@ -649,7 +660,7 @@ def load_online_inference_runtime(
     )
     if (
         audit["metadata"].get("training_phase") == "phase2"
-        or strategy.config.name == "semantic_repae"
+        or strategy.config.name == "semantic_vlm_flow"
     ):
         validate_and_load_phase2_bridge_state(embeddings_processor, state)
     transformer_state = {

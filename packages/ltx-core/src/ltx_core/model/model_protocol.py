@@ -6,7 +6,7 @@ import torch
 
 if TYPE_CHECKING:
     from ltx_core.guidance.perturbations import BatchedPerturbationConfig
-    from ltx_core.model.transformer.modality import Modality
+    from ltx_core.model.transformer.modality import Modality, SemanticVideoPrediction
 
 ModelType = TypeVar("ModelType", covariant=True, bound=torch.nn.Module)  # noqa: PLC0105
 
@@ -29,11 +29,11 @@ class LTXModelProtocol(Protocol):
         video: Modality | None,
         audio: Modality | None,
         perturbations: BatchedPerturbationConfig,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]: ...
+    ) -> tuple[torch.Tensor | SemanticVideoPrediction | None, torch.Tensor | None]: ...
 
     def __call__(
         self,
         video: Modality | None,
         audio: Modality | None,
         perturbations: BatchedPerturbationConfig,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]: ...
+    ) -> tuple[torch.Tensor | SemanticVideoPrediction | None, torch.Tensor | None]: ...

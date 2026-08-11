@@ -633,6 +633,43 @@ def rescale_guided_denoised(
     return scaled.to(dtype=guided_generated.dtype), factor
 
 
+def rescale_guided_denoised_branches(
+    *,
+    positive_semantic: Tensor,
+    guided_semantic: Tensor,
+    positive_video: Tensor,
+    guided_video: Tensor,
+    guidance_rescale: float,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Rescale separated semantic/video predictions from target-video statistics."""
+    if positive_semantic.shape != guided_semantic.shape:
+        raise ValueError("positive and guided semantic branches must have identical shapes")
+    if positive_video.shape != guided_video.shape:
+        raise ValueError("positive and guided video branches must have identical shapes")
+    if positive_semantic.shape[0] != positive_video.shape[0]:
+        raise ValueError("semantic and video guidance branches must share a batch size")
+    if not 0.0 <= guidance_rescale <= 1.0:
+        raise ValueError("guidance_rescale must be between 0.0 and 1.0")
+    batch_size = positive_video.shape[0]
+    if guidance_rescale == 0.0:
+        factor = torch.ones(batch_size, device=guided_video.device, dtype=torch.float32)
+        return guided_semantic, guided_video, factor
+    positive_flat = positive_video.float().reshape(batch_size, -1)
+    guided_flat = guided_video.float().reshape(batch_size, -1)
+    std_positive = positive_flat.std(dim=1, correction=0)
+    std_guided = guided_flat.std(dim=1, correction=0).clamp_min(1.0e-8)
+    factor = guidance_rescale * (std_positive / std_guided) + (1.0 - guidance_rescale)
+
+    def scale(value: Tensor) -> Tensor:
+        scaled = value.float() * factor.to(device=value.device).view(
+            batch_size,
+            *([1] * (value.ndim - 1)),
+        )
+        return scaled.to(dtype=value.dtype)
+
+    return scale(guided_semantic), scale(guided_video), factor
+
+
 __all__ = [
     "GuidanceMode",
     "SemanticGuidanceConfig",
@@ -642,6 +679,7 @@ __all__ = [
     "denoised_to_velocity",
     "parse_stg_blocks",
     "rescale_guided_denoised",
+    "rescale_guided_denoised_branches",
     "validate_stg_blocks",
     "velocity_to_denoised",
 ]

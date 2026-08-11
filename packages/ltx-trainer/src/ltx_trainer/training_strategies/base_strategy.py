@@ -39,7 +39,7 @@ class TrainingStrategyConfigBase(BaseModel):
         "video_to_video",
         "flexible",
         "semantic_flow",
-        "semantic_repae",
+        "semantic_vlm_flow",
     ] = Field(
         description="Unique name identifying the training strategy type"
     )
@@ -77,8 +77,6 @@ class ModelInputs:
     semantic_reconstruction_target: Tensor | None = None
     semantic_alignment_prediction: Tensor | None = None
     semantic_alignment_target: Tensor | None = None
-    semantic_projection_repa_prediction: Tensor | None = None
-    semantic_repa_target: Tensor | None = None
     sequence_offsets: dict[str, int] | None = None
 
 

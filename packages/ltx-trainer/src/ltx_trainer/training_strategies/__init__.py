@@ -18,7 +18,7 @@ from ltx_trainer.training_strategies.base_strategy import (
 )
 from ltx_trainer.training_strategies.flexible import FlexibleStrategy, FlexibleStrategyConfig
 from ltx_trainer.training_strategies.semantic_flow import SemanticFlowConfig, SemanticFlowStrategy
-from ltx_trainer.training_strategies.semantic_repae import SemanticRepaEConfig, SemanticRepaEStrategy
+from ltx_trainer.training_strategies.semantic_vlm_flow import SemanticVLMFlowConfig, SemanticVLMFlowStrategy
 from ltx_trainer.training_strategies.text_to_video import TextToVideoConfig, TextToVideoStrategy
 from ltx_trainer.training_strategies.video_to_video import VideoToVideoConfig, VideoToVideoStrategy
 
@@ -28,7 +28,7 @@ TrainingStrategyConfig = (
     | VideoToVideoConfig
     | FlexibleStrategyConfig
     | SemanticFlowConfig
-    | SemanticRepaEConfig
+    | SemanticVLMFlowConfig
 )
 
 __all__ = [
@@ -39,8 +39,8 @@ __all__ = [
     "ModelInputs",
     "SemanticFlowConfig",
     "SemanticFlowStrategy",
-    "SemanticRepaEConfig",
-    "SemanticRepaEStrategy",
+    "SemanticVLMFlowConfig",
+    "SemanticVLMFlowStrategy",
     "TextToVideoConfig",
     "TextToVideoStrategy",
     "TrainingStrategy",
@@ -89,8 +89,8 @@ def get_training_strategy(config: TrainingStrategyConfig) -> TrainingStrategy:
             strategy = FlexibleStrategy(config)
         case SemanticFlowConfig():
             strategy = SemanticFlowStrategy(config)
-        case SemanticRepaEConfig():
-            strategy = SemanticRepaEStrategy(config)
+        case SemanticVLMFlowConfig():
+            strategy = SemanticVLMFlowStrategy(config)
         case _:
             raise ValueError(f"Unknown training strategy config type: {type(config).__name__}")
 

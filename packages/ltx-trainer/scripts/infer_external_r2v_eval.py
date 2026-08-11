@@ -192,7 +192,7 @@ def main(
         code_commit=commit,
     )
     summary = {
-        "architecture": "semantic_flow_v2",
+        "architecture": runtime.checkpoint_audit["metadata"].get("architecture"),
         "code_commit": commit,
         "dataset_name": dataset_name,
         "manifest": str(Path(manifest).expanduser().resolve()),

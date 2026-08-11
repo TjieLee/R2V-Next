@@ -7,6 +7,14 @@ import torch
 
 
 @dataclass(frozen=True)
+class SemanticVideoPrediction:
+    """Flow velocities for heterogeneous semantic and video state spaces."""
+
+    semantic: torch.Tensor
+    video: torch.Tensor
+
+
+@dataclass(frozen=True)
 class Modality:
     """
     Input data for a single modality (video or audio) in the transformer.
@@ -44,6 +52,10 @@ class Modality:
         semantic_position_bounds: Optional normalized ``[t0,t1,h0,h1,w0,w1]``
             bounds. Non-semantic rows should be zero; the transformer masks the
             trainable semantic position adapter by ``token_type_ids``.
+        reference_latent: Optional clean reference tokens in the native video
+            latent-token width. Used only by heterogeneous semantic/VLM flow.
+        semantic_latent: Optional generated semantic state in frozen VLM hidden
+            width. It is projected independently before joint-token concatenation.
     """
 
     latent: (
@@ -62,6 +74,8 @@ class Modality:
     token_type_ids: torch.Tensor | None = None
     entity_ids: torch.Tensor | None = None
     semantic_position_bounds: torch.Tensor | None = None
+    reference_latent: torch.Tensor | None = None
+    semantic_latent: torch.Tensor | None = None
 
     def split(self, sizes: list[int]) -> list[Modality]:
         """Split along the batch dimension into chunks of the given sizes."""

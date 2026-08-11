@@ -8,7 +8,7 @@ from ltx_trainer.quantization import QuantizationOptions
 from ltx_trainer.training_strategies.base_strategy import TrainingStrategyConfigBase
 from ltx_trainer.training_strategies.flexible import FlexibleStrategyConfig
 from ltx_trainer.training_strategies.semantic_flow import SemanticFlowConfig
-from ltx_trainer.training_strategies.semantic_repae import SemanticRepaEConfig
+from ltx_trainer.training_strategies.semantic_vlm_flow import SemanticVLMFlowConfig
 from ltx_trainer.training_strategies.text_to_video import TextToVideoConfig
 from ltx_trainer.training_strategies.video_to_video import VideoToVideoConfig
 
@@ -329,7 +329,7 @@ TrainingStrategyConfig = Annotated[
     Annotated[TextToVideoConfig, Tag("text_to_video")]
     | Annotated[VideoToVideoConfig, Tag("video_to_video")]
     | Annotated[SemanticFlowConfig, Tag("semantic_flow")]
-    | Annotated[SemanticRepaEConfig, Tag("semantic_repae")]
+    | Annotated[SemanticVLMFlowConfig, Tag("semantic_vlm_flow")]
     | Annotated[FlexibleStrategyConfig, Tag("flexible")],
     Discriminator(_get_strategy_discriminator),
 ]
@@ -352,13 +352,13 @@ class OptimizationConfig(ConfigBaseModel):
     semantic_learning_rate: float | None = Field(
         default=None,
         gt=0.0,
-        description="Optional semantic input projection learning rate for semantic REPA-E.",
+        description="Optional semantic VLM input/output and metadata learning rate.",
     )
 
     repa_learning_rate: float | None = Field(
         default=None,
         gt=0.0,
-        description="Optional representation projector learning rate for semantic REPA-E.",
+        description="Deprecated legacy representation-projector learning rate.",
     )
 
     steps: int = Field(
@@ -1002,29 +1002,27 @@ class LtxTrainerConfig(ConfigBaseModel):
                     "optimization.bridge_learning_rate is only valid for semantic_flow phase2"
                 )
 
-        if self.training_strategy.name == "semantic_repae":
+        if self.training_strategy.name == "semantic_vlm_flow":
             if self.model.training_mode != "full":
-                raise ValueError("semantic_repae requires full DiT training; LoRA is forbidden")
+                raise ValueError("semantic_vlm_flow requires full DiT training; LoRA is forbidden")
             if self.lora is not None:
-                raise ValueError("semantic_repae must not configure DiT LoRA")
+                raise ValueError("semantic_vlm_flow must not configure DiT LoRA")
             if self.text_encoder_lora.enabled:
-                raise ValueError("semantic_repae keeps Gemma frozen and forbids text-encoder LoRA")
+                raise ValueError("semantic_vlm_flow keeps Gemma frozen and forbids text-encoder LoRA")
             if self.data.encoding_mode != "online":
-                raise ValueError("semantic_repae requires online raw-media encoding for the frozen teacher")
+                raise ValueError("semantic_vlm_flow requires online raw-media encoding")
             online = self.data.online_encoding
             if online is None:
-                raise ValueError("semantic_repae requires data.online_encoding")
+                raise ValueError("semantic_vlm_flow requires data.online_encoding")
             if online.vlm_prefix_max_length != self.training_strategy.vlm_prefix_max_length:
-                raise ValueError("online and semantic_repae vlm_prefix_max_length values must match")
+                raise ValueError("online and semantic_vlm_flow vlm_prefix_max_length values must match")
             if online.vlm_teacher_max_length != self.training_strategy.vlm_teacher_max_length:
-                raise ValueError("online and semantic_repae vlm_teacher_max_length values must match")
+                raise ValueError("online and semantic_vlm_flow vlm_teacher_max_length values must match")
             if online.semantic_anchor_count != self.training_strategy.semantic_anchor_count:
-                raise ValueError("online and semantic_repae semantic_anchor_count values must match")
+                raise ValueError("online and semantic_vlm_flow semantic_anchor_count values must match")
             if self.optimization.bridge_learning_rate is None:
-                raise ValueError("semantic_repae requires optimization.bridge_learning_rate")
+                raise ValueError("semantic_vlm_flow requires optimization.bridge_learning_rate")
             if self.optimization.semantic_learning_rate is None:
-                raise ValueError("semantic_repae requires optimization.semantic_learning_rate")
-            if self.optimization.repa_learning_rate is None:
-                raise ValueError("semantic_repae requires optimization.repa_learning_rate")
+                raise ValueError("semantic_vlm_flow requires optimization.semantic_learning_rate")
 
         return self

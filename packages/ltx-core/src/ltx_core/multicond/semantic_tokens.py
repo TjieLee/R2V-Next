@@ -13,8 +13,6 @@ EVIDENCE_GRID_SIZE = 16
 SEMANTIC_GRID_SIZE = 8
 EVIDENCE_TOKENS_PER_FRAME = EVIDENCE_GRID_SIZE**2
 SEMANTIC_TOKENS_PER_FRAME = SEMANTIC_GRID_SIZE**2
-REPAE_SEMANTIC_GRID_SIZE = EVIDENCE_GRID_SIZE
-REPAE_SEMANTIC_TOKENS_PER_FRAME = EVIDENCE_TOKENS_PER_FRAME
 LOCAL_EVIDENCE_TOKENS = 4
 
 
@@ -108,39 +106,6 @@ class SemanticEncoder(nn.Module):
         return self.network(query_hidden)
 
 
-class SemanticInputProjection(nn.Module):
-    """Project contextual Gemma image tokens into the DiT video-token space."""
-
-    def __init__(self, gemma_dim: int, semantic_dim: int, *, hidden_dim: int = 512) -> None:
-        super().__init__()
-        self.network = nn.Sequential(
-            nn.RMSNorm(gemma_dim, elementwise_affine=True),
-            nn.Linear(gemma_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, semantic_dim),
-            nn.RMSNorm(semantic_dim, elementwise_affine=True),
-        )
-
-    def forward(self, teacher_hidden: Tensor) -> Tensor:
-        return self.network(teacher_hidden)
-
-
-class SemanticRepaProjector(nn.Module):
-    """Project semantic or DiT hidden states into frozen Gemma feature space."""
-
-    def __init__(self, input_dim: int, gemma_dim: int, *, hidden_dim: int = 1024) -> None:
-        super().__init__()
-        self.network = nn.Sequential(
-            nn.RMSNorm(input_dim, elementwise_affine=True),
-            nn.Linear(input_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, gemma_dim),
-        )
-
-    def forward(self, hidden: Tensor) -> Tensor:
-        return self.network(hidden)
-
-
 class SemanticAlignmentHead(nn.Module):
     """Project each semantic token independently into frozen Gemma hidden space."""
 
@@ -223,33 +188,6 @@ def semantic_alignment_loss(prediction: Tensor, target: Tensor) -> Tensor:
     return cosine_distance.flatten(1).mean(dim=1)
 
 
-def semantic_projection_smooth_l1_loss(prediction: Tensor, target: Tensor) -> Tensor:
-    """Return per-sample float32 Smooth-L1 alignment loss."""
-    if prediction.shape != target.shape:
-        raise ValueError(
-            "semantic projection Smooth-L1 shapes differ: "
-            f"prediction={tuple(prediction.shape)}, target={tuple(target.shape)}"
-        )
-    element_loss = F.smooth_l1_loss(
-        prediction.float(),
-        target.detach().float(),
-        reduction="none",
-        beta=1.0,
-    )
-    return element_loss.flatten(1).mean(dim=1)
-
-
-def semantic_repa_loss(prediction: Tensor, target: Tensor) -> Tensor:
-    """Return per-sample normalized cosine distance for REPA-E supervision."""
-    if prediction.shape != target.shape:
-        raise ValueError(
-            f"semantic REPA shapes differ: prediction={tuple(prediction.shape)}, target={tuple(target.shape)}"
-        )
-    prediction_normalized = F.normalize(prediction.float(), dim=-1)
-    target_normalized = F.normalize(target.detach().float(), dim=-1)
-    return (1.0 - (prediction_normalized * target_normalized).sum(dim=-1)).flatten(1).mean(dim=1)
-
-
 def build_semantic_teacher_attention_mask(
     prefix_attention_mask: Tensor,
     *,
@@ -298,7 +236,7 @@ def build_semantic_teacher_attention_mask(
     return allowed
 
 
-def build_semantic_repae_teacher_attention_mask(
+def build_semantic_vlm_teacher_attention_mask(
     prefix_attention_mask: Tensor,
     *,
     frame_count: int,

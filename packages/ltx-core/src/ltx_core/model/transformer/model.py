@@ -9,7 +9,7 @@ from ltx_core.guidance.perturbations import BatchedPerturbationConfig, Perturbat
 from ltx_core.model.model_protocol import LTXModelProtocol
 from ltx_core.model.transformer.adaln import AdaLayerNormSingle, adaln_embedding_coefficient
 from ltx_core.model.transformer.attention import attention_label
-from ltx_core.model.transformer.modality import Modality
+from ltx_core.model.transformer.modality import Modality, SemanticVideoPrediction
 from ltx_core.model.transformer.rope import LTXRopeType
 from ltx_core.model.transformer.transformer import (
     DEFAULT_TRANSFORMER_OPS,
@@ -150,11 +150,11 @@ class LTXModel(torch.nn.Module):
         self.semantic_proj_out: torch.nn.Linear | None = None
         self.semantic_token_type_id: int | None = None
         self.reference_token_type_id: int | None = None
-        self.semantic_repae_reference_type_embedding: torch.nn.Embedding | None = None
-        self.semantic_repae_reference_slot_embedding: torch.nn.Embedding | None = None
-        self.semantic_repae_semantic_type_embedding: torch.nn.Embedding | None = None
-        self._semantic_repae_capture_request: tuple[int, int, int] | None = None
-        self._semantic_repae_captured_hidden: torch.Tensor | None = None
+        self.semantic_input_proj: torch.nn.Linear | None = None
+        self.semantic_output_proj: torch.nn.Linear | None = None
+        self.reference_type_embedding: torch.nn.Embedding | None = None
+        self.reference_slot_embedding: torch.nn.Embedding | None = None
+        self.semantic_type_embedding: torch.nn.Embedding | None = None
 
     @property
     def _adaln_embedding_coefficient(self) -> int:
@@ -416,7 +416,7 @@ class LTXModel(torch.nn.Module):
         torch.nn.init.zeros_(self.semantic_position_adapter[2].weight)
         torch.nn.init.zeros_(self.semantic_position_adapter[2].bias)
 
-    def enable_semantic_repae_conditioning(
+    def enable_semantic_vlm_flow(
         self,
         *,
         semantic_dim: int,
@@ -424,74 +424,51 @@ class LTXModel(torch.nn.Module):
         semantic_token_type_id: int = 1,
         reference_token_type_id: int = 0,
     ) -> None:
-        """Install REPA-E metadata adapters without changing target-token hidden states."""
-        if semantic_dim != self.patchify_proj.in_features:
-            raise ValueError(
-                f"semantic_dim={semantic_dim} must match video input token dim={self.patchify_proj.in_features}"
-            )
-        if self.semantic_repae_semantic_type_embedding is not None:
-            if self.semantic_proj_out is None or self.semantic_proj_out.out_features != semantic_dim:
-                raise ValueError("semantic REPA-E conditioning was initialized with a different dimension")
+        """Install heterogeneous VLM-semantic flow projections and metadata."""
+        if self.semantic_input_proj is not None:
+            if (
+                self.semantic_input_proj.in_features != semantic_dim
+                or self.semantic_output_proj is None
+                or self.semantic_output_proj.out_features != semantic_dim
+            ):
+                raise ValueError("semantic VLM flow was initialized with a different dimension")
             return
         if self.semantic_token_type_embedding is not None:
-            raise RuntimeError("semantic flow and semantic REPA-E conditioning cannot be enabled together")
+            raise RuntimeError("legacy semantic flow and semantic VLM flow cannot be enabled together")
         parameter = next(self.parameters())
         device, dtype = parameter.device, parameter.dtype
-        self.semantic_repae_reference_type_embedding = torch.nn.Embedding(1, self.inner_dim).to(
+        self.semantic_input_proj = torch.nn.Linear(semantic_dim, self.inner_dim).to(
             device=device, dtype=dtype
         )
-        self.semantic_repae_reference_slot_embedding = torch.nn.Embedding(
+        self.semantic_output_proj = torch.nn.Linear(self.inner_dim, semantic_dim).to(
+            device=device, dtype=dtype
+        )
+        self.reference_type_embedding = torch.nn.Embedding(1, self.inner_dim).to(
+            device=device, dtype=dtype
+        )
+        self.reference_slot_embedding = torch.nn.Embedding(
             num_reference_slots, self.inner_dim
         ).to(device=device, dtype=dtype)
-        self.semantic_repae_semantic_type_embedding = torch.nn.Embedding(1, self.inner_dim).to(
+        self.semantic_type_embedding = torch.nn.Embedding(1, self.inner_dim).to(
             device=device, dtype=dtype
         )
         self.semantic_norm_out = torch.nn.RMSNorm(self.inner_dim, elementwise_affine=True).to(
             device=device, dtype=dtype
         )
-        self.semantic_proj_out = torch.nn.Linear(self.inner_dim, semantic_dim).to(device=device, dtype=dtype)
-        torch.nn.init.zeros_(self.semantic_repae_reference_type_embedding.weight)
-        torch.nn.init.zeros_(self.semantic_repae_reference_slot_embedding.weight)
-        torch.nn.init.zeros_(self.semantic_repae_semantic_type_embedding.weight)
-        torch.nn.init.zeros_(self.semantic_proj_out.weight)
-        torch.nn.init.zeros_(self.semantic_proj_out.bias)
+        torch.nn.init.zeros_(self.reference_type_embedding.weight)
+        torch.nn.init.zeros_(self.reference_slot_embedding.weight)
+        torch.nn.init.zeros_(self.semantic_type_embedding.weight)
         self.semantic_token_type_id = int(semantic_token_type_id)
         self.reference_token_type_id = int(reference_token_type_id)
 
-    def configure_semantic_repae_capture(
-        self,
-        *,
-        block_index: int,
-        semantic_start: int,
-        semantic_end: int,
-    ) -> None:
-        """Capture one semantic span after one transformer block on the next forward."""
-        if not 0 <= block_index < len(self.transformer_blocks):
-            raise ValueError(f"semantic REPA-E capture block index is out of range: {block_index}")
-        if not 0 <= semantic_start < semantic_end:
-            raise ValueError(
-                f"invalid semantic REPA-E capture span [{semantic_start},{semantic_end})"
-            )
-        self._semantic_repae_capture_request = (block_index, semantic_start, semantic_end)
-        self._semantic_repae_captured_hidden = None
-
-    def consume_semantic_repae_capture(self) -> torch.Tensor:
-        """Return and clear the semantic-only intermediate captured by the last forward."""
-        captured = self._semantic_repae_captured_hidden
-        self._semantic_repae_captured_hidden = None
-        self._semantic_repae_capture_request = None
-        if captured is None:
-            raise RuntimeError("semantic REPA-E intermediate capture is missing")
-        return captured
-
     def apply_video_token_metadata(self, video_args: TransformerArgs, video: Modality) -> TransformerArgs:
         """Apply enabled token metadata adapters through a stable public interface."""
-        if self.semantic_repae_semantic_type_embedding is None:
+        if self.semantic_type_embedding is None:
             return self._apply_semantic_flow_video_token_metadata(video_args, video)
         if video.token_type_ids is None:
-            raise ValueError("semantic REPA-E conditioning requires token_type_ids")
+            raise ValueError("semantic VLM flow requires token_type_ids")
         if video.entity_ids is None:
-            raise ValueError("semantic REPA-E conditioning requires entity_ids")
+            raise ValueError("semantic VLM flow requires entity_ids")
         if video.token_type_ids.shape != video_args.x.shape[:2]:
             raise ValueError("token_type_ids must match the video token shape")
         if video.entity_ids.shape != video_args.x.shape[:2]:
@@ -500,11 +477,11 @@ class LTXModel(torch.nn.Module):
         x = video_args.x
         reference_mask = video.token_type_ids == self.reference_token_type_id
         semantic_mask = video.token_type_ids == self.semantic_token_type_id
-        reference_type = self.semantic_repae_reference_type_embedding.weight[0].to(dtype=x.dtype)
-        semantic_type = self.semantic_repae_semantic_type_embedding.weight[0].to(dtype=x.dtype)
-        slot_count = self.semantic_repae_reference_slot_embedding.num_embeddings
+        reference_type = self.reference_type_embedding.weight[0].to(dtype=x.dtype)
+        semantic_type = self.semantic_type_embedding.weight[0].to(dtype=x.dtype)
+        slot_count = self.reference_slot_embedding.num_embeddings
         slot_ids = (video.entity_ids - 1).clamp(min=0, max=slot_count - 1)
-        slot = self.semantic_repae_reference_slot_embedding(slot_ids).to(dtype=x.dtype)
+        slot = self.reference_slot_embedding(slot_ids).to(dtype=x.dtype)
         metadata = (
             reference_mask.unsqueeze(-1).to(dtype=x.dtype) * (reference_type + slot)
             + semantic_mask.unsqueeze(-1).to(dtype=x.dtype) * semantic_type
@@ -588,18 +565,6 @@ class LTXModel(torch.nn.Module):
             else:
                 video, audio = block(video=video, audio=audio)
 
-            request = self._semantic_repae_capture_request
-            if request is not None and block_idx == request[0]:
-                if video is None:
-                    raise RuntimeError("semantic REPA-E capture requires an enabled video modality")
-                semantic_start, semantic_end = request[1:]
-                if semantic_end > video.x.shape[1]:
-                    raise RuntimeError(
-                        "semantic REPA-E capture span exceeds the video sequence: "
-                        f"end={semantic_end}, length={video.x.shape[1]}"
-                    )
-                self._semantic_repae_captured_hidden = video.x[:, semantic_start:semantic_end].clone()
-
         return video, audio
 
     def _process_output(
@@ -622,9 +587,42 @@ class LTXModel(torch.nn.Module):
         x = proj_out(x)
         return x
 
+    def _prepare_video_args(
+        self,
+        video: Modality,
+        audio: Modality | None,
+    ) -> TransformerArgs:
+        separated = video.reference_latent is not None or video.semantic_latent is not None
+        if not separated:
+            return self.video_args_preprocessor.prepare(video, audio)
+        if video.reference_latent is None or video.semantic_latent is None:
+            raise ValueError(
+                "semantic VLM flow requires both reference_latent and semantic_latent"
+            )
+        if self.semantic_input_proj is None:
+            raise RuntimeError("semantic VLM flow input projection is not initialized")
+        reference_hidden = self.patchify_proj(video.reference_latent)
+        semantic_hidden = self.semantic_input_proj(video.semantic_latent)
+        target_hidden = self.patchify_proj(video.latent)
+        joint_hidden = torch.cat(
+            [reference_hidden, semantic_hidden, target_hidden],
+            dim=1,
+        )
+        expected_tokens = video.timesteps.shape[1]
+        if joint_hidden.shape[1] != expected_tokens:
+            raise ValueError(
+                "semantic VLM flow projected token count differs from metadata: "
+                f"hidden={joint_hidden.shape[1]}, timesteps={expected_tokens}"
+            )
+        return self.video_args_preprocessor.prepare_projected(
+            video,
+            joint_hidden,
+            audio,
+        )
+
     def forward(
         self, video: Modality | None, audio: Modality | None, perturbations: BatchedPerturbationConfig
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor | SemanticVideoPrediction | None, torch.Tensor | None]:
         """
         Forward pass for LTX models.
         Returns:
@@ -635,8 +633,7 @@ class LTXModel(torch.nn.Module):
         if not self.model_type.is_audio_enabled() and audio is not None:
             raise ValueError("Audio is not enabled for this model")
 
-        video_args = self.video_args_preprocessor.prepare(video, audio) if video is not None else None
-        self._semantic_repae_captured_hidden = None
+        video_args = self._prepare_video_args(video, audio) if video is not None else None
         if video_args is not None and video is not None:
             video_args = self._apply_video_token_metadata(video_args, video)
         audio_args = self.audio_args_preprocessor.prepare(audio, video) if audio is not None else None
@@ -648,12 +645,41 @@ class LTXModel(torch.nn.Module):
         )
 
         # Process output
-        vx = None
+        vx: torch.Tensor | SemanticVideoPrediction | None = None
         if video_out is not None:
-            vx = self._process_output(
-                self.scale_shift_table, self.norm_out, self.proj_out, video_out.x, video_out.embedded_timestep
-            )
-            if (
+            if video is not None and video.semantic_latent is not None:
+                if (
+                    video.reference_latent is None
+                    or self.semantic_norm_out is None
+                    or self.semantic_output_proj is None
+                ):
+                    raise RuntimeError("semantic VLM flow output modules are incomplete")
+                reference_length = video.reference_latent.shape[1]
+                semantic_length = video.semantic_latent.shape[1]
+                semantic_end = reference_length + semantic_length
+                semantic_velocity = self.semantic_output_proj(
+                    self.semantic_norm_out(video_out.x[:, reference_length:semantic_end])
+                )
+                video_velocity = self._process_output(
+                    self.scale_shift_table,
+                    self.norm_out,
+                    self.proj_out,
+                    video_out.x[:, semantic_end:],
+                    video_out.embedded_timestep[:, semantic_end:],
+                )
+                vx = SemanticVideoPrediction(
+                    semantic=semantic_velocity,
+                    video=video_velocity,
+                )
+            else:
+                vx = self._process_output(
+                    self.scale_shift_table,
+                    self.norm_out,
+                    self.proj_out,
+                    video_out.x,
+                    video_out.embedded_timestep,
+                )
+            if isinstance(vx, torch.Tensor) and (
                 video is not None
                 and video.token_type_ids is not None
                 and self.semantic_norm_out is not None
@@ -703,6 +729,8 @@ class LegacyX0Model(torch.nn.Module):
             Denoised video and audio
         """
         vx, ax = self.velocity_model(video, audio, perturbations)
+        if isinstance(vx, SemanticVideoPrediction):
+            raise TypeError("LegacyX0Model does not support separated semantic/video state")
         denoised_video = to_denoised(video.latent, vx, sigma) if vx is not None else None
         denoised_audio = to_denoised(audio.latent, ax, sigma) if ax is not None else None
         return denoised_video, denoised_audio
@@ -731,6 +759,8 @@ class X0Model(torch.nn.Module):
             Denoised video and audio
         """
         vx, ax = self.velocity_model(video, audio, perturbations)
+        if isinstance(vx, SemanticVideoPrediction):
+            raise TypeError("X0Model does not support separated semantic/video state")
         denoised_video = to_denoised(video.latent, vx, video.timesteps) if vx is not None else None
         denoised_audio = to_denoised(audio.latent, ax, audio.timesteps) if ax is not None else None
         return denoised_video, denoised_audio

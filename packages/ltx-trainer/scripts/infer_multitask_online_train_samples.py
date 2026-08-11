@@ -215,7 +215,7 @@ def main(
             failures.append(failure)
             atomic_write_json(sample_output_dir(output, sample) / "failure.json", failure)
     summary = {
-        "architecture": "semantic_flow_v2",
+        "architecture": runtime.checkpoint_audit["metadata"].get("architecture"),
         "code_commit": commit,
         "config": str(Path(config).expanduser().resolve()),
         "checkpoint": str(checkpoint_path),

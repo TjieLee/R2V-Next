@@ -208,27 +208,36 @@ class TransformerArgsPreprocessor:
         modality: Modality,
         cross_modality: Modality | None = None,  # noqa: ARG002
     ) -> TransformerArgs:
-        x = self.patchify_proj(modality.latent)
+        return self.prepare_projected(modality, self.patchify_proj(modality.latent))
+
+    def prepare_projected(
+        self,
+        modality: Modality,
+        projected_latent: torch.Tensor,
+        cross_modality: Modality | None = None,  # noqa: ARG002
+    ) -> TransformerArgs:
+        """Prepare transformer arguments from already projected hidden tokens."""
+        x = projected_latent
         batch_size = x.shape[0]
         timestep, embedded_timestep = self._prepare_timestep(
-            modality.timesteps, self.adaln, batch_size, modality.latent.dtype
+            modality.timesteps, self.adaln, batch_size, x.dtype
         )
         prompt_timestep = None
         if self.prompt_adaln is not None:
             prompt_timestep, _ = self._prepare_timestep(
-                modality.sigma, self.prompt_adaln, batch_size, modality.latent.dtype
+                modality.sigma, self.prompt_adaln, batch_size, x.dtype
             )
         context = self._prepare_context(modality.context, x)
-        attention_mask = self._prepare_attention_mask(modality.context_mask, modality.latent.dtype)
+        attention_mask = self._prepare_attention_mask(modality.context_mask, x.dtype)
         pe = self._prepare_positional_embeddings(
             positions=modality.positions,
             inner_dim=self.inner_dim,
             max_pos=self.max_pos,
             use_middle_indices_grid=self.use_middle_indices_grid,
             num_attention_heads=self.num_attention_heads,
-            x_dtype=modality.latent.dtype,
+            x_dtype=x.dtype,
         )
-        self_attention_mask = self._prepare_self_attention_mask(modality.attention_mask, modality.latent.dtype)
+        self_attention_mask = self._prepare_self_attention_mask(modality.attention_mask, x.dtype)
         return TransformerArgs(
             x=x,
             context=context,
@@ -291,7 +300,32 @@ class MultiModalTransformerArgsPreprocessor:
         modality: Modality,
         cross_modality: Modality | None = None,
     ) -> TransformerArgs:
-        transformer_args = self.simple_preprocessor.prepare(modality)
+        return self._prepare(modality, cross_modality=cross_modality)
+
+    def prepare_projected(
+        self,
+        modality: Modality,
+        projected_latent: torch.Tensor,
+        cross_modality: Modality | None = None,
+    ) -> TransformerArgs:
+        return self._prepare(
+            modality,
+            cross_modality=cross_modality,
+            projected_latent=projected_latent,
+        )
+
+    def _prepare(
+        self,
+        modality: Modality,
+        *,
+        cross_modality: Modality | None,
+        projected_latent: torch.Tensor | None = None,
+    ) -> TransformerArgs:
+        transformer_args = (
+            self.simple_preprocessor.prepare(modality)
+            if projected_latent is None
+            else self.simple_preprocessor.prepare_projected(modality, projected_latent)
+        )
         if cross_modality is None:
             return transformer_args
 
@@ -307,7 +341,7 @@ class MultiModalTransformerArgsPreprocessor:
             max_pos=[self.cross_pe_max_pos],
             use_middle_indices_grid=True,
             num_attention_heads=self.simple_preprocessor.num_attention_heads,
-            x_dtype=modality.latent.dtype,
+            x_dtype=transformer_args.x.dtype,
         )
 
         cross_scale_shift_timestep, cross_gate_timestep = self._prepare_cross_attention_timestep(
@@ -315,7 +349,7 @@ class MultiModalTransformerArgsPreprocessor:
             cross_modality_sigma=cross_modality.sigma,
             timestep_scale_multiplier=self.simple_preprocessor.timestep_scale_multiplier,
             batch_size=transformer_args.x.shape[0],
-            hidden_dtype=modality.latent.dtype,
+            hidden_dtype=transformer_args.x.dtype,
         )
 
         return replace(

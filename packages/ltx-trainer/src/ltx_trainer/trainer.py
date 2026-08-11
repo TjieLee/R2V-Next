@@ -56,7 +56,7 @@ from ltx_trainer.model_loader import (
     load_video_vae_encoder,
 )
 from ltx_trainer.online_inference.checkpoint_runtime import (
-    REPAE_TRANSFORMER_CHECKPOINT_PREFIXES,
+    SEMANTIC_VLM_TRANSFORMER_CHECKPOINT_PREFIXES,
     checkpoint_contains_semantic_flow_modules,
     read_checkpoint_metadata,
     validate_reference_rope_checkpoint_metadata,
@@ -119,18 +119,6 @@ _STRATEGY_LOSS_COMPONENTS = (
         "S",
         "train/loss_semantic_flow",
         "train/loss_semantic_flow_weighted",
-    ),
-    (
-        "Projection REPA",
-        "P-REPA",
-        "train/loss_semantic_projection_repa",
-        "train/loss_semantic_projection_repa_weighted",
-    ),
-    (
-        "DiT REPA",
-        "D-REPA",
-        "train/loss_semantic_dit_repa",
-        "train/loss_semantic_dit_repa_weighted",
     ),
     (
         "Reconstruction",
@@ -219,12 +207,12 @@ def _read_fsdp_state_dict_type_name(accelerator: Accelerator) -> str | None:
 
 def _enforce_semantic_flow_fsdp_runtime_safety(config: LtxTrainerConfig, accelerator: Accelerator) -> None:
     if not (
-        config.training_strategy.name in {"semantic_flow", "semantic_repae"}
+        config.training_strategy.name in {"semantic_flow", "semantic_vlm_flow"}
         and config.model.training_mode == "full"
     ):
         return
     strategy_name = config.training_strategy.name
-    strategy_label = "semantic-flow" if strategy_name == "semantic_flow" else "semantic REPA-E"
+    strategy_label = "semantic-flow" if strategy_name == "semantic_flow" else "semantic VLM flow"
     if accelerator.distributed_type != DistributedType.FSDP:
         raise RuntimeError(
             f"Full-DiT {strategy_label} training requires Accelerate FSDP FULL_SHARD. "
@@ -252,12 +240,12 @@ def _enforce_semantic_flow_fsdp_runtime_safety(config: LtxTrainerConfig, acceler
             f"Full-DiT {strategy_label} training requires FSDP FULL_STATE_DICT checkpoint collection. "
             f"Configured FSDP state-dict type is {state_dict_type!r}."
         )
-    if strategy_name == "semantic_repae":
+    if strategy_name == "semantic_vlm_flow":
         required_world_size = int(config.training_strategy.required_fsdp_world_size)
         configured_world_size = int(accelerator.num_processes)
         if configured_world_size != required_world_size:
             raise RuntimeError(
-                "Full-DiT semantic REPA-E training requires exactly "
+                "Full-DiT semantic VLM flow training requires exactly "
                 f"{required_world_size} FSDP processes; configured "
                 f"num_processes={configured_world_size}"
             )
@@ -988,7 +976,7 @@ class LtxvTrainer:
             raise ValueError("No trainable parameters were found for the selected training strategy.")
 
         logger.debug(f"Trainable params count: {sum(p.numel() for p in self._trainable_params):,}")
-        self._validate_semantic_repae_trainability(strategy_modules)
+        self._validate_semantic_vlm_flow_trainability(strategy_modules)
         self._validate_phase2_trainability(strategy_modules)
         self._write_phase2_parameter_audit(strategy_modules)
         self._log_parameter_summary(strategy_modules)
@@ -997,9 +985,9 @@ class LtxvTrainer:
         strategy_config = getattr(self._training_strategy, "config", None)
         return getattr(strategy_config, "training_phase", "phase1") == "phase2"
 
-    def _is_semantic_repae(self) -> bool:
+    def _is_semantic_vlm_flow(self) -> bool:
         strategy_config = getattr(self._training_strategy, "config", None)
-        return getattr(strategy_config, "name", None) == "semantic_repae"
+        return getattr(strategy_config, "name", None) == "semantic_vlm_flow"
 
     def _phase2_optimizer_state_cpu_offload_enabled(self) -> bool:
         data_config = getattr(self._config, "data", None)
@@ -1538,7 +1526,7 @@ class LtxvTrainer:
                 pass
         scheduler = getattr(lr_scheduler, "scheduler", lr_scheduler)
         try:
-            return int(getattr(scheduler, "last_epoch"))
+            return int(scheduler.last_epoch)
         except (AttributeError, TypeError, ValueError):
             return -1
 
@@ -2018,25 +2006,42 @@ class LtxvTrainer:
             f"{self._optimizer_group_parameter_counts['conditioning_bridge']:,}",
         )
 
-    def _semantic_repae_trainable_parameter_groups(
+    def _semantic_vlm_flow_trainable_parameter_groups(
         self,
         strategy_modules: dict[str, torch.nn.Module] | None = None,
     ) -> dict[str, list[nn.Parameter]]:
         if strategy_modules is None:
             strategy_modules = self._training_strategy.get_trainable_modules()
-        expected_modules = {
-            "semantic_input_projection",
-            "semantic_repa_projector",
-            "dit_repa_projector",
-        }
-        if set(strategy_modules) != expected_modules:
+        if strategy_modules:
             raise RuntimeError(
-                "semantic REPA-E trainable modules are incomplete: "
-                f"expected={sorted(expected_modules)}, actual={sorted(strategy_modules)}"
+                "semantic_vlm_flow must not own modules outside the transformer: "
+                f"actual={sorted(strategy_modules)}"
             )
+        semantic_prefixes = (
+            "semantic_input_proj.",
+            "semantic_output_proj.",
+            "semantic_norm_out.",
+            "reference_type_embedding.",
+            "reference_slot_embedding.",
+            "semantic_type_embedding.",
+        )
+        wrapper_parts = {"module", "_fsdp_wrapped_module"}
+        semantic_parameters = [
+            parameter
+            for name, parameter in self._transformer.named_parameters()
+            if parameter.requires_grad
+            and ".".join(
+                part for part in name.split(".") if part not in wrapper_parts
+            ).startswith(semantic_prefixes)
+        ]
+        semantic_parameter_ids = {id(parameter) for parameter in semantic_parameters}
         groups = {
             "dit": self._deduplicate_parameters(
-                [parameter for parameter in self._transformer.parameters() if parameter.requires_grad]
+                [
+                    parameter
+                    for parameter in self._transformer.parameters()
+                    if parameter.requires_grad and id(parameter) not in semantic_parameter_ids
+                ]
             ),
             "conditioning_bridge": self._deduplicate_parameters(
                 [
@@ -2046,78 +2051,59 @@ class LtxvTrainer:
                     if parameter.requires_grad
                 ]
             ),
-            "semantic_projection": self._deduplicate_parameters(
-                [
-                    parameter
-                    for parameter in strategy_modules["semantic_input_projection"].parameters()
-                    if parameter.requires_grad
-                ]
-            ),
-            "repa_projectors": self._deduplicate_parameters(
-                [
-                    parameter
-                    for name in ("semantic_repa_projector", "dit_repa_projector")
-                    for parameter in strategy_modules[name].parameters()
-                    if parameter.requires_grad
-                ]
-            ),
+            "semantic_flow": self._deduplicate_parameters(semantic_parameters),
         }
         empty = [name for name, parameters in groups.items() if not parameters]
         if empty:
-            raise RuntimeError(f"semantic REPA-E optimizer groups are empty: {empty}")
+            raise RuntimeError(f"semantic VLM flow optimizer groups are empty: {empty}")
         flattened = [parameter for parameters in groups.values() for parameter in parameters]
         parameter_ids = [id(parameter) for parameter in flattened]
         if len(parameter_ids) != len(set(parameter_ids)):
-            raise RuntimeError("semantic REPA-E trainable parameters overlap optimizer groups")
+            raise RuntimeError("semantic VLM flow trainable parameters overlap optimizer groups")
         expected_ids = {id(parameter) for parameter in self._trainable_params}
         if set(parameter_ids) != expected_ids:
-            raise RuntimeError("semantic REPA-E optimizer groups do not cover the trainable parameter set")
+            raise RuntimeError("semantic VLM flow optimizer groups do not cover the trainable parameter set")
         return groups
 
-    def _validate_semantic_repae_trainability(
+    def _validate_semantic_vlm_flow_trainability(
         self,
         strategy_modules: dict[str, torch.nn.Module],
     ) -> None:
-        if not self._is_semantic_repae():
+        if not self._is_semantic_vlm_flow():
             return
         frozen_transformer = [
             name for name, parameter in self._transformer.named_parameters() if not parameter.requires_grad
         ]
         if frozen_transformer:
             raise RuntimeError(
-                "semantic REPA-E requires the complete transformer to be trainable from step 0; "
+                "semantic VLM flow requires the complete transformer to be trainable from step 0; "
                 f"frozen={frozen_transformer[:20]}"
             )
         transformer_names = dict(self._transformer.named_parameters())
         required_dit_parameters = {
-            "semantic_repae_reference_type_embedding.weight",
-            "semantic_repae_reference_slot_embedding.weight",
-            "semantic_repae_semantic_type_embedding.weight",
+            "semantic_input_proj.weight",
+            "semantic_input_proj.bias",
+            "semantic_output_proj.weight",
+            "semantic_output_proj.bias",
+            "reference_type_embedding.weight",
+            "reference_slot_embedding.weight",
+            "semantic_type_embedding.weight",
             "semantic_norm_out.weight",
-            "semantic_proj_out.weight",
-            "semantic_proj_out.bias",
         }
         missing_dit = sorted(required_dit_parameters - set(transformer_names))
         if missing_dit:
             raise RuntimeError(
-                f"semantic REPA-E transformer adapters are incomplete: {missing_dit}"
+                f"semantic VLM flow transformer modules are incomplete: {missing_dit}"
             )
-        frozen_strategy = [
-            f"{module_name}.{parameter_name}"
-            for module_name, module in strategy_modules.items()
-            for parameter_name, parameter in module.named_parameters()
-            if not parameter.requires_grad
-        ]
-        if frozen_strategy:
+        if strategy_modules:
             raise RuntimeError(
-                "semantic REPA-E strategy modules must be trainable from step 0; "
-                f"frozen={frozen_strategy[:20]}"
+                "semantic VLM flow must not own trainable modules outside the transformer"
             )
         expected_bridge = phase2_bridge_parameters(self._embeddings_processor)
         frozen_bridge = [item.name for item in expected_bridge if not item.parameter.requires_grad]
         if frozen_bridge:
             raise RuntimeError(
-                f"semantic REPA-E conditioning bridge contains frozen parameters: {frozen_bridge[:20]}"
+                f"semantic VLM flow conditioning bridge contains frozen parameters: {frozen_bridge[:20]}"
             )
         expected_bridge_ids = {id(item.parameter) for item in expected_bridge}
         actual_bridge_ids = {
@@ -2128,20 +2114,20 @@ class LtxvTrainer:
         }
         if actual_bridge_ids != expected_bridge_ids:
             raise RuntimeError(
-                "semantic REPA-E prepared bridge modules do not match the explicit allowlist"
+                "semantic VLM flow prepared bridge modules do not match the explicit allowlist"
             )
         if self._text_encoder is None or any(
             parameter.requires_grad for parameter in self._text_encoder.parameters()
         ):
-            raise RuntimeError("semantic REPA-E Gemma, vision tower, and multimodal projector must remain frozen")
+            raise RuntimeError("semantic VLM flow Gemma, vision tower, and multimodal projector must remain frozen")
         online_vae = getattr(self, "_online_vae_encoder", None)
         if online_vae is None or any(parameter.requires_grad for parameter in online_vae.parameters()):
-            raise RuntimeError("semantic REPA-E VAE encoder must remain frozen")
+            raise RuntimeError("semantic VLM flow VAE encoder must remain frozen")
         audio_connector = getattr(self._embeddings_processor, "audio_connector", None)
         if isinstance(audio_connector, nn.Module) and any(
             parameter.requires_grad for parameter in audio_connector.parameters()
         ):
-            raise RuntimeError("semantic REPA-E audio connector must remain frozen")
+            raise RuntimeError("semantic VLM flow audio connector must remain frozen")
         unexpected_processor = [
             name
             for name, parameter in self._embeddings_processor.named_parameters()
@@ -2149,19 +2135,19 @@ class LtxvTrainer:
         ]
         if unexpected_processor:
             raise RuntimeError(
-                "Unexpected semantic REPA-E trainable embeddings-processor parameters: "
+                "Unexpected semantic VLM flow trainable embeddings-processor parameters: "
                 f"{unexpected_processor[:20]}"
             )
-        groups = self._semantic_repae_trainable_parameter_groups(strategy_modules)
+        groups = self._semantic_vlm_flow_trainable_parameter_groups(strategy_modules)
         self._optimizer_group_parameter_counts = {
             name: sum(parameter.numel() for parameter in parameters)
             for name, parameters in groups.items()
         }
         logger.info(
-            "semantic REPA-E trainability audit passed: %s",
+            "semantic VLM flow trainability audit passed: %s",
             ", ".join(
                 f"{name}={self._optimizer_group_parameter_counts[name]:,}"
-                for name in ("dit", "conditioning_bridge", "semantic_projection", "repa_projectors")
+                for name in ("dit", "conditioning_bridge", "semantic_flow")
             ),
         )
 
@@ -2384,16 +2370,16 @@ class LtxvTrainer:
         logger.info("✅ Full model checkpoint loaded successfully")
 
     def _validate_full_checkpoint_metadata(self, checkpoint_path: Path) -> dict[str, str]:
-        if self._is_semantic_repae():
+        if self._is_semantic_vlm_flow():
             metadata = read_checkpoint_metadata(checkpoint_path)
             validate_reference_rope_checkpoint_metadata(
                 metadata,
                 expected_mode=self._training_strategy.config.reference_rope_mode,
                 allow_legacy=False,
             )
-            if metadata.get("architecture") != "semantic_repae_v1":
+            if metadata.get("architecture") != "semantic_vlm_joint_flow_v1":
                 raise RuntimeError(
-                    "Unsupported semantic REPA-E checkpoint architecture: "
+                    "Unsupported semantic VLM flow checkpoint architecture: "
                     f"{metadata.get('architecture')!r}"
                 )
             return metadata
@@ -2634,12 +2620,12 @@ class LtxvTrainer:
             for key, value in state_dict.items()
             if key.startswith("embeddings_processor.")
         }
-        if self._is_semantic_repae():
+        if self._is_semantic_vlm_flow():
             loaded = validate_and_load_phase2_bridge_state(
                 self._embeddings_processor,
                 state_dict,
             )
-            logger.info("✅ Strictly loaded %d semantic REPA-E conditioning-bridge tensors", loaded)
+            logger.info("✅ Strictly loaded %d semantic VLM flow conditioning-bridge tensors", loaded)
         elif self._is_semantic_flow_phase2() and (checkpoint_metadata or {}).get(
             "training_phase"
         ) == "phase2":
@@ -3687,9 +3673,9 @@ class LtxvTrainer:
         lr = opt_cfg.learning_rate
         optimizer_parameters: Any = self._trainable_params
         phase2_parameter_names_by_group: dict[str, list[str]] = {}
-        if self._is_semantic_repae():
+        if self._is_semantic_vlm_flow():
             strategy_modules = self._training_strategy.get_trainable_modules()
-            groups = self._semantic_repae_trainable_parameter_groups(strategy_modules)
+            groups = self._semantic_vlm_flow_trainable_parameter_groups(strategy_modules)
             optimizer_parameters = [
                 {"name": "dit", "params": groups["dit"], "lr": opt_cfg.learning_rate},
                 {
@@ -3698,14 +3684,9 @@ class LtxvTrainer:
                     "lr": opt_cfg.bridge_learning_rate or opt_cfg.learning_rate,
                 },
                 {
-                    "name": "semantic_projection",
-                    "params": groups["semantic_projection"],
+                    "name": "semantic_flow",
+                    "params": groups["semantic_flow"],
                     "lr": opt_cfg.semantic_learning_rate or opt_cfg.learning_rate,
-                },
-                {
-                    "name": "repa_projectors",
-                    "params": groups["repa_projectors"],
-                    "lr": opt_cfg.repa_learning_rate or opt_cfg.learning_rate,
                 },
             ]
         elif self._is_semantic_flow_phase2():
@@ -3815,14 +3796,13 @@ class LtxvTrainer:
 
         # noinspection PyTypeChecker
         self._optimizer, self._lr_scheduler = self._accelerator.prepare(optimizer, lr_scheduler)
-        if self._is_semantic_repae():
+        if self._is_semantic_vlm_flow():
             logger.info(
-                "semantic REPA-E optimizer learning rates: dit=%g conditioning_bridge=%g "
-                "semantic_projection=%g repa_projectors=%g",
+                "semantic VLM flow optimizer learning rates: dit=%g conditioning_bridge=%g "
+                "semantic_flow=%g",
                 opt_cfg.learning_rate,
                 opt_cfg.bridge_learning_rate or opt_cfg.learning_rate,
                 opt_cfg.semantic_learning_rate or opt_cfg.learning_rate,
-                opt_cfg.repa_learning_rate or opt_cfg.learning_rate,
             )
         if self._is_semantic_flow_phase2():
             self._phase2_optimizer_parameter_names = {}
@@ -3967,10 +3947,10 @@ class LtxvTrainer:
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
 
         # FSDP no_sync accumulates full-model gradients and can exceed device memory.
-        # Semantic REPA-E keeps the same logical accumulation/global batch size while
+        # Semantic VLM flow keeps the same logical accumulation/global batch size while
         # synchronizing every microbatch so gradients remain sharded.
         sync_each_batch = (
-            self._config.training_strategy.name == "semantic_repae"
+            self._config.training_strategy.name == "semantic_vlm_flow"
             and self._config.model.training_mode == "full"
             and self._config.optimization.gradient_accumulation_steps > 1
         )
@@ -4257,8 +4237,8 @@ class LtxvTrainer:
                     "embeddings_processor.feature_extractor.",
                     "embeddings_processor.video_connector.",
                 )
-            if self._is_semantic_repae():
-                required_prefixes += REPAE_TRANSFORMER_CHECKPOINT_PREFIXES
+            if self._is_semantic_vlm_flow():
+                required_prefixes += SEMANTIC_VLM_TRANSFORMER_CHECKPOINT_PREFIXES
             self._atomic_save_safetensors(
                 full_state_dict,
                 saved_weights_path,

@@ -262,7 +262,7 @@ class OnlineBatchEncoder:
             strategy_config=strategy_config,
         )
         phase2 = getattr(strategy_config, "training_phase", "phase1") == "phase2"
-        factorized_til = phase2 or getattr(strategy_config, "name", None) == "semantic_repae"
+        factorized_til = phase2 or getattr(strategy_config, "name", None) == "semantic_vlm_flow"
         if factorized_til:
             if condition_mode not in PHASE2_CONDITION_MODES:
                 raise RuntimeError(f"Unsupported T/I/L condition mode {condition_mode!r}")
@@ -1013,7 +1013,7 @@ class OnlineBatchEncoder:
                 if draw < cumulative:
                     return name
             return "til_000"
-        if getattr(strategy_config, "name", None) == "semantic_repae":
+        if getattr(strategy_config, "name", None) == "semantic_vlm_flow":
             cumulative = 0.0
             for name in PHASE2_CONDITION_MODES:
                 cumulative += float(strategy_config.condition_probabilities[name])
