@@ -119,7 +119,7 @@ def run_online_sample(
     if strict_checks.get("target_path_passed_to_condition_encoder") is not False:
         raise RuntimeError("Strict-no-GT guard failed before denoising")
     metadata: dict[str, Any] = {
-        "architecture": "semantic_flow_v2",
+        "architecture": runtime.checkpoint_audit["metadata"].get("architecture"),
         "sample_key": sample["sample_key"],
         "task": sample["task"],
         "caption": sample["caption"],

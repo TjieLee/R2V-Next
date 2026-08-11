@@ -127,7 +127,10 @@ def test_external_dry_run_records_all_guidance_metadata_without_decoder(
         online_encoder = object()
         device = torch.device("cpu")
         checkpoint_path = tmp_path / "checkpoint.safetensors"
-        checkpoint_audit = {"checkpoint_sha256": "digest"}
+        checkpoint_audit = {
+            "checkpoint_sha256": "digest",
+            "metadata": {"architecture": "semantic_vlm_joint_flow_v1"},
+        }
         vae_decoder = None
         last_generation_geometry: dict[str, object] = {}
 
@@ -158,6 +161,9 @@ def test_external_dry_run_records_all_guidance_metadata_without_decoder(
     assert result["enabled_guidance_branches"] == ["P", "N", "Q"]
     assert result["joint_guided_span"] == "semantic_and_target"
     assert result["has_target"] is False
+    assert result["architecture"] == "semantic_vlm_joint_flow_v1"
+    assert result["architecture"] == FakeRuntime.checkpoint_audit["metadata"]["architecture"]
     sample_dir = tmp_path / "outputs" / "opens2v_open_domain" / "sample_1"
-    assert (sample_dir / "dry_run.json").is_file()
+    dry_run_metadata = json.loads((sample_dir / "dry_run.json").read_text(encoding="utf-8"))
+    assert dry_run_metadata["architecture"] == FakeRuntime.checkpoint_audit["metadata"]["architecture"]
     assert (sample_dir / "negative_prompt.txt").read_text(encoding="utf-8") == "negative\n"
